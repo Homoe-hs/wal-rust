@@ -1,0 +1,14 @@
+;; Benchmark script for VCD loading performance
+;; Usage: cargo run --quiet -- convert <input.vcd> <output.fst>
+
+(print "=== WAL VCD Loading Benchmark ===")
+(print "")
+
+;; Create a simple WAL script that prints a message
+(define script "
+(print \"Starting VCD load benchmark...\")
+(print \"Using convert command for actual VCD loading\")
+(print \"Done\")
+")
+
+(print script)

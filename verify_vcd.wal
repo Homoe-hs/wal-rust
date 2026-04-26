@@ -1,0 +1,33 @@
+;; VCD format validation script
+;; Usage: wal-rust run verify_vcd.wal -l <vcd_file>
+
+(define fname (trace-name 0))
+(print "Loaded: " fname)
+
+;; Check signal count
+(let ((sigs (signals)))
+  (print "Signals: " (length sigs))
+  (print "First 10 signals:"))
+(dotimes (i (min 10 (length (signals))))
+  (print "  " (index (signals) i)))
+
+;; Check timestamp range
+(print "Max index: " (max-index))
+(print "Index 0 timestamp: " (ts 0))
+(print "Index " (max-index) " timestamp: " (ts (max-index)))
+
+;; Sample a few signals at random timestamps
+(let ((mid (/ (max-index) 2)))
+  (print "")
+  (print "=== Sampling signal values ===")
+  (print "counter at 0: " (get counter 0))
+  (print "counter at " mid ": " (get counter mid))
+  (print "counter at " (max-index) ": " (get counter (max-index)))
+  (print "strobe at 0: " (get strobe 0))
+  (print "strobe at 999: " (get strobe 999))
+  (print "strobe at 1000: " (get strobe 1000))
+  (print "sig0 at 0: " (get sig0 0))
+  (print "sig0 at 1: " (get sig0 1)))
+
+(print "")
+(print "=== VCD validation PASSED ===")

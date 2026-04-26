@@ -1,0 +1,11 @@
+;; Simple WAL script to test waveform loading
+;; This script demonstrates basic WAL operations
+
+(define test-name "test_10G")
+(print "Loading VCD file: " test-name)
+
+;; Load the waveform (this is a stub in current implementation)
+;; The actual VCD loading is done via the 'convert' command
+
+(print "Script loaded successfully")
+(print "Result: " (+ 1 2 3 4 5))

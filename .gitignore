@@ -1,0 +1,16 @@
+/target/
+/Cargo.lock
+*.vcd
+*.fst
+test_data/
+stress_tests/
+bench_results.csv
+perf_test.sh
+generate_*.py
+gen_*.py
+regression.py
+requirements.txt
+rustup_install.sh
+generate_vcd.sh
+generate_5000.py
+vcd-samples/

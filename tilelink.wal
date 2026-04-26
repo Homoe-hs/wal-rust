@@ -1,0 +1,356 @@
+;; tilelink.wal — Generic Bus Protocol Performance Analyzer
+;;
+;; Usage: wal-rust run -l <vcd_file> tilelink.wal
+;;
+;; Auto-detects TileLink (a_*, d_*) or AXI (axi_*) signals.
+;; Metrics: handshakes, latency, bandwidth, utilization.
+
+(print "========================================")
+(print " Bus Protocol Performance Analyzer")
+(print "========================================")
+
+;; ============================================================
+;; Protocol auto-detection
+;; ============================================================
+(print "--- Protocol Detection ---")
+
+;; Get all signal names
+(define all_signals (signals))
+(printf "  Total signals in trace: {0}" (length all_signals))
+
+;; Count signals by channel prefix
+(defun count-prefix (prefix)
+  (let ((cnt 0))
+    (fold
+      (fn (n sig)
+        (if (> (length sig) (length prefix))
+          (if (= (slice sig 0 (length prefix)) prefix)
+            (+ n 1)
+            n)
+          n))
+      cnt
+      all_signals)))
+
+(define tl_a_count (count-prefix "a_"))
+(define tl_d_count (count-prefix "d_"))
+(define axi_aw_count (count-prefix "dma_axi_aw"))
+(define axi_ar_count (count-prefix "dma_axi_ar"))
+(define axi_w_count (count-prefix "dma_axi_w"))
+(define axi_r_count (count-prefix "dma_axi_r"))
+(define axi_b_count (count-prefix "dma_axi_b"))
+
+(printf "  TileLink A: {0}  D: {1}" tl_a_count tl_d_count)
+(printf "  AXI AW: {0}  AR: {1}  W: {2}  R: {3}  B: {4}"
+  axi_aw_count axi_ar_count axi_w_count axi_r_count axi_b_count)
+
+;; Determine protocol
+(define PROTO "none")
+(define PREFIX "")
+(define VALID_SUFFIX "_valid")
+(define READY_SUFFIX "_ready")
+
+(if (> tl_a_count 3)
+  (do (define PROTO "tilelink")
+      (define PREFIX "")))
+
+(if (> axi_aw_count 3)
+  (do (define PROTO "axi")
+      (define PREFIX "dma_axi_")
+      (define VALID_SUFFIX "valid")
+      (define READY_SUFFIX "ready")))
+
+(printf "  Detected protocol: {0}" PROTO)
+
+;; ============================================================
+;; Key signal names
+;; ============================================================
+(define A_VALID (concat PREFIX "a" VALID_SUFFIX))
+(define A_READY (concat PREFIX "a" READY_SUFFIX))
+(define D_VALID (concat PREFIX "d" VALID_SUFFIX))
+(define D_READY (concat PREFIX "d" READY_SUFFIX))
+(define A_ADDR  (concat PREFIX "a_address"))
+(define A_DATA  (concat PREFIX "a_data"))
+(define A_OPCODE (concat PREFIX "a_opcode"))
+(define D_DATA  (concat PREFIX "d_data"))
+(define D_OPCODE (concat PREFIX "d_opcode"))
+
+;; AXI-specific
+(define R_VALID (concat PREFIX "r" VALID_SUFFIX))
+(define R_READY (concat PREFIX "r" READY_SUFFIX))
+(define R_DATA  (concat PREFIX "rdata"))
+(define R_RESP  (concat PREFIX "rresp"))
+(define R_LAST  (concat PREFIX "rlast"))
+(define AW_VALID (concat PREFIX "aw" VALID_SUFFIX))
+(define AW_READY (concat PREFIX "aw" READY_SUFFIX))
+(define AW_ADDR  (concat PREFIX "awaddr"))
+(define W_VALID  (concat PREFIX "w" VALID_SUFFIX))
+(define W_READY  (concat PREFIX "w" READY_SUFFIX))
+(define W_DATA   (concat PREFIX "wdata"))
+(define W_STROBE (concat PREFIX "wstrb"))
+(define W_LAST   (concat PREFIX "wlast"))
+(define B_VALID  (concat PREFIX "b" VALID_SUFFIX))
+(define B_READY  (concat PREFIX "b" READY_SUFFIX))
+
+(printf "  Request channel: {0} / {1}" A_VALID A_READY)
+(printf "  Response channel: {0} / {1}" D_VALID D_READY)
+
+;; ============================================================
+;; Metric 1: Handshake Count
+;; ============================================================
+(print "")
+(print "--- Metric 1: Handshake Count ---")
+
+;; TileLink: count (valid && ready) cycles
+(defun count-tl-handshakes (v-name r-name)
+  (let ((hs 0))
+    (step 0)
+    (define idx 0)
+    (define max_i (max-index))
+    (while (< idx max_i)
+      (step 1)
+      (set idx (ts))
+      (if (> (get v-name) 0)
+        (if (> (get r-name) 0)
+          (set hs (+ hs 1)))))
+    (step 0)
+    hs))
+
+;; AXI: read/write channel specific counts
+(defun count-axi-handshake (v-name r-name)
+  (let ((hs 0))
+    (step 0)
+    (define idx 0)
+    (define max_i (max-index))
+    (while (< idx max_i)
+      (step 1)
+      (set idx (ts))
+      (if (> (get v-name) 0)
+        (if (> (get r-name) 0)
+          (set hs (+ hs 1)))))
+    (step 0)
+    hs))
+
+(if (= PROTO "tilelink")
+  (do
+    (printf "  Channel A handshakes: {0}" (count-tl-handshakes A_VALID A_READY))
+    (printf "  Channel D handshakes: {0}" (count-tl-handshakes D_VALID D_READY))))
+
+(if (= PROTO "axi")
+  (do
+    (printf "  AW handshakes: {0}" (count-axi-handshake AW_VALID AW_READY))
+    (printf "  AR handshakes: {0}" (count-axi-handshake (concat PREFIX "ar" VALID_SUFFIX) (concat PREFIX "ar" READY_SUFFIX)))
+    (printf "  R handshakes:  {0}" (count-axi-handshake R_VALID R_READY))
+    (printf "  W handshakes:  {0}" (count-axi-handshake W_VALID W_READY))
+    (printf "  B handshakes:  {0}" (count-axi-handshake B_VALID B_READY))))
+
+(print "")
+(print "--- Metric 2: Time Statistics ---")
+
+(define max_idx (max-index))
+(printf "  Total timepoints: {0}" (count (first (loaded-traces))))
+(printf "  Max index: {0}" max_idx)
+
+;; ============================================================
+;; Metric 3: Total Bus Utilization
+;; ============================================================
+(print "")
+(print "--- Metric 3: Bus Utilization ---")
+
+(defun calc-util (v-name r-name label)
+  (let ((v-cycles 0) (stall 0))
+    (step 0)
+    (define idx 0)
+    (while (< idx max_idx)
+      (step 1)
+      (set idx (ts))
+      (if (> (get v-name) 0)
+        (do
+          (set v-cycles (+ v-cycles 1))
+          (if (= (get r-name) 0)
+            (set stall (+ stall 1))))))
+    (if (> v-cycles 0)
+      (printf "  {0}: valid={1}  stalled={2}  util={3}%"
+        label v-cycles stall
+        (/ (* (- v-cycles stall) 100) v-cycles))
+      (printf "  {0}: no activity" label))
+    (step 0)))
+
+(if (= PROTO "tilelink")
+  (do
+    (calc-util A_VALID A_READY "Channel A")
+    (calc-util D_VALID D_READY "Channel D")))
+
+(if (= PROTO "axi")
+  (do
+    (calc-util AW_VALID AW_READY "Write Address")
+    (calc-util (concat PREFIX "ar" VALID_SUFFIX) (concat PREFIX "ar" READY_SUFFIX) "Read Address")
+    (calc-util R_VALID R_READY  "Read Data")
+    (calc-util W_VALID W_READY  "Write Data")
+    (calc-util B_VALID B_READY  "Write Response")))
+
+;; ============================================================
+;; Metric 4: Bandwidth Estimation
+;; ============================================================
+(print "")
+(print "--- Metric 4: Bandwidth Estimation ---")
+
+;; Count data beats on response channel
+(defun count-data-beats (v-name r-name)
+  (let ((beats 0))
+    (step 0)
+    (define idx 0)
+    (while (< idx max_idx)
+      (step 1)
+      (set idx (ts))
+      (if (> (get v-name) 0)
+        (if (> (get r-name) 0)
+          (set beats (+ beats 1)))))
+    (step 0)
+    beats))
+
+(define resp_handshakes 0)
+
+(if (= PROTO "tilelink")
+  (set resp_handshakes (count-data-beats D_VALID D_READY)))
+
+(if (= PROTO "axi")
+  (set resp_handshakes (+
+    (count-data-beats R_VALID R_READY)    ;; read data
+    (count-data-beats W_VALID W_READY)))) ;; write data
+
+(printf "  Total response beats: {0}" resp_handshakes)
+
+;; Assume 8-byte data bus unless specified
+(define DATA_BYTES 4)
+
+;; For AXI: check W_STROBE or R_DATA width
+(define max_idx_data 0)
+(step 0)
+(define max_idx_data (signal-width A_DATA))
+(if (> max_idx_data 0)
+  (set DATA_BYTES (/ max_idx_data 32)))
+
+(printf "  Approx data width: {0} bytes" DATA_BYTES)
+(printf "  Approx total data transferred: {0} MB"
+  (/ (* resp_handshakes DATA_BYTES) 1048576))
+
+;; Reset position
+(step 0)
+
+;; ============================================================
+;; Metric 5: Request Types (if opcodes available)
+;; ============================================================
+(print "")
+(print "--- Metric 5: Request Type Breakdown ---")
+
+;; Scan first 100 handshakes for opcode sampling
+(if (= PROTO "tilelink")
+  (do
+    (define put_count 0)
+    (define get_count 0)
+    (define sample_count 0)
+    (step 0)
+    (define idx 0)
+    (while (and (< idx max_idx) (< sample_count 100))
+      (step 1)
+      (set idx (ts))
+      (if (> (get A_VALID) 0)
+        (if (> (get A_READY) 0)
+          (do
+            (set sample_count (+ sample_count 1))
+            (define op (get A_OPCODE))
+            (if (< op 4) (set put_count (+ put_count 1))
+              (if (< op 6) (set get_count (+ get_count 1))))))))
+    (printf "  Sampled {0} transactions:" sample_count)
+    (printf "    Put:  {0} ({1}%)" put_count
+      (if (> sample_count 0) (/ (* put_count 100) sample_count) 0))
+    (printf "    Get:  {0} ({1}%)" get_count
+      (if (> sample_count 0) (/ (* get_count 100) sample_count) 0))
+    (step 0)))
+
+(if (= PROTO "axi")
+  (do
+    (define rd_count (count-data-beats
+      (concat PREFIX "ar" VALID_SUFFIX)
+      (concat PREFIX "ar" READY_SUFFIX)))
+    (define wr_count (count-data-beats AW_VALID AW_READY))
+    (printf "  Read reqs:  {0}" rd_count)
+    (printf "  Write reqs: {0}" wr_count)
+    (step 0)))
+
+;; ============================================================
+;; Metric 6: Latency Sampling (Read request → data response)
+;; ============================================================
+(print "")
+(print "--- Metric 6: Latency Sampling (sampled) ---")
+
+(define LAT_SAMPLE_INTERVAL 500)
+
+(defun sample-latency (req-v req-r resp-v resp-r label)
+  (let ((total 0) (samples 0) (min_l 999999) (max_l 0))
+    (step 0)
+    (define idx 0)
+    (define hs 0)
+    (while (< idx max_idx)
+      (step 1)
+      (set idx (ts))
+      (if (> (get req-v) 0)
+        (if (> (get req-r) 0)
+          (do
+            (set hs (+ hs 1))
+            (if (= (mod hs LAT_SAMPLE_INTERVAL) 0)
+              (do
+                (define start_idx idx)
+                (define found_resp false)
+                (define search_i idx)
+                (while (not found_resp)
+                  (set search_i (+ search_i 1))
+                  (if (> search_i max_idx)
+                    (set found_resp true)
+                    (do
+                      (step 1)
+                      (if (> (get resp-v) 0)
+                        (if (> (get resp-r) 0)
+                          (do
+                            (define lat (- search_i start_idx))
+                            (set total (+ total lat))
+                            (set samples (+ samples 1))
+                            (if (< lat min_l) (set min_l lat))
+                            (if (> lat max_l) (set max_l lat))
+                            (set found_resp true)))))))))))))
+    (if (> samples 0)
+      (do
+        (printf "  {0}: {1} samples, avg={2} min={3} max={4}"
+          label samples (/ total samples) min_l max_l))
+      (printf "  {0}: no samples" label))
+    (step 0)))
+
+(if (= PROTO "tilelink")
+  (sample-latency A_VALID A_READY D_VALID D_READY "A→D"))
+
+(if (= PROTO "axi")
+  (do
+    (sample-latency (concat PREFIX "ar" VALID_SUFFIX) (concat PREFIX "ar" READY_SUFFIX)
+                    R_VALID R_READY "AR→R")
+    (sample-latency AW_VALID AW_READY W_VALID W_READY "AW→W")))
+
+;; ============================================================
+;; Summary
+;; ============================================================
+(print "")
+(print "========================================")
+(print " Analysis Complete")
+(print "========================================")
+
+(printf "  Protocol: {0}" PROTO)
+(if (> max_idx 0)
+  (do
+    (printf "  Timepoints analyzed: {0}" max_idx)
+    (printf "  Data beats: {0}" resp_handshakes)
+    (printf "  Approx bandwidth: ~{0} bytes/tick"
+      (/ (* resp_handshakes DATA_BYTES) (max 1 max_idx)))))
+(print "")
+(print "For different VCD configurations, define signals before loading:")
+(print "  (define PROTO \"tilelink\" | \"axi\")")
+(print "  (define PREFIX \"tl_\")   ;; signal prefix")
+(print "  (define DATA_BYTES 8)    ;; bytes per beat")

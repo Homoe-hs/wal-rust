@@ -1,0 +1,58 @@
+[package]
+name = "wal-rust"
+version = "0.5.0"
+edition = "2021"
+rust-version = "1.70"
+description = "WAL: Waveform Analysis Language - High-performance parser, REPL, and waveform tools"
+license = "MIT OR Apache-2.0"
+repository = ""
+keywords = ["wal", "vcd", "fst", "waveform", "verilog", "eda"]
+categories = ["command-line-utilities", "hardware"]
+
+[dependencies]
+# CLI
+clap = { version = "4.5", features = ["derive"] }
+
+# 解析 - tree-sitter
+tree-sitter = "0.22"
+tree-sitter-wal = { path = "tree-sitter-wal" }
+
+# REPL
+rustyline = "14"
+
+# FST decompression
+lz4_flex = "0.11"  # LZ4 decompression
+flate2 = "1.0"      # Zlib decompression
+
+# VCD decompression
+bzip2 = "0.4"      # Bzip2 decompression
+
+# 错误处理
+anyhow = "1"
+thiserror = "1"
+
+# 日志
+log = "0.4"
+env_logger = "0.11"
+
+# 内存管理
+bumpalo = "3"
+
+# 内存映射
+memmap2 = "0.9"
+
+# 快速字节搜索
+memchr = "2.5"
+
+# LRU cache
+lru = "0.12"
+
+[dev-dependencies]
+tempfile = "3"
+itoa = "1"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true

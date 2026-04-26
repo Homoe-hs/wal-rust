@@ -1,0 +1,14 @@
+[package]
+name = "tree-sitter-wal"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tree-sitter = "0.22"
+
+[build-dependencies]
+cc = "1.0"
+
+[lib]
+path = "src/lib.rs"
+build = "build.rs"
