@@ -126,6 +126,39 @@ impl Evaluator {
                 }
                 return Ok(Value::List(WList::new()));
             }
+            "CG" => {
+                return Ok(Value::String(self.env.get_group().to_string()));
+            }
+            "CS" => {
+                return Ok(Value::String(self.env.get_scope().to_string()));
+            }
+            "TS" => {
+                if let Some(traces) = self.env.get_traces() {
+                    let traces = traces.read().unwrap_or_else(|e| e.into_inner());
+                    if let Some(t) = traces.first_trace() {
+                        return Ok(Value::Int(t.index() as i64));
+                    }
+                }
+                return Ok(Value::Int(0));
+            }
+            "TRACE-NAME" => {
+                if let Some(traces) = self.env.get_traces() {
+                    let traces = traces.read().unwrap_or_else(|e| e.into_inner());
+                    if let Some(t) = traces.first_trace() {
+                        return Ok(Value::String(t.id().to_string()));
+                    }
+                }
+                return Ok(Value::String("".to_string()));
+            }
+            "TRACE-FILE" => {
+                if let Some(traces) = self.env.get_traces() {
+                    let traces = traces.read().unwrap_or_else(|e| e.into_inner());
+                    if let Some(t) = traces.first_trace() {
+                        return Ok(Value::String(t.filename().to_string()));
+                    }
+                }
+                return Ok(Value::String("".to_string()));
+            }
             _ => {}
         }
 

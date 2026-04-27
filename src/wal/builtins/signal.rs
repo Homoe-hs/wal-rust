@@ -346,10 +346,12 @@ fn op_call(args: &[Value], _env: &mut Environment, _eval: &mut Evaluator) -> Res
     Ok(Value::Nil)
 }
 
-fn op_eval_file(args: &[Value], _env: &mut Environment, _eval: &mut Evaluator) -> Result<Value, String> {
+fn op_eval_file(args: &[Value], _env: &mut Environment, eval: &mut Evaluator) -> Result<Value, String> {
     ensure_arity(args, 1)?;
-    let _path = extract_string(&args[0])?;
-    Ok(Value::Nil)
+    let path = extract_string(&args[0])?;
+    let source = std::fs::read_to_string(&path)
+        .map_err(|e| format!("eval-file: cannot read '{}': {}", path, e))?;
+    eval.eval(&source)
 }
 
 fn op_require(args: &[Value], _env: &mut Environment, _eval: &mut Evaluator) -> Result<Value, String> {
