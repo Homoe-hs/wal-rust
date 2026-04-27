@@ -29,10 +29,25 @@ fn op_unload(args: &[Value], env: &mut Environment, _eval: &mut Evaluator) -> Re
 }
 
 fn op_step(args: &[Value], env: &mut Environment, _eval: &mut Evaluator) -> Result<Value, String> {
-    ensure_arity_atleast(args, 1)?;
-    let steps = extract_int(&args[0])? as usize;
+    // (step) → step 1; (step amount) → step all by amount; (step id amount) → step specific trace
+    let (tid, steps) = match args.len() {
+        0 => (None, 1_usize),
+        1 => (None, extract_int(&args[0])? as usize),
+        _ => {
+            let tid = extract_string(&args[0])?;
+            let steps = extract_int(&args[1])? as usize;
+            (Some(tid), steps)
+        }
+    };
     if let Some(traces) = env.get_traces() {
-        traces.write().unwrap_or_else(|e| e.into_inner()).step_all(steps)?;
+        let mut traces = traces.write().unwrap_or_else(|e| e.into_inner());
+        if let Some(tid) = tid {
+            traces.get_mut(&tid)
+                .ok_or_else(|| format!("Trace not found: {}", tid))?
+                .step(steps)?;
+        } else {
+            traces.step_all(steps)?;
+        }
     }
     Ok(Value::Nil)
 }
@@ -411,26 +426,31 @@ fn op_count(args: &[Value], env: &mut Environment, eval: &mut Evaluator) -> Resu
 
 fn op_timeframe(args: &[Value], env: &mut Environment, eval: &mut Evaluator) -> Result<Value, String> {
     // (timeframe body+) — save INDEX, evaluate body, restore INDEX
+    // NOTE: must be called as special form (args NOT pre-evaluated)
     if args.is_empty() {
         return Err("timeframe expects at least 1 argument".to_string());
     }
 
     if let Some(traces) = env.get_traces() {
-        let prev_indices = {
+        let (tids, prev_idx_values) = {
             let traces = traces.read().unwrap_or_else(|e| e.into_inner());
-            traces.indices()
+            let tids: Vec<_> = traces.trace_ids();
+            let indices: Vec<_> = tids.iter()
+                .map(|tid| traces.get(tid).map(|t| t.index()).unwrap_or(0))
+                .collect();
+            (tids, indices)
         };
 
-        // Evaluate body
         let mut result = Value::Nil;
         for arg in args {
             result = eval.eval_value_public(arg.clone())?;
         }
 
-        // Restore indices
-        let mut traces = traces.write().unwrap_or_else(|e| e.into_inner());
-        for (tid, idx) in prev_indices {
-            let _ = traces.set_index(&tid, idx);
+        {
+            let mut traces = traces.write().unwrap_or_else(|e| e.into_inner());
+            for (tid, &idx) in tids.iter().zip(prev_idx_values.iter()) {
+                let _ = traces.set_index(tid, idx);
+            }
         }
 
         return Ok(result);

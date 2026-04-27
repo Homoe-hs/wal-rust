@@ -144,6 +144,10 @@ impl Evaluator {
                 if s.name == "for/list" {
                     return self.eval_for_list_macro(&rest);
                 }
+                // Handle timeframe special form (body not pre-evaluated)
+                if s.name == "timeframe" {
+                    return self.eval_timeframe(&rest);
+                }
 
                 // Handle alias special form — first arg is literal symbol, not evaluated
                 if s.name == "alias" {
@@ -492,6 +496,38 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
             lst_expr,
         ]));
         self.eval_value(map_expr)
+    }
+
+    // timeframe special form: (timeframe body...) — save/restore INDEX
+    fn eval_timeframe(&mut self, args: &[Value]) -> Result<Value, String> {
+        if args.is_empty() {
+            return Err("timeframe expects at least 1 argument".to_string());
+        }
+
+        let tids: Vec<_> = {
+            let traces = self.traces.read().unwrap_or_else(|e| e.into_inner());
+            traces.trace_ids()
+        };
+        let prev_idx_values: Vec<_> = {
+            let traces = self.traces.read().unwrap_or_else(|e| e.into_inner());
+            tids.iter()
+                .map(|tid| traces.get(tid).map(|t| t.index()).unwrap_or(0))
+                .collect()
+        };
+
+        let mut result = Value::Nil;
+        for arg in args {
+            result = self.eval_value(arg.clone())?;
+        }
+
+        {
+            let mut traces = self.traces.write().unwrap_or_else(|e| e.into_inner());
+            for (tid, &idx) in tids.iter().zip(prev_idx_values.iter()) {
+                let _ = traces.set_index(tid, idx);
+            }
+        }
+
+        Ok(result)
     }
 
     // alias special form: (alias name target) — first arg is literal symbol
