@@ -269,7 +269,7 @@ fn op_whenever(args: &[Value], env: &mut Environment, eval: &mut Evaluator) -> R
 
 fn op_get(args: &[Value], env: &mut Environment, _eval: &mut Evaluator) -> Result<Value, String> {
     ensure_arity(args, 1)?;
-    let name = extract_symbol(&args[0])?;
+    let name = extract_name(&args[0])?;
 
     if let Some(traces) = env.get_traces() {
         let traces = traces.read().unwrap_or_else(|e| e.into_inner());
@@ -382,6 +382,14 @@ fn extract_symbol(v: &Value) -> Result<String, String> {
     match v {
         Value::Symbol(s) => Ok(s.name.clone()),
         _ => Err("Expected symbol".to_string()),
+    }
+}
+
+fn extract_name(v: &Value) -> Result<String, String> {
+    match v {
+        Value::Symbol(s) => Ok(s.name.clone()),
+        Value::String(s) => Ok(s.clone()),
+        _ => Err("Expected symbol or string".to_string()),
     }
 }
 
