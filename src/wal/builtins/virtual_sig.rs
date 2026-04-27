@@ -5,24 +5,30 @@
 use crate::wal::ast::{Value, Operator};
 use crate::wal::eval::{Environment, Dispatcher, Evaluator};
 
-fn op_defsig(args: &[Value], env: &mut Environment, _eval: &mut Evaluator) -> Result<Value, String> {
+fn op_defsig(args: &[Value], env: &mut Environment, eval: &mut Evaluator) -> Result<Value, String> {
     ensure_arity_atleast(args, 2)?;
     let name = extract_symbol(&args[0])?;
-    let _expr = &args[1];
-    // TODO: implement virtual signal
-    env.define(&name, Value::Int(0));
+    let expr = &args[1];
+    // Store the expression as a virtual signal definition
+    env.define(&name, expr.clone());
     Ok(Value::Nil)
 }
 
 fn op_new_trace(args: &[Value], _env: &mut Environment, _eval: &mut Evaluator) -> Result<Value, String> {
     ensure_arity(args, 1)?;
-    // new-trace name - create new virtual trace
+    let _name = extract_symbol(&args[0])?;
+    // new-trace name - create new virtual trace (placeholder)
     Ok(Value::Nil)
 }
 
 fn op_dump_trace(args: &[Value], _env: &mut Environment, _eval: &mut Evaluator) -> Result<Value, String> {
     ensure_arity(args, 1)?;
-    // dump-trace path - export trace to VCD
+    let _path = match &args[0] {
+        Value::String(s) => s.clone(),
+        Value::Symbol(s) => s.name.clone(),
+        _ => return Err("dump-trace: expected path string".to_string()),
+    };
+    // dump-trace path - export trace to VCD (placeholder)
     Ok(Value::Nil)
 }
 

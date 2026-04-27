@@ -232,34 +232,52 @@ fn op_whenever(args: &[Value], env: &mut Environment, eval: &mut Evaluator) -> R
     let body = &args[1..];
 
     if let Some(traces) = env.get_traces() {
-        let mut traces = traces.write().unwrap_or_else(|e| e.into_inner());
-        let prev_indices = traces.indices();
+        // Save current indices
+        let (tids, prev_idx_values) = {
+            let traces = traces.read().unwrap_or_else(|e| e.into_inner());
+            let tids: Vec<_> = traces.trace_ids();
+            let indices: Vec<_> = tids.iter()
+                .map(|tid| traces.get(tid).map(|t| t.index()).unwrap_or(0))
+                .collect();
+            (tids, indices)
+        };
+
+        // Reset all traces to start
+        {
+            let mut traces = traces.write().unwrap_or_else(|e| e.into_inner());
+            for tid in &tids {
+                let _ = traces.set_index(tid, 0);
+            }
+        }
 
         let mut result = Value::Nil;
         let mut ended = false;
 
         while !ended {
-            match eval.eval_value_public(cond.clone()) {
-                Ok(Value::Bool(true)) => {
-                    for b in body {
-                        result = eval.eval_value_public(b.clone()).unwrap_or(Value::Nil);
-                    }
+            // Evaluate condition (read lock released)
+            let cond_true = eval.eval_value_public(cond.clone())?.is_truthy();
+
+            if cond_true {
+                for b in body {
+                    result = eval.eval_value_public(b.clone())?;
                 }
-                Ok(_) => {}
-                Err(_) => {}
             }
 
+            // Step all traces
+            let mut traces = traces.write().unwrap_or_else(|e| e.into_inner());
             let mut any_ended = true;
             for trace in traces.traces_iter_mut() {
-                if trace.step(1).is_ok() {
-                    any_ended = false;
-                }
+                if trace.step(1).is_ok() { any_ended = false; }
             }
             ended = any_ended;
         }
 
-        for (tid, idx) in prev_indices {
-            let _ = traces.set_index(&tid, idx);
+        // Restore original indices
+        {
+            let mut traces = traces.write().unwrap_or_else(|e| e.into_inner());
+            for (tid, &idx) in tids.iter().zip(prev_idx_values.iter()) {
+                let _ = traces.set_index(tid, idx);
+            }
         }
 
         return Ok(result);
