@@ -43,7 +43,7 @@ module.exports = grammar({
     bin_int: () => /0b[0-1]+/,
     hex_int: () => /0x[0-9a-fA-F]+/,
 
-    bool: () => choice("true", "false"),
+    bool: () => choice("true", "false", "#t", "#f"),
 
     operator: () => choice(
       "+", "-", "*", "/", "&&", "||", "=", "!=", ">", "<", ">=", "<=", "!", "**"

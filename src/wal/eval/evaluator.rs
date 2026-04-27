@@ -37,10 +37,41 @@ impl Evaluator {
     }
 
     pub fn eval(&mut self, source: &str) -> Result<Value, String> {
+        use crate::wal::parser::parse::expr_from_node;
         let mut parser = crate::wal::WalParser::new()?;
-        let value = parser.parse_expr(source)?;
-        self.eval_value(value)
+        let tree = parser.parse(source)?;
+        let root = tree.root_node();
+
+        if root.kind() == "program" {
+            let mut cursor = root.walk();
+            let children: Vec<_> = root.children(&mut cursor)
+                .filter(|c| !is_skip_node(c.clone()))
+                .collect();
+
+            if children.is_empty() {
+                return Ok(Value::Nil);
+            }
+
+            let mut result = Value::Nil;
+            for child in &children {
+                let value = expr_from_node(child.clone(), source)?;
+                result = self.eval_value_internal(value)?;
+            }
+            Ok(result)
+        } else {
+            let value = expr_from_node(root, source)?;
+            self.eval_value_internal(value)
+        }
     }
+}
+
+/// Check if a tree-sitter node should be skipped (whitespace, comments, tokens)
+fn is_skip_node(node: tree_sitter::Node) -> bool {
+    let kind = node.kind();
+    matches!(kind, "whitespace" | "_comment" | "(" | ")" | "[" | "]" | "{" | "}" | "~" | "#" | "'" | "`" | "," | ",@")
+}
+
+impl Evaluator {
 
     pub fn eval_value(&mut self, value: Value) -> Result<Value, String> {
         match value {

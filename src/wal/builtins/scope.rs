@@ -42,9 +42,12 @@ fn op_unset_scope(_args: &[Value], env: &mut Environment, _eval: &mut Evaluator)
     Ok(Value::Nil)
 }
 
-fn op_groups(args: &[Value], env: &mut Environment, eval: &mut Evaluator) -> Result<Value, String> {
+fn op_groups(args: &[Value], env: &mut Environment, _eval: &mut Evaluator) -> Result<Value, String> {
     // (groups posts*) — find all signal name prefixes matching all post suffixes
-    ensure_arity_atleast(args, 1)?;
+    if args.is_empty() {
+        // No post conditions → return empty list
+        return Ok(Value::List(crate::wal::ast::WList::new()));
+    }
 
     if let Some(traces) = env.get_traces() {
         let traces = traces.read().unwrap_or_else(|e| e.into_inner());

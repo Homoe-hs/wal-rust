@@ -65,6 +65,9 @@ impl VcdTrace {
         let mut name_to_idx: HashMap<String, u32> = HashMap::with_capacity(256);
         let mut header_end_offset: u64 = 0;
 
+        // Track $scope / $upscope for hierarchical signal names
+        let mut scope_stack: Vec<String> = Vec::new();
+
         loop {
             let line_offset = reader.current_offset();
             let line = match reader.read_line_bytes() {
@@ -73,16 +76,32 @@ impl VcdTrace {
             if line.is_empty() { continue; }
             if line[0] == b'$' {
                 if line.len() > 4 && line[1] == b'v' && line[2] == b'a' && line[3] == b'r' {
-                    if let Some((sig_hash, name, width)) = parse_var_decl_fast(line) {
+                    if let Some((sig_hash, short_name, width)) = parse_var_decl_fast(line) {
                         let idx = signals.len() as u32;
-                        signals.push(name.clone());
+                        // Build full hierarchical name from scope stack
+                        let full_name = if scope_stack.is_empty() {
+                            short_name.clone()
+                        } else {
+                            format!("{}.{}", scope_stack.join("."), short_name)
+                        };
+                        signals.push(full_name.clone());
                         signal_ids.insert(sig_hash, idx);
-                        name_to_idx.insert(name, idx);
+                        name_to_idx.insert(full_name, idx);
                         signal_widths.insert(idx, width);
                     }
-                } else if line.starts_with(b"$enddefinitions") || line.starts_with(b"$end") {
-                    header_end_offset = line_offset + line.len() as u64 + 1;
-                    break; // header done
+                } else if line.starts_with(b"$scope") {
+                    // $scope module name $end → push scope name
+                    if let Some(scope_name) = parse_scope_name(line) {
+                        scope_stack.push(scope_name);
+                    }
+                } else if line.starts_with(b"$upscope") {
+                    scope_stack.pop();
+                } else if line.starts_with(b"$enddefinitions") || line.starts_with(b"$end") && !line.starts_with(b"$enddefinitions") {
+                    // Only break on $enddefinitions or standalone $end
+                    if line.starts_with(b"$enddefinitions") || line == b"$end" {
+                        header_end_offset = line_offset + line.len() as u64 + 1;
+                        break;
+                    }
                 }
             }
         }
@@ -312,6 +331,21 @@ fn parse_timestamp_fast(line: &[u8]) -> u64 {
         n = n * 10 + (b - b'0') as u64;
     }
     n
+}
+
+/// Parse a $scope line: "$scope module name $end" → "name"
+fn parse_scope_name(line: &[u8]) -> Option<String> {
+    let line_str = std::str::from_utf8(line).ok()?;
+    let parts: Vec<&str> = line_str.split_whitespace().collect();
+    if parts.len() < 3 { return None; }
+    let name = if parts.len() >= 4 {
+        parts[2..].join(" ")
+    } else {
+        parts[2].to_string()
+    };
+    let name = name.trim_end_matches("$end").trim().to_string();
+    if name.is_empty() { return None; }
+    Some(name)
 }
 
 /// Parse a $var declaration: extract (sig_hash, name, width)

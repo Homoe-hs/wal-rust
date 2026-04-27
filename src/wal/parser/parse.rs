@@ -86,7 +86,7 @@ fn should_skip_node(node: tree_sitter::Node) -> bool {
     is_whitespace_or_comment(kind) || is_anon_token(kind)
 }
 
-fn expr_from_node(node: tree_sitter::Node, source: &str) -> Result<Value, String> {
+pub fn expr_from_node(node: tree_sitter::Node, source: &str) -> Result<Value, String> {
     let kind = node.kind();
     match kind {
         "program" | "sexpr_list" => {
@@ -161,7 +161,7 @@ fn expr_from_node(node: tree_sitter::Node, source: &str) -> Result<Value, String
         }
         "bool" => {
             let text = get_node_text(node, source);
-            Ok(Value::Bool(text == "true"))
+            Ok(Value::Bool(text == "true" || text == "#t"))
         }
         "operator" => {
             let text = get_node_text(node, source);
