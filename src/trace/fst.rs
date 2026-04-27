@@ -33,10 +33,10 @@ impl FstTrace {
             signal_data.insert(sig.handle, Vec::new());
         }
 
-        let timestamps = Vec::new();
-        let max_index = 0;
+        let mut timestamps = Vec::new();
+        let mut max_index = 0;
 
-        Ok(FstTrace {
+        let mut trace = FstTrace {
             id,
             filename,
             file,
@@ -44,7 +44,12 @@ impl FstTrace {
             timestamps,
             current_index: 0,
             max_index,
-        })
+        };
+
+        // Load VCDATA blocks (waveform data)
+        trace.read_vcdata_blocks(path)?;
+
+        Ok(trace)
     }
 
     pub fn read_vcdata_blocks(&mut self, path: &Path) -> Result<(), String> {
@@ -133,6 +138,11 @@ impl FstTrace {
             }
 
             current_time += time_delta;
+
+            // Record this timestamp if it's new
+            if !self.timestamps.contains(&current_time) {
+                self.timestamps.push(current_time);
+            }
 
             while pos < data.len() {
                 let handle = match decode_varint(&data[pos..]) {

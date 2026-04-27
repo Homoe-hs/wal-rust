@@ -29,12 +29,9 @@ fn test_fst_trace_read_vcdata() {
         return;
     }
 
-    let mut trace = FstTrace::load(path, "test".to_string()).unwrap();
+    let trace = FstTrace::load(path, "test".to_string()).unwrap();
 
-    let path = Path::new("test_data/test_100M.fst");
-    trace.read_vcdata_blocks(path).unwrap();
-
-    eprintln!("After VCDATA read: max_index={}", trace.max_index());
+    eprintln!("After load (VCDATA included): max_index={}", trace.max_index());
 
     if trace.max_index() > 0 {
         let signals = trace.signals();

@@ -2,6 +2,7 @@
 
 use super::{Trace, TraceId, FindCondition};
 use super::vcd::VcdTrace;
+use super::fst::FstTrace;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use std::path::Path;
@@ -27,6 +28,10 @@ impl TraceContainer {
             "vcd" => {
                 let vcd_trace = VcdTrace::load(path, id.clone())?;
                 Box::new(vcd_trace)
+            }
+            "fst" => {
+                let fst_trace = FstTrace::load(path, id.clone())?;
+                Box::new(fst_trace)
             }
             _ => return Err(format!("Unsupported file format: .{}", ext)),
         };
