@@ -180,13 +180,14 @@ fn is_less(a: &Value, b: &Value) -> bool {
 
 fn op_fold(args: &[Value], _env: &mut Environment, eval: &mut Evaluator) -> Result<Value, String> {
     ensure_arity(args, 3)?;
-    let init = eval.eval_value_public(args[1].clone())?;
-    let list = match eval.eval_value_public(args[2].clone())? {
+    // args are already evaluated by the dispatcher — don't re-evaluate
+    let acc_init = args[1].clone();
+    let list = match &args[2] {
         Value::List(lst) => lst.0.clone(),
         _ => return Err("fold: last argument must be a list".to_string()),
     };
 
-    let mut acc = init;
+    let mut acc = acc_init;
     for item in &list {
         match &args[0] {
             Value::Symbol(s) if Operator::from_str(&s.name).is_some() => {

@@ -10,6 +10,7 @@ use crate::trace::SharedTraceContainer;
 pub struct Environment {
     parent: Option<Rc<RefCell<Environment>>>,
     bindings: HashMap<String, Value>,
+    aliases: HashMap<String, String>,   // alias_name → target_name
     scope: String,
     group: String,
     traces: Option<SharedTraceContainer>,
@@ -20,6 +21,7 @@ impl Environment {
         Self {
             parent: None,
             bindings: HashMap::new(),
+            aliases: HashMap::new(),
             scope: String::new(),
             group: String::new(),
             traces: None,
@@ -30,6 +32,7 @@ impl Environment {
         Self {
             parent: Some(parent),
             bindings: HashMap::new(),
+            aliases: HashMap::new(),
             scope: String::new(),
             group: String::new(),
             traces: None,
@@ -102,6 +105,18 @@ impl Environment {
     pub fn keys(&self) -> impl Iterator<Item = &String> {
         self.bindings.keys()
     }
+
+    pub fn add_alias(&mut self, alias: impl Into<String>, target: impl Into<String>) {
+        self.aliases.insert(alias.into(), target.into());
+    }
+
+    pub fn remove_alias(&mut self, alias: &str) -> bool {
+        self.aliases.remove(alias).is_some()
+    }
+
+    pub fn resolve_alias(&self, name: &str) -> Option<&str> {
+        self.aliases.get(name).map(|s| s.as_str())
+    }
 }
 
 impl Default for Environment {
@@ -115,6 +130,7 @@ impl Clone for Environment {
         Self {
             parent: self.parent.clone(),
             bindings: self.bindings.clone(),
+            aliases: self.aliases.clone(),
             scope: self.scope.clone(),
             group: self.group.clone(),
             traces: self.traces.clone(),

@@ -127,17 +127,22 @@ fn op_type(args: &[Value], _env: &mut Environment, _eval: &mut Evaluator) -> Res
     Ok(Value::String(args[0].type_name().to_string()))
 }
 
-fn op_alias(args: &[Value], _env: &mut Environment, _eval: &mut Evaluator) -> Result<Value, String> {
+fn op_alias(args: &[Value], env: &mut Environment, _eval: &mut Evaluator) -> Result<Value, String> {
     ensure_arity(args, 2)?;
-    let _from = extract_symbol(&args[0])?;
-    let _to = extract_symbol(&args[1])?;
+    let alias_name = extract_symbol(&args[0])?;
+    let target_name = extract_symbol(&args[1])?;
+    env.add_alias(&alias_name, &target_name);
     Ok(Value::Nil)
 }
 
-fn op_unalias(args: &[Value], _env: &mut Environment, _eval: &mut Evaluator) -> Result<Value, String> {
+fn op_unalias(args: &[Value], env: &mut Environment, _eval: &mut Evaluator) -> Result<Value, String> {
     ensure_arity(args, 1)?;
-    let _name = extract_symbol(&args[0])?;
-    Ok(Value::Nil)
+    let name = extract_symbol(&args[0])?;
+    if env.remove_alias(&name) {
+        Ok(Value::Nil)
+    } else {
+        Err(format!("Alias '{}' not found", name))
+    }
 }
 
 fn op_when(args: &[Value], _env: &mut Environment, eval: &mut Evaluator) -> Result<Value, String> {

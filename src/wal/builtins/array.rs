@@ -14,17 +14,26 @@ fn op_array(args: &[Value], _env: &mut Environment, _eval: &mut Evaluator) -> Re
     Ok(Value::List(WList::from_vec(result)))
 }
 
+fn key_to_string(v: &Value) -> String {
+    match v {
+        Value::Int(i) => i.to_string(),
+        Value::Symbol(s) => s.name.clone(),
+        Value::String(s) => s.clone(),
+        Value::Float(f) => f.to_string(),
+        _ => format!("{}", v),
+    }
+}
+
 fn op_seta(args: &[Value], _env: &mut Environment, _eval: &mut Evaluator) -> Result<Value, String> {
     ensure_arity(args, 3)?;
-    // seta arr key val — returns new array with key set to val
     let arr = extract_list(&args[0])?;
-    let key = &args[1];
+    let key = key_to_string(&args[1]);
     let val = args[2].clone();
     let mut result = Vec::new();
     let mut found = false;
     for i in (0..arr.len()).step_by(2) {
-        if i + 1 < arr.len() && &arr[i] == key {
-            result.push(key.clone());
+        if i + 1 < arr.len() && key_to_string(&arr[i]) == key {
+            result.push(Value::String(key.clone()));
             result.push(val.clone());
             found = true;
         } else if i < arr.len() {
@@ -35,7 +44,7 @@ fn op_seta(args: &[Value], _env: &mut Environment, _eval: &mut Evaluator) -> Res
         }
     }
     if !found {
-        result.push(key.clone());
+        result.push(Value::String(key));
         result.push(val);
     }
     Ok(Value::List(WList::from_vec(result)))
@@ -44,9 +53,9 @@ fn op_seta(args: &[Value], _env: &mut Environment, _eval: &mut Evaluator) -> Res
 fn op_geta(args: &[Value], _env: &mut Environment, _eval: &mut Evaluator) -> Result<Value, String> {
     ensure_arity(args, 2)?;
     let arr = extract_list(&args[0])?;
-    let key = &args[1];
+    let key = key_to_string(&args[1]);
     for i in (0..arr.len()).step_by(2) {
-        if i + 1 < arr.len() && &arr[i] == key {
+        if i + 1 < arr.len() && key_to_string(&arr[i]) == key {
             return Ok(arr[i + 1].clone());
         }
     }
@@ -54,16 +63,17 @@ fn op_geta(args: &[Value], _env: &mut Environment, _eval: &mut Evaluator) -> Res
 }
 
 fn op_geta_default(args: &[Value], _env: &mut Environment, _eval: &mut Evaluator) -> Result<Value, String> {
+    // WAL spec: (geta/default array default key)
     ensure_arity(args, 3)?;
     let arr = extract_list(&args[0])?;
-    let key = &args[1];
-    let default = args[2].clone();
+    let default = &args[1];
+    let key = key_to_string(&args[2]);
     for i in (0..arr.len()).step_by(2) {
-        if i + 1 < arr.len() && &arr[i] == key {
+        if i + 1 < arr.len() && key_to_string(&arr[i]) == key {
             return Ok(arr[i + 1].clone());
         }
     }
-    Ok(default)
+    Ok(default.clone())
 }
 
 fn op_dela(args: &[Value], _env: &mut Environment, _eval: &mut Evaluator) -> Result<Value, String> {

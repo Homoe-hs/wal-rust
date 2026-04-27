@@ -69,15 +69,17 @@ fn op_parse(args: &[Value], _env: &mut Environment, _eval: &mut Evaluator) -> Re
 
 fn op_fn(args: &[Value], env: &mut Environment, _eval: &mut Evaluator) -> Result<Value, String> {
     ensure_arity_atleast(args, 2)?;
-    let args_list = match &args[0] {
-        Value::List(lst) => lst.0.iter().filter_map(|v| {
-            if let Value::Symbol(s) = v {
-                Some(s.clone())
-            } else {
-                None
-            }
-        }).collect(),
-        Value::Symbol(s) => vec![s.clone()],
+    let (args_list, variadic) = match &args[0] {
+        Value::List(lst) => {
+            let symbols: Vec<Symbol> = lst.0.iter().filter_map(|v| {
+                if let Value::Symbol(s) = v { Some(s.clone()) } else { None }
+            }).collect();
+            (symbols, false)
+        }
+        Value::Symbol(s) => {
+            // Single symbol → variadic: all arguments packed into a list bound to this symbol
+            (vec![s.clone()], true)
+        }
         _ => return Err("fn expects argument list".to_string()),
     };
 
@@ -86,7 +88,8 @@ fn op_fn(args: &[Value], env: &mut Environment, _eval: &mut Evaluator) -> Result
         body = Value::List(WList::from_vec(vec![body, arg.clone()]));
     }
 
-    let closure = Closure::new(Rc::new(RefCell::new(env.clone())), args_list, body);
+    let mut closure = Closure::new(Rc::new(RefCell::new(env.clone())), args_list, body);
+    closure.variadic = variadic;
     Ok(Value::Closure(closure))
 }
 

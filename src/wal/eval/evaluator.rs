@@ -51,33 +51,71 @@ impl Evaluator {
     }
 
     fn eval_symbol(&mut self, sym: Symbol) -> Result<Value, String> {
-        if let Some(v) = self.env.lookup(&sym.name) {
+        // Resolve alias chain
+        let name = if let Some(target) = self.env.resolve_alias(&sym.name) {
+            target.to_string()
+        } else {
+            sym.name.clone()
+        };
+
+        if let Some(v) = self.env.lookup(&name) {
             return Ok(v);
         }
 
-        if let Some(op) = Operator::from_str(&sym.name) {
+        if let Some(op) = Operator::from_str(&name) {
             return Ok(Value::Symbol(Symbol::new(op.as_str())));
         }
 
+        // Special variables (require trace access)
+        match name.as_str() {
+            "INDEX" => {
+                if let Some(traces) = self.env.get_traces() {
+                    let traces = traces.read().unwrap_or_else(|e| e.into_inner());
+                    if let Some(t) = traces.first_trace() {
+                        return Ok(Value::Int(t.index() as i64));
+                    }
+                }
+                return Ok(Value::Int(0));
+            }
+            "MAX-INDEX" => {
+                if let Some(traces) = self.env.get_traces() {
+                    let traces = traces.read().unwrap_or_else(|e| e.into_inner());
+                    if let Some(t) = traces.first_trace() {
+                        return Ok(Value::Int(t.max_index() as i64));
+                    }
+                }
+                return Ok(Value::Int(0));
+            }
+            "SIGNALS" => {
+                if let Some(traces) = self.env.get_traces() {
+                    let traces = traces.read().unwrap_or_else(|e| e.into_inner());
+                    let sigs: Vec<Value> = traces.all_signals().into_iter()
+                        .map(Value::String).collect();
+                    return Ok(Value::List(WList::from_vec(sigs)));
+                }
+                return Ok(Value::List(WList::new()));
+            }
+            _ => {}
+        }
+
         // Try signal name auto-lookup from loaded traces
+        // WAL spec: bare signal names return their waveform value at current INDEX
         if let Some(traces) = self.env.get_traces() {
             let traces = traces.read().unwrap_or_else(|e| e.into_inner());
             for id in traces.trace_ids() {
                 if let Some(sigs) = traces.signals(&id) {
-                    if sigs.contains(&sym.name) {
-                        // Signal exists - return it as a string reference
-                        // The runtime will resolve it via get/call
-                        return Ok(Value::String(sym.name.clone()));
+                    if sigs.contains(&name) {
+                        let get_expr = Value::List(WList::from_vec(vec![
+                            Value::Symbol(Symbol::new("get")),
+                            Value::String(name.clone()),
+                        ]));
+                        return self.eval_value(get_expr);
                     }
                 }
             }
-            // Check all_signals as well
-            if traces.all_signals().contains(&sym.name) {
-                return Ok(Value::String(sym.name.clone()));
-            }
         }
 
-        Err(format!("Undefined symbol: {}", sym.name))
+        Err(format!("Undefined symbol: {}", name))
     }
 
     fn eval_list(&mut self, lst: WList) -> Result<Value, String> {
@@ -105,6 +143,15 @@ impl Evaluator {
                 // Handle for/list macro: (for/list (x lst) body...) -> for expanded form
                 if s.name == "for/list" {
                     return self.eval_for_list_macro(&rest);
+                }
+
+                // Handle alias special form — first arg is literal symbol, not evaluated
+                if s.name == "alias" {
+                    return self.eval_alias(&rest);
+                }
+                // Handle unalias special form — first arg is literal symbol
+                if s.name == "unalias" {
+                    return self.eval_unalias(&rest);
                 }
 
                 if let Some(op) = Operator::from_str(&s.name) {
@@ -177,10 +224,6 @@ impl Evaluator {
     }
 
 pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value, String> {
-        if let Some(err) = SemanticChecker::validate_closure_args(&closure.args, args) {
-            return Err(err.message());
-        }
-
         let closure_env = closure.env.clone();
         let closure_name = closure.name().map(|s| s.to_string());
 
@@ -195,6 +238,10 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
                 local_env.define(first_arg.name.clone(), Value::List(WList::from_vec(args.to_vec())));
             }
         } else {
+            // Validate arity for non-variadic closures
+            if let Some(err) = SemanticChecker::validate_closure_args(&closure.args, args) {
+                return Err(err.message());
+            }
             for (i, arg) in closure.args.iter().enumerate() {
                 let value = args.get(i).cloned().unwrap_or(Value::Nil);
                 local_env.define(arg.name.clone(), value);
@@ -247,15 +294,14 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
                             if fn_sym.name == "fn" {
                                 let fn_list = lst.rest();
                                 let fn_args_list = fn_list.first().ok_or("fn expects argument list")?;
-                                let closure_args: Vec<Symbol> = match fn_args_list {
-                                    Value::List(args_lst) => args_lst.0.iter().filter_map(|v| {
-                                        if let Value::Symbol(s) = v {
-                                            Some(s.clone())
-                                        } else {
-                                            None
-                                        }
-                                    }).collect(),
-                                    Value::Symbol(s) => vec![s.clone()],
+                                let (closure_args, variadic) = match fn_args_list {
+                                    Value::List(args_lst) => {
+                                        let syms: Vec<Symbol> = args_lst.0.iter().filter_map(|v| {
+                                            if let Value::Symbol(s) = v { Some(s.clone()) } else { None }
+                                        }).collect();
+                                        (syms, false)
+                                    }
+                                    Value::Symbol(s) => (vec![s.clone()], true),
                                     _ => return Err("fn expects argument list".to_string()),
                                 };
                                 let body = if fn_list.len() > 1 {
@@ -263,11 +309,12 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
                                 } else {
                                     Value::Nil
                                 };
-                                let closure = Closure::new(
+                                let mut closure = Closure::new(
                                     Rc::new(RefCell::new(self.env.clone())),
                                     closure_args,
                                     body,
                                 );
+                                closure.variadic = variadic;
                                 self.env.define(name.clone(), Value::Closure(closure));
                                 return Ok(Value::Nil);
                             }
@@ -366,7 +413,8 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
         Ok(args[0].clone())
     }
 
-    // defun macro: (defun name (args...) body...) -> (define name (fn (args...) body...))
+    // defun macro: (defun name (args...) body...) → (define name (fn (args...) body...))
+    //            or (defun name singe-symbol body...) → variadic
     fn eval_defun_macro(&mut self, args: &[Value]) -> Result<Value, String> {
         if args.len() < 2 {
             return Err("defun expects at least name and body".to_string());
@@ -375,9 +423,10 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
             Value::Symbol(s) => s.name.clone(),
             _ => return Err("defun: first argument must be a symbol".to_string()),
         };
+        // args[1] is either a list of parameter symbols, or a single symbol (variadic)
         let fn_expr = Value::List(WList::from_vec(vec![
             Value::Symbol(Symbol::new("fn")),
-            args[1].clone(),
+            args[1].clone(),          // pass through: list or symbol
             Value::List(WList::from_vec(args[2..].to_vec())),
         ]));
         let define_expr = Value::List(WList::from_vec(vec![
@@ -388,7 +437,7 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
         self.eval_value(define_expr)
     }
 
-    // defunm macro: (defunm name (args...) body...) -> (defmacro name (args...) body...)
+    // defunm macro: (defunm name (args...) body...) → (defmacro name (args...) body...)
     fn eval_defunm_macro(&mut self, args: &[Value]) -> Result<Value, String> {
         if args.len() < 2 {
             return Err("defunm expects at least name and body".to_string());
@@ -443,6 +492,39 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
             lst_expr,
         ]));
         self.eval_value(map_expr)
+    }
+
+    // alias special form: (alias name target) — first arg is literal symbol
+    fn eval_alias(&mut self, args: &[Value]) -> Result<Value, String> {
+        if args.len() != 2 {
+            return Err("alias expects 2 arguments".to_string());
+        }
+        let alias_name = match &args[0] {
+            Value::Symbol(s) => s.name.clone(),
+            _ => return Err("alias: first argument must be a symbol".to_string()),
+        };
+        let target_name = match &args[1] {
+            Value::Symbol(s) => s.name.clone(),
+            _ => return Err("alias: second argument must be a symbol".to_string()),
+        };
+        self.env.add_alias(&alias_name, &target_name);
+        Ok(Value::Nil)
+    }
+
+    // unalias special form
+    fn eval_unalias(&mut self, args: &[Value]) -> Result<Value, String> {
+        if args.len() != 1 {
+            return Err("unalias expects 1 argument".to_string());
+        }
+        let name = match &args[0] {
+            Value::Symbol(s) => s.name.clone(),
+            _ => return Err("unalias: argument must be a symbol".to_string()),
+        };
+        if self.env.remove_alias(&name) {
+            Ok(Value::Nil)
+        } else {
+            Err(format!("Alias '{}' not found", name))
+        }
     }
 
     pub fn define(&mut self, name: &str, value: Value) {

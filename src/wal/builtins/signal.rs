@@ -377,39 +377,65 @@ fn extract_int(v: &Value) -> Result<i64, String> {
     }
 }
 
-fn op_count(args: &[Value], env: &mut Environment, _eval: &mut Evaluator) -> Result<Value, String> {
+fn op_count(args: &[Value], env: &mut Environment, eval: &mut Evaluator) -> Result<Value, String> {
     ensure_arity(args, 1)?;
-    let tid = extract_string(&args[0])?;
+    let cond = &args[0];
+
     if let Some(traces) = env.get_traces() {
-        let traces = traces.read().unwrap_or_else(|e| e.into_inner());
-        if let Some(trace) = traces.get(&tid) {
-            return Ok(Value::Int(trace.max_index() as i64));
+        let mut traces = traces.write().unwrap_or_else(|e| e.into_inner());
+        let prev_indices = traces.indices();
+        let mut count: i64 = 0;
+        let mut ended = false;
+
+        while !ended {
+            let cond_result = eval.eval_value_public(cond.clone())?;
+            if cond_result.is_truthy() {
+                count += 1;
+            }
+
+            let mut any_ended = true;
+            for trace in traces.traces_iter_mut() {
+                if trace.step(1).is_ok() { any_ended = false; }
+            }
+            ended = any_ended;
         }
+
+        for (tid, idx) in prev_indices {
+            let _ = traces.set_index(&tid, idx);
+        }
+
+        return Ok(Value::Int(count));
     }
-    Err(format!("count: trace '{}' not found", tid))
+    Ok(Value::Int(0))
 }
 
-fn op_timeframe(args: &[Value], env: &mut Environment, _eval: &mut Evaluator) -> Result<Value, String> {
-    ensure_arity(args, 2)?;
-    let start = extract_int(&args[0])?;
-    let end = extract_int(&args[1])?;
-    let _tid = args.get(2).and_then(|v| extract_string(v).ok());
-    if let Some(traces) = env.get_traces() {
-        let traces = traces.read().unwrap_or_else(|e| e.into_inner());
-        if let Some(trace) = traces.first_trace() {
-            let mut result = Vec::new();
-            for i in start..end {
-                let idx = i.max(0) as usize;
-                if idx <= trace.max_index() {
-                    if let Ok(v) = trace.signal_value("", idx) {
-                        result.push(scalar_to_value(v));
-                    }
-                }
-            }
-            return Ok(Value::List(WList::from_vec(result)));
-        }
+fn op_timeframe(args: &[Value], env: &mut Environment, eval: &mut Evaluator) -> Result<Value, String> {
+    // (timeframe body+) — save INDEX, evaluate body, restore INDEX
+    if args.is_empty() {
+        return Err("timeframe expects at least 1 argument".to_string());
     }
-    Ok(Value::List(WList::new()))
+
+    if let Some(traces) = env.get_traces() {
+        let prev_indices = {
+            let traces = traces.read().unwrap_or_else(|e| e.into_inner());
+            traces.indices()
+        };
+
+        // Evaluate body
+        let mut result = Value::Nil;
+        for arg in args {
+            result = eval.eval_value_public(arg.clone())?;
+        }
+
+        // Restore indices
+        let mut traces = traces.write().unwrap_or_else(|e| e.into_inner());
+        for (tid, idx) in prev_indices {
+            let _ = traces.set_index(&tid, idx);
+        }
+
+        return Ok(result);
+    }
+    Ok(Value::Nil)
 }
 
 pub fn register_signal(disp: &mut Dispatcher) {
