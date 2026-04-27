@@ -14,3 +14,5 @@ rustup_install.sh
 generate_vcd.sh
 generate_5000.py
 vcd-samples/
+.memsearch/
+test_*.wal
