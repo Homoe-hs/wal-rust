@@ -96,12 +96,9 @@ impl VcdTrace {
                     }
                 } else if line.starts_with(b"$upscope") {
                     scope_stack.pop();
-                } else if line.starts_with(b"$enddefinitions") || line.starts_with(b"$end") && !line.starts_with(b"$enddefinitions") {
-                    // Only break on $enddefinitions or standalone $end
-                    if line.starts_with(b"$enddefinitions") || line == b"$end" {
-                        header_end_offset = line_offset + line.len() as u64 + 1;
-                        break;
-                    }
+                } else if line.starts_with(b"$enddefinitions") {
+                    header_end_offset = line_offset + line.len() as u64 + 1;
+                    break;
                 }
             }
         }
@@ -130,10 +127,14 @@ impl VcdTrace {
         let mut boundaries = vec![actual_start];
         for i in 1..n_threads {
             let mut p = actual_start + i * chunk_size;
+            if p >= data.len() {
+                break; // no more chunks needed
+            }
             while p < data.len() && data[p] != b'\n' {
                 p += 1;
             }
             if p < data.len() { p += 1; } // skip newline
+            if p >= data.len() { break; } // don't push past the end
             boundaries.push(p);
         }
         boundaries.push(data.len());
@@ -365,9 +366,11 @@ fn parse_var_decl_fast(line: &[u8]) -> Option<(u64, String, usize)> {
         }
         if part >= 6 { break; }
     }
-    if part < 5 { return None; }
+    if part < 5 {
+        eprintln!("[VCD DEBUG] parse_var_decl: only {} fields, line={:?}", part, std::str::from_utf8(line).unwrap_or("?"));
+        return None;
+    }
 
-    // parts[1] = type, parts[2] = width, parts[3] = ID, parts[4] = name start
     let width: usize = {
         let mut w: usize = 0;
         for &b in &line[parts[2]..] {
@@ -376,7 +379,10 @@ fn parse_var_decl_fast(line: &[u8]) -> Option<(u64, String, usize)> {
         }
         w
     };
-    if width == 0 { return None; }
+    if width == 0 {
+        eprintln!("[VCD DEBUG] parse_var_decl: zero width, line={:?}", std::str::from_utf8(line).unwrap_or("?"));
+        return None;
+    }
 
     // Signal ID: bytes from parts[3] to next space
     let id_start = parts[3];
@@ -386,7 +392,8 @@ fn parse_var_decl_fast(line: &[u8]) -> Option<(u64, String, usize)> {
     // Name: from parts[4] to $end
     let name_start = parts[4];
     let name_end = line[name_start..].iter().position(|&b| b == b' ' || b == b'$').map(|p| name_start + p).unwrap_or(line.len());
-    let name = std::str::from_utf8(&line[name_start..name_end]).ok()?.to_string();
+    let name_str = std::str::from_utf8(&line[name_start..name_end]).ok()?;
+    let name = name_str.to_string();
 
     Some((sig_hash, name, width))
 }
@@ -481,12 +488,19 @@ impl Trace for VcdTrace {
         let idx = if offset < self.timestamps.len() {
             offset
         } else {
-            return Err(format!("Offset {} out of range", offset));
+            return Err(format!(
+                "signal_value: offset {} out of range (max {}) for signal '{}'",
+                offset, self.timestamps.len().max(1u64 as usize)-1, name
+            ));
         };
 
         let target_time = self.timestamps[idx];
         let sig_idx = self.name_to_idx.get(name).copied()
-            .ok_or_else(|| format!("Unknown signal: {}", name))?;
+            .ok_or_else(|| format!(
+                "signal '{}' not found. Available signals (first 5): {:?}",
+                name,
+                self.signals.iter().take(5).collect::<Vec<_>>()
+            ))?;
 
         // Check LRU cache
         let cache_key = (sig_idx, target_time);
