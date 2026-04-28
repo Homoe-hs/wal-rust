@@ -77,16 +77,30 @@ fn op_fn(args: &[Value], env: &mut Environment, _eval: &mut Evaluator) -> Result
             (symbols, false)
         }
         Value::Symbol(s) => {
-            // Single symbol → variadic: all arguments packed into a list bound to this symbol
             (vec![s.clone()], true)
         }
         _ => return Err("fn expects argument list".to_string()),
     };
 
-    let mut body = args[1].clone();
-    for arg in &args[2..] {
-        body = Value::List(WList::from_vec(vec![body, arg.clone()]));
-    }
+    // Multiple body expressions: wrap in do (evaluates sequentially, returns last)
+    let body = if args.len() > 2 {
+        let mut do_args: Vec<Value> = Vec::new();
+        do_args.push(Value::Symbol(Symbol::new("do")));
+        // Only include arguments 1..2 (the body expressions), not extra call args
+        let body_end = 2usize.min(args.len());
+        do_args.extend_from_slice(&args[1..body_end]);
+        if do_args.len() == 1 {
+            // No body expressions — just use Nil
+            Value::Nil
+        } else if do_args.len() == 2 {
+            // Single body expression — don't wrap in do
+            do_args[1].clone()
+        } else {
+            Value::List(WList::from_vec(do_args))
+        }
+    } else {
+        args[1].clone()
+    };
 
     let mut closure = Closure::new(Rc::new(RefCell::new(env.clone())), args_list, body);
     closure.variadic = variadic;

@@ -37,38 +37,37 @@ impl Evaluator {
     }
 
     pub fn eval(&mut self, source: &str) -> Result<Value, String> {
-        use crate::wal::parser::parse::expr_from_node;
         let mut parser = crate::wal::WalParser::new()?;
-        let tree = parser.parse(source)?;
-        let root = tree.root_node();
-
-        if root.kind() == "program" {
-            let mut cursor = root.walk();
-            let children: Vec<_> = root.children(&mut cursor)
-                .filter(|c| !is_skip_node(c.clone()))
-                .collect();
-
-            if children.is_empty() {
-                return Ok(Value::Nil);
-            }
-
-            let mut result = Value::Nil;
-            for child in &children {
-                let value = expr_from_node(child.clone(), source)?;
-                result = self.eval_value_internal(value)?;
-            }
-            Ok(result)
-        } else {
-            let value = expr_from_node(root, source)?;
-            self.eval_value_internal(value)
-        }
+        let value = parser.parse_expr(source)?;
+        self.eval_value(value)
     }
 }
 
-/// Check if a tree-sitter node should be skipped (whitespace, comments, tokens)
-fn is_skip_node(node: tree_sitter::Node) -> bool {
+/// Collect all top-level expression nodes from the parse tree
+fn collect_top_level_sexprs(node: tree_sitter::Node) -> Vec<tree_sitter::Node> {
+    let mut result = Vec::new();
     let kind = node.kind();
-    matches!(kind, "whitespace" | "_comment" | "(" | ")" | "[" | "]" | "{" | "}" | "~" | "#" | "'" | "`" | "," | ",@")
+
+    match kind {
+        "sexpr" | "atom" | "list" => {
+            result.push(node);
+        }
+        "sexpr_list" => {
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                result.extend(collect_top_level_sexprs(child));
+            }
+        }
+        "program" => {
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                result.extend(collect_top_level_sexprs(child));
+            }
+        }
+        _ => {}
+    }
+
+    result
 }
 
 impl Evaluator {
@@ -233,6 +232,26 @@ impl Evaluator {
                         return self.eval_quasiquote(&rest);
                     } else if op == Operator::Quote {
                         return self.eval_quote(&rest);
+                    } else if op == Operator::Fn {
+                        // fn is a special form — create closure, then call with remaining args
+                        if rest.len() <= 2 {
+                            // Just create closure (no extra call args)
+                            return self.eval_fn_special(&rest);
+                        }
+                        // Create closure and call with args[2..]
+                        let closure_val = self.eval_fn_special(&rest)?;
+                        match closure_val {
+                            Value::Closure(c) => {
+                                let call_args: Result<Vec<Value>, String> = rest[2..].iter()
+                                    .map(|a| self.eval_value(a.clone()))
+                                    .collect();
+                                self.eval_closure(c, &call_args?)
+                            }
+                            Value::Macro(m) => {
+                                self.eval_macro(m, &rest[2..].to_vec())
+                            }
+                            _ => Ok(closure_val),
+                        }
                     } else {
                         let mut evaluated_args = Vec::new();
                         for arg in &rest {
@@ -275,18 +294,43 @@ impl Evaluator {
                 }
             }
             Value::List(ref inner) => {
+                // Check if first element evaluates to a function that should consume the rest
                 let mut evaluated = Vec::new();
-                for v in &inner.0 {
-                    evaluated.push(self.eval_value(v.clone())?);
+                let first_val = self.eval_value(inner.0[0].clone())?;
+                match first_val {
+                    Value::Closure(c) => {
+                        let mut args = Vec::new();
+                        for v in inner.0.iter().skip(1) {
+                            args.push(self.eval_value(v.clone())?);
+                        }
+                        return self.eval_closure(c, &args);
+                    }
+                    Value::Macro(m) => {
+                        let args: Vec<Value> = inner.0[1..].to_vec();
+                        return self.eval_macro(m, &args);
+                    }
+                    _ => {
+                        evaluated.push(first_val);
+                        for v in inner.0.iter().skip(1) {
+                            evaluated.push(self.eval_value(v.clone())?);
+                        }
+                        self.eval_list(WList::from_vec(evaluated))
+                    }
                 }
-                self.eval_list(WList::from_vec(evaluated))
             }
             _ => {
+                // First element is not a symbol: evaluate it, then call as function
+                let first = self.eval_value(lst.0[0].clone())?;
                 let mut args = Vec::new();
                 for v in lst.0.iter().skip(1) {
                     args.push(self.eval_value(v.clone())?);
                 }
-                Ok(Value::List(WList::from_vec(args)))
+                match first {
+                    Value::Closure(c) => self.eval_closure(c, &args),
+                    Value::Macro(m) => self.eval_macro(m, &args),
+                    _ if args.is_empty() => Ok(first),
+                    _ => Ok(Value::List(WList::from_vec(args))),
+                }
             }
         }
     }
@@ -306,7 +350,6 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
                 local_env.define(first_arg.name.clone(), Value::List(WList::from_vec(args.to_vec())));
             }
         } else {
-            // Validate arity for non-variadic closures
             if let Some(err) = SemanticChecker::validate_closure_args(&closure.args, args) {
                 return Err(err.message());
             }
@@ -481,6 +524,12 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
         Ok(args[0].clone())
     }
 
+    // fn special form: (fn (args+) body+)
+    // No pre-evaluation — argument list and body expressions are passed as-is
+    fn eval_fn_special(&mut self, args: &[Value]) -> Result<Value, String> {
+        self.eval_dispatch(Operator::Fn, args)
+    }
+
     // defun macro: (defun name (args...) body...) → (define name (fn (args...) body...))
     //            or (defun name singe-symbol body...) → variadic
     fn eval_defun_macro(&mut self, args: &[Value]) -> Result<Value, String> {
@@ -492,10 +541,18 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
             _ => return Err("defun: first argument must be a symbol".to_string()),
         };
         // args[1] is either a list of parameter symbols, or a single symbol (variadic)
+        let body_expr = if args.len() > 2 {
+            // Multiple body expressions → wrap in do
+            let mut do_args = vec![Value::Symbol(Symbol::new("do"))];
+            do_args.extend_from_slice(&args[2..]);
+            Value::List(WList::from_vec(do_args))
+        } else {
+            args[2].clone()
+        };
         let fn_expr = Value::List(WList::from_vec(vec![
             Value::Symbol(Symbol::new("fn")),
-            args[1].clone(),          // pass through: list or symbol
-            Value::List(WList::from_vec(args[2..].to_vec())),
+            args[1].clone(),
+            body_expr,
         ]));
         let define_expr = Value::List(WList::from_vec(vec![
             Value::Symbol(Symbol::new("define")),
