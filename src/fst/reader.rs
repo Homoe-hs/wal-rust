@@ -100,11 +100,13 @@ impl<R: Read + Seek> FstReader<R> {
     }
 
     fn skip_block(&mut self, len: u64) -> io::Result<()> {
-        self.reader.seek(SeekFrom::Current(len as i64))?;
+        let pos = self.reader.stream_position()?;
+        self.reader.seek(SeekFrom::Start(pos + len))?;
         Ok(())
     }
 
-    fn read_header_block(&mut self, _len: u64) -> io::Result<()> {
+    fn read_header_block(&mut self, len: u64) -> io::Result<()> {
+        let start_pos = self.reader.stream_position()?;
         self.file.header.start_time = self.read_u64()?;
         self.file.header.end_time = self.read_u64()?;
         let _endian_check = self.read_u64()?;
@@ -129,6 +131,12 @@ impl<R: Read + Seek> FstReader<R> {
         }
         self.file.header.date = String::from_utf8_lossy(&date).to_string();
 
+        // Skip remaining bytes in the header block (if any)
+        let current_pos = self.reader.stream_position()?;
+        let end_pos = start_pos + len;
+        if current_pos < end_pos {
+            self.reader.seek(SeekFrom::Start(end_pos))?;
+        }
         Ok(())
     }
 
