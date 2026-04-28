@@ -29,6 +29,7 @@ pub enum Operator {
     Floor,
     Ceil,
     Round,
+    Abs,
     Mod,
 
     // Bitwise operations
@@ -96,6 +97,7 @@ pub enum Operator {
     Average,
     Zip,
     Sum,
+    Third,
 
     // Type checks
     IsDefined,
@@ -104,6 +106,7 @@ pub enum Operator {
     IsString,
     IsInt,
     IsList,
+    IsNull,
     ConvertBinary,
     StringToInt,
     BitsToSint,
@@ -182,6 +185,7 @@ impl Operator {
             "floor" => Some(Operator::Floor),
             "ceil" => Some(Operator::Ceil),
             "round" => Some(Operator::Round),
+            "abs" => Some(Operator::Abs),
             "mod" => Some(Operator::Mod),
 
             // Bitwise
@@ -191,6 +195,7 @@ impl Operator {
 
             // Logical
             "not" => Some(Operator::Not),
+            "!" => Some(Operator::Not),
             "=" => Some(Operator::Eq),
             "!=" => Some(Operator::Neq),
             ">" => Some(Operator::Larger),
@@ -217,6 +222,7 @@ impl Operator {
             "unalias" => Some(Operator::Unalias),
             "exit" => Some(Operator::Exit),
             "fn" => Some(Operator::Fn),
+            "lambda" => Some(Operator::Fn),
             "defmacro" => Some(Operator::Defmacro),
             "macroexpand" => Some(Operator::Macroexpand),
             "gensym" => Some(Operator::Gensym),
@@ -249,6 +255,7 @@ impl Operator {
             "average" => Some(Operator::Average),
             "zip" => Some(Operator::Zip),
             "sum" => Some(Operator::Sum),
+            "third" => Some(Operator::Third),
 
             // Type checks
             "defined?" => Some(Operator::IsDefined),
@@ -257,6 +264,8 @@ impl Operator {
             "string?" => Some(Operator::IsString),
             "int?" => Some(Operator::IsInt),
             "list?" => Some(Operator::IsList),
+            "null?" => Some(Operator::IsNull),
+            "empty?" => Some(Operator::IsNull),
             "convert/bin" => Some(Operator::ConvertBinary),
             "string->int" => Some(Operator::StringToInt),
             "bits->sint" => Some(Operator::BitsToSint),
@@ -352,6 +361,7 @@ impl Operator {
             Operator::Floor => "floor",
             Operator::Ceil => "ceil",
             Operator::Round => "round",
+            Operator::Abs => "abs",
             Operator::Mod => "mod",
             Operator::Bor => "bor",
             Operator::Band => "band",
@@ -409,12 +419,14 @@ impl Operator {
             Operator::Average => "average",
             Operator::Zip => "zip",
             Operator::Sum => "sum",
+            Operator::Third => "third",
             Operator::IsDefined => "defined?",
             Operator::IsAtom => "atom?",
             Operator::IsSymbol => "symbol?",
             Operator::IsString => "string?",
             Operator::IsInt => "int?",
             Operator::IsList => "list?",
+            Operator::IsNull => "null?",
             Operator::ConvertBinary => "convert/bin",
             Operator::StringToInt => "string->int",
             Operator::BitsToSint => "bits->sint",

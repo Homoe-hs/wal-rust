@@ -25,6 +25,14 @@ fn op_second(args: &[Value], _env: &mut Environment, _eval: &mut Evaluator) -> R
     }
 }
 
+fn op_third(args: &[Value], _env: &mut Environment, _eval: &mut Evaluator) -> Result<Value, String> {
+    ensure_arity(args, 1)?;
+    match &args[0] {
+        Value::List(lst) if lst.len() >= 3 => Ok(lst[2].clone()),
+        _ => Err("list has no third element".to_string()),
+    }
+}
+
 fn op_last(args: &[Value], _env: &mut Environment, _eval: &mut Evaluator) -> Result<Value, String> {
     ensure_arity(args, 1)?;
     match &args[0] {
@@ -268,6 +276,15 @@ fn extract_float(v: &Value) -> Result<f64, String> {
     }
 }
 
+fn op_is_null(args: &[Value], _env: &mut Environment, _eval: &mut Evaluator) -> Result<Value, String> {
+    ensure_arity(args, 1)?;
+    match &args[0] {
+        Value::Nil => Ok(Value::Bool(true)),
+        Value::List(lst) => Ok(Value::Bool(lst.is_empty())),
+        _ => Ok(Value::Bool(false)),
+    }
+}
+
 fn ensure_arity(args: &[Value], expected: usize) -> Result<(), String> {
     if args.len() != expected {
         return Err(format!("Expected {} arguments, got {}", expected, args.len()));
@@ -296,4 +313,6 @@ pub fn register_list(disp: &mut Dispatcher) {
     disp.register(Operator::Fold, op_fold);
     disp.register(Operator::Length, op_length);
     disp.register(Operator::Average, op_average);
+    disp.register(Operator::Third, op_third);
+    disp.register(Operator::IsNull, op_is_null);
 }

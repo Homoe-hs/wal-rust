@@ -179,6 +179,15 @@ fn op_mod(args: &[Value], _env: &mut Environment, _eval: &mut Evaluator) -> Resu
     Ok(Value::Int(a % b))
 }
 
+fn op_abs(args: &[Value], _env: &mut Environment, _eval: &mut Evaluator) -> Result<Value, String> {
+    ensure_arity(args, 1)?;
+    match &args[0] {
+        Value::Int(i) => Ok(Value::Int(i.abs())),
+        Value::Float(f) => Ok(Value::Float(f.abs())),
+        _ => Err("abs expects number".to_string()),
+    }
+}
+
 fn op_sum(args: &[Value], _env: &mut Environment, eval: &mut Evaluator) -> Result<Value, String> {
     ensure_arity(args, 1)?;
     let list = match eval.eval_value_public(args[0].clone())? {
@@ -258,4 +267,5 @@ pub fn register_math(disp: &mut Dispatcher) {
     disp.register(crate::wal::ast::Operator::Round, op_round);
     disp.register(crate::wal::ast::Operator::Mod, op_mod);
     disp.register(crate::wal::ast::Operator::Sum, op_sum);
+    disp.register(crate::wal::ast::Operator::Abs, op_abs);
 }

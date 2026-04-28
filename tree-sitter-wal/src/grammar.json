@@ -200,6 +200,10 @@
         {
           "type": "STRING",
           "value": "#f"
+        },
+        {
+          "type": "STRING",
+          "value": "nil"
         }
       ]
     },

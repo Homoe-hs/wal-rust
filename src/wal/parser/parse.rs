@@ -161,7 +161,11 @@ pub fn expr_from_node(node: tree_sitter::Node, source: &str) -> Result<Value, St
         }
         "bool" => {
             let text = get_node_text(node, source);
-            Ok(Value::Bool(text == "true" || text == "#t"))
+            if text == "nil" {
+                Ok(Value::Nil)
+            } else {
+                Ok(Value::Bool(text == "true" || text == "#t"))
+            }
         }
         "operator" => {
             let text = get_node_text(node, source);

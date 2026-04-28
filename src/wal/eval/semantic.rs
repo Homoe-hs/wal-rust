@@ -143,19 +143,21 @@ impl SemanticChecker {
             Operator::Unquote => Some((1, Some(1))),
             Operator::Eval => Some((1, Some(1))),
             
-            Operator::List | Operator::Map | Operator::Fold | Operator::Zip => Some((1, None)),
+            Operator::List => None,  // list accepts 0+ args
+            Operator::Map | Operator::Fold | Operator::Zip => Some((1, None)),
             Operator::First | Operator::Second | Operator::Last | Operator::Rest => Some((1, Some(1))),
+            Operator::Third => Some((1, Some(1))),
             Operator::Length => Some((1, Some(1))),
             Operator::In => Some((2, Some(2))),
             Operator::Max | Operator::Min | Operator::Sum | Operator::Average => Some((1, None)),
             
             Operator::IsDefined | Operator::IsAtom | Operator::IsSymbol 
-            | Operator::IsString | Operator::IsInt | Operator::IsList => Some((1, Some(1))),
+            | Operator::IsString | Operator::IsInt | Operator::IsList | Operator::IsNull => Some((1, Some(1))),
             
             Operator::ConvertBinary | Operator::StringToInt | Operator::BitsToSint
             | Operator::SymbolToString | Operator::StringToSymbol | Operator::IntToString => Some((1, Some(1))),
             
-            Operator::Floor | Operator::Ceil | Operator::Round => Some((1, Some(1))),
+            Operator::Floor | Operator::Ceil | Operator::Round | Operator::Abs => Some((1, Some(1))),
             
             Operator::Print | Operator::Printf => Some((1, None)),
             Operator::Exit => Some((0, Some(1))),
