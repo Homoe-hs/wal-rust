@@ -131,11 +131,22 @@ impl<R: Read + Seek> FstReader<R> {
         }
         self.file.header.date = String::from_utf8_lossy(&date).to_string();
 
-        // Skip remaining bytes in the header block (if any)
+        // FST header block has a fixed structure: 8 u64 + 1 i8 + 128 version + 128 date = 321 bytes
+        // Some FST generators (e.g. Icarus Verilog) write incorrect block_len values (e.g. 1 instead of 321).
+        // Always advance past the actual header body (max(321, len) bytes) to handle both cases.
+        const HEADER_BODY_SIZE: u64 = 321; // bytes of fixed header fields
+        let header_end = if len < HEADER_BODY_SIZE {
+            // Some implementations (Icarus) report block_len < actual header size
+            start_pos + 8 + HEADER_BODY_SIZE // 8 = block_len field itself
+        } else {
+            start_pos + len
+        };
         let current_pos = self.reader.stream_position()?;
-        let end_pos = start_pos + len;
-        if current_pos < end_pos {
-            self.reader.seek(SeekFrom::Start(end_pos))?;
+        if current_pos < header_end {
+            self.reader.seek(SeekFrom::Start(header_end))?;
+        } else if current_pos > header_end {
+            // Hard seek forward past any trailing data in the header
+            self.reader.seek(SeekFrom::Start(header_end))?;
         }
         Ok(())
     }
