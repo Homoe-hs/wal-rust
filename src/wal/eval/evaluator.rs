@@ -1,7 +1,7 @@
 //! Basic Evaluator for WAL
 
 use crate::wal::ast::{Value, Symbol, WList, Closure, Operator};
-use crate::wal::eval::{Environment, Dispatcher, SemanticChecker, SemanticError};
+use crate::wal::eval::{Environment, Dispatcher, SemanticChecker};
 use crate::wal::builtins;
 use crate::wal::builtins::special::quasiquote_eval;
 use crate::trace::{TraceContainer, SharedTraceContainer};
@@ -369,7 +369,7 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
         result
     }
 
-    fn eval_macro(&mut self, macro_obj: crate::wal::ast::Macro, args: &[Value]) -> Result<Value, String> {
+    pub(crate) fn eval_macro(&mut self, macro_obj: crate::wal::ast::Macro, args: &[Value]) -> Result<Value, String> {
         let mut local_env = self.env.child();
 
         if macro_obj.variadic {
@@ -533,15 +533,15 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
     // defun macro: (defun name (args...) body...) → (define name (fn (args...) body...))
     //            or (defun name singe-symbol body...) → variadic
     fn eval_defun_macro(&mut self, args: &[Value]) -> Result<Value, String> {
-        if args.len() < 2 {
-            return Err("defun expects at least name and body".to_string());
+        if args.len() < 3 {
+            return Err("defun expects at least name, params, and body".to_string());
         }
         let name = match &args[0] {
             Value::Symbol(s) => s.name.clone(),
             _ => return Err("defun: first argument must be a symbol".to_string()),
         };
         // args[1] is either a list of parameter symbols, or a single symbol (variadic)
-        let body_expr = if args.len() > 2 {
+        let body_expr = if args.len() > 3 {
             // Multiple body expressions → wrap in do
             let mut do_args = vec![Value::Symbol(Symbol::new("do"))];
             do_args.extend_from_slice(&args[2..]);

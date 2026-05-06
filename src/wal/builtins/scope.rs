@@ -5,15 +5,17 @@
 use crate::wal::ast::{Value, Operator};
 use crate::wal::eval::{Environment, Dispatcher, Evaluator};
 
-fn op_scoped(args: &[Value], env: &mut Environment, _eval: &mut Evaluator) -> Result<Value, String> {
+fn op_scoped(args: &[Value], env: &mut Environment, eval: &mut Evaluator) -> Result<Value, String> {
     ensure_arity_atleast(args, 2)?;
     let scope_name = extract_symbol(&args[0])?;
     let mut new_env = env.child();
     new_env.set_scope(&scope_name);
+    let saved_env = std::mem::replace(env, new_env);
     let mut result = Value::Nil;
     for arg in &args[1..] {
-        result = arg.clone();
+        result = eval.eval_value_public(arg.clone())?;
     }
+    let _ = std::mem::replace(env, saved_env);
     Ok(result)
 }
 
@@ -89,15 +91,17 @@ fn op_groups(args: &[Value], env: &mut Environment, _eval: &mut Evaluator) -> Re
     Ok(Value::List(crate::wal::ast::WList::new()))
 }
 
-fn op_in_group(args: &[Value], env: &mut Environment, _eval: &mut Evaluator) -> Result<Value, String> {
+fn op_in_group(args: &[Value], env: &mut Environment, eval: &mut Evaluator) -> Result<Value, String> {
     ensure_arity_atleast(args, 2)?;
     let group_name = extract_symbol(&args[0])?;
     let mut new_env = env.child();
     new_env.set_group(&group_name);
+    let saved_env = std::mem::replace(env, new_env);
     let mut result = Value::Nil;
     for arg in &args[1..] {
-        result = arg.clone();
+        result = eval.eval_value_public(arg.clone())?;
     }
+    let _ = std::mem::replace(env, saved_env);
     Ok(result)
 }
 

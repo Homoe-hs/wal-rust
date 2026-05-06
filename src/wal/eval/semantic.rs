@@ -3,7 +3,7 @@
 //! Performs semantic analysis on WAL expressions to detect type errors,
 //! arity mismatches, undefined references, and other semantic issues.
 
-use crate::wal::ast::{Value, WList, Symbol, Operator};
+use crate::wal::ast::{Value, Symbol, Operator};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum SemanticError {

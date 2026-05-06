@@ -86,9 +86,7 @@ fn op_fn(args: &[Value], env: &mut Environment, _eval: &mut Evaluator) -> Result
     let body = if args.len() > 2 {
         let mut do_args: Vec<Value> = Vec::new();
         do_args.push(Value::Symbol(Symbol::new("do")));
-        // Only include arguments 1..2 (the body expressions), not extra call args
-        let body_end = 2usize.min(args.len());
-        do_args.extend_from_slice(&args[1..body_end]);
+        do_args.extend_from_slice(&args[1..]);
         if do_args.len() == 1 {
             // No body expressions — just use Nil
             Value::Nil
@@ -180,7 +178,7 @@ fn op_gensym(_args: &[Value], _env: &mut Environment, _eval: &mut Evaluator) -> 
     Ok(Value::Symbol(Symbol::new(format!("GENSYM_{}", n))))
 }
 
-fn op_case(args: &[Value], env: &mut Environment, _eval: &mut Evaluator) -> Result<Value, String> {
+fn op_case(args: &[Value], env: &mut Environment, eval: &mut Evaluator) -> Result<Value, String> {
     ensure_arity_atleast(args, 2)?;
     let key = eval_value(&args[0], env)?;
 
@@ -189,7 +187,7 @@ fn op_case(args: &[Value], env: &mut Environment, _eval: &mut Evaluator) -> Resu
             return Err("case expects (key result) pairs".to_string());
         }
         if chunk[0] == key {
-            return eval_value(&chunk[1], env);
+            return eval.eval_value_public(chunk[1].clone());
         }
     }
     Ok(Value::Nil)

@@ -6,7 +6,7 @@
 //! - Scope hierarchy
 //! - Value change emission
 
-use super::blocks::{encode_var_entry, BlockWriter};
+use super::blocks::{encode_var_entry, encode_scope_entry, BlockWriter};
 use super::compress::{get_compressor, Compressor};
 use super::types::{BlockType, Compression, FstHeader, ScopeType, SignalDecl, VarType};
 use super::varint::encode_varint_buf;
@@ -134,12 +134,7 @@ impl<W: Write> FstWriter<W> {
 
     /// Push a scope onto the hierarchy
     pub fn push_scope(&mut self, name: &str, _st: ScopeType) {
-        let full_name = if self.scopes.is_empty() {
-            name.to_string()
-        } else {
-            format!("{}.{}", self.scopes.join("."), name)
-        };
-        self.scopes.push(full_name);
+        self.scopes.push(name.to_string());
     }
 
     /// Pop the current scope
@@ -246,11 +241,7 @@ impl<W: Write> FstWriter<W> {
 
         self.writer.flush()?;
 
-        let ratio = if self.bytes_written > 0 {
-            self.bytes_written as f64 / self.bytes_written.max(1) as f64
-        } else {
-            1.0
-        };
+        let ratio = 0.0; // compression ratio not tracked
 
         Ok(FstStats {
             output_bytes: self.bytes_written,
@@ -289,7 +280,23 @@ impl<W: Write> FstWriter<W> {
     fn write_hier_block(&mut self) -> Result<()> {
         let mut hier_data = Vec::new();
 
-        // Encode scopes and variables
+        // Reconstruct scope stack to encode hierarchy
+        let mut scope_path: Vec<&str> = Vec::new();
+        for scope_name in &self.scopes {
+            // Build the full path incrementally
+            scope_path.push(scope_name);
+            // Encode scope entry with just the name part
+            hier_data.extend_from_slice(&encode_scope_entry(
+                scope_name,
+                ScopeType::VcdModule,
+            ));
+        }
+        // Encode scope entries reverse for upscope
+        for _ in &self.scopes {
+            hier_data.push(0x03); // HIER_UPSCOPE
+        }
+
+        // Encode variables
         for sig in &self.signals {
             hier_data.extend_from_slice(&encode_var_entry(
                 sig.handle,

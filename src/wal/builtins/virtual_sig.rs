@@ -5,7 +5,7 @@
 use crate::wal::ast::{Value, Operator};
 use crate::wal::eval::{Environment, Dispatcher, Evaluator};
 
-fn op_defsig(args: &[Value], env: &mut Environment, eval: &mut Evaluator) -> Result<Value, String> {
+fn op_defsig(args: &[Value], env: &mut Environment, _eval: &mut Evaluator) -> Result<Value, String> {
     ensure_arity_atleast(args, 2)?;
     let name = extract_symbol(&args[0])?;
     let expr = &args[1];

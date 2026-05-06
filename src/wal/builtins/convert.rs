@@ -37,5 +37,5 @@ fn extract_string(v: &Value) -> Result<String, String> {
 }
 
 pub fn register_convert(disp: &mut Dispatcher) {
-    disp.register(Operator::Import, op_convert);
+    disp.register(Operator::Convert, op_convert);
 }

@@ -137,9 +137,9 @@ fn op_trace_file(_args: &[Value], env: &mut Environment, _eval: &mut Evaluator) 
 
 fn scalar_to_value(sv: ScalarValue) -> Value {
     match sv {
-        ScalarValue::Bit(b) => Value::Int(b as i64),
+        ScalarValue::Bit(b) => Value::Int(if b == b'1' { 1 } else { 0 }),
         ScalarValue::Vector(v) => {
-            let int_val = v.iter().fold(0i64, |acc, &b| (acc << 1) | (b as i64));
+            let int_val = v.iter().fold(0i64, |acc, &b| (acc << 1) | if b == b'1' { 1 } else { 0 });
             Value::Int(int_val)
         }
         ScalarValue::Real(r) => Value::Float(r),
@@ -332,20 +332,93 @@ fn op_releval(args: &[Value], env: &mut Environment, eval: &mut Evaluator) -> Re
     Err("No traces loaded".to_string())
 }
 
-fn op_fold_signal(_args: &[Value], _env: &mut Environment, _eval: &mut Evaluator) -> Result<Value, String> {
+fn op_fold_signal(args: &[Value], env: &mut Environment, eval: &mut Evaluator) -> Result<Value, String> {
+    // (fold signal expr init method) — iterate over signal values at each time step
+    ensure_arity_atleast(args, 3)?;
+    let signal_name = extract_symbol(&args[0])?;
+    let expr = &args[1];
+    let init = &args[2];
+    let _method = args.get(3).and_then(|v| extract_symbol(v).ok()).unwrap_or_default();
+
+    if let Some(traces) = env.get_traces() {
+        let traces_lock = traces.read().unwrap_or_else(|e| e.into_inner());
+        if let Some(trace) = traces_lock.first_trace() {
+            let max_idx = trace.max_index();
+            let mut result = eval.eval_value_public(init.clone())?;
+            for idx in 0..=max_idx {
+                let val = trace.signal_value(&signal_name, idx).unwrap_or(ScalarValue::Bit(b'0'));
+                let val_value = scalar_to_value(val);
+                // Bind signal value to $val in environment
+                let mut new_env = env.child();
+                new_env.define("$val".to_string(), val_value);
+                new_env.define("$idx".to_string(), Value::Int(idx as i64));
+                let saved = std::mem::replace(env, new_env);
+                result = eval.eval_value_public(expr.clone())?;
+                let _ = std::mem::replace(env, saved);
+            }
+            return Ok(result);
+        }
+    }
     Ok(Value::Nil)
 }
 
-fn op_signal_width(args: &[Value], _env: &mut Environment, _eval: &mut Evaluator) -> Result<Value, String> {
+fn op_signal_width(args: &[Value], env: &mut Environment, _eval: &mut Evaluator) -> Result<Value, String> {
     ensure_arity(args, 1)?;
+    let name = extract_symbol(&args[0])?;
+    if let Some(traces) = env.get_traces() {
+        let traces_lock = traces.read().unwrap_or_else(|e| e.into_inner());
+        if let Some(trace) = traces_lock.first_trace() {
+            if let Ok(w) = trace.signal_width(&name) {
+                return Ok(Value::Int(w as i64));
+            }
+            // Try all traces
+            for trace in traces_lock.traces_iter() {
+                if let Ok(w) = trace.signal_width(&name) {
+                    return Ok(Value::Int(w as i64));
+                }
+            }
+        }
+    }
     Ok(Value::Int(1))
 }
 
-fn op_sample_at(_args: &[Value], _env: &mut Environment, _eval: &mut Evaluator) -> Result<Value, String> {
+fn op_sample_at(args: &[Value], env: &mut Environment, _eval: &mut Evaluator) -> Result<Value, String> {
+    ensure_arity(args, 2)?;
+    let signal_name = extract_symbol(&args[0])?;
+    let index = match &args[1] {
+        Value::Int(i) => *i as usize,
+        Value::Float(f) => *f as usize,
+        _ => return Err("sample-at: second argument must be an integer index".to_string()),
+    };
+    if let Some(traces) = env.get_traces() {
+        let traces_lock = traces.read().unwrap_or_else(|e| e.into_inner());
+        if let Some(trace) = traces_lock.first_trace() {
+            if let Ok(sv) = trace.signal_value(&signal_name, index) {
+                return Ok(scalar_to_value(sv));
+            }
+            // Try all traces
+            for trace in traces_lock.traces_iter() {
+                if let Ok(sv) = trace.signal_value(&signal_name, index) {
+                    return Ok(scalar_to_value(sv));
+                }
+            }
+        }
+    }
     Ok(Value::Nil)
 }
 
-fn op_trim_trace(_args: &[Value], _env: &mut Environment, _eval: &mut Evaluator) -> Result<Value, String> {
+fn op_trim_trace(args: &[Value], _env: &mut Environment, _eval: &mut Evaluator) -> Result<Value, String> {
+    // (trim-trace start end) — trim all traces to [start, end] index range
+    ensure_arity(args, 2)?;
+    let _start = match &args[0] {
+        Value::Int(i) => *i as usize,
+        _ => return Err("trim-trace: start must be integer".to_string()),
+    };
+    let _end = match &args[1] {
+        Value::Int(i) => *i as usize,
+        _ => return Err("trim-trace: end must be integer".to_string()),
+    };
+    // Trace trimming is not supported by current Trace trait — acknowledge
     Ok(Value::Nil)
 }
 
@@ -359,9 +432,27 @@ fn op_signal_p(args: &[Value], env: &mut Environment, _eval: &mut Evaluator) -> 
     Ok(Value::Bool(false))
 }
 
-fn op_call(args: &[Value], _env: &mut Environment, _eval: &mut Evaluator) -> Result<Value, String> {
+fn op_call(args: &[Value], env: &mut Environment, eval: &mut Evaluator) -> Result<Value, String> {
+    // (call name args...) — dynamically call a named function
     ensure_arity_atleast(args, 2)?;
-    Ok(Value::Nil)
+    let callee = eval.eval_value_public(args[0].clone())?;
+    let call_args: Vec<Value> = args[1..].to_vec();
+    match callee {
+        Value::Closure(c) => eval.eval_closure(c, &call_args),
+        Value::Macro(m) => eval.eval_macro(m, &call_args),
+        Value::Symbol(s) => {
+            if let Some(val) = env.lookup(&s.name) {
+                match val {
+                    Value::Closure(c) => eval.eval_closure(c, &call_args),
+                    Value::Macro(m) => eval.eval_macro(m, &call_args),
+                    _ => Err(format!("call: '{}' is not callable", s.name)),
+                }
+            } else {
+                Err(format!("call: '{}' not found", s.name))
+            }
+        }
+        _ => Err("call: first argument must be callable".to_string()),
+    }
 }
 
 fn op_eval_file(args: &[Value], _env: &mut Environment, eval: &mut Evaluator) -> Result<Value, String> {
@@ -372,9 +463,22 @@ fn op_eval_file(args: &[Value], _env: &mut Environment, eval: &mut Evaluator) ->
     eval.eval(&source)
 }
 
-fn op_require(args: &[Value], _env: &mut Environment, _eval: &mut Evaluator) -> Result<Value, String> {
+fn op_require(args: &[Value], _env: &mut Environment, eval: &mut Evaluator) -> Result<Value, String> {
+    // (require name) — load a WAL module from the search path
     ensure_arity(args, 1)?;
-    Ok(Value::Nil)
+    let name = extract_symbol(&args[0])?;
+    // Search for the file in standard locations
+    let search_paths = [".", "/usr/local/share/wal/stdlib", "/usr/share/wal/stdlib"];
+    for base in &search_paths {
+        let path = std::path::Path::new(base).join(format!("{}.wal", name));
+        if path.exists() {
+            let source = std::fs::read_to_string(&path)
+                .map_err(|e| format!("require: cannot read '{}': {}", path.display(), e))?;
+            return eval.eval(&source);
+        }
+    }
+    // Check if already loaded
+    Err(format!("require: module '{}' not found in search paths", name))
 }
 
 fn ensure_arity(args: &[Value], expected: usize) -> Result<(), String> {

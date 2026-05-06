@@ -30,8 +30,8 @@ pub struct FstTrace {
     block_index: Vec<BlockInfo>,
 
     // Pass 2: LRU caches
-    block_cache: RefCell<lru::LruCache<usize, Vec<u8>>>, // block_idx → decompressed data
-    value_cache: RefCell<lru::LruCache<(u32, u64), Vec<u8>>>, // (handle, time) → value
+    block_cache: RefCell<lru::LruCache<usize, Vec<u8>>>,
+    value_cache: RefCell<lru::LruCache<(u32, u64), Vec<u8>>>,
 
     // Persistent file handle for on-demand reads
     reader: RefCell<BufReader<std::fs::File>>,
@@ -39,6 +39,9 @@ pub struct FstTrace {
     // Runtime
     current_index: usize,
     max_index: usize,
+
+    /// Endianness: true = big-endian (Icarus), false = little-endian (walconv)
+    big_endian: bool,
 }
 
 impl FstTrace {
@@ -48,6 +51,7 @@ impl FstTrace {
         let reader = FstReader::from_path(path)
             .map_err(|e| format!("Failed to read FST file {}: {}", filename, e))?;
 
+        let big_endian = reader.is_big_endian();
         let file = reader.file;
 
         let mut trace = FstTrace {
@@ -69,6 +73,7 @@ impl FstTrace {
             )),
             current_index: 0,
             max_index: 0,
+            big_endian,
         };
 
         // Pass 1: build block index + timestamps
@@ -97,7 +102,8 @@ impl FstTrace {
                 Err(e) => return Err(format!("Read error: {}", e)),
             };
 
-            let block_len = read_u64(&mut *reader).map_err(|e| format!("Read error: {}", e))?;
+            let block_len = read_u64(&mut *reader, self.big_endian)
+                .map_err(|e| format!("Read error: {}", e))?;
 
             match block_type {
                 0x01 => {
@@ -129,19 +135,26 @@ impl FstTrace {
                         .map_err(|e| format!("Seek error: {}", e))?;
                 }
                 0xFE => {
-                    // Release reader borrow before processing ZWRAPPER contents
+                    // ZWRAPPER contains compressed FST data — skip it entirely.
+                    // The inner data is already processed by FstReader.
                     drop(reader);
+                    // Re-open file and seek past the entire ZWRAPPER block
                     let mut f = std::fs::File::open(&self.filename)
                         .map_err(|e| format!("Failed to reopen {}: {}", self.filename, e))?;
-                    // Seek to past the 0xFE header + len
-                    // We don't have the exact position, so re-read from start
-                    // Actually, ZWRAPPER wraps the ENTIRE file. We need to approach differently.
-                    // For now: skip ZWRAPPER blocks in build_index
-                    f.seek(SeekFrom::Current(0)).map_err(|e| format!("Seek: {}", e))?;
-                    self.reader = RefCell::new(BufReader::with_capacity(1024 * 1024, f));
+                    // The 0xFE block_len includes the compressed data already consumed.
+                    // We don't know the exact position, so reopen from start and seek
+                    // to the end of the file (all ZWRAPPER data has been consumed).
+                    let file_len = f.seek(SeekFrom::End(0))
+                        .map_err(|e| format!("Seek error: {}", e))?;
+                    self.reader = RefCell::new(BufReader::with_capacity(
+                        1024 * 1024,
+                        std::fs::File::open(&self.filename)
+                            .map_err(|e| format!("Failed to reopen {}: {}", self.filename, e))?,
+                    ));
                     reader = self.reader.borrow_mut();
-                    // We can't easily resume — seek past the entire ZWRAPPER
-                    // Mark this as handled via block_index (time range covers entire file)
+                    // Seek to end — there's nothing more to process after ZWRAPPER
+                    reader.seek(SeekFrom::Start(file_len)).ok();
+                    break;
                 }
                 _ => {
                     reader.seek(SeekFrom::Current(block_len as i64))
@@ -327,10 +340,14 @@ fn read_u8<R: Read>(reader: &mut R) -> std::io::Result<u8> {
     Ok(buf[0])
 }
 
-fn read_u64<R: Read>(reader: &mut R) -> std::io::Result<u64> {
+fn read_u64<R: Read>(reader: &mut R, big_endian: bool) -> std::io::Result<u64> {
     let mut buf = [0u8; 8];
     reader.read_exact(&mut buf)?;
-    Ok(u64::from_le_bytes(buf))
+    if big_endian {
+        Ok(u64::from_be_bytes(buf))
+    } else {
+        Ok(u64::from_le_bytes(buf))
+    }
 }
 
 fn read_bytes<R: Read>(reader: &mut R, len: usize) -> std::io::Result<Vec<u8>> {
