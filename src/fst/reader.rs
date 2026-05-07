@@ -209,6 +209,10 @@ impl<R: Read + Seek> FstReader<R> {
         }
         let tail = self.read_bytes(tail_len as usize)?;
 
+        // Also check for vcd2fst inline HIER marker (0x52 after GEOM)
+        // vcd2fst uses a non-standard inline HIER format after the GEOM block.
+        self.parse_vcd2fst_inline_hier(&tail)?;
+
         // Find the GEOM block (type 0x03 with valid length)
         let mut pos = 0usize;
         let target_types = [0x03u8, 0x04, 0x06, 0x07];
@@ -223,7 +227,9 @@ impl<R: Read + Seek> FstReader<R> {
             } else {
                 u64::from_le_bytes(tail[pos+1..pos+9].try_into().unwrap())
             };
-            if bl < 8 || bl as usize > tail.len() - pos - 9 {
+            if bl < 8 || bl > 200000 || (bl > (tail.len() - pos - 9) as u64 && bt != 0x03 && bt != 0x06 && bt != 0x07) {
+                // GEOM and HIER blocks may extend past the tail buffer
+                // (they were scanned from the end of the file)
                 pos += 1;
                 continue;
             }
@@ -233,16 +239,16 @@ impl<R: Read + Seek> FstReader<R> {
                     // GEOM block
                     let body = &tail[pos+9..pos+9+bl as usize];
                     self.parse_icarus_geom(body)?;
-                    // After GEOM, scan for gzip HIER data (may have padding bytes)
+                    // After GEOM, scan for gzip-compressed HIER data
                     let geom_end = pos + 9 + bl as usize;
-                    let mut gz_start = geom_end;
-                    while gz_start + 2 <= tail.len() && tail[gz_start] != 0x1f {
-                        gz_start += 1;
+                    let mut hier_start = geom_end;
+                    while hier_start + 2 <= tail.len() && tail[hier_start] != 0x1f {
+                        hier_start += 1;
                     }
-                    if gz_start + 2 <= tail.len() && tail[gz_start] == 0x1f && tail[gz_start+1] == 0x8b {
+                    if hier_start + 2 <= tail.len() && tail[hier_start] == 0x1f && tail[hier_start+1] == 0x8b {
                         use flate2::read::GzDecoder;
                         use std::io::Read;
-                        let mut decoder = GzDecoder::new(&tail[gz_start..]);
+                        let mut decoder = GzDecoder::new(&tail[hier_start..]);
                         let mut hier_data = Vec::new();
                         if decoder.read_to_end(&mut hier_data).is_ok() && !hier_data.is_empty() {
                             self.parse_hier_data(&hier_data)?;
@@ -252,16 +258,33 @@ impl<R: Read + Seek> FstReader<R> {
                 }
                 0x04 | 0x06 | 0x07 => {
                     // Standard HIER block
-                    if bt == 0x04 {
-                        let body = &tail[pos+9..pos+9+bl as usize];
-                        self.parse_hier_data(body)?;
-                    } else {
-                        let compressed = &tail[pos+9..pos+9+bl as usize];
-                        if let Ok(decompressed) = lz4_flex::block::decompress_size_prepended(compressed) {
-                            self.parse_hier_data(&decompressed)?;
+                    let body_len = (bl as usize).min(tail.len().saturating_sub(pos + 9));
+                    let body = &tail[pos+9..pos+9+body_len];
+                    match bt {
+                        0x04 => {
+                            self.parse_hier_data(body)?;
                         }
+                        0x06 | 0x07 => {
+                            // HIER_LZ4 / HIER_LZ4DUO:
+                            // body = [uncompressed_len:u64] + [lz4 compressed data]
+                            if body.len() < 8 { break; }
+                            let _unc_len = if self.big_endian {
+                                u64::from_be_bytes(body[0..8].try_into().unwrap()) as usize
+                            } else {
+                                u64::from_le_bytes(body[0..8].try_into().unwrap()) as usize
+                            };
+                            let comp = &body[8..];
+                            // HIER_LZ4 uses LZ4 block format: [uncompressed_size:4 LE] + [data]
+                            // If the block is truncated, try with trailing zeros padding
+                            let mut padded = comp.to_vec();
+                            padded.resize(comp.len() + 8, 0);
+                            if let Ok(decompressed) = lz4_flex::block::decompress_size_prepended(&padded) {
+                                self.parse_hier_data(&decompressed)?;
+                            }
+                        }
+                        _ => {}
                     }
-                    pos += 9 + bl as usize;
+                    pos += 9 + body_len;
                 }
                 _ => {
                     pos += 9 + bl as usize;
@@ -305,6 +328,29 @@ impl<R: Read + Seek> FstReader<R> {
     fn read_u64_from_slice_be(&self, data: &[u8], offset: usize) -> u64 {
         if offset + 8 > data.len() { return 0; }
         u64::from_be_bytes(data[offset..offset+8].try_into().unwrap())
+    }
+
+    /// Parse vcd2fst inline HIER format.
+    /// After the GEOM block, vcd2fst stores HIER as:
+    ///   [0x52:1][len:8][prefix:2][scope/var entries...]
+    fn parse_vcd2fst_inline_hier(&mut self, tail: &[u8]) -> io::Result<()> {
+        let mut pos = 0usize;
+        while pos + 9 < tail.len() {
+            if tail[pos] == 0x52 {
+                let _inline_len = u64::from_be_bytes(tail[pos+1..pos+9].try_into().unwrap());
+                // Skip the 0x52 header and find the first HIER marker (0xFE)
+                let mut hier_pos = pos + 9;
+                while hier_pos < tail.len() && tail[hier_pos] != 0xFE {
+                    hier_pos += 1;
+                }
+                if hier_pos + 1 < tail.len() {
+                    self.parse_hier_data(&tail[hier_pos..])?;
+                    return Ok(());
+                }
+            }
+            pos += 1;
+        }
+        Ok(())
     }
 
     fn read_u8(&mut self) -> io::Result<u8> {
@@ -566,14 +612,31 @@ impl<R: Read + Seek> FstReader<R> {
     fn parse_hier_data(&mut self, data: &[u8]) -> io::Result<()> {
         let mut pos = 0;
         let mut scope_stack: Vec<usize> = Vec::new();
+        let mut max_iter = data.len();
 
-        while pos < data.len() {
+        while pos < data.len() && max_iter > 0 {
+            max_iter -= 1;
             let code = data[pos];
             pos += 1;
 
             match code {
+                // FST_ST_GEN_ATTRBEGIN = 252 (0xFC): attribute begin — skip over
+                // Format: FC + attrtype(1) + subtype(1) + name\0 + arg\0
+                0xFC => {
+                    if pos + 2 >= data.len() { break; }
+                    pos += 2; // skip FC + attrtype + subtype
+                    // skip name\0
+                    let (_name, consumed) = self.read_cstring_from_slice(&data[pos..]);
+                    pos += consumed;
+                    // skip arg\0
+                    let (_arg, consumed) = self.read_cstring_from_slice(&data[pos..]);
+                    pos += consumed;
+                }
+                // FST_ST_GEN_ATTREND = 253 (0xFD): attribute end
+                0xFD => {
+                    pos += 1;
+                }
                 // FST_ST_VCD_SCOPE = 254 (0xFE): scope begin
-                // Format: scope_type(1) + name(\0) + comp(\0)
                 0xFE => {
                     if pos >= data.len() { break; }
                     let scope_type = data[pos] as u8;
@@ -605,6 +668,7 @@ impl<R: Read + Seek> FstReader<R> {
                     pos += 1;
                     let (name, consumed) = self.read_cstring_from_slice(&data[pos..]);
                     pos += consumed;
+                    if pos >= data.len() { break; }
 
                     // Read width as varint
                     let (width, consumed) = match decode_varint(&data[pos..]) {
@@ -614,24 +678,44 @@ impl<R: Read + Seek> FstReader<R> {
                     pos += consumed;
 
                     // Read alias handle as varint (Icarus format; 0 for non-alias)
-                    let (_alias, consumed) = match decode_varint(&data[pos..]) {
+                    if pos >= data.len() { break; }
+                    let (alias, consumed) = match decode_varint(&data[pos..]) {
                         Some(v) => v,
                         None => break,
                     };
                     pos += consumed;
 
-                    self.file.signals.push(SignalDecl {
-                        handle: self.file.signals.len() as u32,
-                        name,
-                        width: width as u32,
-                        var_type: VarType::from_u8(code),
-                    });
+                    // Validate signal: name should be readable ASCII text
+                    let is_valid = if alias > 0 && name.len() <= 3 {
+                        // Aliases with very short names are likely compact encoding artifacts
+                        false
+                    } else if name.len() < 1 {
+                        false
+                    } else if !name.is_ascii() {
+                        false
+                    } else if name.chars().all(|c| c.is_ascii_control()) {
+                        false
+                    } else {
+                        // At least 50% of the name should be printable non-control chars
+                        let printable = name.chars().filter(|c| c.is_ascii_graphic() || *c == ' ').count();
+                        printable >= name.len().saturating_sub(3)
+                    };
+
+                    if is_valid {
+                        // Primary signal (non-alias) with valid name
+                        self.file.signals.push(SignalDecl {
+                            handle: self.file.signals.len() as u32,
+                            name,
+                            width: width as u32,
+                            var_type: VarType::from_u8(code),
+                        });
+                    }
                 }
-                // FST_ST_GEN_ATTRBEGIN = 252 — skip
-                // FST_ST_GEN_ATTREND = 253 — skip
-                // Unknown codes: stop parsing
+                // Unknown codes (30-251, excluding attribute markers): 
+                // These are compact/alias HIER entries in vcd2fst format.
+                // Skip them individually rather than stopping the entire parse.
                 _ => {
-                    break;
+                    // Skip unknown byte and continue
                 }
             }
         }

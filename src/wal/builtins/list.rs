@@ -92,6 +92,9 @@ fn op_map(args: &[Value], _env: &mut Environment, eval: &mut Evaluator) -> Resul
     let mut result = Vec::new();
     for item in list {
         let applied = match &args[0] {
+            Value::Closure(c) => {
+                eval.eval_closure(c.clone(), &[item.clone()])?
+            }
             Value::Symbol(s) if Operator::from_str(&s.name).is_some() => {
                 let op = Operator::from_str(&s.name).unwrap();
                 let quoted = Value::List(WList::from_vec(vec![

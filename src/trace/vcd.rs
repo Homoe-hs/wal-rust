@@ -161,14 +161,19 @@ impl VcdTrace {
 
                 let mut lp = 0usize;
                 while lp < chunk.len() {
-                    // Find next newline
                     let line_start = lp;
-                    while lp < chunk.len() && chunk[lp] != b'\n' {
-                        lp += 1;
-                    }
-                    let line_end = lp;
-                    if lp < chunk.len() { lp += 1; } // skip newline
-
+                    let line_end = match memchr::memchr(b'\n', &chunk[lp..]) {
+                        Some(nl_pos) => {
+                            lp += nl_pos;
+                            let end = lp;
+                            lp += 1; // skip newline
+                            end
+                        }
+                        None => {
+                            lp = chunk.len();
+                            break;
+                        }
+                    };
                     let line = &chunk[line_start..line_end];
                     if line.is_empty() { continue; }
 

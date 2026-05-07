@@ -42,6 +42,7 @@ impl Value {
         match self {
             Value::Nil => false,
             Value::Bool(b) => *b,
+            Value::List(lst) => !lst.is_empty(),
             _ => true,
         }
     }
@@ -125,7 +126,8 @@ mod tests {
         assert!(!Value::Nil.is_truthy());
         assert!(Value::Bool(true).is_truthy());
         assert!(!Value::Bool(false).is_truthy());
-        assert!(Value::Int(0).is_truthy());
+        assert!(Value::Int(0).is_truthy());  // 0 is truthy in Lisp/WAL
+        assert!(!Value::List(WList::new()).is_truthy());  // empty list is falsy
     }
 
     #[test]

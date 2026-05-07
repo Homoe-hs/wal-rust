@@ -3,185 +3,324 @@
 High-performance Rust implementation of [WAL](https://wal-lang.org), supporting VCD/FST waveform analysis at scale. **155GB VCD loaded in 9 minutes on 16-core CPU.**
 
 ```bash
-$ wal-rust run -l trace.vcd analyze.wal
+$ wal-rust '(+ 1 2)'
+=> 3
+
+$ wal-rust '(load "trace.vcd") (signals)'
 ```
 
 ---
 
-## Features
-
-### Full WAL Language Support (82 operators)
-
-| 类别 | 运算符 |
-|------|--------|
-| 数学 | `+`, `-`, `*`, `/`, `**`, `floor`, `ceil`, `round`, `mod`, `sum` |
-| 逻辑 | `not`, `=`, `!=`, `>`, `<`, `>=`, `<=`, `&&`, `\|\|` |
-| 位运算 | `bor`, `band`, `bxor` |
-| 控制流 | `print`, `printf`, `set!`, `define`, `let`, `if`, `case`, `when`, `unless`, `cond`, `while`, `do`, `exit` |
-| 列表 | `list`, `first`, `second`, `last`, `rest`, `in`, `map`, `fold`, `zip`, `max`, `min`, `average`, `length` |
-| 类型 | `defined?`, `atom?`, `symbol?`, `string?`, `int?`, `list?`, `convert/bin`, `string->int`, `bits->sint`, `symbol->string`, `string->symbol`, `int->string` |
-| 波形 | `load`, `unload`, `step`, `signals`, `index`, `max-index`, `ts`, `trace-name`, `trace-file`, `find`, `find/g`, `whenever`, `count`, `timeframe`, `get`, `call` |
-| 作用域 | `scoped`, `all-scopes`, `resolve-scope`, `groups`, `in-group`, `in-groups`, `in-scope`, `in-scopes`, `resolve-group` |
-| 数组 | `array`, `seta`, `geta`, `geta/default`, `dela`, `mapa` |
-| 特殊形式 | `quote`, `quasiquote`, `unquote`, `eval`, `parse`, `rel_eval`, `slice`, `import` |
-
-### Macros & Syntax Sugar
-
-| 语法 | 展开 |
-|------|------|
-| `(defun f (x) body)` | `(define f (fn (x) body))` |
-| `(defunm m (x) body)` | `(defmacro m (x) body)` |
-| `(set! x val)` | `(set x val)` |
-| `(for/list (x xs) body)` | `(map (fn (x) body) xs)` |
-| `expr@offset` | `(rel_eval expr offset)` |
-| `#signal` | `(resolve-group 'signal)` |
-| `~scope` | `(in-scope scope)` |
-
-### VCD/FST Waveform Engine
-
-```
-Two-pass scan architecture:
-  Pass 1: sparse index (timestamps + offsets + BTreeMap<signal, time→offset>)
-  Pass 2: on-demand mmap seek + zero-copy read_line_bytes + LRU cache
-  
-16-way parallel (rayon): 155GB VCD indexed in 9 minutes
-Memory: ~460 MB for 155GB file (index only, no data loaded)
-```
-
-### Macro System
-
-`defun`, `defunm`, `set!`, `for/list` implemented as syntactic transformations in the evaluator — no separate macro expander needed.
-
-### Environment
-
-`Rc<RefCell<Environment>>` parent chain with mutable traversal — `set!` modifies variables through the scope chain correctly.
-
----
-
-## Performance
-
-### 155GB VCD Benchmark
-
-| 指标 | 值 |
-|------|-----|
-| 文件大小 | 155 GB |
-| 信号数 | 103 |
-| 时间戳数 | 385,314,044 |
-| **加载时间** | **9 分 05 秒** |
-| 并行度 | 16 核 (rayon), 562% CPU |
-| 内存占用 | ~910 MB (PID RSS at peak) |
-| I/O 吞吐 | 284 MB/s (接近 SSD 极限) |
-
-### Stress Test Results
-
-| 测试 | 规模 | 结果 |
-|------|------|------|
-| 嵌套深度 | 1,000 层 | ✅ |
-| WAL 行数 | 10,000,000 行 | ✅ 85s |
-| 单行参数 | 333,333 args | ✅ 0.89s |
-| 并发文件 | 100 个 | ✅ 0.8s |
-| VCD 加载 | 100MB / 1GB / 10GB / 155GB | ✅ |
-
----
-
-## Installation
-
-### Prerequisites
-
-- Rust 1.70+
-- Linux/macOS/Windows (Windows: mmap path untested)
-
-### Build
+## Quick Start
 
 ```bash
-git clone https://github.com/hesheng/wal-rust.git
-cd wal-rust
+# Install
 cargo build --release
 cp target/release/wal-rust ~/.local/bin/
-```
 
-### Verify
+# Evaluate expressions inline (auto-detected)
+wal-rust '(+ 1 2)'
+wal-rust '(load "dump.vcd") (signals)'
 
-```bash
-$ wal-rust --version
-wal-rust 0.5.0
+# Run a script file
+wal-rust script.wal
 
-$ wal-rust run -c '(+ 1 2)'
-=> 3
-```
-
----
-
-## Usage
-
-### Quick Start
-
-```bash
 # Interactive REPL
 wal-rust repl
 
-# Run a script
-wal-rust run script.wal
-
-# Run with VCD preloading
+# Explicit subcommands (still work)
 wal-rust run -l dump.vcd script.wal
-
-# Execute single expression
-wal-rust run -c '(load "dump.vcd") (signals)'
+wal-rust run -c '(signals)'
 ```
 
-### Example: Bus Protocol Analyzer
+**Auto-detection:** input starts with `(` → evaluated as WAL expression.
+Input is a file path → executed as WAL script. No input → REPL.
 
-`tilelink.wal` — Auto-detects TileLink or AXI bus signals and computes:
+---
 
-```
-  Bus Protocol Performance Analyzer
-  ├── Protocol Detection (TileLink a_*/d_* or AXI axi_*)
-  ├── Handshake Count (valid && ready)
-  ├── Bus Utilization (stall ratio)
-  ├── Bandwidth Estimation (data_beats × width / time)
-  ├── Transaction Type Breakdown (Get/Put opcodes)
-  └── Latency Sampling (A→D, AR→R, AW→W response time)
-```
+## WAL Language Reference
 
-```bash
-wal-rust run -l core_sim.vcd tilelink.wal
-```
+### Math
 
-### WAL Script Reference
+| Expression | Result |
+|:-----------|:-------|
+| `(+ 1 2 3)` | `6` |
+| `(- 10 3)` | `7` |
+| `(* 2 3 4)` | `24` |
+| `(/ 10 3)` | `3.333...` |
+| `(** 2 10)` | `1024` |
+| `(mod 10 3)` | `1` |
+| `(sum (list 1 2 3 4))` | `10` |
+| `(average (list 1 2 3 4))` | `2.5` |
+| `(max 3 7 1)` | `7` |
+| `(min 3 7 1)` | `1` |
+
+### Comparison
+
+| Expression | Result |
+|:-----------|:-------|
+| `(= 5 5)` | `true` |
+| `(!= 5 3)` | `true` |
+| `(> 5 3)` | `true` |
+| `(< 3 5)` | `true` |
+| `(>= 5 5)` | `true` |
+| `(<= 3 5)` | `true` |
+
+### Logic
+
+| Expression | Result |
+|:-----------|:-------|
+| `(&& #t #t #f)` | `false` |
+| `(\|\| #f #f #t)` | `true` |
+| `(! #f)` | `true` |
+| `(bor 1 2 4)` | `7` |
+| `(band 7 3)` | `3` |
+| `(bxor 5 3)` | `6` |
+
+### Variables & Functions
 
 ```lisp
-;; Variables
+;; Define
 (define x 42)
+(define name "world")
+
+;; Let bindings — supports both formats:
+(let ([x 10] [y 20]) (+ x y))   ;; vector pair format
+(let (x 10 y 20) (+ x y))        ;; flat format
+
+;; Set!
 (set! x 100)
 
-;; Functions
-(defun sq (x) (* x x))
+;; Named function
+(defun sq [x] (* x x))
 (sq 5)  ;; => 25
 
-;; Waveform queries
-(load "sim.vcd")
-(signals)           ;; list all signal names
-(step 10)           ;; advance 10 timestamps
-(ts)                ;; current timestamp
-(get "clk")         ;; signal value at current time
-(find (= (get "clk") 1))  ;; all indices where clk=1
+;; Anonymous function (inline call)
+((fn [x] (+ x 1)) 5)  ;; => 6
 
-;; Lists
-(map (fn (x) (* x 2)) (list 1 2 3))  ;; => (2 4 6)
-(fold + 0 (list 1 2 3 4))            ;; => 10
+;; Variadic function
+(defun sum-all [xs] (fold + 0 xs))
 
-;; Control flow
+;; Closures
+(defun make-adder [n] (fn [x] (+ x n)))
+(define add5 (make-adder 5))
+(add5 3)  ;; => 8
+```
+
+### Control Flow
+
+```lisp
+;; If — falsy values: #f and ()
 (if (> x 0) "positive" "negative")
-(when true (print "always runs"))
-(unless false (print "also runs"))
-(cond ((= x 1) "one") (true "other"))
+(if () "yes" "no")     ;; => "no"
+(if 0 "yes" "no")     ;; => "yes" (0 is truthy in WAL/Lisp)
+
+;; Cond
+(cond
+  ((= x 1) "one")
+  ((= x 2) "two")
+  (#t "other"))
+
+;; Case — supports default keyword
+(case x
+  (1 "one")
+  (2 "two")
+  (default "other"))
+
+;; When / Unless
+(when #t (print "always runs"))
+(unless #f (print "also runs"))
+
+;; Do (sequential evaluation)
+(do (print "step 1") (print "step 2"))
+
+;; While
+(define i 0)
+(while (< i 5)
+  (print i)
+  (set! i (+ i 1)))
+```
+
+### Strings
+
+```lisp
+(string-append "a" "b" "c")     ;; => "abc"
+(printf "Value: %d" 42)          ;; prints "Value: 42"
+(printf "hex: %x, bin: %b" 255 255)
+(print "hello" " " "world")
+(int->string 42)                 ;; => "42"
+(string->int "42")               ;; => 42
+(string->symbol "foo")           ;; => foo
+(symbol->string 'foo)            ;; => "foo"
+```
+
+### Lists
+
+```lisp
+(list 1 2 3)              ;; => (1 2 3)
+(first (list 10 20 30))   ;; => 10
+(second (list 10 20 30))  ;; => 20
+(last (list 10 20 30))    ;; => 30
+(rest (list 1 2 3))       ;; => (2 3)
+(in 2 (list 1 2 3))       ;; => true
+(length (list 1 2 3 4))   ;; => 4
+
+;; Map — accepts fn closures and operator symbols
+(map (fn [x] (+ x 1)) (list 1 2 3))    ;; => (2 3 4)
+(map + (list 1 2 3) (list 4 5 6))      ;; => (5 7 9)
+
+;; Fold / Reduce
+(fold + 0 (list 1 2 3 4))              ;; => 10
+```
+
+### Arrays (Key-Value Maps)
+
+```lisp
+;; Create — supports flat and vector pair formats
+(define a (array ["x" 10] ["y" 20]))
+(define a (array "x" 10 "y" 20))       ;; same result
+
+;; Access
+(geta a "x")                ;; => 10
+(geta/default a 0 "z")      ;; => 0 (default if not found)
+(seta a "z" 30)             ;; => ("x" 10 "y" 20 "z" 30)
+(dela a "x")                ;; => ("y" 20)
+(mapa a (fn [v] (* v 2)))   ;; => ("x" 20 "y" 40)
+```
+
+### Type Checking & Conversion
+
+```lisp
+(defined? 'x)          ;; check if x is defined
+(atom? 42)             ;; true (non-list)
+(symbol? 'foo)         ;; true
+(string? "hello")      ;; true
+(int? 42)              ;; true
+(list? (list 1 2))     ;; true
+(null? ())             ;; true
+(empty? ())            ;; true
+
+;; Conversions
+(convert/bin 10)       ;; => "1010"
+(convert/bin 10 8)     ;; => "00001010" (padded to 8 bits)
+(string->int "42")     ;; => 42
+(int->string 42)       ;; => "42"
+(bits->sint 1)         ;; => -1  (2's complement)
+```
+
+---
+
+## Waveform Analysis
+
+### Loading
+
+```lisp
+;; Load VCD or FST (auto-detected by extension)
+(load "sim.vcd")
+(load "waveform.fst")
+
+;; Load with custom trace ID
+(load "sim.vcd" "trace_a")
+
+;; Unload
+(unload "trace_a")
+```
+
+### Navigation
+
+```lisp
+;; Current timestamps
+index           ;; current position (0-based)
+max-index       ;; last position
+ts              ;; current simulation timestamp
+trace-name      ;; trace ID
+trace-file      ;; file path
+
+;; Step forward/backward
+(step 10)            ;; advance 10 steps
+(step -5)            ;; go back 5 steps
+
+;; Signal value access
+(signals)            ;; list all signal names
+(get "clk")          ;; signal value at current index
+(get "data_bus")     ;; vector signal value
+
+;; Relative time access (syntax sugar)
+clk@+1               ;; value of clk 1 step ahead
+data_bus@-2          ;; value of data_bus 2 steps back
+
+;; Signal metadata
+(signal-width "clk")    ;; bit width
+(signal? "clk")         ;; true if signal exists
+```
+
+### Search & Find
+
+```lisp
+;; Find all indices matching a condition
+(find (= (get "clk") 1))              ;; rising edges
+(find (&& (= (get "clk") 1) (= (get "rst") 0)))
+
+;; Count matching indices
+(count (> (get "counter") 100))
+
+;; Global find (across all known scopes)
+(find/g (= (get "clk") 1))
+
+;; Combo: check 5 steps ahead where signal was high
+(whenever (= clk@+1 1)
+  (print "next cycle will be high"))
+
+;; Sample at specific index
+(sample-at "clk" 100)
+
+;; Fold over time
+(fold signal expr init method)
+```
+
+### Scopes & Groups
+
+```lisp
+;; Named scopes
+(scoped "top.sub" (get "counter"))
+(all-scopes expr)
+(resolve-scope "counter")
+
+;; Groups (signal name prefixes)
+(groups "_clk" "_data")               ;; find common prefixes
+(in-group "mem" (get "addr"))         ;; evaluate in group context
+(in-groups (list "mem" "cpu") (signals))
 
 ;; Syntax sugar
-clk@100           ;; rel_eval clk 100
-#rst_n            ;; resolve-group rst_n
-~top             ;; in-scope top
+~top.sub        ;; equivalent to (in-scope "top.sub")
+#clk            ;; equivalent to (resolve-group 'clk)
 ```
+
+### Bus Analysis
+
+The built-in `tl-handshakes`, `tl-latency`, `tl-bandwidth` operators
+analyze TileLink bus protocols:
+
+```lisp
+(load "soc.vcd")
+(tl-handshakes "soc.bus")       ;; handshake stats
+(tl-latency "soc.bus")          ;; A→D transaction latency
+(tl-bandwidth "soc.bus")        ;; bandwidth utilization
+```
+
+---
+
+## FST Format Support
+
+| Format | Encoding | Status |
+|:-------|:---------|:-------|
+| walconv (standard) | Little-endian | ✅ Full: signal names, hierarchy, VCDATA, ZWRAP |
+| Icarus Verilog | Big-endian | ✅ Full: gzip HIER after GEOM, signal names, scopes |
+| GTKWave examples | Big-endian | ✅ Verified: des.fst, transaction.fst, 10 test files |
+| vcd2fst (GTKWave) | Big-endian | ⚠️ HDR+GEOM read OK, HIER signal names not decoded ** |
+| ZWRAP (gzip) | Both | ✅ Auto-detect gzip vs zlib compression |
+
+** vcd2fst uses a compact/packed HIER encoding that differs from the Icarus gzip format. No crash — gracefully returns 0 signals.
 
 ---
 
@@ -190,7 +329,7 @@ clk@100           ;; rel_eval clk 100
 ```
 wal-rust/
 ├── src/
-│   ├── main.rs              # CLI entry (run, repl)
+│   ├── main.rs              # CLI entry (auto-detect expr/file/repl)
 │   ├── cli.rs               # clap argument parsing
 │   ├── wal/                 # WAL language core
 │   │   ├── ast/             # Operator, Value, Symbol, WList, Closure, Macro
@@ -203,29 +342,31 @@ wal-rust/
 │   │   ├── parser.rs        # MmapVcdParser
 │   │   └── types.rs         # VcdEvent, VcdValue
 │   ├── fst/                 # FST read/write
-│   │   ├── reader.rs        # FstReader
+│   │   ├── reader.rs        # FstReader (LE/BE auto-detect, Icarus HIER)
 │   │   ├── writer.rs        # FstWriter (blocks, varint, compress)
 │   │   └── types.rs         # BlockType, FstHeader
 │   └── trace/               # Waveform interface
-│       ├── trace.rs          # Trace trait
+│       ├── trace.rs          # Trace trait, ScalarValue, FindCondition
 │       ├── container.rs     # TraceContainer (Arc<RwLock<>>)
 │       ├── vcd.rs           # VcdTrace (parallel two-pass + sparse index + LRU)
-│       └── fst.rs           # FstTrace
+│       └── fst.rs           # FstTrace (on-demand block decompress + LRU)
 ├── tree-sitter-wal/         # WAL grammar
-├── stress_tests/            # Generated stress test files
-└── tilelink.wal             # Bus protocol analyzer script
+└── stress_tests/            # Generated stress test files
 ```
 
 ### Key Design Decisions
 
-| 决策 | 说明 |
-|------|------|
-| **tree-sitter parser** | 共享 wal-lsp grammar，支持 @/#/~ 语法糖 |
-| **mmap + on-demand** | Pass1 仅建索引（~460MB），Pass2 按需查询 |
-| **par_iter** | rayon 并行分块扫描，16 核 562% CPU 利用率 |
-| **madvise(MADV_SEQUENTIAL)** | 内核 2MB 预读，减少 page fault |
-| **Rc<RefCell<Environment>>** | 父作用域可修改，支持 set! 跨 scope |
-| **macro-as-special-form** | defun 等宏在 eval_list 中内联展开，无独立展开器 |
+| Decision | Rationale |
+|:---------|:----------|
+| **Auto-detect expr/file/repl** | No subcommand needed for common cases |
+| **tree-sitter parser** | Shared grammar with wal-lsp, supports @/#/~ syntax |
+| **mmap + on-demand** | Pass 1 builds index (~460MB for 155GB), Pass 2 queries |
+| **par_iter scanning** | 16-way rayon parallel chunk scanning |
+| **madvise(MADV_SEQUENTIAL)** | 2MB kernel readahead reduces page faults |
+| **Rc<RefCell\<Environment\>>** | Parent chain mutable for `set!` traversal |
+| **macro-as-special-form** | defun/defunm expanded inline in eval_list |
+| **FST endian auto-detect** | PI→LE, e→BE; no user configuration needed |
+| **Icarus gzip HIER** | Reverse-engineered from GTKWave fstapi.c source |
 
 ---
 
@@ -254,6 +395,32 @@ Configure in `~/.config/opencode/opencode.json`:
   }
 }
 ```
+
+---
+
+## Performance
+
+### 155GB VCD Benchmark
+
+| Metric | Value |
+|:-------|:------|
+| File size | 155 GB |
+| Signals | 103 |
+| Timestamps | 385,314,044 |
+| **Load time** | **9 min 05 sec** |
+| Parallelism | 16 cores (rayon), 562% CPU |
+| Memory | ~910 MB (PID RSS peak) |
+| I/O throughput | 284 MB/s (SSD bound) |
+
+### Stress Tests
+
+| Test | Scale | Result |
+|:-----|:------|:-------|
+| Nesting depth | 1,000 levels | ✅ |
+| WAL lines | 10,000,000 lines | ✅ 85s |
+| Single-line args | 333,333 args | ✅ 0.89s |
+| Concurrent files | 100 files | ✅ 0.8s |
+| VCD loading | 100MB / 1GB / 10GB / 155GB | ✅ |
 
 ---
 

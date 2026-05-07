@@ -289,16 +289,29 @@ fn op_get(args: &[Value], env: &mut Environment, _eval: &mut Evaluator) -> Resul
     ensure_arity(args, 1)?;
     let name = extract_name(&args[0])?;
 
+    // Try name as-is, then prepend scope, then prepend group
+    let candidates = [
+        name.clone(),
+        format!("{}{}", env.get_scope(), name),
+        format!("{}{}", env.get_group(), name),
+    ];
+
     if let Some(traces) = env.get_traces() {
         let traces = traces.read().unwrap_or_else(|e| e.into_inner());
         if let Some(trace) = traces.first_trace() {
-            let idx = trace.index();
-            return trace.signal_value(&name, idx)
-                .map(scalar_to_value)
-                .map_err(|e| e.to_string());
+            for candidate in &candidates {
+                match trace.signal_value(candidate, trace.index()) {
+                    Ok(sv) => return Ok(scalar_to_value(sv)),
+                    Err(_) => continue,
+                }
+            }
+            let sigs = trace.signals();
+            let preview: Vec<&str> = sigs.iter().take(5).map(|s| s.as_str()).collect();
+            return Err(format!("signal '{}' not found. Available signals (first 5): {:?}",
+                name, preview));
         }
     }
-    Err(format!("signal not found: {}", name))
+    Err(format!("signal '{}' not found.", name))
 }
 
 fn op_releval(args: &[Value], env: &mut Environment, eval: &mut Evaluator) -> Result<Value, String> {

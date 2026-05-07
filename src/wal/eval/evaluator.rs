@@ -163,16 +163,24 @@ impl Evaluator {
 
         // Try signal name auto-lookup from loaded traces
         // WAL spec: bare signal names return their waveform value at current INDEX
+        // Try name as-is, then prepend scope, then prepend group
         if let Some(traces) = self.env.get_traces() {
             let traces = traces.read().unwrap_or_else(|e| e.into_inner());
-            for id in traces.trace_ids() {
-                if let Some(sigs) = traces.signals(&id) {
-                    if sigs.contains(&name) {
-                        let get_expr = Value::List(WList::from_vec(vec![
-                            Value::Symbol(Symbol::new("get")),
-                            Value::String(name.clone()),
-                        ]));
-                        return self.eval_value(get_expr);
+            let candidates = [
+                name.clone(),
+                format!("{}{}", self.env.get_scope(), name),
+                format!("{}{}", self.env.get_group(), name),
+            ];
+            for candidate in &candidates {
+                for id in traces.trace_ids() {
+                    if let Some(sigs) = traces.signals(&id) {
+                        if sigs.contains(candidate) {
+                            let get_expr = Value::List(WList::from_vec(vec![
+                                Value::Symbol(Symbol::new("get")),
+                                Value::String(candidate.clone()),
+                            ]));
+                            return self.eval_value(get_expr);
+                        }
                     }
                 }
             }
@@ -226,6 +234,20 @@ impl Evaluator {
                         return self.eval_define(&rest);
                     } else if op == Operator::If {
                         return self.eval_if(&rest);
+                    } else if op == Operator::Case {
+                        return self.eval_case(&rest);
+                    } else if op == Operator::Scoped {
+                        return self.eval_scoped(&rest);
+                    } else if op == Operator::InGroup {
+                        return self.eval_in_group(&rest);
+                    } else if op == Operator::InScope {
+                        return self.eval_in_scope(&rest);
+                    } else if op == Operator::InScopes {
+                        return self.eval_in_scopes(&rest);
+                    } else if op == Operator::InGroup {
+                        return self.eval_in_group(&rest);
+                    } else if op == Operator::InGroups {
+                        return self.eval_in_groups(&rest);
                     } else if op == Operator::Let {
                         return self.eval_let(&rest);
                     } else if op == Operator::Quasiquote {
@@ -473,29 +495,167 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
         }
     }
 
+    fn eval_case(&mut self, args: &[Value]) -> Result<Value, String> {
+        if args.len() < 2 {
+            return Err("case expects at least key and one clause".to_string());
+        }
+        let key = self.eval_value(args[0].clone())?;
+        for clause in &args[1..] {
+            match clause {
+                Value::List(lst) if lst.len() >= 1 => {
+                    let clause_key = &lst[0];
+                    if matches!(clause_key, Value::Symbol(s) if s.name == "default") {
+                        let mut result = Value::Nil;
+                        for expr in lst.rest() {
+                            result = self.eval_value(expr)?;
+                        }
+                        return Ok(result);
+                    }
+                    let val = self.eval_value(clause_key.clone())?;
+                    if val == key {
+                        let mut result = Value::Nil;
+                        for expr in lst.rest() {
+                            result = self.eval_value(expr)?;
+                        }
+                        return Ok(result);
+                    }
+                }
+                _ => return Err("case clause must be a list (value expr...)".to_string()),
+            }
+        }
+        Ok(Value::Nil)
+    }
+
+    fn eval_scoped(&mut self, args: &[Value]) -> Result<Value, String> {
+        if args.len() < 2 {
+            return Err("scoped expects at least a scope name and body".to_string());
+        }
+        let scope_name = scope_extract_name(&args[0])?;
+        let mut new_env = self.env.child();
+        new_env.set_scope(&scope_name);
+        let saved_env = std::mem::replace(&mut self.env, new_env);
+        let mut result = Value::Nil;
+        for arg in &args[1..] {
+            result = self.eval_value(arg.clone())?;
+        }
+        self.env = saved_env;
+        Ok(result)
+    }
+
+    fn eval_in_group(&mut self, args: &[Value]) -> Result<Value, String> {
+        if args.len() < 2 {
+            return Err("in-group expects at least a group name and body".to_string());
+        }
+        let group_name = scope_extract_name(&args[0])?;
+        let mut new_env = self.env.child();
+        new_env.set_group(&group_name);
+        let saved_env = std::mem::replace(&mut self.env, new_env);
+        let mut result = Value::Nil;
+        for arg in &args[1..] {
+            result = self.eval_value(arg.clone())?;
+        }
+        self.env = saved_env;
+        Ok(result)
+    }
+
+    fn eval_in_scope(&mut self, args: &[Value]) -> Result<Value, String> {
+        if args.len() < 2 {
+            return Err("in-scope expects at least a scope name and body".to_string());
+        }
+        let scope_name = scope_extract_name(&args[0])?;
+        let mut new_env = self.env.child();
+        new_env.set_scope(&scope_name);
+        let saved_env = std::mem::replace(&mut self.env, new_env);
+        let mut result = Value::Nil;
+        for arg in &args[1..] {
+            result = self.eval_value(arg.clone())?;
+        }
+        self.env = saved_env;
+        Ok(result)
+    }
+
+    fn eval_in_scopes(&mut self, args: &[Value]) -> Result<Value, String> {
+        if args.len() < 2 {
+            return Err("in-scopes expects at least a scope list and body".to_string());
+        }
+        // Evaluate the first argument to get the list of scope names
+        let scope_names: Vec<String> = match self.eval_value(args[0].clone())? {
+            Value::List(lst) => lst.0.iter().map(scope_extract_name).collect::<Result<_, _>>()?,
+            _ => return Err("in-scopes: first argument must evaluate to a list of scope names".to_string()),
+        };
+        let mut result = Value::Nil;
+        for scope in &scope_names {
+            let mut new_env = self.env.child();
+            new_env.set_scope(scope);
+            let saved_env = std::mem::replace(&mut self.env, new_env);
+            for arg in &args[1..] {
+                result = self.eval_value(arg.clone())?;
+            }
+            self.env = saved_env;
+        }
+        Ok(result)
+    }
+
+    fn eval_in_groups(&mut self, args: &[Value]) -> Result<Value, String> {
+        if args.len() < 2 {
+            return Err("in-groups expects at least a group list and body".to_string());
+        }
+        // Evaluate the first argument to get the list of group names
+        let group_names: Vec<String> = match self.eval_value(args[0].clone())? {
+            Value::List(lst) => lst.0.iter().map(|v| match v {
+                Value::String(s) => Ok(s.clone()),
+                Value::Symbol(s) => Ok(s.name.clone()),
+                _ => Err("in-groups: group names must be strings or symbols".to_string()),
+            }).collect::<Result<_, _>>()?,
+            _ => return Err("in-groups: first argument must evaluate to a list of group names".to_string()),
+        };
+        let mut result = Value::Nil;
+        for group in &group_names {
+            let mut new_env = self.env.child();
+            new_env.set_group(group);
+            let saved_env = std::mem::replace(&mut self.env, new_env);
+            for arg in &args[1..] {
+                result = self.eval_value(arg.clone())?;
+            }
+            self.env = saved_env;
+        }
+        Ok(result)
+    }
+
     fn eval_let(&mut self, args: &[Value]) -> Result<Value, String> {
         if args.len() < 1 {
             return Err("let expects at least bindings".to_string());
         }
         let mut new_env = self.env.child();
-
         let bindings = match &args[0] {
             Value::List(list) => list.0.clone(),
             _ => return Err("let expects list of bindings".to_string()),
         };
-
-        for binding in bindings.chunks(2) {
-            if binding.len() != 2 {
-                return Err("let binding must be (name value)".to_string());
+        // Support both (let (x 1 y 2) body) and (let ([x 1] [y 2]) body) formats
+        if bindings.len() >= 2 && bindings.iter().all(|b| matches!(b, Value::List(p) if p.len() == 2)) {
+            for pair in &bindings {
+                if let Value::List(pair_lst) = pair {
+                    let name = match &pair_lst[0] {
+                        Value::Symbol(s) => s.name.clone(),
+                        _ => return Err("let binding name must be symbol".to_string()),
+                    };
+                    let value = self.eval_value(pair_lst[1].clone())?;
+                    new_env.define(name, value);
+                }
             }
-            let name = match &binding[0] {
-                Value::Symbol(s) => s.name.clone(),
-                _ => return Err("let binding name must be symbol".to_string()),
-            };
-            let value = self.eval_value(binding[1].clone())?;
-            new_env.define(name, value);
+        } else {
+            for binding in bindings.chunks(2) {
+                if binding.len() != 2 {
+                    return Err("let binding must be (name value)".to_string());
+                }
+                let name = match &binding[0] {
+                    Value::Symbol(s) => s.name.clone(),
+                    _ => return Err("let binding name must be symbol".to_string()),
+                };
+                let value = self.eval_value(binding[1].clone())?;
+                new_env.define(name, value);
+            }
         }
-
         let saved_env = std::mem::replace(&mut self.env, new_env);
         let mut result = Value::Nil;
         for arg in &args[1..] {
@@ -737,6 +897,15 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
             }
             None => Err(format!("Unknown operator: {:?}", op)),
         }
+    }
+}
+
+/// Helper to extract a name from either a Symbol or String value
+fn scope_extract_name(v: &Value) -> Result<String, String> {
+    match v {
+        Value::Symbol(s) => Ok(s.name.clone()),
+        Value::String(s) => Ok(s.clone()),
+        _ => Err("Expected symbol or string".to_string()),
     }
 }
 

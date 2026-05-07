@@ -27,6 +27,7 @@ pub struct FstTrace {
 
     // Pass 1: index only
     timestamps: Vec<u64>,
+    timestamps_set: std::collections::HashSet<u64>,
     block_index: Vec<BlockInfo>,
 
     // Pass 2: LRU caches
@@ -59,6 +60,7 @@ impl FstTrace {
             filename: filename.clone(),
             file,
             timestamps: Vec::new(),
+            timestamps_set: std::collections::HashSet::new(),
             block_index: Vec::new(),
             block_cache: RefCell::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(BLOCK_CACHE_SIZE).unwrap(),
@@ -121,11 +123,11 @@ impl FstTrace {
                         file_offset: start_pos,
                     });
 
-                    // Record timestamps
-                    if !self.timestamps.contains(&time_begin) {
+                    // Record timestamps (dedup via HashSet)
+                    if self.timestamps_set.insert(time_begin) {
                         self.timestamps.push(time_begin);
                     }
-                    if !self.timestamps.contains(&time_end) {
+                    if self.timestamps_set.insert(time_end) {
                         self.timestamps.push(time_end);
                     }
 

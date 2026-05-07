@@ -7,7 +7,7 @@ use crate::wal::eval::{Environment, Dispatcher, Evaluator};
 
 fn op_scoped(args: &[Value], env: &mut Environment, eval: &mut Evaluator) -> Result<Value, String> {
     ensure_arity_atleast(args, 2)?;
-    let scope_name = extract_symbol(&args[0])?;
+    let scope_name = extract_name(&args[0])?;
     let mut new_env = env.child();
     new_env.set_scope(&scope_name);
     let saved_env = std::mem::replace(env, new_env);
@@ -27,14 +27,14 @@ fn op_allscopes(args: &[Value], _env: &mut Environment, _eval: &mut Evaluator) -
 
 fn op_resolve_scope(args: &[Value], env: &mut Environment, _eval: &mut Evaluator) -> Result<Value, String> {
     ensure_arity(args, 1)?;
-    let name = extract_symbol(&args[0])?;
+    let name = extract_name(&args[0])?;
     let scoped_name = format!("{}{}", env.get_scope(), name);
     env.lookup(&scoped_name).ok_or_else(|| format!("Unresolved scope: {}", scoped_name))
 }
 
 fn op_set_scope(args: &[Value], env: &mut Environment, _eval: &mut Evaluator) -> Result<Value, String> {
     ensure_arity(args, 1)?;
-    let scope = extract_symbol(&args[0])?;
+    let scope = extract_name(&args[0])?;
     env.set_scope(&scope);
     Ok(Value::Nil)
 }
@@ -67,8 +67,12 @@ fn op_groups(args: &[Value], env: &mut Environment, _eval: &mut Evaluator) -> Re
         for post in &posts {
             let mut prefixes = Vec::new();
             for sig in &all_sigs {
-                if sig.ends_with(post.as_str()) && sig.len() > post.len() {
-                    let prefix = &sig[..sig.len() - post.len()];
+                if sig.ends_with(post.as_str()) {
+                    let prefix = if sig.len() > post.len() {
+                        &sig[..sig.len() - post.len()]
+                    } else {
+                        ""  // exact match — empty prefix
+                    };
                     if !prefixes.contains(&prefix.to_string()) {
                         prefixes.push(prefix.to_string());
                     }
@@ -93,7 +97,7 @@ fn op_groups(args: &[Value], env: &mut Environment, _eval: &mut Evaluator) -> Re
 
 fn op_in_group(args: &[Value], env: &mut Environment, eval: &mut Evaluator) -> Result<Value, String> {
     ensure_arity_atleast(args, 2)?;
-    let group_name = extract_symbol(&args[0])?;
+    let group_name = extract_name(&args[0])?;
     let mut new_env = env.child();
     new_env.set_group(&group_name);
     let saved_env = std::mem::replace(env, new_env);
@@ -149,7 +153,7 @@ fn op_resolve_group(args: &[Value], env: &mut Environment, _eval: &mut Evaluator
 
 fn op_in_scope(args: &[Value], env: &mut Environment, eval: &mut Evaluator) -> Result<Value, String> {
     ensure_arity_atleast(args, 1)?;
-    let scope = extract_symbol(&args[0])?;
+    let scope = extract_name(&args[0])?;
     let mut new_env = env.child();
     new_env.set_scope(&scope);
     let mut result = Value::Nil;
@@ -163,7 +167,7 @@ fn op_in_scopes(args: &[Value], env: &mut Environment, eval: &mut Evaluator) -> 
     ensure_arity_atleast(args, 2)?;
     let scope_names = match &args[0] {
         Value::List(lst) => {
-            lst.0.iter().map(|v| extract_symbol(v)).collect::<Result<Vec<_>, _>>()?
+            lst.0.iter().map(|v| extract_name(v)).collect::<Result<Vec<_>, _>>()?
         }
         _ => return Err("in-scopes: first argument must be a list of scope names".to_string()),
     };
@@ -198,6 +202,14 @@ fn extract_symbol(v: &Value) -> Result<String, String> {
     match v {
         Value::Symbol(s) => Ok(s.name.clone()),
         _ => Err("Expected symbol".to_string()),
+    }
+}
+
+fn extract_name(v: &Value) -> Result<String, String> {
+    match v {
+        Value::Symbol(s) => Ok(s.name.clone()),
+        Value::String(s) => Ok(s.clone()),
+        _ => Err("Expected symbol or string".to_string()),
     }
 }
 

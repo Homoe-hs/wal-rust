@@ -186,7 +186,8 @@ fn op_case(args: &[Value], env: &mut Environment, eval: &mut Evaluator) -> Resul
         if chunk.len() != 2 {
             return Err("case expects (key result) pairs".to_string());
         }
-        if chunk[0] == key {
+        // Check for default keyword (any symbol named "default")
+        if matches!(&chunk[0], Value::Symbol(s) if s.name == "default") || chunk[0] == key {
             return eval.eval_value_public(chunk[1].clone());
         }
     }
