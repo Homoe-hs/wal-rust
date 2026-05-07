@@ -156,6 +156,9 @@ pub enum Operator {
     TileLinkHandshakes,
     TileLinkLatency,
     TileLinkBandwidth,
+
+    /// String operations
+    StringAppend,
 }
 
 impl Operator {
@@ -274,6 +277,7 @@ impl Operator {
             "symbol->string" => Some(Operator::SymbolToString),
             "string->symbol" => Some(Operator::StringToSymbol),
             "int->string" => Some(Operator::IntToString),
+            "string-append" => Some(Operator::StringAppend),
 
             // Signal operations
             "find" => Some(Operator::Find),
@@ -436,6 +440,7 @@ impl Operator {
             Operator::StringToSymbol => "string->symbol",
             Operator::SymbolToString => "symbol->string",
             Operator::IntToString => "int->string",
+            Operator::StringAppend => "string-append",
             Operator::Find => "find",
             Operator::FindG => "find/g",
             Operator::Whenever => "whenever",

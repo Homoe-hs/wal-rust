@@ -105,7 +105,48 @@ fn op_printf(args: &[Value], _env: &mut Environment, eval: &mut Evaluator) -> Re
     for v in &args[1..] {
         evaluated.push(format!("{}", eval.eval_value_public(v.clone())?));
     }
-    let result = interpolate(&fmt, &evaluated);
+    let result = if fmt.contains('%') {
+        // printf-style: %d, %s, %f, %x, %b
+        let mut pos = 0usize;
+        let mut output = String::new();
+        let mut arg_idx = 0usize;
+        let chars: Vec<char> = fmt.chars().collect();
+        while pos < chars.len() {
+            if chars[pos] == '%' && pos + 1 < chars.len() {
+                let spec = chars[pos + 1];
+                let val = evaluated.get(arg_idx).map(|s| s.as_str()).unwrap_or("");
+                match spec {
+                    'd' | 'i' => {
+                        // Try to parse as integer for %d
+                        let n: i64 = val.parse().unwrap_or(0);
+                        output.push_str(&n.to_string());
+                    }
+                    's' => output.push_str(val),
+                    'f' => {
+                        let n: f64 = val.parse().unwrap_or(0.0);
+                        output.push_str(&n.to_string());
+                    }
+                    'x' => {
+                        let n: i64 = val.parse().unwrap_or(0);
+                        output.push_str(&format!("{:x}", n));
+                    }
+                    '%' => output.push('%'),
+                    _ => {
+                        output.push('%');
+                        output.push(spec);
+                    }
+                }
+                arg_idx += 1;
+                pos += 2;
+            } else {
+                output.push(chars[pos]);
+                pos += 1;
+            }
+        }
+        output
+    } else {
+        interpolate(&fmt, &evaluated)
+    };
     print!("{}", result);
     Ok(Value::Nil)
 }
@@ -197,7 +238,7 @@ fn op_larger(args: &[Value], _env: &mut Environment, _eval: &mut Evaluator) -> R
     let mut prev = extract_number(&args[0])?;
     for arg in &args[1..] {
         let curr = extract_number(arg)?;
-        if curr <= prev {
+        if curr >= prev {
             return Ok(Value::Bool(false));
         }
         prev = curr;
@@ -223,7 +264,7 @@ fn op_larger_equal(args: &[Value], _env: &mut Environment, _eval: &mut Evaluator
     let mut prev = extract_number(&args[0])?;
     for arg in &args[1..] {
         let curr = extract_number(arg)?;
-        if curr < prev {
+        if curr > prev {
             return Ok(Value::Bool(false));
         }
         prev = curr;

@@ -43,17 +43,27 @@ fn op_list_p(args: &[Value], _env: &mut Environment, _eval: &mut Evaluator) -> R
 }
 
 fn op_convert_binary(args: &[Value], _env: &mut Environment, _eval: &mut Evaluator) -> Result<Value, String> {
-    ensure_arity(args, 1)?;
-    match &args[0] {
-        Value::Int(i) => Ok(Value::String(format!("{:b}", i))),
-        Value::String(s) => {
-            if let Ok(n) = s.parse::<i64>() {
-                Ok(Value::String(format!("{:b}", n)))
-            } else {
-                Err("Cannot convert to binary".to_string())
-            }
+    if args.len() < 1 || args.len() > 2 {
+        return Err(format!("convert/bin expects 1 or 2 arguments, got {}", args.len()));
+    }
+    let num = match &args[0] {
+        Value::Int(i) => *i,
+        Value::String(s) => s.parse::<i64>().map_err(|_| "Cannot convert to binary".to_string())?,
+        _ => return Err("convert/bin expects number".to_string()),
+    };
+    let bin_str = format!("{:b}", num);
+    if args.len() == 2 {
+        let width = match &args[1] {
+            Value::Int(i) => *i as usize,
+            _ => return Err("convert/bin: second argument must be integer width".to_string()),
+        };
+        if bin_str.len() < width {
+            Ok(Value::String(format!("{:0>width$}", bin_str)))
+        } else {
+            Ok(Value::String(bin_str))
         }
-        _ => Err("convert/bin expects number".to_string()),
+    } else {
+        Ok(Value::String(bin_str))
     }
 }
 
@@ -120,9 +130,28 @@ fn op_int_to_string(args: &[Value], _env: &mut Environment, _eval: &mut Evaluato
     }
 }
 
+fn op_string_append(args: &[Value], _env: &mut Environment, _eval: &mut Evaluator) -> Result<Value, String> {
+    ensure_arity_atleast(args, 2)?;
+    let mut result = String::new();
+    for arg in args {
+        match arg {
+            Value::String(s) => result.push_str(s),
+            other => result.push_str(&format!("{}", other)),
+        }
+    }
+    Ok(Value::String(result))
+}
+
 fn ensure_arity(args: &[Value], expected: usize) -> Result<(), String> {
     if args.len() != expected {
         return Err(format!("Expected {} arguments, got {}", expected, args.len()));
+    }
+    Ok(())
+}
+
+fn ensure_arity_atleast(args: &[Value], min: usize) -> Result<(), String> {
+    if args.len() < min {
+        return Err(format!("Expected at least {} arguments, got {}", min, args.len()));
     }
     Ok(())
 }
@@ -147,4 +176,5 @@ pub fn register_types(disp: &mut Dispatcher) {
     disp.register(Operator::StringToSymbol, op_symbol_to_string);
     disp.register(Operator::SymbolToString, op_string_to_symbol);
     disp.register(Operator::IntToString, op_int_to_string);
+    disp.register(Operator::StringAppend, op_string_append);
 }

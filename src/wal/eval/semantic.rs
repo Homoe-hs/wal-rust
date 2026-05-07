@@ -154,7 +154,8 @@ impl SemanticChecker {
             Operator::IsDefined | Operator::IsAtom | Operator::IsSymbol 
             | Operator::IsString | Operator::IsInt | Operator::IsList | Operator::IsNull => Some((1, Some(1))),
             
-            Operator::ConvertBinary | Operator::StringToInt | Operator::BitsToSint
+            Operator::ConvertBinary => Some((1, Some(2))),
+            Operator::StringToInt | Operator::BitsToSint
             | Operator::SymbolToString | Operator::StringToSymbol | Operator::IntToString => Some((1, Some(1))),
             
             Operator::Floor | Operator::Ceil | Operator::Round | Operator::Abs => Some((1, Some(1))),

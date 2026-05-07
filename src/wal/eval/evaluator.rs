@@ -294,44 +294,39 @@ impl Evaluator {
                 }
             }
             Value::List(ref inner) => {
-                // Check if first element evaluates to a function that should consume the rest
-                let mut evaluated = Vec::new();
-                let first_val = self.eval_value(inner.0[0].clone())?;
+                // Evaluate the inner list as a whole expression (handles fn/closure creation)
+                let first_val = self.eval_value(Value::List(inner.clone()))?;
                 match first_val {
                     Value::Closure(c) => {
                         let mut args = Vec::new();
-                        for v in inner.0.iter().skip(1) {
+                        for v in lst.0.iter().skip(1) {
                             args.push(self.eval_value(v.clone())?);
                         }
                         return self.eval_closure(c, &args);
                     }
                     Value::Macro(m) => {
-                        let args: Vec<Value> = inner.0[1..].to_vec();
+                        let args: Vec<Value> = lst.0[1..].to_vec();
                         return self.eval_macro(m, &args);
                     }
                     _ => {
+                        let mut evaluated = Vec::new();
                         evaluated.push(first_val);
-                        for v in inner.0.iter().skip(1) {
+                        for v in lst.0.iter().skip(1) {
                             evaluated.push(self.eval_value(v.clone())?);
                         }
                         self.eval_list(WList::from_vec(evaluated))
                     }
                 }
             }
-            _ => {
-                // First element is not a symbol: evaluate it, then call as function
-                let first = self.eval_value(lst.0[0].clone())?;
-                let mut args = Vec::new();
-                for v in lst.0.iter().skip(1) {
-                    args.push(self.eval_value(v.clone())?);
+                _ => {
+                    // First element is not a symbol: evaluate all elements
+                    // and return as a list (not a function application)
+                    let mut all_vals = Vec::with_capacity(lst.len());
+                    for v in lst.0.iter() {
+                        all_vals.push(self.eval_value(v.clone())?);
+                    }
+                    Ok(Value::List(WList::from_vec(all_vals)))
                 }
-                match first {
-                    Value::Closure(c) => self.eval_closure(c, &args),
-                    Value::Macro(m) => self.eval_macro(m, &args),
-                    _ if args.is_empty() => Ok(first),
-                    _ => Ok(Value::List(WList::from_vec(args))),
-                }
-            }
         }
     }
 

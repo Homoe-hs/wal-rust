@@ -7,9 +7,19 @@ use crate::wal::eval::{Environment, Dispatcher, Evaluator};
 
 fn op_array(args: &[Value], _env: &mut Environment, _eval: &mut Evaluator) -> Result<Value, String> {
     // array creates a flat key-value pair list: [k1 v1 k2 v2 ...]
+    // Supports both (array k1 v1 k2 v2) and (array [k1 v1] [k2 v2]) forms
     let mut result = Vec::new();
     for arg in args {
-        result.push(arg.clone());
+        match arg {
+            Value::List(lst) if lst.len() == 2 => {
+                // Nested pair (k v) → flatten
+                result.push(lst[0].clone());
+                result.push(lst[1].clone());
+            }
+            other => {
+                result.push(other.clone());
+            }
+        }
     }
     Ok(Value::List(WList::from_vec(result)))
 }
