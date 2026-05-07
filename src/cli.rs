@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
 #[command(name = "wal-rust")]
-#[command(version = "0.5.0")]
+#[command(version = env!("CARGO_PKG_VERSION"))]
 #[command(
     about = "WAL: Waveform Analysis Language CLI",
     long_about = "High-performance WAL script runner and REPL for VCD/FST waveform analysis.\n\n\

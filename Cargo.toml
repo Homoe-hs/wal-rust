@@ -1,6 +1,6 @@
 [package]
 name = "wal-rust"
-version = "0.5.0"
+version = "0.7.0"
 edition = "2021"
 rust-version = "1.70"
 description = "WAL: Waveform Analysis Language - High-performance parser, REPL, and waveform tools"
