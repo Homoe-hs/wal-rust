@@ -9,6 +9,10 @@ use std::path::PathBuf;
 #[command(
     about = "WAL: Waveform Analysis Language CLI",
     long_about = "High-performance WAL script runner and REPL for VCD/FST waveform analysis.\n\n\
+                  Auto-detection:\n  \
+                  input starts with '(' → evaluated as WAL expression\n  \
+                  input is an existing file → executed as WAL script\n  \
+                  no input → shows help\n\n\
                   Features:\n  \
                   - Full WAL language support (82 operators, macros, @/#/~ syntax)\n  \
                   - mmap-based on-demand VCD loading (two-pass scan + sparse index + LRU cache)\n  \
@@ -17,20 +21,36 @@ use std::path::PathBuf;
                   - Interactive REPL with rustyline",
     after_help = "EXAMPLES:\n  \
                   wal-rust repl\n  \
-                  wal-rust run script.wal\n  \
+                  wal-rust '(+ 1 2)'\n  \
+                  wal-rust '(step 100)'\n  \
+                  wal-rust script.wal\n  \
                   wal-rust run -l trace.vcd script.wal\n  \
-                  wal-rust run -c '(+ 1 2)' script.wal\n  \
-                  wal-rust run -c '(signals)' -l dump.vcd script.wal\n\n\
+                  wal-rust '(+ 1 2)' -l dump.vcd\n\n\
                   See https://wal-lang.org for WAL language documentation."
 )]
+#[command(subcommand_required = false)]
+#[command(args_conflicts_with_subcommands = true)]
 pub struct Args {
+    /// WAL expression (starts with '(') or script file path.
+    /// Auto-detected: expression → evaluate, file → execute.
+    #[arg(help = "WAL expression or script file to execute")]
+    pub input: Option<String>,
+
+    /// Pre-load waveform file(s) before execution
+    #[arg(
+        short = 'l',
+        long = "load",
+        help = "VCD or FST waveform file(s) to load before running.\nCan be specified multiple times."
+    )]
+    pub load: Vec<PathBuf>,
+
     #[command(subcommand)]
-    pub command: Command,
+    pub command: Option<Command>,
 }
 
 #[derive(Parser, Debug)]
 pub enum Command {
-    /// Run a WAL script file (.wal)
+    /// Run a WAL script file (default when file provided)
     #[command(
         about = "Execute a WAL script file",
         long_about = "Parse and evaluate a WAL script file.\n\
@@ -71,19 +91,56 @@ pub struct RunArgs {
     pub code: Option<String>,
 }
 
-impl Args {
-    #[allow(dead_code)]
-    pub fn log_level(&self) -> LogLevel {
-        match &self.command {
-            Command::Run(_) | Command::Repl => LogLevel::Normal,
-        }
-    }
+/// Represents the resolved execution mode after auto-detection
+pub enum ExecMode {
+    /// Run a script file (with optional pre-load waveforms)
+    RunScript {
+        path: PathBuf,
+        load: Vec<PathBuf>,
+        code: Option<String>,
+    },
+    /// Evaluate a WAL expression directly
+    EvalExpr {
+        code: String,
+        load: Vec<PathBuf>,
+    },
+    /// Start the interactive REPL
+    Repl,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
-pub enum LogLevel {
-    Quiet,
-    Normal,
-    Verbose,
+impl Args {
+    pub fn resolve(self) -> ExecMode {
+        // If a subcommand was given explicitly, use it
+        if let Some(cmd) = self.command {
+            return match cmd {
+                Command::Run(r) => ExecMode::RunScript {
+                    path: r.file,
+                    load: r.load,
+                    code: r.code,
+                },
+                Command::Repl => ExecMode::Repl,
+            };
+        }
+
+        // No subcommand — auto-detect
+        let load = self.load;
+
+        match self.input {
+            None => ExecMode::Repl, // no input → help shown by clap
+            Some(input) => {
+                let trimmed = input.trim().to_string();
+                if trimmed.starts_with('(') || trimmed.starts_with('\'') {
+                    // Looks like a WAL expression
+                    ExecMode::EvalExpr { code: trimmed, load }
+                } else {
+                    // Treat as file path
+                    ExecMode::RunScript {
+                        path: PathBuf::from(&trimmed),
+                        load,
+                        code: None,
+                    }
+                }
+            }
+        }
+    }
 }

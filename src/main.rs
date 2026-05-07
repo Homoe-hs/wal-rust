@@ -8,53 +8,68 @@ mod vcd;
 pub mod wal;
 pub mod trace;
 
-use crate::cli::{Args, Command};
+use crate::cli::{Args, ExecMode};
 use clap::Parser;
+use std::path::{Path, PathBuf};
 use std::process;
 
 fn main() {
     let args = Args::parse();
 
-    match args.command {
-        Command::Run(run_args) => {
-            if let Err(e) = run_wal_file(&run_args) {
+    match args.resolve() {
+        ExecMode::RunScript { path, load, code } => {
+            if let Err(e) = run_wal_file(&path, &load, code.as_deref()) {
                 eprintln!("error: {}", e);
                 process::exit(1);
             }
         }
-        Command::Repl => {
+        ExecMode::EvalExpr { code, load } => {
+            if let Err(e) = eval_wal_expr(&code, &load) {
+                eprintln!("error: {}", e);
+                process::exit(1);
+            }
+        }
+        ExecMode::Repl => {
             run_repl();
         }
     }
 }
 
-fn run_wal_file(args: &crate::cli::RunArgs) -> Result<(), String> {
-    use wal::eval::Evaluator;
-    
-    use std::fs;
-
-    let source = fs::read_to_string(&args.file)
-        .map_err(|e| format!("Failed to read file: {}", e))?;
-
-    let mut eval = Evaluator::new();
-
-    // Pre-load waveforms if specified
-    for path in &args.load {
-        let trace_count = eval.traces.read().unwrap().trace_ids().len();
+fn init_eval_with_load(load: &[PathBuf]) -> Result<wal::eval::Evaluator, String> {
+    let mut eval = wal::eval::Evaluator::new();
+    for path in load {
+        let trace_count = eval.traces.read().map_err(|e| format!("{}", e))?.trace_ids().len();
         let id = format!("t{}", trace_count);
         let path_str = path.to_string_lossy().to_string();
         eval.load_trace(&path_str, &id)?;
     }
+    Ok(eval)
+}
 
-    // Execute code expression if provided
-    if let Some(ref code) = args.code {
+fn eval_wal_expr(code: &str, load: &[PathBuf]) -> Result<(), String> {
+    let mut eval = init_eval_with_load(load)?;
+    let result = eval.eval(code)?;
+    println!("=> {}", result);
+    Ok(())
+}
+
+fn run_wal_file(path: &Path, load: &[PathBuf], code: Option<&str>) -> Result<(), String> {
+    use wal::eval::Evaluator;
+
+    let mut eval = init_eval_with_load(load)?;
+
+    // Execute code expression if provided (overrides file)
+    if let Some(code) = code {
         let result = eval.eval(code)?;
         println!("=> {}", result);
         return Ok(());
     }
 
-    // Otherwise, execute the file
-    println!("Evaluating: {}", args.file.display());
+    // Execute the script file
+    let source = std::fs::read_to_string(path)
+        .map_err(|e| format!("Failed to read file: {}", e))?;
+
+    println!("Evaluating: {}", path.display());
 
     // Handle multi-line expressions by accumulating them across lines
     let mut expr = String::new();
