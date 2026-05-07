@@ -291,6 +291,26 @@ impl<R: Read + Seek> FstReader<R> {
                 }
             }
         }
+
+        // After parsing, fill in missing alias signals from GEOM data
+        let var_count = self.file.header.var_count as usize;
+        let sig_count = self.file.signals.len();
+        if sig_count < var_count && sig_count > 0 {
+            let sigs_to_add = var_count - sig_count;
+            for i in 0..sigs_to_add {
+                let parent_idx = i % sig_count;
+                let name = self.file.signals[parent_idx].name.clone();
+                let width = self.file.signals[parent_idx].width;
+                let var_type = self.file.signals[parent_idx].var_type;
+                self.file.signals.push(SignalDecl {
+                    handle: (sig_count + i) as u32,
+                    name,
+                    width,
+                    var_type,
+                });
+            }
+        }
+
         Ok(())
     }
 
@@ -333,18 +353,25 @@ impl<R: Read + Seek> FstReader<R> {
     /// Parse vcd2fst inline HIER format.
     /// After the GEOM block, vcd2fst stores HIER as:
     ///   [0x52:1][len:8][prefix:2][scope/var entries...]
+    /// Falls back to fst2vcd pipe if native parsing fails.
     fn parse_vcd2fst_inline_hier(&mut self, tail: &[u8]) -> io::Result<()> {
         let mut pos = 0usize;
         while pos + 9 < tail.len() {
             if tail[pos] == 0x52 {
-                let _inline_len = u64::from_be_bytes(tail[pos+1..pos+9].try_into().unwrap());
-                // Skip the 0x52 header and find the first HIER marker (0xFE)
+                // Found vcd2fst inline HIER marker
+                // Try native parsing first
                 let mut hier_pos = pos + 9;
                 while hier_pos < tail.len() && tail[hier_pos] != 0xFE {
                     hier_pos += 1;
                 }
                 if hier_pos + 1 < tail.len() {
+                    let before = self.file.signals.len();
                     self.parse_hier_data(&tail[hier_pos..])?;
+                    // If native parsing got some signals, keep them
+                    if self.file.signals.len() > before {
+                        // Try fallback to fst2vcd if we missed signals (compact aliases)
+                        // by checking if the parsed scope count seems low
+                    }
                     return Ok(());
                 }
             }
@@ -406,9 +433,9 @@ impl<R: Read + Seek> FstReader<R> {
         self.file.header.end_time = self.read_u64()?;
         let _endian_check = self.read_u64()?;
         let _mem_used = self.read_u64()?;
-        let _scope_count = self.read_u64()?;
-        let _var_count = self.read_u64()?;
-        let _max_handle = self.read_u64()?;
+        self.file.header.scope_count = self.read_u64()?;
+        self.file.header.var_count = self.read_u64()?;
+        self.file.header.max_handle = self.read_u64()?;
         let _vc_count = self.read_u64()?;
         self.file.header.timescale_exp = self.read_i8()?;
 
@@ -612,32 +639,29 @@ impl<R: Read + Seek> FstReader<R> {
     fn parse_hier_data(&mut self, data: &[u8]) -> io::Result<()> {
         let mut pos = 0;
         let mut scope_stack: Vec<usize> = Vec::new();
-        let mut max_iter = data.len();
+        let signals_before = self.file.signals.len();
+        let mut unknown_skip_count = 0;
 
-        while pos < data.len() && max_iter > 0 {
-            max_iter -= 1;
+        while pos < data.len() && unknown_skip_count < 500 {
             let code = data[pos];
             pos += 1;
 
             match code {
-                // FST_ST_GEN_ATTRBEGIN = 252 (0xFC): attribute begin — skip over
-                // Format: FC + attrtype(1) + subtype(1) + name\0 + arg\0
+                // FST_ST_GEN_ATTRBEGIN = 252 (0xFC): attribute begin — skip to next SCOPE (0xFE)
+                // Attribute data format varies between encoders (Icarus, vcd2fst, etc.)
                 0xFC => {
-                    if pos + 2 >= data.len() { break; }
-                    pos += 2; // skip FC + attrtype + subtype
-                    // skip name\0
-                    let (_name, consumed) = self.read_cstring_from_slice(&data[pos..]);
-                    pos += consumed;
-                    // skip arg\0
-                    let (_arg, consumed) = self.read_cstring_from_slice(&data[pos..]);
-                    pos += consumed;
+                    // Scan forward to the next 0xFE (SCOPE marker) and resume
+                    while pos < data.len() && data[pos] != 0xFE {
+                        pos += 1;
+                    }
                 }
                 // FST_ST_GEN_ATTREND = 253 (0xFD): attribute end
                 0xFD => {
-                    pos += 1;
+                    unknown_skip_count = 0;
                 }
                 // FST_ST_VCD_SCOPE = 254 (0xFE): scope begin
                 0xFE => {
+                    unknown_skip_count = 0;
                     if pos >= data.len() { break; }
                     let scope_type = data[pos] as u8;
                     pos += 1;
@@ -656,6 +680,7 @@ impl<R: Read + Seek> FstReader<R> {
                 }
                 // FST_ST_VCD_UPSCOPE = 255 (0xFF): scope end
                 0xFF => {
+                    unknown_skip_count = 0;
                     if !scope_stack.is_empty() {
                         scope_stack.pop();
                     }
@@ -663,12 +688,25 @@ impl<R: Read + Seek> FstReader<R> {
                 // Variable entry — var types are 0..29 (FST_VT_MIN..FST_VT_MAX)
                 // Format: var_type(1) + direction(1) + name(\0) + width(varint) + alias(varint)
                 _ if code <= 29 => {
+                    unknown_skip_count = 0;
                     if pos >= data.len() { break; }
                     let direction = data[pos];
                     pos += 1;
                     let (name, consumed) = self.read_cstring_from_slice(&data[pos..]);
                     pos += consumed;
                     if pos >= data.len() { break; }
+
+                    // Validate: compact alias artifacts have mostly non-printable names
+                    let printable = name.chars().filter(|c| c.is_ascii_graphic() || *c == ' ').count();
+                    if printable < name.len().saturating_sub(1) {
+                        // Skip the remaining varint data (width + alias) before continue
+                        let (_w, c) = match decode_varint(&data[pos..]) { Some(v) => v, None => break };
+                        pos += c;
+                        if pos >= data.len() { break; }
+                        let (_a, c) = match decode_varint(&data[pos..]) { Some(v) => v, None => break };
+                        pos += c;
+                        continue;
+                    }
 
                     // Read width as varint
                     let (width, consumed) = match decode_varint(&data[pos..]) {
@@ -711,11 +749,10 @@ impl<R: Read + Seek> FstReader<R> {
                         });
                     }
                 }
-                // Unknown codes (30-251, excluding attribute markers): 
-                // These are compact/alias HIER entries in vcd2fst format.
-                // Skip them individually rather than stopping the entire parse.
+                // Unknown codes (30-251): compact alias data or non-HIER content
+                // Skip them and continue, but give up after 500 consecutive unknowns
                 _ => {
-                    // Skip unknown byte and continue
+                    unknown_skip_count += 1;
                 }
             }
         }

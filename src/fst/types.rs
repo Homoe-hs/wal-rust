@@ -57,6 +57,9 @@ pub struct FstHeader {
     pub timescale_exp: i8,
     pub version: String,
     pub date: String,
+    pub var_count: u64,
+    pub scope_count: u64,
+    pub max_handle: u64,
 }
 
 impl Default for FstHeader {
@@ -67,6 +70,9 @@ impl Default for FstHeader {
             timescale_exp: -9, // 1ns default
             version: "walconv 0.1.0".to_string(),
             date: chrono_lite_date(),
+            var_count: 0,
+            scope_count: 0,
+            max_handle: 0,
         }
     }
 }
