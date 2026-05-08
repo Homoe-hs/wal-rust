@@ -31,6 +31,7 @@ pub struct VcdTrace {
 
     // Pass 1: sparse index
     timestamps: Vec<u64>,
+    #[allow(dead_code)]
     timestamp_offsets: Vec<u64>,
     sparse_index: HashMap<u32, BTreeMap<u64, u64>>,
 

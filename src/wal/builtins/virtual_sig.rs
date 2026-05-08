@@ -22,13 +22,6 @@ fn op_dump_trace(_args: &[Value], _env: &mut Environment, _eval: &mut Evaluator)
     Err("dump-trace: not yet implemented".to_string())
 }
 
-fn ensure_arity(args: &[Value], expected: usize) -> Result<(), String> {
-    if args.len() != expected {
-        return Err(format!("Expected {} arguments, got {}", expected, args.len()));
-    }
-    Ok(())
-}
-
 fn ensure_arity_atleast(args: &[Value], min: usize) -> Result<(), String> {
     if args.len() < min {
         return Err(format!("Expected at least {} arguments, got {}", min, args.len()));
