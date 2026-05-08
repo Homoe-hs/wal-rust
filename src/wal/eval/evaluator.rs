@@ -159,6 +159,69 @@ impl Evaluator {
                 }
                 return Ok(Value::String("".to_string()));
             }
+            "SIGNALS-NO-ALIAS" => {
+                if let Some(traces) = self.env.get_traces() {
+                    let traces = traces.read().unwrap_or_else(|e| e.into_inner());
+                    let sigs: Vec<Value> = traces.all_signals().into_iter()
+                        .map(Value::String).collect();
+                    return Ok(Value::List(WList::from_vec(sigs)));
+                }
+                return Ok(Value::List(WList::new()));
+            }
+            "SCOPES" => {
+                if let Some(traces) = self.env.get_traces() {
+                    let traces = traces.read().unwrap_or_else(|e| e.into_inner());
+                    let mut all_scopes = Vec::new();
+                    for trace in traces.traces_iter() {
+                        all_scopes.extend(trace.scopes());
+                    }
+                    all_scopes.sort();
+                    all_scopes.dedup();
+                    return Ok(Value::List(WList::from_vec(
+                        all_scopes.into_iter().map(Value::String).collect()
+                    )));
+                }
+                return Ok(Value::List(WList::new()));
+            }
+            "LOCAL-SIGNALS" => {
+                let cs = self.env.get_scope();
+                if let Some(traces) = self.env.get_traces() {
+                    let traces = traces.read().unwrap_or_else(|e| e.into_inner());
+                    let sigs: Vec<Value> = traces.all_signals().into_iter()
+                        .filter(|s| s.starts_with(&cs))
+                        .map(Value::String).collect();
+                    return Ok(Value::List(WList::from_vec(sigs)));
+                }
+                return Ok(Value::List(WList::new()));
+            }
+            "LOCAL-SCOPES" => {
+                let cs = self.env.get_scope();
+                if let Some(traces) = self.env.get_traces() {
+                    let traces = traces.read().unwrap_or_else(|e| e.into_inner());
+                    let mut local = Vec::new();
+                    for trace in traces.traces_iter() {
+                        for s in trace.scopes() {
+                            if s.starts_with(&cs) && s.len() > cs.len() {
+                                let rest = &s[cs.len()..];
+                                if let Some(dot) = rest.find('.') {
+                                    local.push(format!("{}{}", cs, &rest[..dot+1]));
+                                } else {
+                                    local.push(s.clone());
+                                }
+                            }
+                        }
+                    }
+                    local.sort();
+                    local.dedup();
+                    return Ok(Value::List(WList::from_vec(
+                        local.into_iter().map(Value::String).collect()
+                    )));
+                }
+                return Ok(Value::List(WList::new()));
+            }
+            "VIRTUAL-SIGNALS" => {
+                return Ok(Value::List(WList::new()));
+            }
             _ => {}
         }
 
@@ -415,7 +478,7 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
         match &args[0] {
             Value::Symbol(s) => {
                 let name = s.name.clone();
-                let value = match &args[1] {
+                let (value, _is_closure) = match &args[1] {
                     Value::List(lst) if !lst.is_empty() => {
                         if let Some(Value::Symbol(fn_sym)) = lst.first() {
                             if fn_sym.name == "fn" {
@@ -442,16 +505,18 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
                                     body,
                                 );
                                 closure.variadic = variadic;
-                                self.env.define(name.clone(), Value::Closure(closure));
-                                return Ok(Value::Nil);
+                                (Value::Closure(closure), true)
+                            } else {
+                                (self.eval_value(args[1].clone())?, false)
                             }
+                        } else {
+                            (self.eval_value(args[1].clone())?, false)
                         }
-                        self.eval_value(args[1].clone())?
                     }
-                    _ => self.eval_value(args[1].clone())?,
+                    _ => (self.eval_value(args[1].clone())?, false),
                 };
-                self.env.define(name, value);
-                Ok(Value::Nil)
+                self.env.define(name, value.clone());
+                return Ok(value);
             }
             Value::List(list) => {
                 if list.is_empty() {
@@ -475,8 +540,9 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
                     args[1].clone(),
                 ).with_name(&func_name);
 
-                self.env.define(func_name, Value::Closure(closure));
-                Ok(Value::Nil)
+                let closure_val = Value::Closure(closure);
+                self.env.define(func_name, closure_val.clone());
+                Ok(closure_val)
             }
             _ => Err("define expects symbol or function definition".to_string()),
         }
@@ -964,7 +1030,7 @@ mod tests {
     fn test_eval_define() {
         let mut eval = Evaluator::new();
         let result = eval.eval("(define x 42)");
-        assert_eq!(result.unwrap(), Value::Nil);
+        assert_eq!(result.unwrap(), Value::Int(42));
         let result = eval.eval("x");
         assert_eq!(result.unwrap(), Value::Int(42));
     }
@@ -973,7 +1039,7 @@ mod tests {
     fn test_quasiquote_simple() {
         let mut eval = Evaluator::new();
         let result = eval.eval("(define x 5)");
-        assert_eq!(result.unwrap(), Value::Nil);
+        assert_eq!(result.unwrap(), Value::Int(5));
         let result = eval.eval("`(+ 1 ,x)");
         let list = result.unwrap();
         assert_eq!(list, Value::List(WList::from_vec(vec![

@@ -114,10 +114,11 @@ fn op_mapa(args: &[Value], _env: &mut Environment, eval: &mut Evaluator) -> Resu
             let val = arr[i + 1].clone();
             let mapped_val = match func {
                 Value::Closure(c) => {
-                    eval.eval_closure(c.clone(), &[val])?
+                    eval.eval_closure(c.clone(), &[key.clone(), val])?
                 }
                 _ => eval.eval_value_public(Value::List(WList::from_vec(vec![
                     func.clone(),
+                    key.clone(),
                     val,
                 ])))?,
             };

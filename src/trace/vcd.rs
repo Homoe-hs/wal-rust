@@ -465,23 +465,6 @@ impl Trace for VcdTrace {
         &self.filename
     }
 
-    fn load(path: &Path) -> Result<Self, String>
-    where
-        Self: Sized,
-    {
-        Self::load(path, "default".to_string())
-    }
-
-    fn unload(&mut self) {
-        self.signals.clear();
-        self.signal_ids.clear();
-        self.signal_widths.clear();
-        self.timestamps.clear();
-        self.timestamp_offsets.clear();
-        self.sparse_index.clear();
-        self.lru_cache.borrow_mut().clear();
-    }
-
     fn step(&mut self, steps: usize) -> Result<(), String> {
         let new_index = self.current_index.saturating_add(steps);
         if new_index > self.max_index {

@@ -10,7 +10,15 @@ use std::path::Path;
 fn op_load(args: &[Value], env: &mut Environment, _eval: &mut Evaluator) -> Result<Value, String> {
     ensure_arity_atleast(args, 1)?;
     let path = extract_string(&args[0])?;
-    let tid = args.get(1).and_then(|v| extract_string(v).ok()).unwrap_or_else(|| "t0".to_string());
+    let tid = if let Some(v) = args.get(1) {
+        extract_string(v)?
+    } else {
+        // Auto-generate ID using scheme t0, t1, t2...
+        let count = env.get_traces()
+            .map(|t| t.read().unwrap_or_else(|e| e.into_inner()).trace_ids().len())
+            .unwrap_or(0);
+        format!("t{}", count)
+    };
 
     if let Some(traces) = env.get_traces() {
         let mut traces = traces.write().unwrap_or_else(|e| e.into_inner());
@@ -30,6 +38,7 @@ fn op_unload(args: &[Value], env: &mut Environment, _eval: &mut Evaluator) -> Re
 
 fn op_step(args: &[Value], env: &mut Environment, _eval: &mut Evaluator) -> Result<Value, String> {
     // (step) → step 1; (step amount) → step all by amount; (step id amount) → step specific trace
+    // Returns #f if the end of any loaded trace is reached (per WAL spec)
     let (tid, steps) = match args.len() {
         0 => (None, 1_usize),
         1 => (None, extract_int(&args[0])? as usize),
@@ -41,15 +50,17 @@ fn op_step(args: &[Value], env: &mut Environment, _eval: &mut Evaluator) -> Resu
     };
     if let Some(traces) = env.get_traces() {
         let mut traces = traces.write().unwrap_or_else(|e| e.into_inner());
-        if let Some(tid) = tid {
-            traces.get_mut(&tid)
-                .ok_or_else(|| format!("Trace not found: {}", tid))?
-                .step(steps)?;
+        let ok = if let Some(tid) = tid {
+            match traces.get_mut(&tid) {
+                Some(trace) => trace.step(steps).is_ok(),
+                None => return Err(format!("Trace not found: {}", tid)),
+            }
         } else {
-            traces.step_all(steps)?;
-        }
+            traces.step_all(steps).is_ok()
+        };
+        return Ok(Value::Bool(ok));
     }
-    Ok(Value::Nil)
+    Ok(Value::Bool(true))
 }
 
 fn op_signals(args: &[Value], env: &mut Environment, _eval: &mut Evaluator) -> Result<Value, String> {

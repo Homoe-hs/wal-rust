@@ -2,7 +2,8 @@
 //!
 //! scoped, all-scopes, resolve-scope, set-scope, unset-scope, groups, in-group, in-groups, resolve-group
 
-use crate::wal::ast::{Value, Operator};
+use crate::trace::ScalarValue;
+use crate::wal::ast::{Value, WList, Operator};
 use crate::wal::eval::{Environment, Dispatcher, Evaluator};
 
 fn op_scoped(args: &[Value], env: &mut Environment, eval: &mut Evaluator) -> Result<Value, String> {
@@ -19,10 +20,26 @@ fn op_scoped(args: &[Value], env: &mut Environment, eval: &mut Evaluator) -> Res
     Ok(result)
 }
 
-fn op_allscopes(args: &[Value], _env: &mut Environment, _eval: &mut Evaluator) -> Result<Value, String> {
+fn op_allscopes(args: &[Value], env: &mut Environment, eval: &mut Evaluator) -> Result<Value, String> {
     ensure_arity(args, 1)?;
-    // all-scopes expr - evaluate expr in all scopes
-    Ok(Value::List(crate::wal::ast::WList::new()))
+    let mut results = Vec::new();
+    let mut seen = Vec::new();
+    if let Some(traces) = env.get_traces() {
+        let traces = traces.read().unwrap_or_else(|e| e.into_inner());
+        for trace in traces.traces_iter() {
+            for scope_name in trace.scopes() {
+                if seen.contains(&scope_name) { continue; }
+                seen.push(scope_name.clone());
+                let mut scope_env = env.child();
+                scope_env.set_scope(&format!("{}.", scope_name));
+                let saved_env = std::mem::replace(env, scope_env);
+                let r = eval.eval_value_public(args[0].clone())?;
+                let _ = std::mem::replace(env, saved_env);
+                results.push(r);
+            }
+        }
+    }
+    Ok(Value::List(WList::from_vec(results)))
 }
 
 fn op_resolve_scope(args: &[Value], env: &mut Environment, _eval: &mut Evaluator) -> Result<Value, String> {
@@ -139,7 +156,6 @@ fn op_resolve_group(args: &[Value], env: &mut Environment, _eval: &mut Evaluator
     let name = match &args[0] {
         Value::Symbol(s) => s.name.clone(),
         Value::List(lst) if !lst.is_empty() => {
-            // Handle (quote signal) form from parser -> extract the quoted symbol
             match &lst.0[0] {
                 Value::Symbol(s) => s.name.clone(),
                 _ => return Err("resolve-group: expected symbol".to_string()),
@@ -147,8 +163,21 @@ fn op_resolve_group(args: &[Value], env: &mut Environment, _eval: &mut Evaluator
         }
         _ => return Err("resolve-group: expected symbol".to_string()),
     };
-    let grouped_name = format!("#{}", name);
-    env.lookup(&grouped_name).ok_or_else(|| format!("Unresolved group: {}", grouped_name))
+    // Per WAL spec: prepend CG (current group) to signal name, then look up trace signal
+    let group = env.get_group();
+    let full_name = format!("{}{}", group, name);
+    if let Some(traces) = env.get_traces() {
+        let traces = traces.read().unwrap_or_else(|e| e.into_inner());
+        if let Some(trace) = traces.first_trace() {
+            match trace.signal_value(&full_name, trace.index()) {
+                Ok(sv) => {
+                    return Ok(scalar_to_value(sv));
+                }
+                Err(_) => {}
+            }
+        }
+    }
+    Err(format!("Unresolved group signal: {} (CG='{}')", full_name, group))
 }
 
 fn op_in_scope(args: &[Value], env: &mut Environment, eval: &mut Evaluator) -> Result<Value, String> {
@@ -156,10 +185,12 @@ fn op_in_scope(args: &[Value], env: &mut Environment, eval: &mut Evaluator) -> R
     let scope = extract_name(&args[0])?;
     let mut new_env = env.child();
     new_env.set_scope(&scope);
+    let saved_env = std::mem::replace(env, new_env);
     let mut result = Value::Nil;
     for arg in &args[1..] {
         result = eval.eval_value_public(arg.clone())?;
     }
+    let _ = std::mem::replace(env, saved_env);
     Ok(result)
 }
 
@@ -196,6 +227,17 @@ fn ensure_arity_atleast(args: &[Value], min: usize) -> Result<(), String> {
         return Err(format!("Expected at least {} arguments, got {}", min, args.len()));
     }
     Ok(())
+}
+
+fn scalar_to_value(sv: ScalarValue) -> Value {
+    match sv {
+        ScalarValue::Bit(b) => Value::Int(if b == b'1' { 1 } else { 0 }),
+        ScalarValue::Vector(v) => {
+            let int_val = v.iter().fold(0i64, |acc, &b| (acc << 1) | if b == b'1' { 1 } else { 0 });
+            Value::Int(int_val)
+        }
+        ScalarValue::Real(r) => Value::Float(r),
+    }
 }
 
 fn extract_name(v: &Value) -> Result<String, String> {

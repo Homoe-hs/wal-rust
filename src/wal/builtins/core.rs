@@ -36,8 +36,8 @@ fn op_define(args: &[Value], env: &mut Environment, _eval: &mut Evaluator) -> Re
     ensure_arity(args, 2)?;
     let name = extract_symbol(&args[0])?;
     let value = args[1].clone();
-    env.define(name, value);
-    Ok(Value::Nil)
+    env.define(name, value.clone());
+    Ok(value)
 }
 
 fn op_set(args: &[Value], env: &mut Environment, _eval: &mut Evaluator) -> Result<Value, String> {

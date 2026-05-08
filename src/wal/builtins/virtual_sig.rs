@@ -14,22 +14,12 @@ fn op_defsig(args: &[Value], env: &mut Environment, _eval: &mut Evaluator) -> Re
     Ok(Value::Nil)
 }
 
-fn op_new_trace(args: &[Value], _env: &mut Environment, _eval: &mut Evaluator) -> Result<Value, String> {
-    ensure_arity(args, 1)?;
-    let _name = extract_symbol(&args[0])?;
-    // new-trace name - create new virtual trace (placeholder)
-    Ok(Value::Nil)
+fn op_new_trace(_args: &[Value], _env: &mut Environment, _eval: &mut Evaluator) -> Result<Value, String> {
+    Err("new-trace: not yet implemented".to_string())
 }
 
-fn op_dump_trace(args: &[Value], _env: &mut Environment, _eval: &mut Evaluator) -> Result<Value, String> {
-    ensure_arity(args, 1)?;
-    let _path = match &args[0] {
-        Value::String(s) => s.clone(),
-        Value::Symbol(s) => s.name.clone(),
-        _ => return Err("dump-trace: expected path string".to_string()),
-    };
-    // dump-trace path - export trace to VCD (placeholder)
-    Ok(Value::Nil)
+fn op_dump_trace(_args: &[Value], _env: &mut Environment, _eval: &mut Evaluator) -> Result<Value, String> {
+    Err("dump-trace: not yet implemented".to_string())
 }
 
 fn ensure_arity(args: &[Value], expected: usize) -> Result<(), String> {

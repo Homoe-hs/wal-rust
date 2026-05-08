@@ -25,17 +25,12 @@ impl WalParser {
             .ok_or_else(|| "Parse failed".to_string())
     }
 
-    pub fn parse_with_errors(&mut self, source: &str) -> Tree {
-        self.parser.parse(source, None).unwrap_or_else(|| {
-            let mut parser = Parser::new();
-            parser.set_language(&crate::wal::language()).unwrap();
-            parser.parse(source, None).unwrap()
-        })
-    }
-
     pub fn parse_expr(&mut self, source: &str) -> Result<Value, String> {
         let tree = self.parse(source)?;
         let root = tree.root_node();
+        if root.has_error() {
+            return Err("Parse error: syntax error or mismatched parentheses".to_string());
+        }
         if root.kind() == "program" {
             let mut last_result: Result<Value, String> = Ok(Value::Nil);
             let mut cursor = root.walk();
@@ -54,12 +49,6 @@ impl WalParser {
         } else {
             expr_from_node(root, source)
         }
-    }
-}
-
-impl Default for WalParser {
-    fn default() -> Self {
-        Self::new().expect("Failed to create WalParser")
     }
 }
 
@@ -146,12 +135,12 @@ pub fn expr_from_node(node: tree_sitter::Node, source: &str) -> Result<Value, St
         }
         "int" | "dec_int" => {
             let text = get_node_text(node, source);
-            let n: i64 = text.parse().unwrap_or(0);
+            let n: i64 = text.parse().map_err(|e| format!("Invalid integer '{}': {}", text, e))?;
             Ok(Value::Int(n))
         }
         "float" => {
             let text = get_node_text(node, source);
-            let n: f64 = text.parse().unwrap_or(0.0);
+            let n: f64 = text.parse().map_err(|e| format!("Invalid float '{}': {}", text, e))?;
             Ok(Value::Float(n))
         }
         "string" => {

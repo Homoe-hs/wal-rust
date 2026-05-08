@@ -178,22 +178,6 @@ fn op_gensym(_args: &[Value], _env: &mut Environment, _eval: &mut Evaluator) -> 
     Ok(Value::Symbol(Symbol::new(format!("GENSYM_{}", n))))
 }
 
-fn op_case(args: &[Value], env: &mut Environment, eval: &mut Evaluator) -> Result<Value, String> {
-    ensure_arity_atleast(args, 2)?;
-    let key = eval_value(&args[0], env)?;
-
-    for chunk in args[1..].chunks(2) {
-        if chunk.len() != 2 {
-            return Err("case expects (key result) pairs".to_string());
-        }
-        // Check for default keyword (any symbol named "default")
-        if matches!(&chunk[0], Value::Symbol(s) if s.name == "default") || chunk[0] == key {
-            return eval.eval_value_public(chunk[1].clone());
-        }
-    }
-    Ok(Value::Nil)
-}
-
 fn op_slice(args: &[Value], _env: &mut Environment, eval: &mut Evaluator) -> Result<Value, String> {
     ensure_arity_range(args)?;
     let val = eval.eval_value_public(args[0].clone())?;
@@ -215,7 +199,15 @@ fn op_slice(args: &[Value], _env: &mut Environment, eval: &mut Evaluator) -> Res
                 }
                 Ok(lst.get(idx).cloned().unwrap_or(Value::Nil))
             }
-            _ => Err("slice: first argument must be a string or list".to_string()),
+            Value::Int(n) => {
+                // Bit extraction: (slice int bit) — get single bit
+                let bit = idx1;
+                if bit < 0 || bit >= 64 {
+                    return Err(format!("slice: bit index {} out of range (0..63)", bit));
+                }
+                Ok(Value::Int(if (n >> bit) & 1 == 1 { 1 } else { 0 }))
+            }
+            _ => Err("slice: first argument must be a string, list, or int".to_string()),
         }
     } else {
         let idx2 = extract_int(&eval.eval_value_public(args[2].clone())?)?;
@@ -238,7 +230,18 @@ fn op_slice(args: &[Value], _env: &mut Environment, eval: &mut Evaluator) -> Res
                 let end = end.min(lst.len());
                 Ok(Value::List(WList::from_vec(lst.0[start..end].to_vec())))
             }
-            _ => Err("slice: first argument must be a string or list".to_string()),
+            Value::Int(n) => {
+                // Bit slicing: (slice int upper lower) — extract bits [upper:lower]
+                let upper = idx1.max(0) as u32;
+                let lower = idx2.max(0) as u32;
+                if upper > 63 || lower > 63 || lower > upper {
+                    return Err(format!("slice: invalid bit range {}..{}", lower, upper));
+                }
+                let width = upper - lower + 1;
+                let masked = (n >> lower) & ((1i64 << width) - 1);
+                Ok(Value::Int(masked))
+            }
+            _ => Err("slice: first argument must be a string, list, or int".to_string()),
         }
     }
 }
@@ -298,10 +301,6 @@ fn extract_string(v: &Value) -> Result<String, String> {
     }
 }
 
-fn eval_value(v: &Value, _env: &mut Environment) -> Result<Value, String> {
-    Ok(v.clone())
-}
-
 pub fn register_special(disp: &mut Dispatcher) {
     disp.register(Operator::Quote, op_quote);
     disp.register(Operator::Quasiquote, op_quasiquote);
@@ -315,5 +314,4 @@ pub fn register_special(disp: &mut Dispatcher) {
     disp.register(Operator::Slice, op_slice);
     disp.register(Operator::Repl, op_repl);
     disp.register(Operator::Import, op_import);
-    disp.register(Operator::Case, op_case);
 }

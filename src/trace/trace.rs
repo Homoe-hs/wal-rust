@@ -1,7 +1,5 @@
 //! Trace trait for waveform access
 
-use std::path::Path;
-
 pub type TraceId = String;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -16,10 +14,6 @@ pub enum FindCondition {
 pub trait Trace {
     fn id(&self) -> &TraceId;
     fn filename(&self) -> &str;
-    fn load(path: &Path) -> Result<Self, String>
-    where
-        Self: Sized;
-    fn unload(&mut self);
     fn step(&mut self, steps: usize) -> Result<(), String>;
     fn signal_value(&self, name: &str, offset: usize) -> Result<ScalarValue, String>;
     fn signal_width(&self, name: &str) -> Result<usize, String>;

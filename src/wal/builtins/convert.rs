@@ -5,21 +5,8 @@
 use crate::wal::ast::{Value, Operator};
 use crate::wal::eval::{Environment, Dispatcher, Evaluator};
 
-fn op_convert(args: &[Value], _env: &mut Environment, _eval: &mut Evaluator) -> Result<Value, String> {
-    ensure_arity_atleast(args, 2)?;
-    let input = extract_string(&args[0])?;
-    let output = extract_string(&args[1])?;
-
-    // Get optional compression option
-    let compression = if args.len() > 2 {
-        extract_string(&args[2])?
-    } else {
-        "lz4".to_string()
-    };
-
-    // TODO: integrate with convert/pipeline.rs
-    // For now, just return success
-    Ok(Value::String(format!("converted {} -> {} ({})", input, output, compression)))
+fn op_convert(_args: &[Value], _env: &mut Environment, _eval: &mut Evaluator) -> Result<Value, String> {
+    Err("convert: not yet implemented".to_string())
 }
 
 fn ensure_arity_atleast(args: &[Value], min: usize) -> Result<(), String> {

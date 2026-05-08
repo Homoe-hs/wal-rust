@@ -95,16 +95,27 @@ fn op_map(args: &[Value], _env: &mut Environment, eval: &mut Evaluator) -> Resul
             Value::Closure(c) => {
                 eval.eval_closure(c.clone(), &[item.clone()])?
             }
-            Value::Symbol(s) if Operator::from_str(&s.name).is_some() => {
-                let op = Operator::from_str(&s.name).unwrap();
-                let quoted = Value::List(WList::from_vec(vec![
-                    Value::Symbol(crate::wal::ast::Symbol::new("quote")),
-                    item.clone()
-                ]));
-                let expr = Value::List(WList::from_vec(vec![Value::Symbol(crate::wal::ast::Symbol::new(op.as_str())), quoted]));
-                eval.eval_value_public(expr)?
+            Value::Symbol(s) => {
+                if let Some(op) = Operator::from_str(&s.name) {
+                    let quoted = Value::List(WList::from_vec(vec![
+                        Value::Symbol(crate::wal::ast::Symbol::new("quote")),
+                        item.clone()
+                    ]));
+                    let expr = Value::List(WList::from_vec(vec![Value::Symbol(crate::wal::ast::Symbol::new(op.as_str())), quoted]));
+                    eval.eval_value_public(expr)?
+                } else {
+                    let quoted = Value::List(WList::from_vec(vec![
+                        Value::Symbol(crate::wal::ast::Symbol::new("quote")),
+                        item.clone()
+                    ]));
+                    let func = eval.eval_value_public(args[0].clone())?;
+                    match func {
+                        Value::Closure(c) => eval.eval_closure(c, &[quoted])?,
+                        _ => return Err("map: first argument must be a function or operator".to_string()),
+                    }
+                }
             }
-            Value::List(_) | Value::Symbol(_) => {
+            Value::List(_) => {
                 let quoted = Value::List(WList::from_vec(vec![
                     Value::Symbol(crate::wal::ast::Symbol::new("quote")),
                     item.clone()
@@ -201,24 +212,41 @@ fn op_fold(args: &[Value], _env: &mut Environment, eval: &mut Evaluator) -> Resu
     let mut acc = acc_init;
     for item in &list {
         match &args[0] {
-            Value::Symbol(s) if Operator::from_str(&s.name).is_some() => {
-                let op = Operator::from_str(&s.name).unwrap();
-                let quoted_acc = Value::List(WList::from_vec(vec![
-                    Value::Symbol(crate::wal::ast::Symbol::new("quote")),
-                    acc.clone()
-                ]));
-                let quoted_item = Value::List(WList::from_vec(vec![
-                    Value::Symbol(crate::wal::ast::Symbol::new("quote")),
-                    item.clone()
-                ]));
-                let expr = Value::List(WList::from_vec(vec![
-                    Value::Symbol(crate::wal::ast::Symbol::new(op.as_str())),
-                    quoted_acc,
-                    quoted_item
-                ]));
-                acc = eval.eval_value_public(expr)?;
+            Value::Symbol(s) => {
+                if let Some(op) = Operator::from_str(&s.name) {
+                    let quoted_acc = Value::List(WList::from_vec(vec![
+                        Value::Symbol(crate::wal::ast::Symbol::new("quote")),
+                        acc.clone()
+                    ]));
+                    let quoted_item = Value::List(WList::from_vec(vec![
+                        Value::Symbol(crate::wal::ast::Symbol::new("quote")),
+                        item.clone()
+                    ]));
+                    let expr = Value::List(WList::from_vec(vec![
+                        Value::Symbol(crate::wal::ast::Symbol::new(op.as_str())),
+                        quoted_acc,
+                        quoted_item
+                    ]));
+                    acc = eval.eval_value_public(expr)?;
+                } else {
+                    let func = eval.eval_value_public(args[0].clone())?;
+                    match func {
+                        Value::Closure(c) => {
+                            let quoted_acc = Value::List(WList::from_vec(vec![
+                                Value::Symbol(crate::wal::ast::Symbol::new("quote")),
+                                acc.clone()
+                            ]));
+                            let quoted_item = Value::List(WList::from_vec(vec![
+                                Value::Symbol(crate::wal::ast::Symbol::new("quote")),
+                                item.clone()
+                            ]));
+                            acc = eval.eval_closure(c, &[quoted_acc, quoted_item])?;
+                        }
+                        _ => return Err("fold: first argument must be a function".to_string()),
+                    }
+                }
             }
-            Value::List(_) | Value::Symbol(_) => {
+            Value::List(_) => {
                 let func = eval.eval_value_public(args[0].clone())?;
                 let quoted_acc = Value::List(WList::from_vec(vec![
                     Value::Symbol(crate::wal::ast::Symbol::new("quote")),

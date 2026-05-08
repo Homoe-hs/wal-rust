@@ -238,7 +238,7 @@ impl Operator {
             "unquote" => Some(Operator::Unquote),
             "eval" => Some(Operator::Eval),
             "parse" => Some(Operator::Parse),
-            "rel_eval" | "@" => Some(Operator::RelEval),
+            "rel_eval" | "reval" | "@" => Some(Operator::RelEval),
             "slice" => Some(Operator::Slice),
             "get" => Some(Operator::Get),
             "call" => Some(Operator::Call),
@@ -323,24 +323,6 @@ impl Operator {
 
             _ => None,
         }
-    }
-
-    pub fn is_special_form(&self) -> bool {
-        matches!(
-            self,
-            Operator::Define
-                | Operator::Set
-                | Operator::Let
-                | Operator::If
-                | Operator::While
-                | Operator::Fn
-                | Operator::Defmacro
-                | Operator::Quote
-                | Operator::Quasiquote
-                | Operator::Unquote
-                | Operator::Do
-                | Operator::Case
-        )
     }
 
     pub fn as_str(&self) -> &'static str {

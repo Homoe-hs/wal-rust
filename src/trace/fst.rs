@@ -388,17 +388,6 @@ impl Trace for FstTrace {
     fn id(&self) -> &TraceId { &self.id }
     fn filename(&self) -> &str { &self.filename }
 
-    fn load(path: &Path) -> Result<Self, String> where Self: Sized {
-        Self::load(path, "default".to_string())
-    }
-
-    fn unload(&mut self) {
-        self.timestamps.clear();
-        self.block_index.clear();
-        self.block_cache.borrow_mut().clear();
-        self.value_cache.borrow_mut().clear();
-    }
-
     fn step(&mut self, steps: usize) -> Result<(), String> {
         let new_index = self.current_index.saturating_add(steps);
         if new_index > self.max_index {
