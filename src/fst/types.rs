@@ -78,10 +78,10 @@ impl Default for FstHeader {
 }
 
 fn chrono_lite_date() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{SystemTime, UNIX_EPOCH, Duration};
     let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap()
+        .unwrap_or(Duration::ZERO)
         .as_secs();
     let days = secs / 86400;
     let year = 1970 + days / 365;

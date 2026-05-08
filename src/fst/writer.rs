@@ -189,7 +189,7 @@ impl<W: Write> FstWriter<W> {
 
         // Check if block is full
         if self.current_block_data.len() >= self.opts.block_size {
-            self.flush_block().unwrap();
+            self.flush_block().unwrap_or(());
         }
     }
 

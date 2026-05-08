@@ -181,8 +181,10 @@ impl<R: Read + Seek> FstReader<R> {
                 0x07 => self.read_hier_lz4duo_block(block_len),
                 0xFE => self.read_zwrapper_block(block_len),
                 _ => {
-                    let p = self.reader.stream_position()?;
-                    self.reader.seek(SeekFrom::Start(p + 1))?;
+                    // Unknown block type: skip the full block body to maintain stream sync
+                    if block_len > 0 {
+                        self.reader.seek(SeekFrom::Current(block_len as i64))?;
+                    }
                     Ok(())
                 }
             };
@@ -403,6 +405,7 @@ impl<R: Read + Seek> FstReader<R> {
     }
 
     fn read_u32_from_slice(&self, data: &[u8]) -> u32 {
+        if data.len() < 4 { return 0; }
         let buf: [u8; 4] = data[..4].try_into().unwrap();
         if self.big_endian {
             u32::from_be_bytes(buf)
@@ -692,10 +695,9 @@ impl<R: Read + Seek> FstReader<R> {
                     pos += consumed;
                     if pos >= data.len() { break; }
 
-                    // Validate: compact alias artifacts have mostly non-printable names
+                    // Validate: skip entries where name is >50% non-printable control chars
                     let printable = name.chars().filter(|c| c.is_ascii_graphic() || *c == ' ').count();
-                    if printable < name.len().saturating_sub(1) {
-                        // Skip the remaining varint data (width + alias) before continue
+                    if printable < name.len().saturating_sub(3) {
                         let (_w, c) = match decode_varint(&data[pos..]) { Some(v) => v, None => break };
                         pos += c;
                         if pos >= data.len() { break; }
@@ -720,28 +722,33 @@ impl<R: Read + Seek> FstReader<R> {
                     pos += consumed;
 
                     // Validate signal: name should be readable ASCII text
-                    let is_valid = if alias > 0 && name.len() <= 3 {
-                        // Aliases with very short names are likely compact encoding artifacts
+                    // Compact aliases (alias > 0, short names) from vcd2fst are accepted
+                    // with a placeholder name so signal count stays accurate.
+                    let is_valid = if name.is_empty() {
                         false
-                    } else if name.is_empty() {
-                        false
-                    } else if !name.is_ascii() {
-                        // Non-ASCII names are suspicious but could be valid — require stronger validation
-                        let printable = name.chars().filter(|c| c.is_ascii_graphic() || *c == ' ').count();
-                        printable >= name.len().saturating_sub(2)
                     } else if name.chars().all(|c| c.is_ascii_control()) {
                         false
+                    } else if alias > 0 && name.len() <= 3 {
+                        // Compact alias from vcd2fst: accept with placeholder name
+                        true
+                    } else if !name.is_ascii() {
+                        let printable = name.chars().filter(|c| c.is_ascii_graphic() || *c == ' ').count();
+                        printable >= name.len().saturating_sub(2)
                     } else {
-                        // At least 50% of the name should be printable non-control chars
                         let printable = name.chars().filter(|c| c.is_ascii_graphic() || *c == ' ').count();
                         printable >= name.len().saturating_sub(3)
                     };
 
                     if is_valid {
-                        // Primary signal (non-alias) with valid name
+                        let final_name = if alias > 0 && name.len() <= 3 {
+                            // Compact alias: generate placeholder referencing parent
+                            format!("@alias_{}", alias)
+                        } else {
+                            name
+                        };
                         self.file.signals.push(SignalDecl {
                             handle: self.file.signals.len() as u32,
-                            name,
+                            name: final_name,
                             width: width as u32,
                             var_type: VarType::from_u8(code),
                             direction,
