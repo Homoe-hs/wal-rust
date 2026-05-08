@@ -170,6 +170,7 @@ pub struct SignalDecl {
     pub name: String,
     pub width: u32,
     pub var_type: VarType,
+    pub direction: u8,
 }
 
 /// Compression algorithm selection

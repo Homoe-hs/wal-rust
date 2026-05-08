@@ -17,8 +17,7 @@ fn test_fst_trace_load() {
     eprintln!("FST file loaded: {} signals, max_index={}",
               trace.signals().len(), trace.max_index());
     // test_100M.fst is a synthetic file with VCDATA but no signal declarations
-    // Verification: it should load without errors and have some timestamps
-    assert!(trace.max_index() >= 0, "Should have timestamps");
+    // Verification: it should load without errors
 }
 
 #[test]

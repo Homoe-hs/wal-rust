@@ -307,6 +307,7 @@ impl<R: Read + Seek> FstReader<R> {
                     name,
                     width,
                     var_type,
+                    direction: 0,
                 });
             }
         }
@@ -327,21 +328,15 @@ impl<R: Read + Seek> FstReader<R> {
             return Ok(());
         }
         let comp = &body[16..];
-        let decomp = if remaining < 5000 && comp[0] == 0x78 {
+        if remaining < 5000 && comp[0] == 0x78 {
             use flate2::read::ZlibDecoder;
             use std::io::Read;
             let mut decoder = ZlibDecoder::new(comp);
-            let mut output = Vec::new();
-            if decoder.read_to_end(&mut output).is_ok() {
-                output
-            } else {
+            let mut _output = Vec::new();
+            if decoder.read_to_end(&mut _output).is_err() {
                 return Ok(());
             }
-        } else {
-            comp.to_vec()
-        };
-        // Parse varint signal lengths (for verification only)
-        // Signal names come from the gzip HIER data following the GEOM
+        }
         Ok(())
     }
 
@@ -396,6 +391,7 @@ impl<R: Read + Seek> FstReader<R> {
         }
     }
 
+    #[allow(dead_code)]
     fn read_u32(&mut self) -> io::Result<u32> {
         let mut buf = [0u8; 4];
         self.reader.read_exact(&mut buf)?;
@@ -606,7 +602,7 @@ impl<R: Read + Seek> FstReader<R> {
                 break;
             }
             let var_type = data[pos];
-            let _direction = data[pos + 1];
+            let direction = data[pos + 1];
             let width = self.read_u32_from_slice(&data[pos + 2..]);
             pos += 6;
 
@@ -615,6 +611,7 @@ impl<R: Read + Seek> FstReader<R> {
                 name,
                 width,
                 var_type: VarType::from_u8(var_type),
+                direction,
             });
         }
     }
@@ -639,7 +636,6 @@ impl<R: Read + Seek> FstReader<R> {
     fn parse_hier_data(&mut self, data: &[u8]) -> io::Result<()> {
         let mut pos = 0;
         let mut scope_stack: Vec<usize> = Vec::new();
-        let signals_before = self.file.signals.len();
         let mut unknown_skip_count = 0;
 
         while pos < data.len() && unknown_skip_count < 500 {
@@ -727,10 +723,12 @@ impl<R: Read + Seek> FstReader<R> {
                     let is_valid = if alias > 0 && name.len() <= 3 {
                         // Aliases with very short names are likely compact encoding artifacts
                         false
-                    } else if name.len() < 1 {
+                    } else if name.is_empty() {
                         false
                     } else if !name.is_ascii() {
-                        false
+                        // Non-ASCII names are suspicious but could be valid — require stronger validation
+                        let printable = name.chars().filter(|c| c.is_ascii_graphic() || *c == ' ').count();
+                        printable >= name.len().saturating_sub(2)
                     } else if name.chars().all(|c| c.is_ascii_control()) {
                         false
                     } else {
@@ -746,6 +744,7 @@ impl<R: Read + Seek> FstReader<R> {
                             name,
                             width: width as u32,
                             var_type: VarType::from_u8(code),
+                            direction,
                         });
                     }
                 }
@@ -803,6 +802,7 @@ impl<R: Read + Seek> FstReader<R> {
         Ok(())
     }
 
+    #[allow(dead_code)]
     fn read_cstring(&mut self) -> io::Result<String> {
         let mut buf = Vec::new();
         loop {

@@ -331,23 +331,28 @@ wal-rust/
 ├── src/
 │   ├── main.rs              # CLI entry (auto-detect expr/file/repl)
 │   ├── cli.rs               # clap argument parsing
+│   ├── lib.rs               # Crate library root, re-exports
 │   ├── wal/                 # WAL language core
-│   │   ├── ast/             # Operator, Value, Symbol, WList, Closure, Macro
+│   │   ├── ast/             # Operator (128 variants), Value, Symbol, WList, Closure, Macro
+│   │   ├── lexer/           # Tokenizer: Token, TokenKind (27 variants), Position
 │   │   ├── parser/          # WalParser (tree-sitter + @/#/~ transforms)
-│   │   ├── eval/            # Evaluator, Environment (Rc<RefCell>), Dispatcher
-│   │   ├── builtins/        # 82 operators across 12 modules
+│   │   ├── eval/            # Evaluator, Environment (Rc<RefCell>), Dispatcher, SemanticChecker
+│   │   ├── builtins/        # 128 operators across 12 modules
 │   │   └── repl/            # Interactive REPL (rustyline)
 │   ├── vcd/                 # VCD parsing
-│   │   ├── reader.rs        # MmapReader (madvise + memchr + zero-copy)
-│   │   ├── parser.rs        # MmapVcdParser
+│   │   ├── reader.rs        # MmapReader (madvise + memchr + zero-copy + compression detection)
+│   │   ├── parser.rs        # MmapVcdParser + VcdParser
 │   │   └── types.rs         # VcdEvent, VcdValue
 │   ├── fst/                 # FST read/write
 │   │   ├── reader.rs        # FstReader (LE/BE auto-detect, Icarus HIER)
 │   │   ├── writer.rs        # FstWriter (blocks, varint, compress)
-│   │   └── types.rs         # BlockType, FstHeader
+│   │   ├── blocks.rs        # FST block types and parsing
+│   │   ├── compress.rs      # Compression/decompression (gzip, zlib, LZ4)
+│   │   ├── varint.rs        # Variable-length integer encoding/decoding
+│   │   └── types.rs         # FstHeader, ScopeType, VarType, SignalDecl
 │   └── trace/               # Waveform interface
-│       ├── trace.rs          # Trace trait, ScalarValue, FindCondition
-│       ├── container.rs     # TraceContainer (Arc<RwLock<>>)
+│       ├── trace.rs          # Trace trait, ScalarValue, FindCondition, TraceId
+│       ├── container.rs     # TraceContainer, SharedTraceContainer (Arc<RwLock<>>)
 │       ├── vcd.rs           # VcdTrace (parallel two-pass + sparse index + LRU)
 │       └── fst.rs           # FstTrace (on-demand block decompress + LRU)
 ├── tree-sitter-wal/         # WAL grammar

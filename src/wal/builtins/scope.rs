@@ -198,13 +198,6 @@ fn ensure_arity_atleast(args: &[Value], min: usize) -> Result<(), String> {
     Ok(())
 }
 
-fn extract_symbol(v: &Value) -> Result<String, String> {
-    match v {
-        Value::Symbol(s) => Ok(s.name.clone()),
-        _ => Err("Expected symbol".to_string()),
-    }
-}
-
 fn extract_name(v: &Value) -> Result<String, String> {
     match v {
         Value::Symbol(s) => Ok(s.name.clone()),

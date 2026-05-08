@@ -122,6 +122,7 @@ impl<W: Write> FstWriter<W> {
             name: full_name,
             width,
             var_type: vartype,
+            direction: 0,
         });
 
         handle

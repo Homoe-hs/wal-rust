@@ -44,6 +44,7 @@ impl Evaluator {
 }
 
 /// Collect all top-level expression nodes from the parse tree
+#[allow(dead_code)]
 fn collect_top_level_sexprs(node: tree_sitter::Node) -> Vec<tree_sitter::Node> {
     let mut result = Vec::new();
     let kind = node.kind();
@@ -244,8 +245,6 @@ impl Evaluator {
                         return self.eval_in_scope(&rest);
                     } else if op == Operator::InScopes {
                         return self.eval_in_scopes(&rest);
-                    } else if op == Operator::InGroup {
-                        return self.eval_in_group(&rest);
                     } else if op == Operator::InGroups {
                         return self.eval_in_groups(&rest);
                     } else if op == Operator::Let {

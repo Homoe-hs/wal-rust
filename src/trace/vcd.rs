@@ -41,6 +41,9 @@ pub struct VcdTrace {
     reader: RefCell<crate::vcd::reader::MmapReader>,
     header_end_offset: u64,
 
+    // Scopes
+    scopes: Vec<String>,
+
     // Runtime
     current_index: usize,
     max_index: usize,
@@ -67,6 +70,7 @@ impl VcdTrace {
 
         // Track $scope / $upscope for hierarchical signal names
         let mut scope_stack: Vec<String> = Vec::new();
+        let mut scopes: Vec<String> = Vec::new();
 
         loop {
             let line_offset = reader.current_offset();
@@ -93,6 +97,7 @@ impl VcdTrace {
                     // $scope module name $end → push scope name
                     if let Some(scope_name) = parse_scope_name(line) {
                         scope_stack.push(scope_name);
+                        scopes.push(scope_stack.join("."));
                     }
                 } else if line.starts_with(b"$upscope") {
                     scope_stack.pop();
@@ -169,10 +174,9 @@ impl VcdTrace {
                             lp += 1; // skip newline
                             end
                         }
-                        None => {
-                            lp = chunk.len();
-                            break;
-                        }
+                    None => {
+                        break;
+                    }
                     };
                     let line = &chunk[line_start..line_end];
                     if line.is_empty() { continue; }
@@ -235,6 +239,7 @@ impl VcdTrace {
             )),
             reader: RefCell::new(reader),
             header_end_offset,
+            scopes,
             current_index: 0, max_index,
         })
     }
@@ -530,7 +535,7 @@ impl Trace for VcdTrace {
     }
 
     fn scopes(&self) -> Vec<String> {
-        Vec::new()
+        self.scopes.clone()
     }
 
     fn max_index(&self) -> usize {

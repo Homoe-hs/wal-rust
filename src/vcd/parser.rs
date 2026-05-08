@@ -172,7 +172,8 @@ impl<R: Read> VcdParser<R> {
         let width = parts[2].parse().unwrap_or(1);
         let id = parts[3].to_string();
 
-        let name_start = line.find(parts[3]).unwrap() + parts[3].len();
+        let id_pos = line.find(parts[3]).unwrap_or(0);
+        let name_start = id_pos + parts[3].len();
         let name_end = line.rfind("$end").unwrap_or(line.len());
         let name = line[name_start..name_end].trim().to_string();
 

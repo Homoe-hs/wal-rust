@@ -54,8 +54,6 @@ fn eval_wal_expr(code: &str, load: &[PathBuf]) -> Result<(), String> {
 }
 
 fn run_wal_file(path: &Path, load: &[PathBuf], code: Option<&str>) -> Result<(), String> {
-    use wal::eval::Evaluator;
-
     let mut eval = init_eval_with_load(load)?;
 
     // Execute code expression if provided (overrides file)

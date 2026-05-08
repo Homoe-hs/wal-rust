@@ -107,11 +107,18 @@ impl TraceContainer {
     }
 
     pub fn find_indices(&self, name: &str, cond: FindCondition) -> Result<Vec<usize>, String> {
-        if let Some(trace) = self.first_trace() {
-            trace.find_indices(name, cond)
-        } else {
-            Err("No traces loaded".to_string())
+        let mut all_indices = Vec::new();
+        for trace in self.traces_iter() {
+            if let Ok(indices) = trace.find_indices(name, cond.clone()) {
+                all_indices.extend(indices);
+            }
         }
+        if all_indices.is_empty() && !self.traces.is_empty() {
+            return Err(format!("signal '{}' not found in any loaded trace", name));
+        }
+        all_indices.sort();
+        all_indices.dedup();
+        Ok(all_indices)
     }
 }
 
