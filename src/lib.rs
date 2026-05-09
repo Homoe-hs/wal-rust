@@ -13,5 +13,4 @@ pub mod wal;
 pub mod trace;
 
 pub use cli::Args;
-pub use vcd::{VcdError, VcdEvent, VcdParser};
 pub use fst::{FstWriter, FstOptions, Compression};

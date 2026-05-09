@@ -10,13 +10,13 @@ use std::io::Read;
 pub struct VcdParser<R: Read> {
     reader: LineReader<R>,
     state: ParserState,
-    /// Current scope stack
+    // Current scope stack
     scopes: Vec<String>,
-    /// Known signal IDs
+    // Known signal IDs
     signal_ids: Vec<String>,
-    /// Last timestamp
+    // Last timestamp
     last_timestamp: u64,
-    /// Line buffer for multi-line constructs
+    // Line buffer for multi-line constructs
     #[allow(dead_code)]
     line_buf: String,
 }
@@ -221,7 +221,7 @@ impl<R: Read> VcdParser<R> {
 
     /// Parse a line in dump state (implementation)
     #[inline]
-    fn parse_dump_line_impl(&mut self, line_num: usize, line: &str) -> Option<Result<VcdEvent, VcdError>> {
+    fn parse_dump_line_impl(&mut self, _line_num: usize, line: &str) -> Option<Result<VcdEvent, VcdError>> {
         if line.is_empty() {
             return None;
         }
@@ -240,76 +240,30 @@ impl<R: Read> VcdParser<R> {
             } else if line.starts_with("$dumpon") {
                 return Some(Ok(VcdEvent::DumpOn));
             } else if line.starts_with("$dumpall") {
-                return None;
+                return Some(Ok(VcdEvent::DumpAll));
             }
         } else if first_char == b'b' || first_char == b'r' {
-            return Some(self.parse_vector_change_impl(line_num, line, first_char as char));
-        } else if first_char == b'0' || first_char == b'1' || first_char == b'x' || first_char == b'z' || first_char == b'X' || first_char == b'Z' {
-            return Some(self.parse_scalar_change_impl(line_num, line, first_char as char));
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() >= 2 {
+                let signal_num = parse_signal_number_fast(parts[1]);
+                let value = if first_char == b'r' {
+                    VcdValue::parse_real(&parts[0][1..])
+                } else {
+                    VcdValue::parse_vector(&parts[0][1..])
+                };
+                if let Some(v) = value {
+                    return Some(Ok(VcdEvent::ValueChange { id: signal_num, value: v }));
+                }
+            }
+        } else if matches!(first_char, b'0' | b'1' | b'x' | b'X' | b'z' | b'Z' | b'u' | b'U' | b'w' | b'W' | b'l' | b'L' | b'-') {
+            let id_str = &line[1..];
+            let signal_num = parse_signal_number_fast(id_str);
+            if let Some(v) = VcdValue::parse_scalar(first_char as char) {
+                return Some(Ok(VcdEvent::ValueChange { id: signal_num, value: v }));
+            }
         }
 
         None
-    }
-
-    /// Parse a vector value change (implementation)
-    fn parse_vector_change_impl(&mut self, line_num: usize, line: &str, prefix: char) -> Result<VcdEvent, VcdError> {
-        let parts: Vec<&str> = line.split_whitespace().collect();
-
-        if parts.len() < 2 {
-            return Err(VcdError {
-                line: line_num,
-                column: 0,
-                kind: ErrorKind::UnexpectedChar {
-                    found: ' ',
-                    expected: "vector value and signal id",
-                },
-                help: None,
-            });
-        }
-
-        let value_str = &parts[0][1..];
-        let signal_num = parse_signal_number_fast(parts[1]);
-
-        let value = if prefix == 'r' {
-            VcdValue::parse_real(value_str)
-        } else {
-            VcdValue::parse_vector(value_str)
-        };
-
-        match value {
-            Some(v) => Ok(VcdEvent::ValueChange { id: signal_num, value: v }),
-            None => Err(VcdError {
-                line: line_num,
-                column: 0,
-                kind: ErrorKind::InvalidTimestamp {
-                    value: value_str.to_string(),
-                },
-                help: Some(format!("Invalid {} value format", if prefix == 'r' { "real" } else { "vector" })),
-            }),
-        }
-    }
-
-    /// Parse a scalar value change (implementation)
-    #[inline]
-    fn parse_scalar_change_impl(&mut self, line_num: usize, line: &str, value_char: char) -> Result<VcdEvent, VcdError> {
-        // Fast path: for IDs like "s1", "s2", extract the number directly without allocating
-        // Line format: "0s1" or "1s123" etc. - value_char is the first char (0 or 1)
-        let id_str = &line[1..];
-        let signal_num = parse_signal_number_fast(id_str);
-        let value = VcdValue::parse_scalar(value_char);
-
-        match value {
-            Some(v) => Ok(VcdEvent::ValueChange { id: signal_num, value: v }),
-            None => Err(VcdError {
-                line: line_num,
-                column: 0,
-                kind: ErrorKind::UnexpectedChar {
-                    found: value_char,
-                    expected: "valid signal value (0, 1, x, z, X, Z)",
-                },
-                help: None,
-            }),
-        }
     }
 }
 
@@ -321,7 +275,6 @@ impl<R: Read> Iterator for VcdParser<R> {
     }
 }
 
-/// Parse a timescale string to exponent
 /// Examples:
 ///   "1 fs" -> -15
 ///   "1 ps" -> -12
@@ -650,7 +603,7 @@ impl MmapVcdParser {
 
     /// Parse a line in dump state (implementation)
     #[inline]
-    fn parse_dump_line_impl(&mut self, line_num: usize, line: &str) -> Option<Result<VcdEvent, VcdError>> {
+    fn parse_dump_line_impl(&mut self, _line_num: usize, line: &str) -> Option<Result<VcdEvent, VcdError>> {
         if line.is_empty() {
             return None;
         }
@@ -669,74 +622,25 @@ impl MmapVcdParser {
             } else if line.starts_with("$dumpon") {
                 return Some(Ok(VcdEvent::DumpOn));
             } else if line.starts_with("$dumpall") {
-                return None;
+                return Some(Ok(VcdEvent::DumpAll));
             }
         } else if first_char == b'b' || first_char == b'r' {
-            return Some(self.parse_vector_change_impl(line_num, line, first_char as char));
-        } else if first_char == b'0' || first_char == b'1' || first_char == b'x' || first_char == b'z' || first_char == b'X' || first_char == b'Z' {
-            return Some(self.parse_scalar_change_impl(line_num, line, first_char as char));
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() >= 2 {
+                let signal_num = parse_signal_number_fast(parts[1]);
+                if first_char == b'r' {
+                    return Some(Ok(VcdEvent::ValueChange { id: signal_num, value: VcdValue::parse_real(&parts[0][1..])? }));
+                } else {
+                    return Some(Ok(VcdEvent::ValueChange { id: signal_num, value: VcdValue::parse_vector(&parts[0][1..])? }));
+                }
+            }
+        } else if matches!(first_char, b'0' | b'1' | b'x' | b'X' | b'z' | b'Z' | b'u' | b'U' | b'w' | b'W' | b'l' | b'L' | b'-') {
+            let id_str = &line[1..];
+            let signal_num = parse_signal_number_fast(id_str);
+            return Some(Ok(VcdEvent::ValueChange { id: signal_num, value: VcdValue::parse_scalar(first_char as char)? }));
         }
 
         None
-    }
-
-    /// Parse a vector value change (implementation)
-    fn parse_vector_change_impl(&mut self, line_num: usize, line: &str, prefix: char) -> Result<VcdEvent, VcdError> {
-        let parts: Vec<&str> = line.split_whitespace().collect();
-
-        if parts.len() < 2 {
-            return Err(VcdError {
-                line: line_num,
-                column: 0,
-                kind: ErrorKind::UnexpectedChar {
-                    found: ' ',
-                    expected: "vector value and signal id",
-                },
-                help: None,
-            });
-        }
-
-        let value_str = &parts[0][1..];
-        let signal_num = parse_signal_number_fast(parts[1]);
-
-        let value = if prefix == 'r' {
-            VcdValue::parse_real(value_str)
-        } else {
-            VcdValue::parse_vector(value_str)
-        };
-
-        match value {
-            Some(v) => Ok(VcdEvent::ValueChange { id: signal_num, value: v }),
-            None => Err(VcdError {
-                line: line_num,
-                column: 0,
-                kind: ErrorKind::InvalidTimestamp {
-                    value: value_str.to_string(),
-                },
-                help: Some(format!("Invalid {} value format", if prefix == 'r' { "real" } else { "vector" })),
-            }),
-        }
-    }
-
-    /// Parse a scalar value change (implementation)
-    #[inline]
-    fn parse_scalar_change_impl(&mut self, line_num: usize, line: &str, value_char: char) -> Result<VcdEvent, VcdError> {
-        let id_str = &line[1..];
-        let signal_num = parse_signal_number_fast(id_str);
-        let value = VcdValue::parse_scalar(value_char);
-
-        match value {
-            Some(v) => Ok(VcdEvent::ValueChange { id: signal_num, value: v }),
-            None => Err(VcdError {
-                line: line_num,
-                column: 0,
-                kind: ErrorKind::UnexpectedChar {
-                    found: value_char,
-                    expected: "valid signal value (0, 1, x, z, X, Z)",
-                },
-                help: None,
-            }),
-        }
     }
 }
 

@@ -33,8 +33,6 @@ pub mod reader;
 pub mod types;
 
 #[allow(unused_imports)]
-pub use parser::{VcdParser, MmapVcdParser};
+pub use types::VcdError;
 #[allow(unused_imports)]
-pub use reader::FileInfo;
-#[allow(unused_imports)]
-pub use types::{VcdError, VcdEvent};
+pub use types::VcdEvent;

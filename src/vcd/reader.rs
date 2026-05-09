@@ -8,7 +8,6 @@ use std::path::Path;
 
 /// Compression format detection
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
 pub enum Compression {
     None,
     Gzip,
@@ -16,8 +15,6 @@ pub enum Compression {
 }
 
 impl Compression {
-    /// Detect compression from file extension
-    #[allow(dead_code)]
     pub fn from_extension(ext: &str) -> Option<Self> {
         match ext.to_lowercase().as_str() {
             "gz" => Some(Compression::Gzip),
@@ -46,34 +43,6 @@ pub fn detect_compression(path: &Path) -> Compression {
     }
 
     Compression::from_extension(ext).unwrap_or(Compression::None)
-}
-
-/// Open a file with automatic decompression
-#[allow(dead_code)]
-pub fn open(path: &Path) -> io::Result<Box<dyn Read>> {
-    let compression = detect_compression(path);
-
-    let file = File::open(path)?;
-    let reader: Box<dyn Read> = match compression {
-        Compression::None => Box::new(file),
-        Compression::Gzip => {
-            let decoder = flate2::read::GzDecoder::new(file);
-            Box::new(decoder)
-        }
-        Compression::Bzip2 => {
-            let decoder = bzip2::read::BzDecoder::new(file);
-            Box::new(decoder)
-        }
-    };
-
-    Ok(reader)
-}
-
-/// Create a buffered line reader from a file path
-#[allow(dead_code)]
-pub fn open_buffered(path: &Path) -> io::Result<BufReader<Box<dyn Read>>> {
-    let reader = open(path)?;
-    Ok(BufReader::with_capacity(8 * 1024, reader))
 }
 
 /// Line reader for VCD files
@@ -305,43 +274,6 @@ impl Seek for MmapReader {
         }
         self.pos = new_pos as usize;
         Ok(self.pos as u64)
-    }
-}
-
-/// Open a file with automatic decompression, or memory-map if uncompressed
-#[allow(dead_code)]
-pub fn open_mmap(path: &Path) -> io::Result<Box<dyn Read>> {
-    let compression = detect_compression(path);
-
-    match compression {
-        Compression::None => {
-            let mmap_reader = MmapReader::new(path)?;
-            Ok(Box::new(mmap_reader))
-        }
-        Compression::Gzip | Compression::Bzip2 => {
-            let reader = open(path)?;
-            Ok(reader)
-        }
-    }
-}
-
-/// File metadata
-#[allow(dead_code)]
-pub struct FileInfo {
-    pub path: String,
-    pub size: u64,
-    pub compression: Compression,
-}
-
-#[allow(dead_code)]
-impl FileInfo {
-    pub fn from_path(path: &Path) -> io::Result<Self> {
-        let metadata = std::fs::metadata(path)?;
-        Ok(Self {
-            path: path.to_string_lossy().to_string(),
-            size: metadata.len(),
-            compression: detect_compression(path),
-        })
     }
 }
 

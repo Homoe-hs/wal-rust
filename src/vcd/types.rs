@@ -107,6 +107,8 @@ pub enum VcdEvent {
     DumpOff,
     /// Dump on marker
     DumpOn,
+    /// Dump all marker
+    DumpAll,
     /// Comment (ignored)
     #[allow(dead_code)]
     Comment(String),

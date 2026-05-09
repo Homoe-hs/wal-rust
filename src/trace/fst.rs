@@ -137,25 +137,8 @@ impl FstTrace {
                         .map_err(|e| format!("Seek error: {}", e))?;
                 }
                 0xFE => {
-                    // ZWRAPPER contains compressed FST data — skip it entirely.
-                    // The inner data is already processed by FstReader.
-                    drop(reader);
-                    // Re-open file and seek past the entire ZWRAPPER block
-                    let mut f = std::fs::File::open(&self.filename)
-                        .map_err(|e| format!("Failed to reopen {}: {}", self.filename, e))?;
-                    // The 0xFE block_len includes the compressed data already consumed.
-                    // We don't know the exact position, so reopen from start and seek
-                    // to the end of the file (all ZWRAPPER data has been consumed).
-                    let file_len = f.seek(SeekFrom::End(0))
-                        .map_err(|e| format!("Seek error: {}", e))?;
-                    self.reader = RefCell::new(BufReader::with_capacity(
-                        1024 * 1024,
-                        std::fs::File::open(&self.filename)
-                            .map_err(|e| format!("Failed to reopen {}: {}", self.filename, e))?,
-                    ));
-                    reader = self.reader.borrow_mut();
-                    // Seek to end — there's nothing more to process after ZWRAPPER
-                    reader.seek(SeekFrom::Start(file_len)).ok();
+                    // ZWRAPPER: inner FST already processed by FstReader.
+                    // No more VCDATA blocks after ZWRAPPER — exit loop.
                     break;
                 }
                 _ => {
@@ -179,7 +162,10 @@ impl FstTrace {
     fn read_signal_value_at(&self, handle: u32, target_time: u64) -> Vec<u8> {
         let block_idx = match self.find_block(target_time) {
             Some(i) => i,
-            None => return vec![b'x'],
+            None => {
+                log::warn!("read_signal_value_at: target_time {} not in any block", target_time);
+                return vec![b'x'];
+            }
         };
 
         // Check block cache
@@ -194,12 +180,17 @@ impl FstTrace {
         let mut reader = self.reader.borrow_mut();
         let block = &self.block_index[block_idx];
 
-        if let Err(_) = reader.seek(SeekFrom::Start(block.file_offset)) {
+        if let Err(e) = reader.seek(SeekFrom::Start(block.file_offset)) {
+            log::warn!("read_signal_value_at: seek to block {} failed: {}", block_idx, e);
             return vec![b'x'];
         }
 
         let _time_begin = match decode_varint_from_reader(&mut *reader) {
-            Ok(t) => t, Err(_) => return vec![b'x'],
+            Ok(t) => t,
+            Err(e) => {
+                log::warn!("read_signal_value_at: decode time_begin failed: {}", e);
+                return vec![b'x'];
+            }
         };
         let _time_end = decode_varint_from_reader(&mut *reader).unwrap_or(0);
         let _mem_required = decode_varint_from_reader(&mut *reader).unwrap_or(0);
@@ -208,12 +199,18 @@ impl FstTrace {
 
         let compressed_data = match read_bytes(&mut *reader, compressed_len as usize) {
             Ok(d) => d,
-            Err(_) => return vec![b'x'],
+            Err(e) => {
+                log::warn!("read_signal_value_at: read compressed data failed: {}", e);
+                return vec![b'x'];
+            }
         };
 
         let decompressed = match lz4_flex::block::decompress_size_prepended(&compressed_data) {
             Ok(d) => d,
-            Err(_) => return vec![b'x'],
+            Err(e) => {
+                log::warn!("read_signal_value_at: LZ4 decompress block {} failed: {}", block_idx, e);
+                return vec![b'x'];
+            }
         };
 
         // Cache the decompressed block

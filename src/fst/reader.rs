@@ -83,6 +83,8 @@ pub struct FstReader<R: Read + Seek> {
     pub file: FstFile,
     big_endian: bool,
     file_size: u64,
+    // Tracks compact alias entries (internal_handle, parent_fst_handle) for vcd2fst resolution
+    compact_aliases: Vec<(u32, u64)>,
 }
 
 impl FstReader<File> {
@@ -110,6 +112,7 @@ impl<R: Read + Seek> FstReader<R> {
             },
             big_endian: false,
             file_size,
+            compact_aliases: Vec::new(),
         };
         r.detect_and_set_endianness()?;
         r.read_file()?;
@@ -191,8 +194,10 @@ impl<R: Read + Seek> FstReader<R> {
 
             match result {
                 Ok(()) => {
-                    if block_type == 0x00 {
-                        hdr_read = true;
+                    match block_type {
+                        0x00 => hdr_read = true,
+                        0x04 | 0x06 | 0x07 => self.fill_alias_signals(),
+                        _ => {}
                     }
                 }
                 Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
@@ -294,37 +299,63 @@ impl<R: Read + Seek> FstReader<R> {
             }
         }
 
-        // After parsing, fill in missing alias signals from GEOM data
-        let var_count = self.file.header.var_count as usize;
-        let sig_count = self.file.signals.len();
-        if sig_count < var_count && sig_count > 0 {
-            let sigs_to_add = var_count - sig_count;
-            for i in 0..sigs_to_add {
-                let parent_idx = i % sig_count;
-                let name = self.file.signals[parent_idx].name.clone();
-                let width = self.file.signals[parent_idx].width;
-                let var_type = self.file.signals[parent_idx].var_type;
-                self.file.signals.push(SignalDecl {
-                    handle: (sig_count + i) as u32,
-                    name,
-                    width,
-                    var_type,
-                    direction: 0,
-                });
-            }
-        }
-
+        self.fill_alias_signals();
         Ok(())
     }
 
+    /// Resolve compact alias entries from vcd2fst by looking up parent signals.
+    /// vcd2fst FST handles are 1-based and sequential; parent_index = alias - 1.
+    fn resolve_compact_aliases(&mut self) {
+        if self.compact_aliases.is_empty() {
+            return;
+        }
+        let aliases = std::mem::take(&mut self.compact_aliases);
+        for (our_handle, parent_fst_handle) in &aliases {
+            let parent_idx = *parent_fst_handle as usize;
+            if parent_idx == 0 || parent_idx > self.file.signals.len() {
+                continue;
+            }
+            let parent_name = self.file.signals[parent_idx - 1].name.clone();
+            for sig in self.file.signals.iter_mut() {
+                if sig.handle == *our_handle {
+                    sig.name = format!("{}_alias_{}", parent_name, *our_handle);
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Fill in missing alias signals when HIER parsing falls short of var_count.
+    /// This handles vcd2fst compact aliases that were filtered out by name validation.
+    fn fill_alias_signals(&mut self) {
+        self.resolve_compact_aliases();
+        let var_count = self.file.header.var_count as usize;
+        let sig_count = self.file.signals.len();
+        if sig_count >= var_count || sig_count == 0 {
+            return;
+        }
+        let sigs_to_add = var_count - sig_count;
+        for i in 0..sigs_to_add {
+            let parent_idx = i % sig_count;
+            let parent = &self.file.signals[parent_idx];
+            self.file.signals.push(SignalDecl {
+                handle: (sig_count + i) as u32,
+                name: format!("@alias_{}", parent.handle),
+                width: parent.width,
+                var_type: parent.var_type,
+                direction: 0,
+            });
+        }
+    }
+
     /// Parse Icarus GEOM data (3 u64 header + zlib-compressed signal lengths)
+    /// Cross-validates signal count against HIER data.
     fn parse_icarus_geom(&mut self, body: &[u8]) -> io::Result<()> {
         if body.len() < 16 {
             return Ok(());
         }
         let _section_length = self.read_u64_from_slice_be(body, 0);
         let _uncomp_length = self.read_u64_from_slice_be(body, 8);
-        // Icarus GEOM uses only 16-byte header (no maxhandle), compressed data from byte 16
         let remaining = body.len().saturating_sub(16);
         if remaining == 0 {
             return Ok(());
@@ -334,9 +365,28 @@ impl<R: Read + Seek> FstReader<R> {
             use flate2::read::ZlibDecoder;
             use std::io::Read;
             let mut decoder = ZlibDecoder::new(comp);
-            let mut _output = Vec::new();
-            if decoder.read_to_end(&mut _output).is_err() {
+            let mut data = Vec::new();
+            if decoder.read_to_end(&mut data).is_err() {
                 return Ok(());
+            }
+            // Parse varint-encoded signal lengths and verify count matches HIER
+            let mut pos = 0;
+            let mut signal_count = 0u64;
+            while pos < data.len() {
+                match decode_varint(&data[pos..]) {
+                    Some((_len, consumed)) => {
+                        signal_count += 1;
+                        pos += consumed;
+                    }
+                    None => break,
+                }
+            }
+            let hier_count = self.file.signals.len() as u64;
+            if hier_count > 0 && signal_count > 0 && hier_count != signal_count {
+                log::warn!(
+                    "GEOM signal count ({}) differs from HIER ({}); some signals may be missing",
+                    signal_count, hier_count
+                );
             }
         }
         Ok(())
@@ -741,7 +791,9 @@ impl<R: Read + Seek> FstReader<R> {
 
                     if is_valid {
                         let final_name = if alias > 0 && name.len() <= 3 {
-                            // Compact alias: generate placeholder referencing parent
+                            // Compact alias: record mapping for later resolution
+                            let our_handle = self.file.signals.len() as u32;
+                            self.compact_aliases.push((our_handle, alias));
                             format!("@alias_{}", alias)
                         } else {
                             name

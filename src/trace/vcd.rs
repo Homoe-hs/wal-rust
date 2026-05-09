@@ -378,7 +378,6 @@ fn parse_var_decl_fast(line: &[u8]) -> Option<(u64, String, usize)> {
         if part >= 6 { break; }
     }
     if part < 5 {
-        eprintln!("[VCD DEBUG] parse_var_decl: only {} fields, line={:?}", part, std::str::from_utf8(line).unwrap_or("?"));
         return None;
     }
 
@@ -391,7 +390,6 @@ fn parse_var_decl_fast(line: &[u8]) -> Option<(u64, String, usize)> {
         w
     };
     if width == 0 {
-        eprintln!("[VCD DEBUG] parse_var_decl: zero width, line={:?}", std::str::from_utf8(line).unwrap_or("?"));
         return None;
     }
 
@@ -400,11 +398,11 @@ fn parse_var_decl_fast(line: &[u8]) -> Option<(u64, String, usize)> {
     let id_end = line[id_start..].iter().position(|&b| b == b' ').map(|p| id_start + p).unwrap_or(line.len());
     let sig_hash = hash_sig_id(&line[id_start..id_end]);
 
-    // Name: from parts[4] to $end
+    // Name: from parts[4] to $end (spaces are valid in signal names)
     let name_start = parts[4];
-    let name_end = line[name_start..].iter().position(|&b| b == b' ' || b == b'$').map(|p| name_start + p).unwrap_or(line.len());
+    let name_end = line[name_start..].iter().position(|&b| b == b'$').map(|p| name_start + p).unwrap_or(line.len());
     let name_str = std::str::from_utf8(&line[name_start..name_end]).ok()?;
-    let name = name_str.to_string();
+    let name = name_str.trim().to_string();
 
     Some((sig_hash, name, width))
 }
