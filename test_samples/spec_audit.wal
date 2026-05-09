@@ -1,0 +1,252 @@
+;; ================================================================
+;; WAL Specification Audit v0.8.2
+;; Tests every documented feature from wal-lang.org/documentation
+;; and marks compliance status.
+;;
+;; Each test outputs a structured result:
+;;   [SECTION.ITEM] PASS|FAIL|INFO <details>
+;;
+;; Run on original WAL:  /tmp/wal-env/bin/wal test_samples/spec_audit.wal
+;; Run on wal-rust:      wal-rust test_samples/spec_audit.wal
+;; ================================================================
+
+(print "WAL_SPEC_AUDIT v0.8.2")
+(print "")
+
+;; ---------- Test harness ----------
+(defun check [tag expected actual]
+  (if (= expected actual)
+    (print tag " PASS")
+    (print tag " FAIL: expected " expected ", got " actual)))
+
+(defun info xs
+  (print (first xs) " INFO: " (rest xs)))
+
+(print "=== 1. Core Language ===")
+(print "")
+
+;; --- 1.1 Arithmetic (doc: +, -, *, /, **, floor, ceil, round) ---
+(print "-- 1.1 Arithmetic --")
+(check "1.1.1" 6 (+ 1 2 3))
+(check "1.1.2" 7 (- 10 3))
+(check "1.1.3" 24 (* 2 3 4))
+(check "1.1.4" 1 (mod 10 3))
+(info "1.1.5" "(/ 10 3): " (/ 10 3))
+(check "1.1.6" 1024 (** 2 10))
+(info "1.1.7" "floor 3.7: " (floor 3.7))
+(info "1.1.8" "ceil 3.2: " (ceil 3.2))
+(info "1.1.9" "round 3.5: " (round 3.5))
+
+;; --- 1.2 Logic and Comparisons (doc: !, &&, ||, =, !=, >, <, >=, <=) ---
+(print "-- 1.2 Logic & Comparisons --")
+(check "1.2.1" #t (! #f))
+(check "1.2.2" #f (! #t))
+(check "1.2.3" #t (&& #t #t #t))
+(check "1.2.4" #f (&& #t #t #f))
+(check "1.2.5" #t (|| #f #f #t))
+(check "1.2.6" #f (|| #f #f #f))
+(check "1.2.7" #t (= 5 5))
+(check "1.2.8" #f (= 5 3))
+(check "1.2.9" #t (!= 5 3))
+(check "1.2.10" #t (> 5 3))
+(check "1.2.11" #t (< 3 5))
+(check "1.2.12" #t (>= 5 5))
+(check "1.2.13" #t (<= 3 5))
+;; = supports lists per spec
+(check "1.2.14" #t (= '(1 2) '(1 2)))
+(check "1.2.15" #f (= '(1 2) '(1 3)))
+(check "1.2.16" #t (= "abc" "abc"))
+
+;; --- 1.3 Program State (doc: let, define, set!) ---
+(print "-- 1.3 Program State --")
+(check "1.3.1" 30 (let ([x 10] [y 20]) (+ x y)))
+(define x42 42)
+(check "1.3.2" 42 x42)
+;; define returns the bound value (per spec)
+(define x42b (define x42c 42))
+(check "1.3.3" 42 x42b)
+(set! x42 100)
+(check "1.3.4" 100 x42)
+
+;; --- 1.4 Functions (doc: defun, fn, closures, variadic) ---
+(print "-- 1.4 Functions --")
+(defun sq [n] (* n n))
+(check "1.4.1" 25 (sq 5))
+
+;; Variadic
+(defun sum-all xs (fold + 0 xs))
+(check "1.4.2" 10 (sum-all 1 2 3 4))
+
+;; Anonymous
+(check "1.4.3" 3 ((fn [a b] (+ a b)) 1 2))
+
+;; Closures
+(defun make-adder [n] (fn [x] (+ x n)))
+(define add5 (make-adder 5))
+(check "1.4.4" 8 (add5 3))
+
+;; --- 1.5 Control Flow (doc: do, when, unless, if, cond, case) ---
+(print "-- 1.5 Control Flow --")
+(check "1.5.1" 3 (do 1 2 3))
+(check "1.5.2" "yes" (if #t "yes" "no"))
+(check "1.5.3" "no" (if #f "yes" "no"))
+;; 0 is falsy per spec
+(check "1.5.4" "no" (if 0 "yes" "no"))
+
+(when #t (check "1.5.5" #t #t))
+;; when with falsy cond returns None/nil
+(unless #f (check "1.5.6" #t #t))
+
+(define cv 2)
+(check "1.5.7" "two" (cond
+  [(= cv 1) "one"]
+  [(= cv 2) "two"]
+  [#t "other"]))
+
+(check "1.5.8" "> three" (case (+ cv 2)
+  [1 "one"]
+  [2 "two"]
+  [3 "three"]
+  [default "> three"]))
+
+;; --- 1.6 Printing (doc: print, printf) ---
+(print "-- 1.6 Printing --")
+(print "1.6.1" "print test")
+(printf "1.6.2 %s %d\n" "printf" 42)
+
+;; --- 1.7 Utility (doc: eval-file, exit) ---
+(print "-- 1.7 Utility --")
+(info "1.7.1" "eval-file: n/a (needs external file)")
+;; exit tested manually
+
+(print "")
+(print "=== 2. Waveform Handling ===")
+(print "")
+
+(load "test_data/counter.vcd")
+
+;; --- 2.1 load, signals ---
+(print "-- 2.1 load/signals --")
+(info "2.1.1" "loaded")
+(define sigs SIGNALS)
+(check "2.1.2" #t (> (length sigs) 0))
+
+;; --- 2.2 step (doc: returns #f at end) ---
+(print "-- 2.2 step --")
+(step 5)
+(info "2.2.1" "step 5: " INDEX)
+(step -3)
+(info "2.2.2" "step -3: " INDEX)
+(step "t0" 2)
+(info "2.2.3" "step t0 2: " INDEX)
+
+;; --- 2.3 get ---
+(print "-- 2.3 get --")
+(define clk (get "counter_tb.clk"))
+(info "2.3.1" "clk: " clk)
+
+;; --- 2.4 reval / @ ---
+(print "-- 2.4 reval / @ --")
+(step -4)
+(check "2.4.1" 0 INDEX)
+(check "2.4.2" 3 (reval INDEX 3))
+(check "2.4.3" 0 INDEX)
+
+;; --- 2.5 find / count ---
+(print "-- 2.5 find/count --")
+(define edges (find (= (get "counter_tb.clk") 1)))
+(info "2.5.1" "edges found: " (length edges))
+(define cnt (count (= (get "counter_tb.clk") 1)))
+(info "2.5.2" "count: " cnt)
+
+;; --- 2.6 timeframe ---
+(print "-- 2.6 timeframe --")
+(step -5)
+(define tf-before INDEX)
+(timeframe (step 10))
+(check "2.6.1" tf-before INDEX)
+
+(print "")
+(print "=== 3. Accessing Signals ===")
+(print "")
+
+;; --- 3.1 slice (doc: signal upper lower) ---
+(print "-- 3.1 slice --")
+(info "3.1.1" "slice on list: " (slice (list 0 1 2 3 4 5 6 7) 3 0))
+(info "3.1.2" "slice on string: " (slice "hello" 1 3))
+
+(print "")
+(print "=== 4. Groups and Scopes ===")
+(print "")
+
+(unload "t0")
+(load "test_data/hierarchy.vcd" "hier")
+
+;; --- 4.1 in-scope ---
+(print "-- 4.1 in-scope --")
+(in-scope "hierarchy_tb.top."
+  (info "4.1.1" "in-scope CS: " CS))
+
+;; --- 4.2 groups/cl@ ---
+(print "-- 4.2 groups --")
+(info "4.2.1" "groups result: n/a (varies by VCD)")
+
+;; --- 4.3 Special Variables ---
+(print "-- 4.3 Special Variables --")
+(info "4.3.1" "INDEX: " INDEX)
+(info "4.3.2" "CG: " CG)
+(info "4.3.3" "CS: " CS)
+(info "4.3.4" "TRACE-NAME: " TRACE-NAME)
+(info "4.3.5" "TRACE-FILE: " TRACE-FILE)
+(info "4.3.6" "MAX-INDEX: " MAX-INDEX)
+
+(unload "hier")
+
+(print "")
+(print "=== 5. Lists ===")
+(print "")
+
+(define lst (list 10 20 30 40 50))
+(check "5.1" 10 (first lst))
+(check "5.2" 20 (second lst))
+(check "5.3" 50 (last lst))
+(check "5.4" 5 (length lst))
+(check "5.5" #t (in 30 lst))
+(check "5.6" 50 (max lst))
+(check "5.7" 10 (min lst))
+(check "5.8" 150 (sum lst))
+(check "5.9" 30 (average lst))
+(check "5.10" '(20 40 60 80 100) (map (fn [x] (* x 2)) lst))
+(check "5.11" 150 (fold + 0 lst))
+
+(print "")
+(print "=== 6. Arrays ===")
+(print "")
+
+(define arr (array ["x" 10] ["y" 20]))
+(check "6.1" 10 (geta arr "x"))
+(check "6.2" 5 (geta/default arr 5 "z"))
+(define arr2 (seta arr "x" 99))
+(check "6.3" 99 (geta arr2 "x"))
+;; dela with cross-type key: seta stores as String, dela via Symbol
+(define dtest (dela (seta (array ["x" 10]) "x" 99) 'x))
+(info "6.4" "dela cross-type: " dtest)
+
+(print "")
+(print "=== 7. Types and Conversions ===")
+(print "")
+
+(check "7.1" #t (int? 42))
+(check "7.2" #t (string? "hello"))
+(check "7.3" #t (symbol? (quote x)))
+(check "7.4" #t (list? lst))
+(check "7.5" #t (atom? 42))
+(check "7.6" #f (atom? lst))
+(check "7.7" "1010" (convert/bin 10))
+(check "7.8" "00001010" (convert/bin 10 8))
+(check "7.9" 42 (string->int "42"))
+(check "7.10" "42" (int->string 42))
+(check "7.11" -1 (bits->sint "1"))
+
+(print "")
+(print "WAL_SPEC_AUDIT COMPLETE")

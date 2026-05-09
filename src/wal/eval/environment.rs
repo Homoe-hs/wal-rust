@@ -11,6 +11,7 @@ pub struct Environment {
     parent: Option<Rc<RefCell<Environment>>>,
     bindings: HashMap<String, Value>,
     aliases: HashMap<String, String>,   // alias_name → target_name
+    virtual_signals: std::collections::HashSet<String>,
     scope: String,
     group: String,
     traces: Option<SharedTraceContainer>,
@@ -22,6 +23,7 @@ impl Environment {
             parent: None,
             bindings: HashMap::new(),
             aliases: HashMap::new(),
+            virtual_signals: std::collections::HashSet::new(),
             scope: String::new(),
             group: String::new(),
             traces: None,
@@ -33,6 +35,7 @@ impl Environment {
             parent: Some(parent),
             bindings: HashMap::new(),
             aliases: HashMap::new(),
+            virtual_signals: std::collections::HashSet::new(),
             scope: String::new(),
             group: String::new(),
             traces: None,
@@ -114,6 +117,20 @@ impl Environment {
         self.aliases.remove(alias).is_some()
     }
 
+    pub fn add_virtual_signal(&mut self, name: &str) {
+        self.virtual_signals.insert(name.to_string());
+    }
+
+    pub fn virtual_signal_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.virtual_signals.iter().cloned().collect();
+        if let Some(ref parent) = self.parent {
+            names.extend(parent.borrow().virtual_signal_names());
+        }
+        names.sort();
+        names.dedup();
+        names
+    }
+
     pub fn resolve_alias(&self, name: &str) -> Option<&str> {
         self.aliases.get(name).map(|s| s.as_str())
     }
@@ -131,6 +148,7 @@ impl Clone for Environment {
             parent: self.parent.clone(),
             bindings: self.bindings.clone(),
             aliases: self.aliases.clone(),
+            virtual_signals: self.virtual_signals.clone(),
             scope: self.scope.clone(),
             group: self.group.clone(),
             traces: self.traces.clone(),

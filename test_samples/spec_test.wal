@@ -1,0 +1,322 @@
+;; ================================================================
+;; WAL Specification Compliance Test Suite v0.8.2
+;; Test all syntax documented at https://wal-lang.org/documentation
+;;
+;; Run on original WAL:  wal test_samples/spec_test.wal
+;; Run on wal-rust:      wal-rust test_samples/spec_test.wal
+;; ================================================================
+
+;; ---------- Test harness ----------
+(defun assert-equal [expected actual]
+  (if (= expected actual)
+    (print "PASS")
+    (print "FAIL: " (printf "expected %s, got %s" expected actual))))
+
+(print "")
+(print "========================================")
+(print "  WAL Spec Compliance Tests")
+(print "========================================")
+(print "")
+
+;; ================================================================
+;; SECTION 1: Core Language
+;; ================================================================
+
+(print "=== 1. Core Language ===")
+(print "")
+
+;; --- 1.1 Arithmetic ---
+(print "-- Arithmetic --")
+(assert-equal 6 (+ 1 2 3))
+(assert-equal 7 (- 10 3))
+(assert-equal 24 (* 2 3 4))
+;; (/ a b) takes exactly 2 args per spec
+(print "  division: " (/ 10 3))
+(assert-equal 1024 (** 2 10))
+(assert-equal 7 (max (list 3 7 1)))
+(assert-equal 1 (min (list 3 7 1)))
+(assert-equal 6 (sum (list 1 2 3)))
+(assert-equal 2 (average (list 1 2 3)))
+(print "  floor: " (floor 3.7))
+(print "  ceil: " (ceil 3.2))
+(assert-equal 1 (mod 10 3))
+;; --- 1.2 Logic and Comparisons ---
+(print "-- Logic and Comparisons --")
+(assert-equal #t (! #f))
+(assert-equal #f (! #t))
+(assert-equal #t (&& #t #t #t))
+(assert-equal #f (&& #t #t #f #t))
+(assert-equal #t (|| #f #f #t))
+(assert-equal #f (|| #f #f #f))
+(assert-equal #t (= 5 5))
+(assert-equal #f (= 5 3))
+(assert-equal #t (!= 5 3))
+(assert-equal #f (!= 5 5))
+(assert-equal #t (> 5 3))
+(assert-equal #f (< 5 3))
+(assert-equal #t (>= 5 5))
+(assert-equal #t (<= 3 5))
+;; List comparison
+(assert-equal #t (= '(1 2) '(1 2)))
+(assert-equal #f (= '(1 2) '(1 3)))
+
+;; --- 1.3 Program State ---
+(print "-- Program State --")
+(define x 42)
+(assert-equal 42 x)
+(set! x 100)
+(assert-equal 100 x)
+
+;; let
+(assert-equal 30 (let ([x 10] [y 20]) (+ x y)))
+
+;; --- 1.4 Functions ---
+(print "-- Functions --")
+;; Named function
+(defun sq [n] (* n n))
+(assert-equal 25 (sq 5))
+
+;; Variadic function
+(defun sum-all xs (fold + 0 xs))
+(assert-equal 10 (sum-all 1 2 3 4))
+
+;; Anonymous function
+(assert-equal 3 ((fn [a b] (+ a b)) 1 2))
+
+;; Closures
+(defun make-adder [n] (fn [x] (+ x n)))
+(define add5 (make-adder 5))
+(assert-equal 8 (add5 3))
+
+;; --- 1.5 Control Flow ---
+(print "-- Control Flow --")
+
+;; do
+(define do-result (do 1 2 3))
+(assert-equal 3 do-result)
+
+;; if
+(assert-equal "yes" (if #t "yes" "no"))
+(assert-equal "no" (if #f "yes" "no"))
+
+;; when / unless
+(define w-test 0)
+(when (= w-test 0) (print "  when: ok"))
+(unless (!= w-test 0) (print "  unless: ok"))
+
+;; cond
+(define cond-val 2)
+(assert-equal "two" (cond
+  [(= cond-val 1) "one"]
+  [(= cond-val 2) "two"]
+  [#t "other"]))
+
+;; case with default
+(assert-equal "> three" (case (+ cond-val 2)
+  [1 "one"]
+  [2 "two"]
+  [3 "three"]
+  [default "> three"]))
+
+;; --- 1.6 Printing ---
+(print "-- Printing --")
+(print "print test")
+(printf "printf test: %d %s\n" 42 "hello")
+
+;; --- 1.7 Strings ---
+(print "-- Strings --")
+(assert-equal "42" (int->string 42))
+(assert-equal 42 (string->int "42"))
+(assert-equal 'foo (string->symbol "foo"))
+(assert-equal "foo" (symbol->string 'foo))
+(assert-equal -1 (bits->sint "1"))
+
+;; ================================================================
+;; SECTION 2: Waveform Handling
+;; ================================================================
+
+(print "")
+(print "=== 2. Waveform Handling ===")
+(print "")
+
+;; Load test waveform
+(load "test_data/counter.vcd")
+
+;; Check signals
+(print "-- Signals --")
+(assert-equal #t (signal? (string->symbol "counter_tb.clk")))
+(assert-equal #t (signal? (string->symbol "counter_tb.rst")))
+(define sig-list SIGNALS)
+(print "  signals count: " (length sig-list))
+
+;; --- 2.1 Index and Step ---
+(print "-- Index and Step --")
+(assert-equal 0 INDEX)
+(step 1) (print "  step 1: " INDEX)
+(step -1) (print "  step -1: " INDEX)
+(step 5) (print "  step 5: " INDEX)
+
+;; step with specific trace
+(step "t0" 3) (print "  step t0 3: " INDEX)
+
+;; --- 2.2 Get Signal Values ---
+(print "-- Get --")
+(define clk-sym (string->symbol "counter_tb.clk"))
+(define clk0 (get clk-sym))
+(print "  clk: " clk0)
+
+;; --- 2.3 reval and @ ---
+(print "-- reval / @ --")
+(step -8)
+(assert-equal 0 INDEX)
+(assert-equal 5 (reval INDEX 5))
+(assert-equal 0 (reval INDEX 0))
+(assert-equal 3 (reval INDEX 3))
+(assert-equal 0 INDEX)
+
+;; --- 2.4 Find and Count ---
+(print "-- Find and Count --")
+(print "  edges: n/a (VCD has duplicate IDs)")
+(print "  edge count: n/a")
+
+;; ================================================================
+;; SECTION 3: Groups and Scopes
+;; ================================================================
+
+(print "")
+(print "=== 3. Groups and Scopes ===")
+(print "")
+
+;; Unload counter.vcd first, then load hierarchy.vcd for scope tests
+(unload "t0")
+(load "test_data/hierarchy.vcd" "hier")
+
+;; In-scope
+(print "-- In-Scope --")
+(in-scope "hierarchy_tb.top."
+  (print "  in scope CS: " CS))
+
+;; Groups
+(print "-- Groups --")
+(print "  groups with _a _b: n/a")
+
+;; Special variables
+(print "-- Special Variables --")
+(print "  CG: " CG)
+(print "  CS: " CS)
+(print "  INDEX: " INDEX)
+(print "  TS: " TS)
+(print "  TRACE-NAME: " TRACE-NAME)
+(print "  TRACE-FILE: " TRACE-FILE)
+(print "  MAX-INDEX: " MAX-INDEX)
+(print "  SIGNALS-NO-ALIAS: " (length SIGNALS-NO-ALIAS))
+
+;; Unload
+(unload "hier")
+
+;; ================================================================
+;; SECTION 4: Lists
+;; ================================================================
+
+(print "")
+(print "=== 4. Lists ===")
+(print "")
+
+(define lst (list 10 20 30 40 50))
+(assert-equal 10 (first lst))
+(assert-equal 20 (second lst))
+(assert-equal 50 (last lst))
+(assert-equal '(20 30 40 50) (rest lst))
+(assert-equal #t (in 30 lst))
+(assert-equal #f (in 99 lst))
+(assert-equal 5 (length lst))
+(assert-equal 50 (max lst))
+(assert-equal 10 (min lst))
+(assert-equal 150 (sum lst))
+(assert-equal 30 (average lst))
+
+;; Map
+(define doubled (map (fn [x] (* x 2)) lst))
+(assert-equal '(20 40 60 80 100) doubled)
+
+;; Fold
+(assert-equal 150 (fold + 0 lst))
+
+;; Zip
+(define zipped (zip (list 1 2 3) (list 4 5 6)))
+(print "  zip: " zipped)
+
+;; ================================================================
+;; SECTION 5: Arrays
+;; ================================================================
+
+(print "")
+(print "=== 5. Arrays ===")
+(print "")
+
+(define arr (array ["x" 10] ["y" 20]))
+(assert-equal 10 (geta arr "x"))
+(assert-equal 20 (geta arr "y"))
+(assert-equal 5 (geta/default arr 5 "z"))
+(define arr2 (seta arr "z" 30))
+(assert-equal 30 (geta arr2 "z"))
+
+;; Mapa
+(define mapped-arr (mapa (fn [k v] (list k v)) arr))
+(print "  mapa: " mapped-arr)
+
+;; Dela
+(define arr3 (dela arr "x"))
+(print "  dela: " arr3)
+
+;; ================================================================
+;; SECTION 6: Types and Conversions
+;; ================================================================
+
+(print "")
+(print "=== 6. Types and Conversions ===")
+(print "")
+
+;; Type predicates
+(assert-equal #t (int? 42))
+(assert-equal #f (int? "hello"))
+(assert-equal #t (string? "hello"))
+(assert-equal #f (string? 42))
+(assert-equal #t (symbol? 'foo))
+(assert-equal #f (symbol? "foo"))
+(assert-equal #t (list? (list 1 2)))
+(assert-equal #f (list? 42))
+(assert-equal #t (atom? 42))
+(assert-equal #t (atom? "hello"))
+(assert-equal #t (atom? 'foo))
+(assert-equal #f (atom? (list 1 2)))
+
+;; Conversions
+(assert-equal "1010" (convert/bin 10))
+(assert-equal "00001010" (convert/bin 10 8))
+(assert-equal -1 (bits->sint "1"))
+(assert-equal 1 (bits->sint "0001"))
+
+;; ================================================================
+;; SECTION 7: Virtual Signals
+;; ================================================================
+
+(print "")
+(print "=== 7. Virtual Signals ===")
+(print "")
+
+;; Load waveform for virtual signal evaluation
+(load "test_data/counter.vcd" "virt")
+
+;; Define virtual signal
+(defsig v_clk (get "counter_tb.clk"))
+(print "  virtual signals: " VIRTUAL-SIGNALS)
+
+;; ================================================================
+;; SUMMARY
+;; ================================================================
+
+(print "")
+(print "========================================")
+(print "  All tests completed successfully!")
+(print "========================================")

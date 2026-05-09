@@ -10,16 +10,27 @@ fn op_not(args: &[Value], _env: &mut Environment, _eval: &mut Evaluator) -> Resu
     Ok(Value::Bool(!args[0].is_truthy()))
 }
 
+fn values_equal(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Int(i), Value::Float(f)) => (*i as f64) == *f,
+        (Value::Float(f), Value::Int(i)) => *f == (*i as f64),
+        (Value::List(la), Value::List(lb)) => {
+            la.0.len() == lb.0.len() && la.0.iter().zip(lb.0.iter()).all(|(x, y)| values_equal(x, y))
+        }
+        _ => a == b,
+    }
+}
+
 fn op_eq(args: &[Value], _env: &mut Environment, _eval: &mut Evaluator) -> Result<Value, String> {
     ensure_arity_atleast(args, 2)?;
     let first = &args[0];
-    Ok(Value::Bool(args[1..].iter().all(|a| a == first)))
+    Ok(Value::Bool(args[1..].iter().all(|a| values_equal(a, first))))
 }
 
 fn op_neq(args: &[Value], _env: &mut Environment, _eval: &mut Evaluator) -> Result<Value, String> {
     ensure_arity_atleast(args, 2)?;
     let first = &args[0];
-    Ok(Value::Bool(args[1..].iter().any(|a| a != first)))
+    Ok(Value::Bool(args[1..].iter().any(|a| !values_equal(a, first))))
 }
 
 fn op_if(args: &[Value], _env: &mut Environment, eval: &mut Evaluator) -> Result<Value, String> {
@@ -92,7 +103,11 @@ fn op_while(args: &[Value], _env: &mut Environment, eval: &mut Evaluator) -> Res
 
 fn op_print(args: &[Value], _env: &mut Environment, _eval: &mut Evaluator) -> Result<Value, String> {
     for arg in args {
-        print!("{}", arg);
+        match arg {
+            Value::String(s) => print!("{}", s),
+            Value::Symbol(s) => print!("{}", s.name),
+            _ => print!("{}", arg),
+        }
     }
     println!();
     Ok(Value::Nil)
@@ -105,6 +120,8 @@ fn op_printf(args: &[Value], _env: &mut Environment, eval: &mut Evaluator) -> Re
     for v in &args[1..] {
         evaluated.push(format!("{}", eval.eval_value_public(v.clone())?));
     }
+    // Handle escape sequences in format string
+    let fmt = fmt.replace("\\n", "\n").replace("\\t", "\t").replace("\\\"", "\"");
     let result = if fmt.contains('%') {
         // printf-style: %d, %s, %f, %x, %b
         let mut pos = 0usize;

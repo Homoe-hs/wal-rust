@@ -89,11 +89,11 @@ fn op_geta_default(args: &[Value], _env: &mut Environment, _eval: &mut Evaluator
 fn op_dela(args: &[Value], _env: &mut Environment, _eval: &mut Evaluator) -> Result<Value, String> {
     ensure_arity(args, 2)?;
     let arr = extract_list(&args[0])?;
-    let key = &args[1];
+    let key = key_to_string(&args[1]);
     let mut result = Vec::new();
     for i in (0..arr.len()).step_by(2) {
-        if i + 1 < arr.len() && &arr[i] == key {
-            continue; // skip this key-value pair
+        if i + 1 < arr.len() && key_to_string(&arr[i]) == key {
+            continue;
         }
         result.push(arr[i].clone());
         if i + 1 < arr.len() {

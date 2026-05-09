@@ -220,7 +220,16 @@ impl Evaluator {
                 return Ok(Value::List(WList::new()));
             }
             "VIRTUAL-SIGNALS" => {
-                return Ok(Value::List(WList::new()));
+                let names = self.env.virtual_signal_names();
+                return Ok(Value::List(WList::from_vec(
+                    names.into_iter().map(|s| {
+                        if s.starts_with('"') && s.ends_with('"') {
+                            Value::String(s[1..s.len()-1].to_string())
+                        } else {
+                            Value::String(s)
+                        }
+                    }).collect()
+                )));
             }
             _ => {}
         }
@@ -245,6 +254,18 @@ impl Evaluator {
                             ]));
                             return self.eval_value(get_expr);
                         }
+                    }
+                }
+            }
+            // Fuzzy fallback: try suffix / substring match
+            for id in traces.trace_ids() {
+                if let Some(sigs) = traces.signals(&id) {
+                    if let Some(matched) = fuzzy_match_signal(&name, &sigs) {
+                        let get_expr = Value::List(WList::from_vec(vec![
+                            Value::Symbol(Symbol::new("get")),
+                            Value::String(matched.clone()),
+                        ]));
+                        return self.eval_value(get_expr);
                     }
                 }
             }
@@ -296,6 +317,8 @@ impl Evaluator {
                 if let Some(op) = Operator::from_str(&s.name) {
                     if op == Operator::Define {
                         return self.eval_define(&rest);
+                    } else if op == Operator::Set {
+                        return self.eval_set(&rest);
                     } else if op == Operator::If {
                         return self.eval_if(&rest);
                     } else if op == Operator::Case {
@@ -316,6 +339,8 @@ impl Evaluator {
                         return self.eval_quasiquote(&rest);
                     } else if op == Operator::Quote {
                         return self.eval_quote(&rest);
+                    } else if op == Operator::RelEval {
+                        return self.eval_releval(&rest);
                     } else if op == Operator::Fn {
                         // fn is a special form — create closure, then call with remaining args
                         if rest.len() <= 2 {
@@ -468,6 +493,19 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
 
         let expanded = expanded?;
         self.eval_value(expanded)
+    }
+
+    fn eval_set(&mut self, args: &[Value]) -> Result<Value, String> {
+        if args.len() != 2 {
+            return Err(format!("set expects 2 arguments, got {}", args.len()));
+        }
+        let name = match &args[0] {
+            Value::Symbol(s) => s.name.clone(),
+            _ => return Err("set: first argument must be a symbol".to_string()),
+        };
+        let value = self.eval_value(args[1].clone())?;
+        self.env.set(&name, value.clone())?;
+        Ok(value)
     }
 
     fn eval_define(&mut self, args: &[Value]) -> Result<Value, String> {
@@ -737,6 +775,70 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
         quasiquote_eval(&args[0], self)
     }
 
+    fn eval_releval(&mut self, args: &[Value]) -> Result<Value, String> {
+        // (reval expr offset) — evaluate expr at current_index + offset
+        if args.len() != 2 {
+            return Err(format!("reval expects 2 arguments, got {}", args.len()));
+        }
+        let offset = match self.eval_value(args[1].clone())? {
+            Value::Int(i) => i,
+            _ => return Err("reval: offset must be an integer".to_string()),
+        };
+
+        if let Some(traces) = self.traces.read().map(|g| g.trace_ids()).ok() {
+            if traces.is_empty() {
+                return Err("reval: no traces loaded".to_string());
+            }
+            // Save current indices
+            let saved: Vec<(String, usize)> = {
+                let t = self.traces.read().unwrap_or_else(|e| e.into_inner());
+                traces.iter().filter_map(|tid| {
+                    t.get(tid).map(|tr| (tid.clone(), tr.index()))
+                }).collect()
+            };
+
+            // Check bounds and adjust indices
+            {
+                let mut t = self.traces.write().unwrap_or_else(|e| e.into_inner());
+                for (tid, _) in &saved {
+                    if let Some(tr) = t.get(tid) {
+                        let new_idx = tr.index() as i64 + offset;
+                        if new_idx < 0 || new_idx as usize > tr.max_index() {
+                            _ = std::mem::drop(t);
+                            // Restore all
+                            let mut t2 = self.traces.write().unwrap_or_else(|e| e.into_inner());
+                            for (tid, idx) in &saved {
+                                let _ = t2.set_index(tid, *idx);
+                            }
+                            return Ok(Value::Bool(false));
+                        }
+                    }
+                }
+                for (tid, _) in &saved {
+                    if let Some(tr) = t.get_mut(tid) {
+                        let new_idx = (tr.index() as i64 + offset) as usize;
+                        let _ = tr.set_index(new_idx);
+                    }
+                }
+            }
+
+            // Evaluate the expression
+            let result = self.eval_value(args[0].clone());
+
+            // Restore indices
+            {
+                let mut t = self.traces.write().unwrap_or_else(|e| e.into_inner());
+                for (tid, idx) in &saved {
+                    let _ = t.set_index(tid, *idx);
+                }
+            }
+
+            result
+        } else {
+            Err("reval: no traces loaded".to_string())
+        }
+    }
+
     fn eval_quote(&mut self, args: &[Value]) -> Result<Value, String> {
         if args.len() != 1 {
             return Err(format!("quote expects 1 argument, got {}", args.len()));
@@ -963,6 +1065,22 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
             None => Err(format!("Unknown operator: {:?}", op)),
         }
     }
+}
+
+fn fuzzy_match_signal<'a>(name: &str, signals: &'a [String]) -> Option<&'a String> {
+    let dot_name = format!(".{}", name);
+    if let Some(s) = signals.iter().find(|s| s.as_str() == name || s.ends_with(&dot_name)) {
+        return Some(s);
+    }
+    if name.len() <= 8 || !name.contains('.') {
+        if let Some(s) = signals.iter().find(|s| {
+            let last = s.rsplitn(2, '.').next().unwrap_or("");
+            last == name
+        }) {
+            return Some(s);
+        }
+    }
+    signals.iter().find(|s| s.contains(name))
 }
 
 /// Helper to extract a name from either a Symbol or String value

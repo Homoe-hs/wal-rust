@@ -18,13 +18,35 @@ impl TraceContainer {
         }
     }
 
-    pub fn load(&mut self, path: &Path, id: TraceId) -> Result<(), String> {
-        let ext = path.extension()
-            .and_then(|e| e.to_str())
-            .map(|e| e.to_lowercase())
-            .unwrap_or_default();
+    fn detect_format(path: &Path) -> Option<&'static str> {
+        let fname = path.to_string_lossy().to_lowercase();
+        if fname.ends_with(".vcd") || fname.ends_with(".vcd.gz") || fname.ends_with(".vcd.bz2") {
+            return Some("vcd");
+        }
+        if fname.ends_with(".fst") {
+            return Some("fst");
+        }
+        // Magic-byte fallback: peek first bytes
+        if let Ok(mut f) = std::fs::File::open(path) {
+            use std::io::Read;
+            let mut buf = [0u8; 16];
+            if f.read(&mut buf).unwrap_or(0) >= 4 {
+                if &buf[..4] == b"$da" || &buf[..4] == b"$ti" || &buf[..4] == b"$ve" || &buf[..4] == b"$sc" {
+                    return Some("vcd");
+                }
+                if buf[0] == 0x00 || buf[0] == 0x01 || buf[0] == 0x03 || buf[0] == 0x04 {
+                    return Some("fst");
+                }
+            }
+        }
+        None
+    }
 
-        let trace: Box<dyn Trace> = match ext.as_str() {
+    pub fn load(&mut self, path: &Path, id: TraceId) -> Result<(), String> {
+        let fmt = Self::detect_format(path)
+            .ok_or_else(|| format!("Unsupported file format: {}", path.display()))?;
+
+        let trace: Box<dyn Trace> = match fmt {
             "vcd" => {
                 let vcd_trace = VcdTrace::load(path, id.clone())?;
                 Box::new(vcd_trace)
@@ -33,7 +55,7 @@ impl TraceContainer {
                 let fst_trace = FstTrace::load(path, id.clone())?;
                 Box::new(fst_trace)
             }
-            _ => return Err(format!("Unsupported file format: .{}", ext)),
+            _ => return Err(format!("Unsupported file format: {}", path.display())),
         };
 
         self.traces.insert(id, trace);

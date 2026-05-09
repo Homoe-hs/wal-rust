@@ -4,7 +4,7 @@
 
 use crate::wal::ast::{Value, WList, Operator};
 use crate::wal::eval::{Environment, Dispatcher, Evaluator};
-use crate::trace::ScalarValue;
+use crate::trace::{ScalarValue, Trace, TraceContainer};
 use std::path::Path;
 
 fn op_load(args: &[Value], env: &mut Environment, _eval: &mut Evaluator) -> Result<Value, String> {
@@ -39,24 +39,50 @@ fn op_unload(args: &[Value], env: &mut Environment, _eval: &mut Evaluator) -> Re
 fn op_step(args: &[Value], env: &mut Environment, _eval: &mut Evaluator) -> Result<Value, String> {
     // (step) → step 1; (step amount) → step all by amount; (step id amount) → step specific trace
     // Returns #f if the end of any loaded trace is reached (per WAL spec)
+    // Negative steps go backward (via set_index)
+    let parse_steps = |v: &Value| -> Result<i64, String> {
+        let n = extract_int(v)?;
+        Ok(n)
+    };
+
     let (tid, steps) = match args.len() {
-        0 => (None, 1_usize),
-        1 => (None, extract_int(&args[0])? as usize),
+        0 => (None, 1i64),
+        1 => (None, parse_steps(&args[0])?),
         _ => {
             let tid = extract_string(&args[0])?;
-            let steps = extract_int(&args[1])? as usize;
+            let steps = parse_steps(&args[1])?;
             (Some(tid), steps)
         }
     };
+
+    let do_step = |trace: &mut dyn Trace, steps: i64| -> bool {
+        if steps >= 0 {
+            trace.step(steps as usize).is_ok()
+        } else {
+            let new_idx = (trace.index() as i64 + steps).max(0) as usize;
+            trace.set_index(new_idx).is_ok()
+        }
+    };
+
+    let do_step_all = |traces: &mut TraceContainer, steps: i64| -> bool {
+        let mut all_ok = true;
+        for trace in traces.traces_iter_mut() {
+            if !do_step(&mut **trace, steps) {
+                all_ok = false;
+            }
+        }
+        all_ok
+    };
+
     if let Some(traces) = env.get_traces() {
         let mut traces = traces.write().unwrap_or_else(|e| e.into_inner());
         let ok = if let Some(tid) = tid {
             match traces.get_mut(&tid) {
-                Some(trace) => trace.step(steps).is_ok(),
+                Some(trace) => do_step(&mut **trace, steps),
                 None => return Err(format!("Trace not found: {}", tid)),
             }
         } else {
-            traces.step_all(steps).is_ok()
+            do_step_all(&mut traces, steps)
         };
         return Ok(Value::Bool(ok));
     }
@@ -158,8 +184,9 @@ fn scalar_to_value(sv: ScalarValue) -> Value {
 }
 
 fn op_find(args: &[Value], env: &mut Environment, eval: &mut Evaluator) -> Result<Value, String> {
-    ensure_arity(args, 1)?;
+    ensure_arity_atleast(args, 1)?;
     let cond = &args[0];
+    let max_results = args.get(1).and_then(|v| match v { Value::Int(n) => Some(*n as usize), _ => None }).unwrap_or(usize::MAX);
 
     if let Some(traces) = env.get_traces() {
         let mut traces = traces.write().unwrap_or_else(|e| e.into_inner());
@@ -169,7 +196,7 @@ fn op_find(args: &[Value], env: &mut Environment, eval: &mut Evaluator) -> Resul
             let start_index = trace.index();
             let mut ended = false;
 
-            while !ended {
+            while !ended && found.len() < max_results {
                 match eval.eval_value_public(cond.clone()) {
                     Ok(Value::Bool(true)) => found.push(trace.index() as i64),
                     Ok(_) => {}
@@ -183,6 +210,9 @@ fn op_find(args: &[Value], env: &mut Environment, eval: &mut Evaluator) -> Resul
 
         found.sort();
         found.dedup();
+        if found.len() > max_results {
+            found.truncate(max_results);
+        }
         return Ok(Value::List(WList::from_vec(
             found.into_iter().map(Value::Int).collect()
         )));
@@ -296,11 +326,37 @@ fn op_whenever(args: &[Value], env: &mut Environment, eval: &mut Evaluator) -> R
     Ok(Value::Nil)
 }
 
+fn fuzzy_match_signal<'a>(name: &str, signals: &'a [String]) -> Option<&'a String> {
+    // 1. Exact match
+    if let Some(s) = signals.iter().find(|s| s.as_str() == name) {
+        return Some(s);
+    }
+    // 2. Suffix match: signal ends with .name
+    let dot_name = format!(".{}", name);
+    if let Some(s) = signals.iter().find(|s| s.ends_with(&dot_name)) {
+        return Some(s);
+    }
+    // 3. Contains match (after dot) for very short names
+    if name.len() <= 8 || !name.contains('.') {
+        if let Some(s) = signals.iter().find(|s| {
+            let last = s.rsplitn(2, '.').next().unwrap_or("");
+            last == name
+        }) {
+            return Some(s);
+        }
+    }
+    // 4. Substring match
+    if let Some(s) = signals.iter().find(|s| s.contains(name)) {
+        return Some(s);
+    }
+    None
+}
+
 fn op_get(args: &[Value], env: &mut Environment, _eval: &mut Evaluator) -> Result<Value, String> {
     ensure_arity(args, 1)?;
     let name = extract_name(&args[0])?;
 
-    // Try name as-is, then prepend scope, then prepend group
+    // Try exact candidates with scope/group prepended
     let candidates = [
         name.clone(),
         format!("{}{}", env.get_scope(), name),
@@ -316,7 +372,13 @@ fn op_get(args: &[Value], env: &mut Environment, _eval: &mut Evaluator) -> Resul
                     Err(_) => continue,
                 }
             }
+            // Fuzzy fallback: try suffix / substring matching
             let sigs = trace.signals();
+            if let Some(matched) = fuzzy_match_signal(&name, &sigs) {
+                if let Ok(sv) = trace.signal_value(matched, trace.index()) {
+                    return Ok(scalar_to_value(sv));
+                }
+            }
             let preview: Vec<&str> = sigs.iter().take(5).map(|s| s.as_str()).collect();
             return Err(format!("signal '{}' not found. Available signals (first 5): {:?}",
                 name, preview));

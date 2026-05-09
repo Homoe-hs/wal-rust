@@ -67,12 +67,11 @@ fn run_wal_file(path: &Path, load: &[PathBuf], code: Option<&str>) -> Result<(),
     let source = std::fs::read_to_string(path)
         .map_err(|e| format!("Failed to read file: {}", e))?;
 
-    println!("Evaluating: {}", path.display());
-
     // Handle multi-line expressions by accumulating them across lines
     let mut expr = String::new();
     let mut paren_depth = 0;
     let mut line_number = 0;
+    let mut in_string = false;
 
     for line in source.lines() {
         line_number += 1;
@@ -84,30 +83,43 @@ fn run_wal_file(path: &Path, load: &[PathBuf], code: Option<&str>) -> Result<(),
 
         for ch in line.chars() {
             expr.push(ch);
-            match ch {
-                '(' | '[' | '{' => paren_depth += 1,
-                ')' | ']' | '}' => paren_depth -= 1,
-                _ => {}
+            if ch == '"' { in_string = !in_string; }
+            if !in_string {
+                match ch {
+                    '(' | '[' | '{' => paren_depth += 1,
+                    ')' | ']' | '}' => paren_depth -= 1,
+                    _ => {}
+                }
+            }
+            // Evaluate complete expressions as soon as paren_depth reaches 0
+            if paren_depth == 0 && !in_string && !expr.trim().is_empty() {
+                let trimmed = expr.trim().to_string();
+                if !trimmed.is_empty() && !trimmed.starts_with(";;") {
+                    match eval.eval(&trimmed) {
+                        Ok(_v) => {}
+                        Err(e) => {
+                            if !e.starts_with("exit:") {
+                                eprintln!("Error on line {}: {}", line_number, e);
+                            }
+                        }
+                    }
+                }
+                expr.clear();
             }
         }
 
-        // Add space between lines for proper tokenization
-        expr.push(' ');
+        // Add space between lines for proper tokenization (continues multi-line expr)
+        if !in_string && paren_depth != 0 {
+            expr.push(' ');
+        }
+    }
 
-        if paren_depth == 0 && !expr.trim().is_empty() {
-            match eval.eval(expr.trim()) {
-                Ok(v) => {
-                    if !matches!(v, wal::ast::Value::Nil) {
-                        println!("=> {}", v);
-                    }
-                }
-                Err(e) => {
-                    if !e.starts_with("exit:") {
-                        eprintln!("Error on line {}: {}", line_number, e);
-                    }
-                }
+    // Evaluate any remaining expression at EOF
+    if !expr.trim().is_empty() {
+        if let Err(e) = eval.eval(expr.trim()) {
+            if !e.starts_with("exit:") {
+                eprintln!("Error on line {}: {}", line_number, e);
             }
-            expr.clear();
         }
     }
 

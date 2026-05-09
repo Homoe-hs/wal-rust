@@ -402,23 +402,27 @@ impl<R: Read + Seek> FstReader<R> {
     ///   [0x52:1][len:8][prefix:2][scope/var entries...]
     /// Falls back to fst2vcd pipe if native parsing fails.
     fn parse_vcd2fst_inline_hier(&mut self, tail: &[u8]) -> io::Result<()> {
+        // vcd2fst inline HIER format: [0x52:1][len:8][prefix:2][scope/var entries...]
+        // The 2-byte prefix is 0x0000; HIER data starts at offset 11.
         let mut pos = 0usize;
-        while pos + 9 < tail.len() {
+        while pos + 11 < tail.len() {
             if tail[pos] == 0x52 {
-                // Found vcd2fst inline HIER marker
-                // Try native parsing first
+                // Direct offset: skip 1-byte marker + 8-byte length + 2-byte prefix
+                let hier_start = pos + 11;
+                if hier_start < tail.len() {
+                    let before = self.file.signals.len();
+                    self.parse_hier_data(&tail[hier_start..])?;
+                    if self.file.signals.len() > before {
+                        return Ok(());
+                    }
+                }
+                // Fallback: scan for 0xFE (SCOPE marker) if direct offset failed
                 let mut hier_pos = pos + 9;
                 while hier_pos < tail.len() && tail[hier_pos] != 0xFE {
                     hier_pos += 1;
                 }
                 if hier_pos + 1 < tail.len() {
-                    let before = self.file.signals.len();
                     self.parse_hier_data(&tail[hier_pos..])?;
-                    // If native parsing got some signals, keep them
-                    if self.file.signals.len() > before {
-                        // Try fallback to fst2vcd if we missed signals (compact aliases)
-                        // by checking if the parsed scope count seems low
-                    }
                     return Ok(());
                 }
             }
@@ -690,6 +694,8 @@ impl<R: Read + Seek> FstReader<R> {
         let mut pos = 0;
         let mut scope_stack: Vec<usize> = Vec::new();
         let mut unknown_skip_count = 0;
+        // FST handles are 1-based and sequential in HIER format
+        let mut fst_handle: u32 = 0;
 
         while pos < data.len() && unknown_skip_count < 500 {
             let code = data[pos];
@@ -738,6 +744,7 @@ impl<R: Read + Seek> FstReader<R> {
                 // Format: var_type(1) + direction(1) + name(\0) + width(varint) + alias(varint)
                 _ if code <= 29 => {
                     unknown_skip_count = 0;
+                    fst_handle += 1; // FST handles are 1-based
                     if pos >= data.len() { break; }
                     let direction = data[pos];
                     pos += 1;
@@ -792,14 +799,13 @@ impl<R: Read + Seek> FstReader<R> {
                     if is_valid {
                         let final_name = if alias > 0 && name.len() <= 3 {
                             // Compact alias: record mapping for later resolution
-                            let our_handle = self.file.signals.len() as u32;
-                            self.compact_aliases.push((our_handle, alias));
+                            self.compact_aliases.push((fst_handle, alias));
                             format!("@alias_{}", alias)
                         } else {
                             name
                         };
                         self.file.signals.push(SignalDecl {
-                            handle: self.file.signals.len() as u32,
+                            handle: fst_handle,
                             name: final_name,
                             width: width as u32,
                             var_type: VarType::from_u8(code),

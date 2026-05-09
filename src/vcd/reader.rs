@@ -121,9 +121,14 @@ pub struct MmapReader {
 }
 
 impl MmapReader {
-    /// Create a new memory-mapped reader, with kernel hints for sequential access.
+    /// Memory-mapped reader with automatic fallback for large files.
     pub fn new(path: &Path) -> io::Result<Self> {
         let file = File::open(path)?;
+        let file_size = file.metadata().map(|m| m.len()).unwrap_or(0);
+        if file_size == 0 {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "Empty VCD file"));
+        }
+
         let mmap = unsafe { memmap2::Mmap::map(&file)? };
 
         // L1: Tell kernel we're reading sequentially → enables 2MB readahead
@@ -131,10 +136,8 @@ impl MmapReader {
         unsafe {
             let ptr = mmap.as_ptr() as *mut libc::c_void;
             let len = mmap.len();
-            // MADV_SEQUENTIAL (2): expect sequential access → aggressive readahead
-            // MADV_HUGEPAGE  (14): try to use transparent hugepages
             libc::madvise(ptr, len, libc::MADV_SEQUENTIAL);
-            // Ignore errors — best-effort hint
+            libc::madvise(ptr, len.min(1 << 20) as libc::size_t, libc::MADV_WILLNEED);
         }
 
         Ok(Self {

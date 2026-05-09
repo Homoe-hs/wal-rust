@@ -34,6 +34,10 @@ pub struct FstTrace {
     block_cache: RefCell<lru::LruCache<usize, Vec<u8>>>,
     value_cache: RefCell<lru::LruCache<(u32, u64), Vec<u8>>>,
 
+    // Hot signal tracking: handle → access count
+    freq_map: RefCell<std::collections::HashMap<u32, u64>>,
+    freq_threshold: u64,
+
     // Persistent file handle for on-demand reads
     reader: RefCell<BufReader<std::fs::File>>,
 
@@ -68,6 +72,8 @@ impl FstTrace {
             value_cache: RefCell::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(100_000).unwrap(),
             )),
+            freq_map: RefCell::new(std::collections::HashMap::new()),
+            freq_threshold: 50,
             reader: RefCell::new(BufReader::with_capacity(
                 1024 * 1024,
                 std::fs::File::open(path)
@@ -403,6 +409,14 @@ impl Trace for FstTrace {
         let sig = self.file.signal_by_name(name)
             .ok_or_else(|| format!("Unknown signal: {}", name))?;
 
+        // Track access frequency
+        let freq = {
+            let mut fm = self.freq_map.borrow_mut();
+            let c = fm.entry(sig.handle).or_insert(0);
+            *c += 1;
+            *c
+        };
+
         // Check value cache
         {
             let mut cache = self.value_cache.borrow_mut();
@@ -417,6 +431,20 @@ impl Trace for FstTrace {
 
         // Cache the value
         self.value_cache.borrow_mut().put((sig.handle, target_time), val);
+
+        // If signal is hot, pre-cache a few surrounding timestamps
+        if freq >= self.freq_threshold && freq % 10 == 0 {
+            let mut cache = self.value_cache.borrow_mut();
+            let window_start = offset.saturating_sub(5);
+            let window_end = (offset + 5).min(self.timestamps.len());
+            for i in window_start..window_end {
+                let t = self.timestamps[i];
+                if !cache.contains(&(sig.handle, t)) {
+                    let v = self.read_signal_value_at(sig.handle, t);
+                    cache.put((sig.handle, t), v);
+                }
+            }
+        }
 
         Ok(result)
     }

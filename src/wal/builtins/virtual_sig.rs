@@ -12,7 +12,9 @@ fn op_defsig(args: &[Value], env: &mut Environment, _eval: &mut Evaluator) -> Re
     ensure_arity_atleast(args, 2)?;
     let name = extract_symbol(&args[0])?;
     let expr = &args[1];
-    env.define(name, expr.clone());
+    // Store both the expression and register as virtual signal
+    env.define(name.clone(), expr.clone());
+    env.add_virtual_signal(&name);
     Ok(Value::Nil)
 }
 
