@@ -106,19 +106,78 @@ pub fn encode_signed_varint(n: i64) -> Vec<u8> {
     encode_varint(unsigned)
 }
 
-/// Decode a signed varint
+/// Decode a signed varint (protobuf zigzag encoding)
 #[inline]
 #[allow(dead_code)]
 pub fn decode_signed_varint(buf: &[u8]) -> Option<(i64, usize)> {
     let (unsigned, consumed) = decode_varint(buf)?;
-    // Reverse zigzag encoding
-    // n = unsigned >> 1 for positive (LSB=0), n = -(unsigned >> 1) - 1 for negative (LSB=1)
     let n = if (unsigned & 1) == 0 {
         (unsigned >> 1) as i64
     } else {
         -((unsigned >> 1) as i64) - 1
     };
     Some((n, consumed))
+}
+
+/// Decode FST signed varint (NOT zigzag — sign-extended raw varint).
+/// The FST DYNALIAS2 format uses this for the chain index table.
+/// Uses u64 internally to avoid overflow, then casts to i64 (preserving bit pattern).
+#[inline]
+pub fn decode_fst_svarint(buf: &[u8]) -> Option<(i64, usize)> {
+    if buf.is_empty() {
+        return None;
+    }
+
+    let mut pos = 0;
+    while pos < buf.len() && buf[pos] & 0x80 != 0 {
+        pos += 1;
+    }
+    if pos >= buf.len() {
+        return None;
+    }
+    let consumed = pos + 1;
+
+    let mut result: u64 = 0;
+    let mut shift = 0;
+    loop {
+        result |= ((buf[pos] & 0x7F) as u64) << shift;
+        if pos == 0 {
+            break;
+        }
+        pos -= 1;
+        shift += 7;
+    }
+
+    Some((result as i64, consumed))
+}
+
+/// Decode FST varint32 (same as decode_varint but returns u32)
+#[inline]
+pub fn decode_fst_varint32(buf: &[u8]) -> Option<(u32, usize)> {
+    let (val, consumed) = decode_varint(buf)?;
+    Some((val as u32, consumed))
+}
+
+/// Read a FST signed varint from a reader
+pub fn decode_fst_svarint_from_reader<R: std::io::Read>(reader: &mut R) -> Result<i64, String> {
+    let mut buf = [0u8; 10];
+    let mut pos = 0;
+    loop {
+        if pos >= buf.len() {
+            return Err("Signed varint too long".to_string());
+        }
+        let mut byte = [0u8; 1];
+        reader.read_exact(&mut byte).map_err(|e| format!("Read error: {}", e))?;
+        buf[pos] = byte[0];
+        pos += 1;
+        if byte[0] & 0x80 == 0 {
+            break;
+        }
+    }
+    match decode_fst_svarint(&buf[..pos]) {
+        Some((v, _)) => Ok(v),
+        None => Err("Failed to decode signed varint".to_string()),
+    }
 }
 
 #[cfg(test)]

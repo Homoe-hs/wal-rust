@@ -47,6 +47,31 @@ impl VcdValue {
             }
         }
     }
+
+    /// Extract as single bit value if width == 1
+    pub fn as_bit(&self) -> Option<u8> {
+        match self {
+            VcdValue::Bit(b) => Some(*b),
+            VcdValue::Vector(v) if v.len() == 1 => Some(v[0]),
+            _ => None,
+        }
+    }
+
+    /// Convert to i64 (binary vector parsed MSB-first)
+    pub fn to_i64(&self) -> Option<i64> {
+        match self {
+            VcdValue::Bit(b) => Some(if *b == b'1' { 1 } else { 0 }),
+            VcdValue::Vector(v) => {
+                if v.is_empty() { return None; }
+                // Check for unknowns
+                if v.iter().any(|&b| b != b'0' && b != b'1') { return None; }
+                Some(v.iter().fold(0i64, |acc, &b|
+                    acc.overflowing_shl(1).0 | if b == b'1' { 1 } else { 0 }
+                ))
+            }
+            VcdValue::Real(r) => Some(*r as i64),
+        }
+    }
 }
 
 impl VcdValue {

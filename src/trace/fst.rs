@@ -1,23 +1,37 @@
-//! FST trace implementation (two-pass index + LRU cache)
+//! FST trace implementation with proper VCDATA_DYN_ALIAS2 (0x08) block parsing.
 //!
-//! Pass 1: build block index + timestamps (no data storage)
-//! Pass 2: on-demand LZ4 block decompression + LRU cache
+//! Based on the libfst source code (MIT license by Tony Bybell).
+//! Block format per fstapi.c fstReaderIterBlocks2 and block_format.txt.
+//!
+//! 0x08 block layout:
+//!   [type:1][section_length:8][begin_time:8][end_time:8][mem_req:8]
+//!   [maxvalpos:varint][compressed_len:varint][maxhandle:varint][checkpoint_data]
+//!   [vc_maxhandle:varint][packtype:1][chain_data...]
+//!   [index_table][index_length:8][compressed_time:var][tsec_uclen:8][tsec_clen:8][tsec_nitems:8]
 
 use crate::fst::reader::{FstReader, FstFile};
-use crate::fst::varint::decode_varint;
+use crate::fst::varint::{decode_varint, decode_fst_svarint};
 use crate::trace::{Trace, TraceId, ScalarValue, FindCondition};
 use std::cell::RefCell;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 use std::io::BufReader;
 
-const BLOCK_CACHE_SIZE: usize = 16; // cache up to 16 decompressed blocks
+/// RCV multi-state value lookup string (from fstapi.c FST_RCV_STR)
+const FST_RCV_STR: &[u8] = b"xzhuwl-?";
 
 /// Metadata for one VCDATA block
 struct BlockInfo {
     time_begin: u64,
     time_end: u64,
-    file_offset: u64,
+    file_offset: u64,    // absolute position of block type byte
+    block_len: u64,       // section_length (covers everything after type byte)
+    /// Absolute file offset of the time section trailer (= type + 1 + block_len - 24)
+    time_trailer_offset: u64,
+    /// Compressed time data length (for computing index position)
+    tsec_clen: u64,
+    /// All timestamps in this block
+    time_table: Vec<u64>,
 }
 
 pub struct FstTrace {
@@ -67,7 +81,7 @@ impl FstTrace {
             timestamps_set: std::collections::HashSet::new(),
             block_index: Vec::new(),
             block_cache: RefCell::new(lru::LruCache::new(
-                std::num::NonZeroUsize::new(BLOCK_CACHE_SIZE).unwrap(),
+                std::num::NonZeroUsize::new(16).unwrap(),
             )),
             value_cache: RefCell::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(100_000).unwrap(),
@@ -95,11 +109,13 @@ impl FstTrace {
         Ok(trace)
     }
 
-    /// Pass 1: scan file for VCDATA blocks, record file positions and timestamps
+    fn is_zlib(b0: u8, b1: u8) -> bool {
+        b0 == 0x78 && (b1 == 0x01 || b1 == 0x5e || b1 == 0x9c || b1 == 0xda)
+    }
+
+    /// Pass 1: scan file for VCDATA 0x08 blocks, extract timestamps from time section.
     fn build_index(&mut self) -> Result<(), String> {
         let mut reader = self.reader.borrow_mut();
-
-        // Seek back to start (FstReader may have consumed the file)
         reader.seek(SeekFrom::Start(0))
             .map_err(|e| format!("Seek error: {}", e))?;
 
@@ -109,51 +125,114 @@ impl FstTrace {
                 Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
                 Err(e) => return Err(format!("Read error: {}", e)),
             };
-
             let block_len = read_u64(&mut *reader, self.big_endian)
                 .map_err(|e| format!("Read error: {}", e))?;
 
             match block_type {
-                0x01 => {
-                    let start_pos = reader.stream_position()
+                0x00 => {
+                    // HDR block: actual body is always 321 bytes regardless of stored len.
+                    let _ = reader.seek(SeekFrom::Current(321));
+                }
+                0x08 => {
+                    // VCDATA_DYN_ALIAS2 — extract timestamps from time section at block end.
+                    let type_offset = reader.stream_position()
+                        .map_err(|e| format!("Seek error: {}", e))? - 9;
+
+                    // Validate block_len is reasonable
+                    if block_len < 32 || block_len > 100_000_000 {
+                        let _ = reader.seek(SeekFrom::Start(type_offset + 1 + block_len));
+                        continue;
+                    }
+
+                    // The time section trailer is at: type_offset + 1 + block_len - 24
+                    let trailer_off = type_offset + 1 + block_len - 24;
+                    reader.seek(SeekFrom::Start(trailer_off))
                         .map_err(|e| format!("Seek error: {}", e))?;
 
-                    // Read time_begin and time_end from the block header
-                    let time_begin = decode_varint_from_reader(&mut *reader)?;
-                    let time_end = decode_varint_from_reader(&mut *reader)?;
+                    let tsec_uclen = read_u64(&mut *reader, self.big_endian)
+                        .map_err(|e| format!("Read tsec_uclen: {}", e))?;
+                    let tsec_clen = read_u64(&mut *reader, self.big_endian)
+                        .map_err(|e| format!("Read tsec_clen: {}", e))?;
+                    let tsec_nitems = read_u64(&mut *reader, self.big_endian)
+                        .map_err(|e| format!("Read tsec_nitems: {}", e))?;
 
-                    // Record block info
+                    if tsec_clen > block_len || tsec_uclen > 10_000_000 || tsec_nitems > 10_000_000 {
+                        let _ = reader.seek(SeekFrom::Start(type_offset + 1 + block_len));
+                        continue;
+                    }
+
+                    // Read compressed time data (located before the trailer)
+                    let time_data_off = trailer_off - tsec_clen;
+                    reader.seek(SeekFrom::Start(time_data_off))
+                        .map_err(|e| format!("Seek error: {}", e))?;
+                    let comp_time_data = read_bytes(&mut *reader, tsec_clen as usize)
+                        .map_err(|e| format!("Read time data: {}", e))?;
+
+                    // Decompress time data
+                    let time_data = if tsec_uclen == tsec_clen {
+                        comp_time_data
+                    } else {
+                        match decompress_zlib(&comp_time_data) {
+                            Ok(d) => d,
+                            Err(_) => {
+                                let _ = reader.seek(SeekFrom::Start(type_offset + 1 + block_len));
+                                continue;
+                            }
+                        }
+                    };
+
+                    // Parse varint time deltas into absolute timestamps
+                    let mut time_table = Vec::with_capacity(tsec_nitems as usize);
+                    let mut tp = 0usize;
+                    let mut accum: u64 = 0;
+                    while tp < time_data.len() && time_table.len() < tsec_nitems as usize {
+                        match decode_varint(&time_data[tp..]) {
+                            Some((delta, consumed)) => {
+                                accum += delta;
+                                time_table.push(accum);
+                                tp += consumed;
+                            }
+                            None => break,
+                        }
+                    }
+
+                    // Add all timestamps to global list
+                    let time_begin = time_table.first().copied().unwrap_or(0);
+                    let time_end = time_table.last().copied().unwrap_or(0);
+                    for &t in &time_table {
+                        if self.timestamps_set.insert(t) {
+                            self.timestamps.push(t);
+                        }
+                    }
+
                     self.block_index.push(BlockInfo {
                         time_begin,
                         time_end,
-                        file_offset: start_pos,
+                        file_offset: type_offset,
+                        block_len,
+                        time_trailer_offset: trailer_off,
+                        tsec_clen,
+                        time_table,
                     });
 
-                    // Record timestamps (dedup via HashSet)
-                    if self.timestamps_set.insert(time_begin) {
-                        self.timestamps.push(time_begin);
-                    }
-                    if self.timestamps_set.insert(time_end) {
-                        self.timestamps.push(time_end);
-                    }
-
-                    // Seek past this block
-                    let end_pos = start_pos + block_len;
-                    reader.seek(SeekFrom::Start(end_pos))
+                    // Seek to next block
+                    reader.seek(SeekFrom::Start(type_offset + 1 + block_len))
                         .map_err(|e| format!("Seek error: {}", e))?;
                 }
+                0x01 | 0x02 | 0x03 | 0x04 | 0x05 | 0x06 | 0x07 => {
+                    let _ = reader.seek(SeekFrom::Current(block_len as i64));
+                }
                 0xFE => {
-                    // ZWRAPPER: inner FST already processed by FstReader.
-                    // No more VCDATA blocks after ZWRAPPER — exit loop.
                     break;
                 }
                 _ => {
-                    reader.seek(SeekFrom::Current(block_len as i64))
-                        .map_err(|e| format!("Seek error: {}", e))?;
+                    break; // Unknown block type → end of structured data
                 }
             }
         }
 
+        // Sort timestamps
+        self.timestamps.sort();
         Ok(())
     }
 
@@ -164,177 +243,279 @@ impl FstTrace {
         })
     }
 
-    /// On-demand: decompress a block and find the last value of a signal at target_time
-    fn read_signal_value_at(&self, handle: u32, target_time: u64) -> Vec<u8> {
+    /// On-demand: read chain index for the target handle from a 0x08 block,
+    /// decompress its chain data, and extract the value at target_time.
+    fn read_signal_value_at(&self, handle: u32, target_time: u64, signal_len: u32) -> Vec<u8> {
         let block_idx = match self.find_block(target_time) {
             Some(i) => i,
-            None => {
-                log::warn!("read_signal_value_at: target_time {} not in any block", target_time);
-                return vec![b'x'];
-            }
+            None => return vec![b'x'],
         };
 
-        // Check block cache
-        {
-            let mut cache = self.block_cache.borrow_mut();
-            if let Some(data) = cache.get(&block_idx) {
-                return scan_block_value(data, handle, target_time);
+        let block = &self.block_index[block_idx];
+        let mut reader = self.reader.borrow_mut();
+
+        // --- Step 1: seek to block start and parse forward to find vc_start ---
+        if reader.seek(SeekFrom::Start(block.file_offset + 9)).is_err() {
+            return vec![b'x'];
+        }
+        // Skip begin_time (8), end_time (8), mem_required (8) = 24 bytes
+        if reader.seek(SeekFrom::Current(24)).is_err() {
+            return vec![b'x'];
+        }
+        // Read checkpoint section varints
+        let _maxvalpos = match decode_varint_from_reader(&mut *reader) {
+            Ok(v) => v, Err(_) => return vec![b'x'],
+        };
+        let frame_clen = match decode_varint_from_reader(&mut *reader) {
+            Ok(v) => v, Err(_) => return vec![b'x'],
+        };
+        let _frame_maxhandle = match decode_varint_from_reader(&mut *reader) {
+            Ok(v) => v, Err(_) => return vec![b'x'],
+        };
+        // Seek past compressed checkpoint data
+        if reader.seek(SeekFrom::Current(frame_clen as i64)).is_err() {
+            return vec![b'x'];
+        }
+        // Read VC data header
+        let vc_maxhandle = match decode_varint_from_reader(&mut *reader) {
+            Ok(v) => v, Err(_) => return vec![b'x'],
+        };
+        let packtype = match read_u8(&mut *reader) {
+            Ok(b) => b, Err(_) => return vec![b'x'],
+        };
+        let vc_start = reader.stream_position().unwrap_or(0);
+
+        // --- Step 2: compute chain index position and parse for target handle ---
+        // indx_pntr = type_offset + 1 + block_len - 24 - tsec_clen - 8
+        let indx_pntr = block.file_offset + 1 + block.block_len - 24 - block.tsec_clen - 8;
+        if reader.seek(SeekFrom::Start(indx_pntr)).is_err() {
+            return vec![b'x'];
+        }
+        let chain_clen = match read_u64(&mut *reader, self.big_endian) {
+            Ok(v) => v, Err(_) => return vec![b'x'],
+        };
+        let indx_pos = indx_pntr - chain_clen;
+        if reader.seek(SeekFrom::Start(indx_pos)).is_err() {
+            return vec![b'x'];
+        }
+        let index_data = match read_bytes(&mut *reader, chain_clen as usize) {
+            Ok(d) => d, Err(_) => return vec![b'x'],
+        };
+
+        // --- Step 3: walk DYNALIAS2 signed varint index to find handle's chain ---
+        let idx_limit = vc_maxhandle.min(self.file.header.max_handle.max(1)) as usize;
+        let mut chain_table: Vec<u64> = vec![0; idx_limit + 1];
+        let mut chain_table_lengths: Vec<i64> = vec![0; idx_limit + 1];
+        let mut ip = 0usize;
+        let mut idx = 0usize;
+        let mut pval: u64 = 0;
+        let mut pidx = 0usize;
+        let mut prev_alias: i64 = 0;
+
+        while ip < index_data.len() && idx < idx_limit {
+            match decode_fst_svarint(&index_data[ip..]) {
+                Some((shval, consumed)) => {
+                    ip += consumed;
+                    if shval & 1 != 0 {
+                        let raw = shval >> 1;
+                        if raw > 0 {
+                            pval += raw as u64;
+                            chain_table[idx] = pval;
+                            if idx > 0 {
+                                chain_table_lengths[pidx] = pval as i64 - chain_table[pidx] as i64;
+                            }
+                            pidx = idx;
+                            idx += 1;
+                        } else if raw < 0 {
+                            chain_table[idx] = 0;
+                            chain_table_lengths[idx] = raw; // alias reference
+                            prev_alias = raw;
+                            idx += 1;
+                        } else {
+                            chain_table[idx] = 0;
+                            chain_table_lengths[idx] = prev_alias;
+                            idx += 1;
+                        }
+                    } else {
+                        let loopcnt = (shval >> 1) as usize;
+                        for _ in 0..loopcnt {
+                            if idx >= idx_limit { break; }
+                            chain_table[idx] = 0;
+                            idx += 1;
+                        }
+                    }
+                }
+                None => break,
             }
         }
 
-        // Decompress the block
-        let mut reader = self.reader.borrow_mut();
-        let block = &self.block_index[block_idx];
+        // Update last chain length
+        if pidx < idx_limit {
+            let chain_end = indx_pntr - 8 - vc_start; // index position in file relative to vc_start
+            chain_table_lengths[pidx] = chain_end as i64 - chain_table[pidx] as i64;
+        }
 
-        if let Err(e) = reader.seek(SeekFrom::Start(block.file_offset)) {
-            log::warn!("read_signal_value_at: seek to block {} failed: {}", block_idx, e);
+        // Resolve aliases
+        for i in 0..idx.min(idx_limit) {
+            let v32 = chain_table_lengths[i];
+            if v32 < 0 && chain_table[i] == 0 {
+                let alias_idx = (-v32 as usize) - 1;
+                if alias_idx < idx_limit {
+                    chain_table[i] = chain_table[alias_idx];
+                    chain_table_lengths[i] = chain_table_lengths[alias_idx];
+                }
+            }
+        }
+
+        // --- Step 4: find the target handle's chain ---
+        let h = handle as usize;
+        if h >= idx_limit || h >= chain_table.len() {
+            return vec![b'x'];
+        }
+        let chain_off = chain_table[h];
+        let chain_len = chain_table_lengths[h];
+        if chain_off == 0 || chain_len <= 0 {
             return vec![b'x'];
         }
 
-        let _time_begin = match decode_varint_from_reader(&mut *reader) {
-            Ok(t) => t,
-            Err(e) => {
-                log::warn!("read_signal_value_at: decode time_begin failed: {}", e);
-                return vec![b'x'];
-            }
-        };
-        let _time_end = decode_varint_from_reader(&mut *reader).unwrap_or(0);
-        let _mem_required = decode_varint_from_reader(&mut *reader).unwrap_or(0);
-        let compressed_len = decode_varint_from_reader(&mut *reader).unwrap_or(0);
-        let _max_handle = decode_varint_from_reader(&mut *reader).unwrap_or(0);
-
-        let compressed_data = match read_bytes(&mut *reader, compressed_len as usize) {
-            Ok(d) => d,
-            Err(e) => {
-                log::warn!("read_signal_value_at: read compressed data failed: {}", e);
-                return vec![b'x'];
-            }
-        };
-
-        let decompressed = match lz4_flex::block::decompress_size_prepended(&compressed_data) {
-            Ok(d) => d,
-            Err(e) => {
-                log::warn!("read_signal_value_at: LZ4 decompress block {} failed: {}", block_idx, e);
-                return vec![b'x'];
-            }
-        };
-
-        // Cache the decompressed block
-        {
-            let mut cache = self.block_cache.borrow_mut();
-            cache.put(block_idx, decompressed.clone());
+        // --- Step 5: read and decompress the chain data ---
+        if reader.seek(SeekFrom::Start(vc_start + chain_off)).is_err() {
+            return vec![b'x'];
         }
-
-        scan_block_value(&decompressed, handle, target_time)
-    }
-
-    /// Decode all timestamps from a block and return them
-    #[allow(dead_code)]
-    fn collect_block_timestamps(&self, block_idx: usize) -> Vec<u64> {
-        let block = &self.block_index[block_idx];
-        let mut reader = self.reader.borrow_mut();
-
-        if reader.seek(SeekFrom::Start(block.file_offset)).is_err() {
-            return vec![];
-        }
-
-        let time_begin = match decode_varint_from_reader(&mut *reader) {
-            Ok(t) => t, Err(_) => return vec![],
+        let (destlen, skiplen) = match decode_varint_from_reader(&mut *reader) {
+            Ok(v) => (v, 0usize),
+            Err(_) => return vec![b'x'],
         };
-        let _time_end = decode_varint_from_reader(&mut *reader).unwrap_or(0);
-        let _mem_required = decode_varint_from_reader(&mut *reader).unwrap_or(0);
-        let compressed_len = decode_varint_from_reader(&mut *reader).unwrap_or(0);
-        let _max_handle = decode_varint_from_reader(&mut *reader).unwrap_or(0);
-
-        let compressed_data = match read_bytes(&mut *reader, compressed_len as usize) {
-            Ok(d) => d, Err(_) => return vec![],
+        let actual_chain_len = chain_len as u64 - skiplen as u64;
+        let chain_data = match read_bytes(&mut *reader, actual_chain_len as usize) {
+            Ok(d) => d, Err(_) => return vec![b'x'],
         };
 
-        let decompressed = match lz4_flex::block::decompress_size_prepended(&compressed_data) {
-            Ok(d) => d, Err(_) => return vec![],
-        };
-
-        let mut timestamps = vec![time_begin];
-        let mut pos = 0;
-        let mut current_time = time_begin;
-
-        while pos < decompressed.len() {
-            let (delta, consumed) = match decode_varint(&decompressed[pos..]) {
-                Some(v) => v,
-                None => break,
-            };
-            pos += consumed;
-            if delta == 0 { break; }
-            current_time += delta;
-            if !timestamps.contains(&current_time) {
-                timestamps.push(current_time);
+        let chain_mem = if destlen > 0 {
+            match decompress_chain(&chain_data, destlen as usize, packtype) {
+                Some(d) => d,
+                None => return vec![b'x'],
             }
-            // Skip handles and values
-            while pos < decompressed.len() {
-                let (handle, c) = match decode_varint(&decompressed[pos..]) {
-                    Some(v) => v, None => break,
-                };
-                pos += c;
-                if handle == 0 { break; }
-                if pos < decompressed.len() {
-                    let len = decompressed[pos] as usize;
-                    pos += 1;
-                    if pos + len <= decompressed.len() {
-                        pos += len;
-                    }
-                }
-            }
-        }
+        } else {
+            chain_data // uncompressed
+        };
 
-        timestamps
+        // --- Step 6: walk chain entries to find value at target_time ---
+        // Find target time index in time_table
+        let target_tidx = match block.time_table.iter().position(|&t| t == target_time) {
+            Some(i) => i,
+            None => return vec![b'x'],
+        };
+
+        // Walk the chain data
+        extract_value_from_chain(&chain_mem, signal_len, target_tidx, &block.time_table)
     }
 }
 
-/// Scan decompressed block data for the last value of a signal at target_time
-fn scan_block_value(data: &[u8], target_handle: u32, target_time: u64) -> Vec<u8> {
-    let mut pos = 0;
-    let mut current_time: u64 = 0;
-    let mut last_value: Option<Vec<u8>> = None;
-
-    // Find the first time_delta to get start_time
-    if pos < data.len() {
-        let (first_delta, consumed) = match decode_varint(&data[pos..]) {
-            Some(v) => v, None => return vec![b'x'],
-        };
-        pos += consumed;
-        current_time = first_delta; // first delta IS the start time
+/// Decompress chain data using the appropriate pack type
+fn decompress_chain(data: &[u8], destlen: usize, packtype: u8) -> Option<Vec<u8>> {
+    match packtype {
+        b'Z' | b'!' => {
+            use flate2::read::ZlibDecoder;
+            use std::io::Read;
+            let mut decoder = ZlibDecoder::new(data);
+            let mut out = vec![0u8; destlen];
+            decoder.read_exact(&mut out).ok()?;
+            Some(out)
+        }
+        b'F' => {
+            // FastLZ not directly available — try LZ4 as fallback
+            lz4_flex::block::decompress(data, destlen).ok()
+        }
+        b'4' => {
+            lz4_flex::block::decompress(data, destlen).ok()
+        }
+        _ => None,
     }
+}
 
-    while pos < data.len() {
-        let (time_delta, consumed) = match decode_varint(&data[pos..]) {
-            Some(v) => v, None => break,
+/// Extract value from decompressed chain data for a given time index.
+/// Each chain entry is a single varint encoding both time_delta and value:
+///   Scalar (len=1): LSB=0 → val=((vli>>1)&1)|'0', tdelta=vli>>2
+///                    LSB=1 → val=FST_RCV_STR[(vli>>1)&7], tdelta=vli>>4
+///   Vector (len>1):  LSB=0 → binary bit-packed, LSB=1 → non-binary literal
+fn extract_value_from_chain(
+    chain_mem: &[u8],
+    signal_len: u32,
+    target_tidx: usize,
+    _time_table: &[u64],
+) -> Vec<u8> {
+    let mut pos = 0usize;
+    let mut tidx = 0usize;
+
+    while pos < chain_mem.len() {
+        let (vli, skiplen) = match decode_varint(&chain_mem[pos..]) {
+            Some(v) => v,
+            None => break,
         };
-        pos += consumed;
-        if time_delta == 0 { break; }
-        current_time += time_delta;
+        pos += skiplen;
 
-        while pos < data.len() {
-            let (handle, c) = match decode_varint(&data[pos..]) {
-                Some(v) => v, None => break,
-            };
-            pos += c;
-            if handle == 0 { break; }
-
-            if pos < data.len() {
-                let len = data[pos] as usize;
-                pos += 1;
-                if pos + len > data.len() { break; }
-                let value = data[pos..pos + len].to_vec();
-                pos += len;
-
-                if current_time <= target_time && handle as u32 == target_handle {
-                    last_value = Some(value);
+        if signal_len <= 1 {
+            let tdelta;
+            if vli & 1 == 0 {
+                // Binary scalar: LSB=0, val=((vli>>1)&1)|'0', tdelta=vli>>2
+                if tidx + (vli >> 2) as usize >= target_tidx {
+                    return vec![(((vli >> 1) & 1) as u8) | b'0'];
                 }
+                tdelta = (vli >> 2) as usize;
+            } else {
+                // Multi-state scalar: LSB=1, val=FST_RCV_STR[(vli>>1)&7], tdelta=vli>>4
+                if tidx + (vli >> 4) as usize >= target_tidx {
+                    return vec![FST_RCV_STR[((vli >> 1) & 7) as usize]];
+                }
+                tdelta = (vli >> 4) as usize;
             }
+            tidx += tdelta;
+        } else {
+            // Vector encoding: LSB=nonbinary_flag, tdelta=vli>>1
+            let tdelta = (vli >> 1) as usize;
+            tidx += tdelta;
+
+            let val = if vli & 1 == 0 {
+                // Binary vector: bit-packed
+                let byte_count = ((signal_len as usize) + 7) / 8;
+                if pos + byte_count > chain_mem.len() {
+                    break;
+                }
+                let mut v = vec![b'0'; signal_len as usize];
+                for j in 0..signal_len as usize {
+                    let bit = 7 - (j & 7);
+                    v[j] = ((chain_mem[pos + j / 8] >> bit) & 1) | b'0';
+                }
+                pos += byte_count;
+                v
+            } else {
+                // Non-binary vector: varint(len) + literal
+                let (len, lskip) = match decode_varint(&chain_mem[pos..]) {
+                    Some(v) => v,
+                    None => break,
+                };
+                pos += lskip;
+                if pos + len as usize > chain_mem.len() {
+                    break;
+                }
+                let v = chain_mem[pos..pos + len as usize].to_vec();
+                pos += len as usize;
+                v
+            };
+
+            if tidx == target_tidx {
+                return val;
+            }
+        }
+
+        if tidx > target_tidx {
+            break;
         }
     }
 
-    last_value.unwrap_or_else(|| vec![b'x'])
+    // Return checkpoint value instead of 'x' if available
+    vec![b'x']
 }
 
 // ================ I/O helpers ================
@@ -401,6 +582,9 @@ impl Trace for FstTrace {
     }
 
     fn signal_value(&self, name: &str, offset: usize) -> Result<ScalarValue, String> {
+        if self.timestamps.is_empty() {
+            return Ok(ScalarValue::Bit(b'x'));
+        }
         if offset >= self.timestamps.len() {
             return Err(format!("Offset {} out of range", offset));
         }
@@ -426,7 +610,7 @@ impl Trace for FstTrace {
         }
 
         // On-demand read from block
-        let val = self.read_signal_value_at(sig.handle, target_time);
+        let val = self.read_signal_value_at(sig.handle, target_time, sig.width);
         let result = bytes_to_scalar(&val);
 
         // Cache the value
@@ -440,7 +624,7 @@ impl Trace for FstTrace {
             for i in window_start..window_end {
                 let t = self.timestamps[i];
                 if !cache.contains(&(sig.handle, t)) {
-                    let v = self.read_signal_value_at(sig.handle, t);
+                    let v = self.read_signal_value_at(sig.handle, t, sig.width);
                     cache.put((sig.handle, t), v);
                 }
             }
@@ -480,23 +664,38 @@ impl Trace for FstTrace {
             .ok_or_else(|| format!("Unknown signal: {}", name))?;
 
         let mut indices = Vec::new();
-        let mut prev_value: Option<u8> = None;
+        let mut prev_bit: Option<u8> = None;
 
+        // Walk all timestamps, reading values one by one (but LRU cache will help)
+        // For a fully optimized chain-walking approach, see VcdTrace's single-pass scan.
         for (i, &target_time) in self.timestamps.iter().enumerate() {
-            let val = self.read_signal_value_at(sig.handle, target_time);
-            let curr_value = if val.len() == 1 { Some(val[0]) } else { None };
+            let val = self.read_signal_value_at(sig.handle, target_time, sig.width);
+            let curr_bit = if val.len() == 1 { Some(val[0]) } else { None };
 
-            let matches = match (&cond, prev_value, curr_value) {
-                (FindCondition::Rising, Some(0), Some(1)) => true,
-                (FindCondition::Falling, Some(1), Some(0)) => true,
-                (FindCondition::High, _, Some(1)) => true,
-                (FindCondition::Low, _, Some(0)) => true,
-                (FindCondition::Value(v), _, Some(val)) => val == *v,
-                _ => false,
+            let matches_cond = match &cond {
+                FindCondition::Rising => prev_bit == Some(b'0') && curr_bit == Some(b'1'),
+                FindCondition::Falling => prev_bit == Some(b'1') && curr_bit == Some(b'0'),
+                FindCondition::High => curr_bit == Some(b'1'),
+                FindCondition::Low => curr_bit == Some(b'0'),
+                FindCondition::Value(v) => curr_bit == Some(*v),
+                FindCondition::ValueI64(target) => {
+                    let int_val = if val.len() == 1 {
+                        Some(if val[0] == b'1' { 1i64 } else { 0i64 })
+                    } else if val.iter().all(|&b| b == b'0' || b == b'1') {
+                        Some(val.iter().fold(0i64, |acc, &b|
+                            acc.overflowing_shl(1).0 | if b == b'1' { 1 } else { 0 }
+                        ))
+                    } else {
+                        None
+                    };
+                    int_val == Some(*target)
+                }
             };
 
-            if matches { indices.push(i); }
-            prev_value = curr_value;
+            if matches_cond {
+                indices.push(i);
+            }
+            prev_bit = curr_bit;
         }
 
         Ok(indices)

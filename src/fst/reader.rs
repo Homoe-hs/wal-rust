@@ -141,13 +141,13 @@ impl<R: Read + Seek> FstReader<R> {
         loop {
             let block_type = match self.read_u8() {
                 Ok(b) => b,
-                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
+                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
                 Err(e) => return Err(e),
             };
 
             let block_len = match self.read_u64() {
                 Ok(len) => len,
-                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
+                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
                 Err(e) => return Err(e),
             };
 
@@ -161,18 +161,31 @@ impl<R: Read + Seek> FstReader<R> {
                 continue;
             }
 
-            // After HDR, for Icarus (BE) files: jump to near the end where
-            // GEOM + inline HIER blocks are stored (Icarus puts metadata at end).
-            // For standard (LE) files: process VCDATA blocks normally.
+            // For BE files: after HDR, peek ahead to detect format.
+            // Icarus: metadata (GEOM+HIER) is at the tail of the file.
+            // vcd2fst: VCDATA blocks are inline; HIER may be at the tail.
             if hdr_read && self.big_endian {
-                let search_start = if self.file_size > 4000 {
-                    self.file_size - 4000
+                let current_pos = self.reader.stream_position()?;
+                let mut peek_buf = [0u8; 9];
+                let is_vcd2fst = self.reader.read(&mut peek_buf).ok() == Some(9)
+                    && (peek_buf[0] == 0x08 || (0x30..=0x39).contains(&peek_buf[0]));
+                self.reader.seek(SeekFrom::Start(current_pos))?;
+
+                if is_vcd2fst {
+                    // vcd2fst: process blocks inline for VCDATA.
+                    // Also scan the tail for HIER blocks that contain signal names.
+                    // (Don't return early — let the main loop process, then tail-scan)
                 } else {
-                    0
-                };
-                self.reader.seek(SeekFrom::Start(search_start))?;
-                self.scan_icarus_tail()?;
-                return Ok(());
+                    // Icarus: jump to tail where GEOM+HIER are stored
+                    let search_start = if self.file_size > 4000 {
+                        self.file_size - 4000
+                    } else {
+                        0
+                    };
+                    self.reader.seek(SeekFrom::Start(search_start))?;
+                    self.scan_icarus_tail()?;
+                    return Ok(());
+                }
             }
 
             let result = match block_type {
@@ -200,10 +213,79 @@ impl<R: Read + Seek> FstReader<R> {
                         _ => {}
                     }
                 }
-                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
+                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
                 Err(e) => return Err(e),
             }
         }
+
+        // After processing all inline blocks, scan the tail for HIER blocks
+        // (vcd2fst appends signal metadata at the end of the file)
+        self.scan_tail_for_hier()?;
+        Ok(())
+    }
+
+    /// Scan the tail of the file for HIER blocks that may contain signal names.
+    /// vcd2fst stores HIER at the end of the file even when VCDATA blocks are inline.
+    fn scan_tail_for_hier(&mut self) -> io::Result<()> {
+        let tail_start = if self.file_size > 4_000_000 { self.file_size - 4_000_000 } else { 0 };
+        let tail_len = self.file_size.saturating_sub(tail_start);
+        if tail_len < 50 {
+            return Ok(());
+        }
+        let cur = self.reader.stream_position()?;
+        self.reader.seek(SeekFrom::Start(tail_start))?;
+        let tail = self.read_bytes(tail_len as usize)?;
+        self.reader.seek(SeekFrom::Start(cur))?;
+
+        // Scan for HIER block markers (0x04/0x06/0x07/0xFE) in the tail
+        for pos in (0..tail.len().saturating_sub(9)).rev() {
+            let bt = tail[pos];
+            if bt != 0x04 && bt != 0x06 && bt != 0x07 && bt != 0xFE {
+                continue;
+            }
+            let bl = u64::from_be_bytes(tail[pos+1..pos+9].try_into().unwrap_or([0u8; 8]));
+            if bt == 0xFE {
+                // ZWRAP: decompress and parse inner
+                let compressed = &tail[pos+9..];
+                let decompressed = {
+                    use std::io::Read;
+                    if compressed.starts_with(&[0x1f, 0x8b]) {
+                        use flate2::read::GzDecoder;
+                        let mut d = GzDecoder::new(compressed);
+                        let mut out = Vec::new();
+                        if d.read_to_end(&mut out).is_ok() { out } else { continue; }
+                    } else {
+                        use flate2::read::ZlibDecoder;
+                        let mut d = ZlibDecoder::new(compressed);
+                        let mut out = Vec::new();
+                        if d.read_to_end(&mut out).is_ok() { out } else { continue; }
+                    }
+                };
+                let mut cursor = std::io::Cursor::new(decompressed);
+                let inner = FstReader::from_reader(&mut cursor)?;
+                self.file.signals.extend(inner.file.signals);
+                self.file.scopes.extend(inner.file.scopes);
+            } else if bl > 0 && bl < 4_000_000 && pos + 9 + bl as usize <= tail.len() {
+                let body = &tail[pos+9..pos+9+bl as usize];
+                match bt {
+                    0x04 => { self.parse_hier_data(body)?; }
+                    0x06 | 0x07 => {
+                        if body.len() < 8 { continue; }
+                        let comp = &body[8..];
+                        let mut padded = comp.to_vec();
+                        padded.resize(comp.len() + 8, 0);
+                        if let Ok(decompressed) = lz4_flex::block::decompress_size_prepended(&padded) {
+                            self.parse_hier_data(&decompressed)?;
+                        }
+                    }
+                    _ => {}
+                }
+                if bt == 0x04 || bt == 0x06 || bt == 0x07 {
+                    if self.file.signals.len() > 0 { break; }
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Scan the tail of an Icarus BE FST file for GEOM + inline gzip HIER blocks.
@@ -310,15 +392,48 @@ impl<R: Read + Seek> FstReader<R> {
             return;
         }
         let aliases = std::mem::take(&mut self.compact_aliases);
-        for (our_handle, parent_fst_handle) in &aliases {
-            let parent_idx = *parent_fst_handle as usize;
-            if parent_idx == 0 || parent_idx > self.file.signals.len() {
-                continue;
+        // Multiple passes: resolve chains until stable
+        let mut remaining: Vec<(u32, u64)> = aliases;
+        let mut max_passes = 10;
+        while !remaining.is_empty() && max_passes > 0 {
+            max_passes -= 1;
+            let mut unresolved = Vec::new();
+            for (our_handle, parent_fst_handle) in &remaining {
+                let parent_name = self.file.signals.iter()
+                    .find(|s| s.handle == *parent_fst_handle as u32)
+                    .and_then(|s| {
+                        // Skip if parent itself is an unresolved alias
+                        if s.name.starts_with("@alias_") || s.name.starts_with("@UNKNOWN_") {
+                            None
+                        } else {
+                            Some(s.name.clone())
+                        }
+                    });
+                match parent_name {
+                    Some(name) => {
+                        for sig in self.file.signals.iter_mut() {
+                            if sig.handle == *our_handle {
+                                sig.name = format!("{}.{}", name, *our_handle);
+                                break;
+                            }
+                        }
+                    }
+                    None => {
+                        unresolved.push((*our_handle, *parent_fst_handle));
+                    }
+                }
             }
-            let parent_name = self.file.signals[parent_idx - 1].name.clone();
+            remaining = unresolved;
+        }
+        // Final fallback: give unresolved aliases UNKNOWN names
+        for (our_handle, parent_fst_handle) in &remaining {
+            let parent_name = self.file.signals.iter()
+                .find(|s| s.handle == *parent_fst_handle as u32)
+                .map(|s| s.name.clone())
+                .unwrap_or_else(|| format!("@UNKNOWN_{}", parent_fst_handle));
             for sig in self.file.signals.iter_mut() {
                 if sig.handle == *our_handle {
-                    sig.name = format!("{}_alias_{}", parent_name, *our_handle);
+                    sig.name = format!("{}.{}", parent_name, *our_handle);
                     break;
                 }
             }
@@ -506,18 +621,19 @@ impl<R: Read + Seek> FstReader<R> {
         }
         self.file.header.date = String::from_utf8_lossy(&date).to_string();
 
-        // FST header block has a fixed structure: 8 u64 + 1 i8 + 128 version + 128 date = 321 bytes
-        // Some FST generators (e.g. Icarus Verilog) write incorrect block_len values (e.g. 1 instead of 321).
-        // Always advance past the actual header body (max(321, len) bytes) to handle both cases.
-        const HEADER_BODY_SIZE: u64 = 321; // bytes of fixed header fields
-        let header_end = start_pos + std::cmp::max(len, HEADER_BODY_SIZE);
+        // FST header block body: 8 u64 + 1 i8 + 128 version + 128 date = 321 bytes.
+        // Some generators (e.g. Icarus) write incorrect block_len (e.g. 1).
+        // Some generators (vcd2fst) write padded block_len (e.g. 329).
+        // The actual header body is always 321 bytes — don't seek more.
+        // If we read less than 321 bytes (Icarus), skip remaining.
+        const HEADER_BODY_SIZE: u64 = 321;
         let current_pos = self.reader.stream_position()?;
-        if current_pos < header_end {
-            self.reader.seek(SeekFrom::Start(header_end))?;
-        } else if current_pos > header_end {
-            // Hard seek forward past any trailing data in the header
-            self.reader.seek(SeekFrom::Start(header_end))?;
+        let bytes_read = current_pos - start_pos;
+        if bytes_read < HEADER_BODY_SIZE {
+            self.reader.seek(SeekFrom::Current((HEADER_BODY_SIZE - bytes_read) as i64))?;
         }
+        // Note: if len > HEADER_BODY_SIZE, the extra bytes are NOT header padding.
+        // They are the start of the next block (vcd2fst may over-count).
         Ok(())
     }
 
@@ -752,17 +868,6 @@ impl<R: Read + Seek> FstReader<R> {
                     pos += consumed;
                     if pos >= data.len() { break; }
 
-                    // Validate: skip entries where name is >50% non-printable control chars
-                    let printable = name.chars().filter(|c| c.is_ascii_graphic() || *c == ' ').count();
-                    if printable < name.len().saturating_sub(3) {
-                        let (_w, c) = match decode_varint(&data[pos..]) { Some(v) => v, None => break };
-                        pos += c;
-                        if pos >= data.len() { break; }
-                        let (_a, c) = match decode_varint(&data[pos..]) { Some(v) => v, None => break };
-                        pos += c;
-                        continue;
-                    }
-
                     // Read width as varint
                     let (width, consumed) = match decode_varint(&data[pos..]) {
                         Some(v) => v,
@@ -781,16 +886,11 @@ impl<R: Read + Seek> FstReader<R> {
                     // Validate signal: name should be readable ASCII text
                     // Compact aliases (alias > 0, short names) from vcd2fst are accepted
                     // with a placeholder name so signal count stays accurate.
-                    let is_valid = if name.is_empty() {
-                        false
-                    } else if name.chars().all(|c| c.is_ascii_control()) {
+                    let all_control = name.chars().all(|c| c.is_ascii_control());
+                    let is_valid = if name.is_empty() || all_control {
                         false
                     } else if alias > 0 && name.len() <= 3 {
-                        // Compact alias from vcd2fst: accept with placeholder name
                         true
-                    } else if !name.is_ascii() {
-                        let printable = name.chars().filter(|c| c.is_ascii_graphic() || *c == ' ').count();
-                        printable >= name.len().saturating_sub(2)
                     } else {
                         let printable = name.chars().filter(|c| c.is_ascii_graphic() || *c == ' ').count();
                         printable >= name.len().saturating_sub(3)
@@ -798,7 +898,6 @@ impl<R: Read + Seek> FstReader<R> {
 
                     if is_valid {
                         let final_name = if alias > 0 && name.len() <= 3 {
-                            // Compact alias: record mapping for later resolution
                             self.compact_aliases.push((fst_handle, alias));
                             format!("@alias_{}", alias)
                         } else {

@@ -96,7 +96,11 @@ fn run_wal_file(path: &Path, load: &[PathBuf], code: Option<&str>) -> Result<(),
                 let trimmed = expr.trim().to_string();
                 if !trimmed.is_empty() && !trimmed.starts_with(";;") {
                     match eval.eval(&trimmed) {
-                        Ok(_v) => {}
+                        Ok(v) => {
+                            if !matches!(v, wal::ast::Value::Nil) {
+                                println!("{}", v);
+                            }
+                        }
                         Err(e) => {
                             if !e.starts_with("exit:") {
                                 eprintln!("Error on line {}: {}", line_number, e);

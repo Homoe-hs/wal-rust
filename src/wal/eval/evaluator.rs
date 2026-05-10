@@ -4,7 +4,7 @@ use crate::wal::ast::{Value, Symbol, WList, Closure, Operator};
 use crate::wal::eval::{Environment, Dispatcher, SemanticChecker};
 use crate::wal::builtins;
 use crate::wal::builtins::special::quasiquote_eval;
-use crate::trace::{TraceContainer, SharedTraceContainer};
+use crate::trace::{FindCondition, TraceContainer, SharedTraceContainer};
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::{Arc, RwLock};
@@ -341,6 +341,14 @@ impl Evaluator {
                         return self.eval_quote(&rest);
                     } else if op == Operator::RelEval {
                         return self.eval_releval(&rest);
+                    } else if op == Operator::Find {
+                        return self.eval_find(&rest);
+                    } else if op == Operator::FindG {
+                        return self.eval_find_g(&rest);
+                    } else if op == Operator::Count {
+                        return self.eval_count(&rest);
+                    } else if op == Operator::Whenever {
+                        return self.eval_whenever(&rest);
                     } else if op == Operator::Fn {
                         // fn is a special form — create closure, then call with remaining args
                         if rest.len() <= 2 {
@@ -839,6 +847,356 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
         }
     }
 
+    /// Try to parse a simple condition pattern like (= (get "signal") value)
+    /// Returns (signal_name, target_value) if matched.
+    fn parse_simple_condition(&self, expr: &Value) -> Option<(String, i64)> {
+        let lst = match expr {
+            Value::List(lst) if lst.len() == 3 => lst,
+            _ => return None,
+        };
+        let op = match &lst[0] {
+            Value::Symbol(s) => s.name.as_str(),
+            _ => return None,
+        };
+        if op != "=" { return None; }
+        // Try (= (get "sig") val) or (= val (get "sig"))
+        for (a, b) in &[(0, 1), (1, 0)] {
+            if let Value::List(inner) = &lst[*a] {
+                if inner.len() == 2 {
+                    if let Value::Symbol(fn_sym) = &inner[0] {
+                        if fn_sym.name == "get" {
+                            let sig = match &inner[1] {
+                                Value::String(s) => s.clone(),
+                                Value::Symbol(s) => s.name.clone(),
+                                _ => continue,
+                            };
+                            let val = match &lst[*b] {
+                                Value::Int(i) => *i,
+                                _ => continue,
+                            };
+                            return Some((sig, val));
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Fast-path: evaluate a simple (= (get "sig") val) condition at given index
+    fn eval_simple_cond(&self, sig_name: &str, target: i64, idx: usize) -> bool {
+        if let Ok(t) = self.traces.read() {
+            for tid in t.trace_ids() {
+                if let Some(tr) = t.get(&tid) {
+                    if let Ok(sv) = tr.signal_value(sig_name, idx) {
+                        let val = match sv {
+                            crate::trace::ScalarValue::Bit(b) => {
+                                if b == b'1' { 1i64 } else { 0i64 }
+                            }
+                            crate::trace::ScalarValue::Vector(v) => {
+                                v.iter().fold(0i64, |acc, &b| (acc << 1) | if b == b'1' { 1 } else { 0 })
+                            }
+                            crate::trace::ScalarValue::Real(r) => r as i64,
+                        };
+                        return val == target;
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    fn eval_find(&mut self, args: &[Value]) -> Result<Value, String> {
+        // (find cond) — find all indices where cond evaluates to true
+        // Args are NOT pre-evaluated (special form)
+        if args.len() < 1 {
+            return Err("find expects at least 1 argument".to_string());
+        }
+        let max_results = if args.len() > 1 {
+            match self.eval_value(args[1].clone())? {
+                Value::Int(n) => n as usize,
+                _ => return Err("find: second argument must be an integer limit".to_string()),
+            }
+        } else {
+            usize::MAX
+        };
+
+        if let Some(traces) = self.traces.read().map(|g| g.trace_ids()).ok() {
+            if traces.is_empty() {
+                return Ok(Value::List(WList::new()));
+            }
+
+            let mut found: Vec<i64> = Vec::new();
+
+            // Fast path: try simple condition (= (get "sig") val)
+            // Uses trace.find_indices() for a parallel scan.
+            if let Some((sig_name, target)) = self.parse_simple_condition(&args[0]) {
+                let cond = if target <= 1 && target >= 0 {
+                    FindCondition::Value(target as u8)
+                } else {
+                    FindCondition::ValueI64(target)
+                };
+                if let Ok(t) = self.traces.read() {
+                    for tid in &traces {
+                        if let Some(tr) = t.get(tid) {
+                            // Resolve signal name via fuzzy matching (handles short names)
+                            let resolved = resolve_signal_name(&sig_name, &tr.signals())
+                                .unwrap_or_else(|| sig_name.clone());
+                            if let Ok(mut idxs) = tr.find_indices(&resolved, cond.clone()) {
+                                found.extend(idxs.into_iter().map(|i| i as i64));
+                            }
+                        }
+                    }
+                    found.sort();
+                    found.dedup();
+                    if found.len() > max_results { found.truncate(max_results); }
+                    return Ok(Value::List(WList::from_vec(
+                        found.into_iter().map(Value::Int).collect()
+                    )));
+                }
+            }
+
+            // Fallback: evaluate condition at each step
+            let saved: Vec<(String, usize)> = {
+                let t = self.traces.read().unwrap_or_else(|e| e.into_inner());
+                traces.iter().filter_map(|tid| t.get(tid).map(|tr| (tid.clone(), tr.index()))).collect()
+            };
+            let mut ended = false;
+            while !ended && found.len() < max_results {
+                match self.eval_value(args[0].clone())? {
+                    Value::Bool(true) => {
+                        let t = self.traces.read().unwrap_or_else(|e| e.into_inner());
+                        for tid in &traces {
+                            if let Some(tr) = t.get(tid) {
+                                found.push(tr.index() as i64);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                let mut any_ended = true;
+                if let Ok(mut t) = self.traces.write() {
+                    for tid in &traces {
+                        if let Some(tr) = t.get_mut(tid) {
+                            if tr.step(1).is_ok() { any_ended = false; }
+                        }
+                    }
+                }
+                ended = any_ended;
+            }
+
+            // Restore
+            if let Ok(mut t) = self.traces.write() {
+                for (tid, idx) in &saved {
+                    let _ = t.set_index(tid, *idx);
+                }
+            }
+
+            found.sort();
+            found.dedup();
+            if found.len() > max_results { found.truncate(max_results); }
+            return Ok(Value::List(WList::from_vec(found.into_iter().map(Value::Int).collect())));
+        }
+        Ok(Value::List(WList::new()))
+    }
+
+    fn eval_find_g(&mut self, args: &[Value]) -> Result<Value, String> {
+        if args.len() < 1 {
+            return Err("find/g expects at least 1 argument".to_string());
+        }
+        let saved: Vec<(String, usize)>;
+        let traces_ids: Vec<String>;
+        if let Ok(t) = self.traces.read() {
+            traces_ids = t.trace_ids();
+            saved = traces_ids.iter().filter_map(|tid| t.get(tid).map(|tr| (tid.clone(), tr.index()))).collect();
+        } else {
+            return Ok(Value::List(WList::new()));
+        }
+
+        let mut found = Vec::new();
+        let mut ended = false;
+        while !ended {
+            match self.eval_value(args[0].clone())? {
+                Value::Bool(true) => {
+                    if let Ok(t) = self.traces.read() {
+                        let indices: Vec<i64> = traces_ids.iter()
+                            .filter_map(|tid| t.get(tid).map(|tr| tr.index() as i64))
+                            .collect();
+                        found.push(if indices.len() == 1 {
+                            Value::Int(indices[0])
+                        } else {
+                            Value::List(WList::from_vec(indices.into_iter().map(Value::Int).collect()))
+                        });
+                    }
+                }
+                _ => {}
+            }
+            let mut any_ended = true;
+            if let Ok(mut t) = self.traces.write() {
+                for tid in &traces_ids {
+                    if let Some(tr) = t.get_mut(tid) {
+                        if tr.step(1).is_ok() { any_ended = false; }
+                    }
+                }
+            }
+            ended = any_ended;
+        }
+
+        if let Ok(mut t) = self.traces.write() {
+            for (tid, idx) in &saved {
+                let _ = t.set_index(tid, *idx);
+            }
+        }
+        Ok(Value::List(WList::from_vec(found)))
+    }
+
+    fn eval_count(&mut self, args: &[Value]) -> Result<Value, String> {
+        if args.len() < 1 {
+            return Err("count expects at least 1 argument".to_string());
+        }
+        let saved: Vec<(String, usize)>;
+        let traces_ids: Vec<String>;
+        if let Ok(t) = self.traces.read() {
+            traces_ids = t.trace_ids();
+            saved = traces_ids.iter().filter_map(|tid| t.get(tid).map(|tr| (tid.clone(), tr.index()))).collect();
+        } else {
+            return Ok(Value::Int(0));
+        }
+
+        // Fast path: try simple condition (= (get "sig") val)
+        if let Some((sig_name, target)) = self.parse_simple_condition(&args[0]) {
+            let cond = if target <= 1 && target >= 0 {
+                FindCondition::Value(target as u8)
+            } else {
+                FindCondition::ValueI64(target)
+            };
+            let total: usize = {
+                let t = self.traces.read().unwrap_or_else(|e| e.into_inner());
+                traces_ids.iter().filter_map(|tid| {
+                    t.get(tid).and_then(|tr| {
+                        let resolved = resolve_signal_name(&sig_name, &tr.signals())
+                            .unwrap_or_else(|| sig_name.clone());
+                        tr.find_indices(&resolved, cond.clone()).ok()
+                    })
+                }).map(|v| v.len()).sum()
+            };
+            return Ok(Value::Int(total as i64));
+        }
+
+        // Fallback: evaluate condition at each step
+        let mut count: i64 = 0;
+        let mut ended = false;
+        while !ended {
+            if self.eval_value(args[0].clone())?.is_truthy() {
+                count += 1;
+            }
+            let mut any_ended = true;
+            if let Ok(mut t) = self.traces.write() {
+                for tid in &traces_ids {
+                    if let Some(tr) = t.get_mut(tid) {
+                        if tr.step(1).is_ok() { any_ended = false; }
+                    }
+                }
+            }
+            ended = any_ended;
+        }
+
+        if let Ok(mut t) = self.traces.write() {
+            for (tid, idx) in &saved {
+                let _ = t.set_index(tid, *idx);
+            }
+        }
+        Ok(Value::Int(count))
+    }
+
+    fn eval_whenever(&mut self, args: &[Value]) -> Result<Value, String> {
+        if args.len() < 2 {
+            return Err("whenever expects at least 2 arguments".to_string());
+        }
+        let body_args: Vec<Value> = args[1..].to_vec();
+
+        let saved: Vec<(String, usize)>;
+        let traces_ids: Vec<String>;
+        if let Ok(t) = self.traces.read() {
+            traces_ids = t.trace_ids();
+            saved = traces_ids.iter().filter_map(|tid| t.get(tid).map(|tr| (tid.clone(), tr.index()))).collect();
+        } else {
+            return Ok(Value::Nil);
+        }
+
+        // Fast path: try simple condition (= (get "sig") val)
+        // Uses trace.find_indices() for a parallel scan.
+        if let Some((sig_name, target)) = self.parse_simple_condition(&args[0]) {
+            let cond = if target <= 1 && target >= 0 {
+                FindCondition::Value(target as u8)
+            } else {
+                FindCondition::ValueI64(target)
+            };
+            let all_indices: Vec<usize> = {
+                let t = self.traces.read().unwrap_or_else(|e| e.into_inner());
+                traces_ids.iter().filter_map(|tid| {
+                    t.get(tid).and_then(|tr| {
+                        let resolved = resolve_signal_name(&sig_name, &tr.signals())
+                            .unwrap_or_else(|| sig_name.clone());
+                        tr.find_indices(&resolved, cond.clone()).ok()
+                    })
+                }).flatten().collect()
+            };
+            let mut result = Value::Nil;
+            for &idx in &all_indices {
+                if let Ok(mut t) = self.traces.write() {
+                    for tid in &traces_ids {
+                        let _ = t.set_index(tid, idx);
+                    }
+                }
+                for b in &body_args {
+                    result = self.eval_value(b.clone())?;
+                }
+            }
+            // Restore indices
+            for (tid, idx) in &saved {
+                if let Ok(mut t) = self.traces.write() {
+                    let _ = t.set_index(tid, *idx);
+                }
+            }
+            return Ok(result);
+        }
+
+        // Reset all traces to start (fallback path)
+        if let Ok(mut t) = self.traces.write() {
+            for tid in &traces_ids {
+                let _ = t.set_index(tid, 0);
+            }
+        }
+
+        let mut result = Value::Nil;
+        let mut ended = false;
+        while !ended {
+            let cond_true = self.eval_value(args[0].clone())?.is_truthy();
+            if cond_true {
+                for b in &body_args {
+                    result = self.eval_value(b.clone())?;
+                }
+            }
+            let mut any_ended = true;
+            if let Ok(mut t) = self.traces.write() {
+                for tid in &traces_ids {
+                    if let Some(tr) = t.get_mut(tid) {
+                        if tr.step(1).is_ok() { any_ended = false; }
+                    }
+                }
+            }
+            ended = any_ended;
+        }
+
+        if let Ok(mut t) = self.traces.write() {
+            for (tid, idx) in &saved {
+                let _ = t.set_index(tid, *idx);
+            }
+        }
+        Ok(result)
+    }
+
     fn eval_quote(&mut self, args: &[Value]) -> Result<Value, String> {
         if args.len() != 1 {
             return Err(format!("quote expects 1 argument, got {}", args.len()));
@@ -1168,4 +1526,24 @@ mod tests {
         let add_result = eval.eval("(+ 1 5)");
         assert_eq!(add_result.unwrap(), Value::Int(6));
     }
+}
+
+/// Resolve a signal name against a trace's signal list using the same fuzzy matching
+/// as `op_get`. Returns the full signal name if found.
+fn resolve_signal_name(name: &str, sigs: &[String]) -> Option<String> {
+    // 1. Exact match
+    if let Some(s) = sigs.iter().find(|s| *s == name) {
+        return Some(s.clone());
+    }
+    // 2. Suffix match (short names, or names without dot)
+    if name.len() <= 8 || !name.contains('.') {
+        if let Some(s) = sigs.iter().find(|s| {
+            let last = s.rsplitn(2, '.').next().unwrap_or("");
+            last == name
+        }) {
+            return Some(s.clone());
+        }
+    }
+    // 3. Substring match
+    sigs.iter().find(|s| s.contains(name)).cloned()
 }

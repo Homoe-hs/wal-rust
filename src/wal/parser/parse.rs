@@ -31,24 +31,16 @@ impl WalParser {
         if root.has_error() {
             return Err("Parse error: syntax error or mismatched parentheses".to_string());
         }
+        let result = expr_from_node(root, source)?;
+        // Unwrap single-expression program: return the child, not the wrapping list
         if root.kind() == "program" {
-            let mut last_result: Result<Value, String> = Ok(Value::Nil);
-            let mut cursor = root.walk();
-            let mut count = 0;
-            for child in root.children(&mut cursor) {
-                if should_skip_node(child) {
-                    continue;
+            if let Value::List(ref lst) = result {
+                if lst.len() == 1 {
+                    return Ok(lst[0].clone());
                 }
-                count += 1;
-                last_result = expr_from_node(child, source);
             }
-            if count == 1 {
-                return last_result;
-            }
-            last_result
-        } else {
-            expr_from_node(root, source)
         }
+        Ok(result)
     }
 }
 

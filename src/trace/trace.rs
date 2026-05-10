@@ -9,6 +9,7 @@ pub enum FindCondition {
     High,
     Low,
     Value(u8),
+    ValueI64(i64),
 }
 
 pub trait Trace {
