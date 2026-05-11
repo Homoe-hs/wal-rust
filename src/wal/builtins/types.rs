@@ -12,34 +12,40 @@ fn op_defined_p(args: &[Value], env: &mut Environment, _eval: &mut Evaluator) ->
 }
 
 fn op_atom_p(args: &[Value], _env: &mut Environment, _eval: &mut Evaluator) -> Result<Value, String> {
-    ensure_arity(args, 1)?;
-    let is_atom = match &args[0] {
+    ensure_arity_atleast(args, 1)?;
+    Ok(all_satisfy(args, |v| match v {
         Value::Nil | Value::Bool(_) | Value::Int(_) | Value::Float(_) | Value::String(_) => true,
         Value::Symbol(_) | Value::Closure(_) | Value::Macro(_) => true,
         Value::List(lst) => lst.is_empty(),
         Value::Unquote(_) | Value::UnquoteSplice(_) => true,
-    };
-    Ok(Value::Bool(is_atom))
+    }))
 }
 
 fn op_symbol_p(args: &[Value], _env: &mut Environment, _eval: &mut Evaluator) -> Result<Value, String> {
-    ensure_arity(args, 1)?;
-    Ok(Value::Bool(matches!(&args[0], Value::Symbol(_))))
+    ensure_arity_atleast(args, 1)?;
+    Ok(all_satisfy(args, |v| matches!(v, Value::Symbol(_))))
 }
 
 fn op_string_p(args: &[Value], _env: &mut Environment, _eval: &mut Evaluator) -> Result<Value, String> {
-    ensure_arity(args, 1)?;
-    Ok(Value::Bool(matches!(&args[0], Value::String(_))))
+    ensure_arity_atleast(args, 1)?;
+    Ok(all_satisfy(args, |v| matches!(v, Value::String(_))))
+}
+
+/// Check that all args satisfy a predicate (golden-compatible multi-arg behavior)
+fn all_satisfy<F>(args: &[Value], pred: F) -> Value
+where F: Fn(&Value) -> bool {
+    if args.is_empty() { return Value::Bool(false); }
+    Value::Bool(args.iter().all(pred))
 }
 
 fn op_int_p(args: &[Value], _env: &mut Environment, _eval: &mut Evaluator) -> Result<Value, String> {
-    ensure_arity(args, 1)?;
-    Ok(Value::Bool(matches!(&args[0], Value::Int(_))))
+    ensure_arity_atleast(args, 1)?;
+    Ok(all_satisfy(args, |v| matches!(v, Value::Int(_))))
 }
 
 fn op_list_p(args: &[Value], _env: &mut Environment, _eval: &mut Evaluator) -> Result<Value, String> {
-    ensure_arity(args, 1)?;
-    Ok(Value::Bool(matches!(&args[0], Value::List(_))))
+    ensure_arity_atleast(args, 1)?;
+    Ok(all_satisfy(args, |v| matches!(v, Value::List(_))))
 }
 
 fn op_convert_binary(args: &[Value], _env: &mut Environment, _eval: &mut Evaluator) -> Result<Value, String> {

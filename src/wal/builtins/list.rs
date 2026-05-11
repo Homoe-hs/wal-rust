@@ -307,6 +307,41 @@ fn extract_float(v: &Value) -> Result<f64, String> {
     }
 }
 
+fn op_range(args: &[Value], _env: &mut Environment, _eval: &mut Evaluator) -> Result<Value, String> {
+    ensure_arity_atleast(args, 1)?;
+    ensure_arity_max(args, 3)?;
+    let start: i64;
+    let end: i64;
+    let step: i64;
+    if args.len() == 1 {
+        start = 0;
+        end = extract_int(&args[0])?;
+        step = 1;
+    } else if args.len() == 2 {
+        start = extract_int(&args[0])?;
+        end = extract_int(&args[1])?;
+        step = 1;
+    } else {
+        start = extract_int(&args[0])?;
+        end = extract_int(&args[1])?;
+        step = extract_int(&args[2])?;
+    }
+    let mut result = Vec::new();
+    let mut i = start;
+    if step > 0 {
+        while i < end {
+            result.push(Value::Int(i));
+            i += step;
+        }
+    } else if step < 0 {
+        while i > end {
+            result.push(Value::Int(i));
+            i += step;
+        }
+    }
+    Ok(Value::List(WList::from_vec(result)))
+}
+
 fn op_is_null(args: &[Value], _env: &mut Environment, _eval: &mut Evaluator) -> Result<Value, String> {
     ensure_arity(args, 1)?;
     match &args[0] {
@@ -316,9 +351,24 @@ fn op_is_null(args: &[Value], _env: &mut Environment, _eval: &mut Evaluator) -> 
     }
 }
 
+fn extract_int(v: &Value) -> Result<i64, String> {
+    match v {
+        Value::Int(i) => Ok(*i),
+        Value::Float(f) => Ok(*f as i64),
+        _ => Err("Expected integer".to_string()),
+    }
+}
+
 fn ensure_arity(args: &[Value], expected: usize) -> Result<(), String> {
     if args.len() != expected {
         return Err(format!("Expected {} arguments, got {}", expected, args.len()));
+    }
+    Ok(())
+}
+
+fn ensure_arity_max(args: &[Value], max: usize) -> Result<(), String> {
+    if args.len() > max {
+        return Err(format!("Expected at most {} arguments, got {}", max, args.len()));
     }
     Ok(())
 }
@@ -346,4 +396,5 @@ pub fn register_list(disp: &mut Dispatcher) {
     disp.register(Operator::Average, op_average);
     disp.register(Operator::Third, op_third);
     disp.register(Operator::IsNull, op_is_null);
+    disp.register(Operator::Range, op_range);
 }

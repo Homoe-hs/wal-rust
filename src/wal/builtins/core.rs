@@ -6,8 +6,9 @@ use crate::wal::ast::{Value, Operator, Symbol};
 use crate::wal::eval::{Environment, Dispatcher, Evaluator};
 
 fn op_not(args: &[Value], _env: &mut Environment, _eval: &mut Evaluator) -> Result<Value, String> {
-    ensure_arity(args, 1)?;
-    Ok(Value::Bool(!args[0].is_truthy()))
+    ensure_arity_atleast(args, 1)?;
+    let any_truthy = args.iter().any(|a| a.is_truthy());
+    Ok(Value::Bool(!any_truthy))
 }
 
 fn values_equal(a: &Value, b: &Value) -> bool {
@@ -122,39 +123,91 @@ fn op_printf(args: &[Value], _env: &mut Environment, eval: &mut Evaluator) -> Re
     }
     // Handle escape sequences in format string
     let fmt = fmt.replace("\\n", "\n").replace("\\t", "\t").replace("\\\"", "\"");
-    let result = if fmt.contains('%') {
-        // printf-style: %d, %s, %f, %x, %b
+        let result = if fmt.contains('%') {
+        // printf-style: Python format spec: %[flags][width][.precision]spec
         let mut pos = 0usize;
         let mut output = String::new();
         let mut arg_idx = 0usize;
         let chars: Vec<char> = fmt.chars().collect();
         while pos < chars.len() {
             if chars[pos] == '%' && pos + 1 < chars.len() {
-                let spec = chars[pos + 1];
-                let val = evaluated.get(arg_idx).map(|s| s.as_str()).unwrap_or("");
-                match spec {
-                    'd' | 'i' => {
-                        // Try to parse as integer for %d
-                        let n: i64 = val.parse().unwrap_or(0);
-                        output.push_str(&n.to_string());
+                let start = pos;
+                pos += 1; // skip %
+                // Parse flags
+                let mut flags = String::new();
+                while pos < chars.len() && matches!(chars[pos], '-' | '+' | ' ' | '0' | '#') {
+                    flags.push(chars[pos]);
+                    pos += 1;
+                }
+                // Parse width
+                let mut width_str = String::new();
+                while pos < chars.len() && chars[pos].is_ascii_digit() {
+                    width_str.push(chars[pos]);
+                    pos += 1;
+                }
+                let width: usize = width_str.parse().unwrap_or(0);
+                // Parse precision
+                let mut precision: Option<usize> = None;
+                if pos < chars.len() && chars[pos] == '.' {
+                    pos += 1;
+                    let mut prec_str = String::new();
+                    while pos < chars.len() && chars[pos].is_ascii_digit() {
+                        prec_str.push(chars[pos]);
+                        pos += 1;
                     }
-                    's' => output.push_str(val),
+                    precision = prec_str.parse().ok();
+                }
+                // Read specifier
+                let spec = if pos < chars.len() { chars[pos] } else { '%' };
+                pos += 1;
+                let val = evaluated.get(arg_idx).map(|s| s.as_str()).unwrap_or("");
+                let formatted = match spec {
+                    'd' | 'i' => {
+                        let n: i64 = val.parse().unwrap_or(0);
+                        if let Some(prec) = precision {
+                            format!("{:0>width$}", n.to_string(), width = prec)
+                        } else if flags.contains('0') && width > 0 {
+                            format!("{:0>width$}", n, width = width)
+                        } else if width > 0 {
+                            format!("{:>width$}", n, width = width)
+                        } else {
+                            n.to_string()
+                        }
+                    }
+                    's' => {
+                        if width > 0 && flags.contains('-') {
+                            format!("{:width$}", val, width = width)
+                        } else if width > 0 {
+                            format!("{:>width$}", val, width = width)
+                        } else {
+                            val.to_string()
+                        }
+                    }
                     'f' => {
                         let n: f64 = val.parse().unwrap_or(0.0);
-                        output.push_str(&n.to_string());
+                        match precision {
+                            Some(p) => format!("{:.prec$}", n, prec = p),
+                            None => n.to_string(),
+                        }
                     }
                     'x' => {
                         let n: i64 = val.parse().unwrap_or(0);
-                        output.push_str(&format!("{:x}", n));
+                        let s = format!("{:x}", n);
+                        if width > 0 && flags.contains('0') {
+                            format!("{:0>width$}", s, width = width)
+                        } else if width > 0 {
+                            format!("{:>width$}", s, width = width)
+                        } else {
+                            s
+                        }
                     }
-                    '%' => output.push('%'),
+                    '%' => "%".to_string(),
                     _ => {
-                        output.push('%');
-                        output.push(spec);
+                        format!("%{}", spec)
                     }
-                }
+                };
+                output.push_str(&formatted);
                 arg_idx += 1;
-                pos += 2;
             } else {
                 output.push(chars[pos]);
                 pos += 1;
@@ -182,13 +235,29 @@ fn op_exit(args: &[Value], _env: &mut Environment, _eval: &mut Evaluator) -> Res
 
 fn op_type(args: &[Value], _env: &mut Environment, _eval: &mut Evaluator) -> Result<Value, String> {
     ensure_arity(args, 1)?;
-    Ok(Value::String(args[0].type_name().to_string()))
+    let type_str = match args[0].type_name() {
+        "int" => "<class 'int'>",
+        "float" => "<class 'float'>",
+        "string" => "<class 'str'>",
+        "bool" => "<class 'bool'>",
+        "symbol" => "<class 'symbol'>",
+        "list" => "<class 'list'>",
+        "nil" => "<class 'NoneType'>",
+        other => other,
+    };
+    Ok(Value::String(type_str.to_string()))
 }
 
-fn op_alias(args: &[Value], env: &mut Environment, _eval: &mut Evaluator) -> Result<Value, String> {
+fn op_alias(args: &[Value], env: &mut Environment, eval: &mut Evaluator) -> Result<Value, String> {
     ensure_arity(args, 2)?;
     let alias_name = extract_symbol(&args[0])?;
-    let target_name = extract_symbol(&args[1])?;
+    // Evaluate target expression (golden behavior)
+    let target_val = eval.eval_value_public(args[1].clone())?;
+    let target_name = match &target_val {
+        Value::Symbol(s) => s.name.clone(),
+        Value::String(s) => s.clone(),
+        other => other.to_string(),
+    };
     env.add_alias(&alias_name, &target_name);
     Ok(Value::Nil)
 }
@@ -304,26 +373,24 @@ fn op_smaller_equal(args: &[Value], _env: &mut Environment, _eval: &mut Evaluato
 
 fn op_and(args: &[Value], _env: &mut Environment, eval: &mut Evaluator) -> Result<Value, String> {
     ensure_arity_atleast(args, 1)?;
-    let mut result = Value::Bool(true);
     for arg in args {
-        result = eval.eval_value_public(arg.clone())?;
+        let result = eval.eval_value_public(arg.clone())?;
         if !result.is_truthy() {
-            return Ok(Value::Bool(false));
+            return Ok(Value::Int(0));
         }
     }
-    Ok(result)
+    Ok(Value::Int(1))
 }
 
 fn op_or(args: &[Value], _env: &mut Environment, eval: &mut Evaluator) -> Result<Value, String> {
     ensure_arity_atleast(args, 1)?;
-    let mut result = Value::Bool(false);
     for arg in args {
-        result = eval.eval_value_public(arg.clone())?;
+        let result = eval.eval_value_public(arg.clone())?;
         if result.is_truthy() {
-            return Ok(Value::Bool(true));
+            return Ok(Value::Int(1));
         }
     }
-    Ok(result)
+    Ok(Value::Int(0))
 }
 
 fn ensure_arity(args: &[Value], expected: usize) -> Result<(), String> {

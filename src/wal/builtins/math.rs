@@ -137,6 +137,14 @@ fn op_div(args: &[Value], _env: &mut Environment, _eval: &mut Evaluator) -> Resu
 
 fn op_exp(args: &[Value], _env: &mut Environment, _eval: &mut Evaluator) -> Result<Value, String> {
     ensure_arity(args, 2)?;
+    // When both operands are int, return int (matching golden behavior)
+    if let (Value::Int(base), Value::Int(exp)) = (&args[0], &args[1]) {
+        if *exp >= 0 && *exp <= 20 {
+            if let Some(result) = base.checked_pow(*exp as u32) {
+                return Ok(Value::Int(result));
+            }
+        }
+    }
     let base = extract_float(&args[0])?;
     let exp = extract_float(&args[1])?;
     Ok(Value::Float(base.powf(exp)))

@@ -98,6 +98,7 @@ pub enum Operator {
     Zip,
     Sum,
     Third,
+    Range,
 
     // Type checks
     IsDefined,
@@ -240,6 +241,7 @@ impl Operator {
             "parse" => Some(Operator::Parse),
             "rel_eval" | "reval" | "@" => Some(Operator::RelEval),
             "slice" => Some(Operator::Slice),
+            "range" => Some(Operator::Range),
             "get" => Some(Operator::Get),
             "call" => Some(Operator::Call),
             "import" => Some(Operator::Import),
@@ -399,6 +401,7 @@ impl Operator {
             Operator::Last => "last",
             Operator::Rest => "rest",
             Operator::In => "in",
+            Operator::Range => "range",
             Operator::Map => "map",
             Operator::Max => "max",
             Operator::Min => "min",

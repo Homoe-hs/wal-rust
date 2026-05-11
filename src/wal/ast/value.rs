@@ -42,7 +42,9 @@ impl Value {
         match self {
             Value::Nil => false,
             Value::Bool(b) => *b,
-            Value::Int(i) => *i > 0,
+            Value::Int(i) => *i != 0,
+            Value::Float(f) => *f != 0.0,
+            Value::String(s) => !s.is_empty(),
             Value::List(lst) => !lst.is_empty(),
             _ => true,
         }

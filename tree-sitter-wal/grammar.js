@@ -1,7 +1,7 @@
 module.exports = grammar({
   name: 'wal',
 
-  extras: $ => [$._comment, $.whitespace],
+  extras: $ => [$._comment, $.whitespace, $._line_comment],
 
   word: $ => $.base_symbol,
 
@@ -18,7 +18,7 @@ module.exports = grammar({
       $.timed_atom,
     ),
 
-    timed_atom: $ => seq($.atom, "@", $.atom),
+    timed_atom: $ => seq($.atom, "@", choice($.atom, $.list)),
 
     quoted: $ => seq("'", $.sexpr),
     quasiquoted: $ => seq("`", $.sexpr),
@@ -27,6 +27,7 @@ module.exports = grammar({
 
     whitespace: () => /[\t \r\n]+/,
     _comment: () => /;;.*/,
+    _line_comment: () => /;.*/,
 
     atom: $ => choice(
       $.string,
@@ -59,7 +60,7 @@ module.exports = grammar({
     grouped_symbol: $ => seq("#", $.base_symbol),
     base_symbol: () => /[a-zA-Z_\.][=$\*\/>:\.\-_\?=%§^!\\~+<>|,\w]*/,
 
-    string: () => /"[^"]*"/,
+    string: () => /"([^"\\]|\\.)*"/,
 
     list: $ => choice(
       seq("(", optional($.sexpr_list), ")"),

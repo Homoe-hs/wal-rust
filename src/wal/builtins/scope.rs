@@ -117,6 +117,11 @@ fn op_in_group(args: &[Value], env: &mut Environment, eval: &mut Evaluator) -> R
     let group_name = extract_name(&args[0])?;
     let mut new_env = env.child();
     new_env.set_group(&group_name);
+    // Sync scope (CS) from group name: strip trailing dot if present
+    let scope_from_group = group_name.trim_end_matches('.');
+    if !scope_from_group.is_empty() {
+        new_env.set_scope(scope_from_group);
+    }
     let saved_env = std::mem::replace(env, new_env);
     let mut result = Value::Nil;
     for arg in &args[1..] {

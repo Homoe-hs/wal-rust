@@ -246,6 +246,10 @@
         {
           "type": "atom",
           "named": true
+        },
+        {
+          "type": "list",
+          "named": true
         }
       ]
     }

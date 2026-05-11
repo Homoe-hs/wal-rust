@@ -126,8 +126,9 @@ impl SemanticChecker {
         match op {
             Operator::Add | Operator::Sub | Operator::Mul | Operator::Div => Some((2, None)),
             Operator::Exp | Operator::Mod => Some((2, Some(2))),
-            Operator::Eq | Operator::Neq | Operator::Larger | Operator::Smaller 
-            | Operator::LargerEqual | Operator::SmallerEqual => Some((2, Some(2))),
+            Operator::Eq | Operator::Neq => Some((2, None)),
+            Operator::Larger | Operator::Smaller 
+            | Operator::LargerEqual | Operator::SmallerEqual => Some((2, None)),
             Operator::Not => Some((1, Some(1))),
             Operator::And | Operator::Or => Some((2, None)),
             Operator::Bor | Operator::Band | Operator::Bxor => Some((2, None)),
@@ -135,7 +136,7 @@ impl SemanticChecker {
             Operator::Define => Some((2, Some(2))),
             Operator::Set => Some((2, Some(2))),
             Operator::Let => Some((1, None)),
-            Operator::If => Some((3, None)),
+            Operator::If => Some((2, None)),
             Operator::Fn => Some((1, None)),
             Operator::Defmacro => Some((2, None)),
             
@@ -226,7 +227,7 @@ impl SemanticChecker {
     }
 
     fn is_comparable(v: &Value) -> bool {
-        matches!(v, Value::Int(_) | Value::Float(_) | Value::String(_) | Value::Bool(_))
+        matches!(v, Value::Int(_) | Value::Float(_) | Value::String(_) | Value::Bool(_) | Value::List(_))
     }
 
     pub fn validate_closure_args(closure_args: &[Symbol], call_args: &[Value]) -> Option<SemanticError> {

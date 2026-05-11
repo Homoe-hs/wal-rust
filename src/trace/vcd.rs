@@ -165,37 +165,18 @@ impl VcdTrace {
         }
         boundaries.push(data.len());
 
-        // Pre-compute chunk start ts_idx (number of # before each boundary)
-        let mut chunk_start_ts = vec![0usize; boundaries.len()];
-        {
-            let mut ts_count = 0usize;
-            let mut bi = 1usize;
-            for (i, &b) in data[actual_start..].iter().enumerate() {
-                if b == b'#' { ts_count += 1; }
-                while bi < boundaries.len() && actual_start + i + 1 >= boundaries[bi] {
-                    chunk_start_ts[bi] = ts_count;
-                    bi += 1;
-                }
-                if bi >= boundaries.len() { break; }
-            }
-        }
-
         // Shared read-only data for parallel threads
         let signal_ids_arc = Arc::new(signal_ids);
+        let has_events = !event_signals.is_empty();
         let event_sigs_arc = Arc::new(event_signals.clone());
-
-        // Build chunk descriptors with pre-computed start_ts_idx
-        let mut chunk_descs: Vec<(usize, usize, usize)> = Vec::with_capacity(boundaries.len() - 1);
-        for i in 0..boundaries.len() - 1 {
-            chunk_descs.push((boundaries[i], boundaries[i+1], chunk_start_ts[i]));
-        }
 
         // Parallel processing
         let sparse_interval: u64 = 100;
-        #[allow(clippy::type_complexity)]
-        let results: Vec<(Vec<u64>, Vec<u64>, HashMap<u32, BTreeMap<u64, u64>>, HashMap<u32, Vec<usize>>)> = chunk_descs
-            .par_iter()
-            .map(|&(chunk_start, chunk_end, chunk_ts_idx)| {
+        let results: Vec<(Vec<u64>, Vec<u64>, HashMap<u32, BTreeMap<u64, u64>>, Vec<(u32, u64)>)> = boundaries
+            .par_windows(2)
+            .map(|w| {
+                let chunk_start = w[0];
+                let chunk_end = w[1];
                 let chunk = &data[chunk_start..chunk_end];
                 let sid = signal_ids_arc.clone();
                 let evt = event_sigs_arc.clone();
@@ -204,9 +185,8 @@ impl VcdTrace {
                 let mut ts_offsets = Vec::new();
                 let mut si: HashMap<u32, BTreeMap<u64, u64>> = HashMap::new();
                 let mut change_counts: HashMap<u32, u64> = HashMap::new();
-                let mut event_cp: HashMap<u32, Vec<usize>> = HashMap::new();
+                let mut event_cp: Vec<(u32, u64)> = Vec::new();
                 let mut current_timestamp: u64 = 0;
-                let mut local_ts_cnt: usize = 0;
                 let base_offset = chunk_start as u64;
 
                 let mut lp = 0usize;
@@ -219,9 +199,7 @@ impl VcdTrace {
                             lp += 1; // skip newline
                             end
                         }
-                    None => {
-                        break;
-                    }
+                    None => { break; }
                     };
                     let line = &chunk[line_start..line_end];
                     if line.is_empty() { continue; }
@@ -232,7 +210,6 @@ impl VcdTrace {
                             current_timestamp = parse_timestamp_fast(line);
                             ts.push(current_timestamp);
                             ts_offsets.push(base_offset + line_start as u64);
-                            local_ts_cnt += 1;
                         }
                         b'$' => {}
                         _ => {
@@ -245,13 +222,8 @@ impl VcdTrace {
                                             .or_default()
                                             .insert(current_timestamp, base_offset + line_start as u64);
                                     }
-                                    // Event signal: record global INDEX for every change
-                                    if evt.contains(&sig_idx) {
-                                        // The value change occurs at the current timestamp.
-                                        // Global index = chunk_ts_idx + (local_ts_cnt - 1)
-                                        // because local_ts_cnt was incremented when we saw the # line.
-                                        let global_idx = chunk_ts_idx + local_ts_cnt.saturating_sub(1);
-                                        event_cp.entry(sig_idx).or_default().push(global_idx);
+                                    if has_events && evt.contains(&sig_idx) {
+                                        event_cp.push((sig_idx, current_timestamp));
                                     }
                                 }
                             }
@@ -266,7 +238,7 @@ impl VcdTrace {
         let mut timestamps: Vec<u64> = Vec::with_capacity(est_ts);
         let mut timestamp_offsets: Vec<u64> = Vec::with_capacity(est_ts);
         let mut sparse_index: HashMap<u32, BTreeMap<u64, u64>> = HashMap::with_capacity(128);
-        let mut event_change_points: HashMap<u32, Vec<usize>> = HashMap::new();
+        let mut event_change_ts: HashMap<u32, Vec<u64>> = HashMap::new();
         // Init empty btreemaps for each signal
         for idx in 0..signals.len() {
             sparse_index.insert(idx as u32, BTreeMap::new());
@@ -278,9 +250,24 @@ impl VcdTrace {
             for (sig_idx, entries) in chunk_si {
                 sparse_index.entry(sig_idx).or_default().extend(entries);
             }
-            for (sig_idx, points) in chunk_evt {
-                event_change_points.entry(sig_idx).or_default().extend(points);
+            // Group flat event tuples by sig_idx
+            for (sig_idx, ts) in chunk_evt {
+                event_change_ts.entry(sig_idx).or_default().push(ts);
             }
+        }
+
+        // Convert event timestamps to sequential INDEX using sorted timestamps
+        let mut event_change_points: HashMap<u32, Vec<usize>> = HashMap::with_capacity(event_change_ts.len());
+        for (sig_idx, ts_list) in &event_change_ts {
+            let mut indices = Vec::with_capacity(ts_list.len());
+            let mut ti = 0usize;
+            for ts in ts_list {
+                while ti < timestamps.len() && timestamps[ti] < *ts { ti += 1; }
+                if ti < timestamps.len() && timestamps[ti] == *ts {
+                    indices.push(ti);
+                }
+            }
+            event_change_points.insert(*sig_idx, indices);
         }
 
         let signal_ids = Arc::try_unwrap(signal_ids_arc).unwrap_or_else(|arc| (*arc).clone());
@@ -630,13 +617,7 @@ impl Trace for VcdTrace {
         // Event signal fast path: change points already recorded during load
         if self.event_signals.contains(&sig_idx) {
             if let Some(points) = self.event_change_points.get(&sig_idx) {
-                // Event signals only ever transition 0→1 (trigger), never 1→0 in VCD.
-                // Match Value(1) or ValueI64(1): return all trigger indices.
-                if matches!(&cond, FindCondition::Value(b'1') | FindCondition::ValueI64(1)) {
-                    return Ok(points.clone());
-                }
-                // For edge detection (Rising): same as Value(1) — 0→1 transition.
-                if matches!(&cond, FindCondition::Rising) {
+                if matches!(&cond, FindCondition::Value(1) | FindCondition::ValueI64(1) | FindCondition::Rising) {
                     return Ok(points.clone());
                 }
             }
@@ -783,7 +764,10 @@ fn find_cond_matches(val: &VcdValue, prev_bit: Option<u8>, cond: &FindCondition)
         FindCondition::Falling => prev_bit == Some(b'1') && val.as_bit() == Some(b'0'),
         FindCondition::High => val.as_bit() == Some(b'1'),
         FindCondition::Low => val.as_bit() == Some(b'0'),
-        FindCondition::Value(v) => val.as_bit() == Some(*v),
+        FindCondition::Value(v) => {
+            let bit = val.as_bit();
+            bit == Some(*v) || (bit == Some(b'1') && *v == 1) || (bit == Some(b'0') && *v == 0)
+        }
         FindCondition::ValueI64(target) => val.to_i64() == Some(*target),
     }
 }

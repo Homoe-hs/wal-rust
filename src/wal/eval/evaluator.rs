@@ -260,7 +260,13 @@ impl Evaluator {
             // Fuzzy fallback: try suffix / substring match
             for id in traces.trace_ids() {
                 if let Some(sigs) = traces.signals(&id) {
-                    if let Some(matched) = fuzzy_match_signal(&name, &sigs) {
+                    let (matched, candidates) = fuzzy_match_signal(&name, &sigs);
+                    if candidates.len() > 1 {
+                        log::warn!("signal '{}' is ambiguous: matches {:?}, using '{}'",
+                            name, &candidates[..candidates.len().min(5)],
+                            matched.map(|s| s.as_str()).unwrap_or("?"));
+                    }
+                    if let Some(matched) = matched {
                         let get_expr = Value::List(WList::from_vec(vec![
                             Value::Symbol(Symbol::new("get")),
                             Value::String(matched.clone()),
@@ -504,16 +510,40 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
     }
 
     fn eval_set(&mut self, args: &[Value]) -> Result<Value, String> {
-        if args.len() != 2 {
-            return Err(format!("set expects 2 arguments, got {}", args.len()));
+        if args.is_empty() {
+            return Err("set expects at least 1 argument".to_string());
         }
-        let name = match &args[0] {
-            Value::Symbol(s) => s.name.clone(),
-            _ => return Err("set: first argument must be a symbol".to_string()),
-        };
-        let value = self.eval_value(args[1].clone())?;
-        self.env.set(&name, value.clone())?;
-        Ok(value)
+
+        // Single mode: (set! name value)
+        if matches!(&args[0], Value::Symbol(_))  {
+            if args.len() != 2 {
+                return Err(format!("set expects 2 arguments for single mode, got {}", args.len()));
+            }
+            let name = match &args[0] {
+                Value::Symbol(s) => s.name.clone(),
+                _ => unreachable!(),
+            };
+            let value = self.eval_value(args[1].clone())?;
+            self.env.set(&name, value.clone())?;
+            return Ok(value);
+        }
+
+        // Multi-pair mode: (set! (name1 val1) (name2 val2) ...)
+        let mut result = Value::Nil;
+        for arg in args {
+            let pair = match arg {
+                Value::List(lst) if lst.len() == 2 => lst,
+                _ => return Err(format!("set: each argument must be a (name value) pair, got {:?}", arg)),
+            };
+            let name = match &pair.0[0] {
+                Value::Symbol(s) => s.name.clone(),
+                _ => return Err("set: pair first element must be a symbol".to_string()),
+            };
+            let value = self.eval_value(pair.0[1].clone())?;
+            self.env.set(&name, value.clone())?;
+            result = value;
+        }
+        Ok(result)
     }
 
     fn eval_define(&mut self, args: &[Value]) -> Result<Value, String> {
@@ -595,14 +625,16 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
     }
 
     fn eval_if(&mut self, args: &[Value]) -> Result<Value, String> {
-        if args.len() < 3 {
-            return Err(format!("if expects at least 3 arguments, got {}", args.len()));
+        if args.len() < 2 {
+            return Err(format!("if expects at least 2 arguments, got {}", args.len()));
         }
         let cond = self.eval_value(args[0].clone())?;
         if cond.is_truthy() {
             self.eval_value(args[1].clone())
-        } else {
+        } else if args.len() >= 3 {
             self.eval_value(args[2].clone())
+        } else {
+            Ok(Value::Nil)
         }
     }
 
@@ -1425,20 +1457,28 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
     }
 }
 
-fn fuzzy_match_signal<'a>(name: &str, signals: &'a [String]) -> Option<&'a String> {
+fn fuzzy_match_signal<'a>(name: &str, signals: &'a [String]) -> (Option<&'a String>, Vec<&'a String>) {
     let dot_name = format!(".{}", name);
-    if let Some(s) = signals.iter().find(|s| s.as_str() == name || s.ends_with(&dot_name)) {
-        return Some(s);
-    }
+    // 1. Exact or suffix match
+    let mut suffix: Vec<&'a String> = signals.iter().filter(|s| s.as_str() == name || s.ends_with(&dot_name)).collect();
+    if suffix.len() == 1 { return (Some(suffix[0]), vec![]); }
+    if suffix.len() > 1 { return (Some(suffix[0]), suffix); }
+
+    // 2. Last component match for short names
     if name.len() <= 8 || !name.contains('.') {
-        if let Some(s) = signals.iter().find(|s| {
-            let last = s.rsplitn(2, '.').next().unwrap_or("");
-            last == name
-        }) {
-            return Some(s);
-        }
+        let last_comp: Vec<&'a String> = signals.iter()
+            .filter(|s| s.rsplitn(2, '.').next().unwrap_or("") == name)
+            .collect();
+        if last_comp.len() == 1 { return (Some(last_comp[0]), vec![]); }
+        if last_comp.len() > 1 { return (Some(last_comp[0]), last_comp); }
     }
-    signals.iter().find(|s| s.contains(name))
+
+    // 3. Substring match
+    let sub: Vec<&'a String> = signals.iter().filter(|s| s.contains(name)).collect();
+    if sub.len() == 1 { return (Some(sub[0]), vec![]); }
+    if sub.len() > 1 { return (Some(sub[0]), sub); }
+
+    (None, vec![])
 }
 
 /// Helper to extract a name from either a Symbol or String value

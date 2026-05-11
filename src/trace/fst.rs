@@ -677,7 +677,9 @@ impl Trace for FstTrace {
                 FindCondition::Falling => prev_bit == Some(b'1') && curr_bit == Some(b'0'),
                 FindCondition::High => curr_bit == Some(b'1'),
                 FindCondition::Low => curr_bit == Some(b'0'),
-                FindCondition::Value(v) => curr_bit == Some(*v),
+                FindCondition::Value(v) => {
+                    curr_bit == Some(*v) || (curr_bit == Some(b'1') && *v == 1) || (curr_bit == Some(b'0') && *v == 0)
+                }
                 FindCondition::ValueI64(target) => {
                     let int_val = if val.len() == 1 {
                         Some(if val[0] == b'1' { 1i64 } else { 0i64 })

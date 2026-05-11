@@ -2,9 +2,9 @@
 //!
 //! load, unload, step, find, find/g, whenever, signal-width, sample-at, trim-trace, signal?
 
-use crate::wal::ast::{Value, WList, Operator};
+use crate::wal::ast::{Value, WList, Operator, Symbol};
 use crate::wal::eval::{Environment, Dispatcher, Evaluator};
-use crate::trace::{ScalarValue, Trace, TraceContainer};
+use crate::trace::{FindCondition, ScalarValue, Trace, TraceContainer};
 use std::path::Path;
 
 fn op_load(args: &[Value], env: &mut Environment, _eval: &mut Evaluator) -> Result<Value, String> {
@@ -283,17 +283,50 @@ fn op_whenever(args: &[Value], env: &mut Environment, eval: &mut Evaluator) -> R
             (tids, indices)
         };
 
-        // Reset all traces to start
-        {
-            let mut traces = traces.write().unwrap_or_else(|e| e.into_inner());
-            for tid in &tids {
-                let _ = traces.set_index(tid, 0);
+        let mut result = Value::Nil;
+
+        // Fast path: try simple condition (= (get "sig") val) → use find_indices
+        if let Some((sig_name, target)) = parse_simple_condition(cond) {
+            let cond_enum = if target <= 1 && target >= 0 {
+                FindCondition::Value(target as u8)
+            } else {
+                FindCondition::ValueI64(target)
+            };
+            if let Some(trace) = {
+                let t = traces.read().unwrap_or_else(|e| e.into_inner());
+                t.first_trace().map(|tr| (tr.id().clone(), tr.signals()))
+            } {
+                let (tid, sigs) = trace;
+                let (resolved, _candidates) = fuzzy_match_signal(&sig_name, &sigs);
+                if let Some(resolved) = resolved {
+                    if let Ok(indices) = {
+                        let t = traces.read().unwrap_or_else(|e| e.into_inner());
+                        t.find_indices(resolved, cond_enum)
+                    } {
+                        for &idx in &indices {
+                            {
+                                let mut t = traces.write().unwrap_or_else(|e| e.into_inner());
+                                let _ = t.set_index(&tid, idx);
+                            }
+                            for b in body {
+                                result = eval.eval_value_public(b.clone())?;
+                            }
+                        }
+                        // Restore original indices
+                        {
+                            let mut t = traces.write().unwrap_or_else(|e| e.into_inner());
+                            for (tid, &idx) in tids.iter().zip(prev_idx_values.iter()) {
+                                let _ = t.set_index(tid, idx);
+                            }
+                        }
+                        return Ok(result);
+                    }
+                }
             }
         }
 
-        let mut result = Value::Nil;
+        // Fallback: step-by-step iteration
         let mut ended = false;
-
         while !ended {
             // Evaluate condition (read lock released)
             let cond_true = eval.eval_value_public(cond.clone())?.is_truthy();
@@ -326,28 +359,66 @@ fn op_whenever(args: &[Value], env: &mut Environment, eval: &mut Evaluator) -> R
     Ok(Value::Nil)
 }
 
-fn fuzzy_match_signal<'a>(name: &str, signals: &'a [String]) -> Option<&'a String> {
+/// Signal name resolution: returns (selected_signal, all_substring_matches for warning)
+/// Returns empty candidates vec for exact/suffix matches (no ambiguity).
+fn fuzzy_match_signal<'a>(name: &str, signals: &'a [String]) -> (Option<&'a String>, Vec<&'a String>) {
     // 1. Exact match
     if let Some(s) = signals.iter().find(|s| s.as_str() == name) {
-        return Some(s);
+        return (Some(s), vec![]);
     }
     // 2. Suffix match: signal ends with .name
     let dot_name = format!(".{}", name);
-    if let Some(s) = signals.iter().find(|s| s.ends_with(&dot_name)) {
-        return Some(s);
-    }
-    // 3. Contains match (after dot) for very short names
+    let suffix: Vec<&'a String> = signals.iter().filter(|s| s.ends_with(&dot_name)).collect();
+    if suffix.len() == 1 { return (Some(suffix[0]), vec![]); }
+    if suffix.len() > 1 { return (Some(suffix[0]), suffix); }
+
+    // 3. Last component match for short names
     if name.len() <= 8 || !name.contains('.') {
-        if let Some(s) = signals.iter().find(|s| {
-            let last = s.rsplitn(2, '.').next().unwrap_or("");
-            last == name
-        }) {
-            return Some(s);
-        }
+        let last_comp: Vec<&'a String> = signals.iter()
+            .filter(|s| s.rsplitn(2, '.').next().unwrap_or("") == name)
+            .collect();
+        if last_comp.len() == 1 { return (Some(last_comp[0]), vec![]); }
+        if last_comp.len() > 1 { return (Some(last_comp[0]), last_comp); }
     }
+
     // 4. Substring match
-    if let Some(s) = signals.iter().find(|s| s.contains(name)) {
-        return Some(s);
+    let sub: Vec<&'a String> = signals.iter().filter(|s| s.contains(name)).collect();
+    if sub.len() == 1 { return (Some(sub[0]), vec![]); }
+    if sub.len() > 1 { return (Some(sub[0]), sub); }
+
+    (None, vec![])
+}
+
+/// Parse a simple condition expression like (= (get "signal") N)
+fn parse_simple_condition(expr: &Value) -> Option<(String, i64)> {
+    let lst = match expr {
+        Value::List(lst) if lst.len() == 3 => lst,
+        _ => return None,
+    };
+    let op = match &lst.0[0] {
+        Value::Symbol(s) => s.name.as_str(),
+        _ => return None,
+    };
+    if op != "=" { return None; }
+    for (a, b) in &[(0, 1), (1, 0), (1, 2)] {
+        if let Value::List(inner) = &lst.0[*a] {
+            if inner.len() == 2 {
+                if let Value::Symbol(fn_sym) = &inner.0[0] {
+                    if fn_sym.name == "get" {
+                        let sig = match &inner.0[1] {
+                            Value::String(s) => s.clone(),
+                            Value::Symbol(s) => s.name.clone(),
+                            _ => continue,
+                        };
+                        let val = match &lst.0[*b] {
+                            Value::Int(i) => *i,
+                            _ => continue,
+                        };
+                        return Some((sig, val));
+                    }
+                }
+            }
+        }
     }
     None
 }
@@ -374,7 +445,12 @@ fn op_get(args: &[Value], env: &mut Environment, _eval: &mut Evaluator) -> Resul
             }
             // Fuzzy fallback: try suffix / substring matching
             let sigs = trace.signals();
-            if let Some(matched) = fuzzy_match_signal(&name, &sigs) {
+            let (matched, candidates) = fuzzy_match_signal(&name, &sigs);
+            if candidates.len() > 1 {
+                log::warn!("signal '{}' is ambiguous: matches {:?}, using '{}'",
+                    name, &candidates[..candidates.len().min(5)], matched.as_ref().map(|s| s.as_str()).unwrap_or("?"));
+            }
+            if let Some(matched) = matched {
                 if let Ok(sv) = trace.signal_value(matched, trace.index()) {
                     return Ok(scalar_to_value(sv));
                 }
@@ -419,31 +495,66 @@ fn op_releval(args: &[Value], env: &mut Environment, eval: &mut Evaluator) -> Re
 }
 
 fn op_fold_signal(args: &[Value], env: &mut Environment, eval: &mut Evaluator) -> Result<Value, String> {
-    // (fold signal expr init method) — iterate over signal values at each time step
-    ensure_arity_atleast(args, 3)?;
-    let signal_name = extract_symbol(&args[0])?;
-    let expr = &args[1];
-    let init = &args[2];
-    let _method = args.get(3).and_then(|v| extract_symbol(v).ok()).unwrap_or_default();
+    // golden-compatible: (fold/signal f acc stop signal)
+    //   f     = function (fn [acc val] ...) applied at each step
+    //   acc   = initial accumulator value
+    //   stop  = condition expression; fold stops when truthy
+    //   signal = signal name
+    ensure_arity(args, 4)?;
+    let f = &args[0];
+    let mut acc = eval.eval_value_public(args[1].clone())?;
+    let stop = &args[2];
+    let signal_name = extract_symbol(&args[3])?;
 
     if let Some(traces) = env.get_traces() {
-        let traces_lock = traces.read().unwrap_or_else(|e| e.into_inner());
-        if let Some(trace) = traces_lock.first_trace() {
-            let max_idx = trace.max_index();
-            let mut result = eval.eval_value_public(init.clone())?;
-            for idx in 0..=max_idx {
-                let val = trace.signal_value(&signal_name, idx).unwrap_or(ScalarValue::Bit(b'0'));
-                let val_value = scalar_to_value(val);
-                // Bind signal value to $val in environment
-                let mut new_env = env.child();
-                new_env.define("$val".to_string(), val_value);
-                new_env.define("$idx".to_string(), Value::Int(idx as i64));
-                let saved = std::mem::replace(env, new_env);
-                result = eval.eval_value_public(expr.clone())?;
-                let _ = std::mem::replace(env, saved);
+        // Save current trace positions
+        let saved_positions: Vec<(String, usize)> = {
+            let t = traces.read().unwrap_or_else(|e| e.into_inner());
+            t.trace_ids().iter().filter_map(|tid| {
+                t.get(tid).map(|tr| (tid.clone(), tr.index()))
+            }).collect()
+        };
+
+        let mut stopped = false;
+        while !stopped {
+            // Check stop condition
+            if eval.eval_value_public(stop.clone())?.is_truthy() {
+                break;
             }
-            return Ok(result);
+
+            // Read current signal value
+            let signal_val = {
+                let t = traces.read().unwrap_or_else(|e| e.into_inner());
+                t.first_trace().and_then(|tr| {
+                    let idx = tr.index();
+                    tr.signal_value(&signal_name, idx).ok()
+                }).unwrap_or(ScalarValue::Bit(b'0'))
+            };
+            let val_value = scalar_to_value(signal_val);
+
+            // Apply f(acc, signal_val) → new acc
+            let call_expr = Value::List(WList::from_vec(vec![
+                f.clone(),
+                Value::List(WList::from_vec(vec![Value::Symbol(Symbol::new("quote")), acc])),
+                Value::List(WList::from_vec(vec![Value::Symbol(Symbol::new("quote")), val_value])),
+            ]));
+            acc = eval.eval_value_public(call_expr)?;
+
+            // Step forward
+            let mut t = traces.write().unwrap_or_else(|e| e.into_inner());
+            let mut any_ended = true;
+            for trace in t.traces_iter_mut() {
+                if trace.step(1).is_ok() { any_ended = false; }
+            }
+            stopped = any_ended;
         }
+
+        // Restore positions
+        let mut t = traces.write().unwrap_or_else(|e| e.into_inner());
+        for (tid, idx) in &saved_positions {
+            let _ = t.set_index(tid, *idx);
+        }
+        return Ok(acc);
     }
     Ok(Value::Nil)
 }
@@ -680,12 +791,6 @@ pub fn register_signal(disp: &mut Dispatcher) {
     disp.register(Operator::Load, op_load);
     disp.register(Operator::Unload, op_unload);
     disp.register(Operator::Step, op_step);
-    disp.register(Operator::Signals, op_signals);
-    disp.register(Operator::Index, op_index);
-    disp.register(Operator::MaxIndex, op_max_index);
-    disp.register(Operator::Ts, op_ts);
-    disp.register(Operator::TraceName, op_trace_name);
-    disp.register(Operator::TraceFile, op_trace_file);
     disp.register(Operator::Find, op_find);
     disp.register(Operator::FindG, op_find_g);
     disp.register(Operator::Whenever, op_whenever);
