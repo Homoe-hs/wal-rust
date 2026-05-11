@@ -222,7 +222,7 @@ impl<W: Write> FstWriter<W> {
         use flate2::write::ZlibEncoder;
         use flate2::Compression as ZlComp;
         use std::io::Write;
-        let mut zlib = ZlibEncoder::new(Vec::new(), ZlComp::fast());
+        let mut zlib = ZlibEncoder::new(Vec::new(), ZlComp::best());
         zlib.write_all(&time_raw).unwrap();
         let time_comp = zlib.finish().unwrap();
         let tsec_uclen = time_raw.len() as u64;
