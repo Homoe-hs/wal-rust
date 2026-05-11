@@ -299,8 +299,13 @@ impl VcdTrace {
         }
     }
 
-    /// On-demand: read signal value at a specific timestamp (optimized with u64 hash)
+    /// On-demand: read signal value at a specific timestamp (optimized with direct byte match)
     fn read_signal_value_at(&self, sig_idx: u32, target_timestamp: u64) -> VcdValue {
+        let target_id = match self.signal_id_bytes.get(&sig_idx) {
+            Some(id) => id,
+            None => return VcdValue::Bit(b'x'),
+        };
+        let id_len = target_id.len();
         let mut reader = self.reader.borrow_mut();
 
         let start_offset = self
@@ -324,15 +329,25 @@ impl VcdTrace {
             if first == b'#' {
                 let ts = parse_timestamp_fast(line);
                 if ts > target_timestamp { break; }
-                // Event signal: auto-reset to 0 at each timestamp boundary
                 if self.event_signals.contains(&sig_idx) {
                     last_value = Some(VcdValue::Bit(b'0'));
                 }
-            } else if first != b'$' {
-                if let Some((sig_hash, value)) = parse_value_change_fast(line) {
-                    if self.signal_ids.get(&sig_hash) == Some(&sig_idx) {
-                        last_value = Some(value);
-                    }
+            } else if first != b'$' && line.len() > id_len {
+                let id_start = line.len() - id_len;
+                if &line[id_start..] == target_id.as_slice() {
+                    let val = match first {
+                        b'b' => {
+                            let ve = id_start.saturating_sub(1);
+                            let vs = if ve > 1 && line[ve] == b' ' { &line[1..ve] } else { &line[1..id_start] };
+                            VcdValue::Vector(vs.to_vec())
+                        }
+                        b'r' => {
+                            let vs = std::str::from_utf8(&line[1..id_start]).unwrap_or("0");
+                            if let Ok(r) = vs.trim().parse::<f64>() { VcdValue::Real(r) } else { continue; }
+                        }
+                        _ => VcdValue::Bit(first),
+                    };
+                    last_value = Some(val);
                 }
             }
         }
