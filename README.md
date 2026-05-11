@@ -310,6 +310,8 @@ analyze TileLink bus protocols:
 
 ---
 
+> **注**: TileLink 分析操作符（`tl-handshakes`、`tl-latency`、`tl-bandwidth`）和 VCD→FST 转换（`convert`）已从 wal-rust 核心中移除。这些是协议/工具特定的功能，不应属于语言核心。如需使用，可以通过 WAL 宏实现。
+
 ## FST Format Support
 
 | Format | Encoding | Status |

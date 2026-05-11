@@ -237,15 +237,54 @@ impl<R: Read + Seek> FstReader<R> {
         let tail = self.read_bytes(tail_len as usize)?;
         self.reader.seek(SeekFrom::Start(cur))?;
 
-        // Scan for HIER block markers (0x04/0x06/0x07/0xFE) in the tail
+        // Scan for raw vcd2fst HIER data at the end of the tail.
+        // vcd2fst appends uncompressed HIER starting with 0xFE scope markers.
+        // Find the LAST valid SCOPE entry in the tail, then walk forward from there
+        // to confirm it's the start of HIER data (compact tags 30-251 before it).
+        // The HIER data is after the GEOM data, so we look for the first 0xFE after
+        // a region of compact GEOM data (tags 30-251 in sequence).
+        let mut found_raw_hier = false;
+        // Scan forward from 200KB before end of tail for first valid SCOPE
+        let search_start = tail.len().saturating_sub(200000);
+        for pos in search_start..tail.len().saturating_sub(10) {
+            if tail[pos] == 0xFE && tail[pos + 1] <= 22 {
+                let name_start = pos + 2;
+                let null_pos = tail[name_start..].iter().position(|&b| b == 0).unwrap_or(0);
+                if null_pos > 2 && null_pos < 100 {
+                    let name = &tail[name_start..name_start + null_pos];
+                    let printable = name.iter().filter(|&&b| b.is_ascii_graphic() || b == b' ' || b == b'[' || b == b']' || b == b':').count();
+                    if printable > null_pos / 2 {
+                        let before = self.file.signals.len();
+                        self.parse_hier_data(&tail[pos..])?;
+                        if self.file.signals.len() > before {
+                            found_raw_hier = true;
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+
+        if found_raw_hier {
+            return Ok(());
+        }
+
+        // Fallback: scan backward for block-wrapped HIER (0x04/0x06/0x07/0xFE)
         for pos in (0..tail.len().saturating_sub(9)).rev() {
             let bt = tail[pos];
             if bt != 0x04 && bt != 0x06 && bt != 0x07 && bt != 0xFE {
                 continue;
             }
-            let bl = u64::from_be_bytes(tail[pos+1..pos+9].try_into().unwrap_or([0u8; 8]));
-            if bt == 0xFE {
-                // ZWRAP: decompress and parse inner
+            if bt == 0xFE && pos + 3 < tail.len() {
+                let scope_type = tail[pos + 1];
+                let next_printable = tail.get(pos + 2).map(|&b| b.is_ascii_graphic() || b == b' ' || b == 0).unwrap_or(false);
+                if scope_type <= 22 && next_printable {
+                    let before = self.file.signals.len();
+                    self.parse_hier_data(&tail[pos..])?;
+                    if self.file.signals.len() > before { break; }
+                    continue;
+                }
+                // ZWRAP fallback for 0xFE blocks
                 let compressed = &tail[pos+9..];
                 let decompressed = {
                     use std::io::Read;
@@ -265,23 +304,26 @@ impl<R: Read + Seek> FstReader<R> {
                 let inner = FstReader::from_reader(&mut cursor)?;
                 self.file.signals.extend(inner.file.signals);
                 self.file.scopes.extend(inner.file.scopes);
-            } else if bl > 0 && bl < 4_000_000 && pos + 9 + bl as usize <= tail.len() {
-                let body = &tail[pos+9..pos+9+bl as usize];
-                match bt {
-                    0x04 => { self.parse_hier_data(body)?; }
-                    0x06 | 0x07 => {
-                        if body.len() < 8 { continue; }
-                        let comp = &body[8..];
-                        let mut padded = comp.to_vec();
-                        padded.resize(comp.len() + 8, 0);
-                        if let Ok(decompressed) = lz4_flex::block::decompress_size_prepended(&padded) {
-                            self.parse_hier_data(&decompressed)?;
+            } else {
+                let bl = u64::from_be_bytes(tail[pos+1..pos+9].try_into().unwrap_or([0u8; 8]));
+                if bl > 0 && bl < 4_000_000 && pos + 9 + bl as usize <= tail.len() {
+                    let body = &tail[pos+9..pos+9+bl as usize];
+                    match bt {
+                        0x04 => { self.parse_hier_data(body)?; }
+                        0x06 | 0x07 => {
+                            if body.len() < 8 { continue; }
+                            let comp = &body[8..];
+                            let mut padded = comp.to_vec();
+                            padded.resize(comp.len() + 8, 0);
+                            if let Ok(decompressed) = lz4_flex::block::decompress_size_prepended(&padded) {
+                                self.parse_hier_data(&decompressed)?;
+                            }
                         }
+                        _ => {}
                     }
-                    _ => {}
-                }
-                if bt == 0x04 || bt == 0x06 || bt == 0x07 {
-                    if self.file.signals.len() > 0 { break; }
+                    if bt == 0x04 || bt == 0x06 || bt == 0x07 {
+                        if self.file.signals.len() > 0 { break; }
+                    }
                 }
             }
         }
@@ -791,7 +833,12 @@ impl<R: Read + Seek> FstReader<R> {
 
     fn read_hier_block(&mut self, len: u64) -> io::Result<()> {
         let data = self.read_bytes(len as usize)?;
-        self.parse_hier_data(&data)
+        // Only parse if block contains SCOPE markers (real HIER data)
+        // vcd2fst may use 0x04 type for non-HIER compact alias data
+        if data.contains(&0xFE) {
+            self.parse_hier_data(&data)?;
+        }
+        Ok(())
     }
 
     fn read_hier_lz4_block(&mut self, len: u64) -> io::Result<()> {
@@ -813,7 +860,7 @@ impl<R: Read + Seek> FstReader<R> {
         // FST handles are 1-based and sequential in HIER format
         let mut fst_handle: u32 = 0;
 
-        while pos < data.len() && unknown_skip_count < 500 {
+        while pos < data.len() && unknown_skip_count < 10000 {
             let code = data[pos];
             pos += 1;
 
@@ -868,73 +915,58 @@ impl<R: Read + Seek> FstReader<R> {
                     pos += 1;
                     if pos >= data.len() { break; }
 
-                    let (name, width, alias) = if pos < data.len() && data[pos] & 0x80 != 0 {
-                        // Compact: first byte has MSB set → it's a varint (length), not a name
-                        // Format: [len_varint][alias_varint][name\0]
-                        let (width_val, consumed) = match decode_varint(&data[pos..]) {
-                            Some(v) => v,
-                            None => break,
-                        };
+                    let result = if pos < data.len() && data[pos] & 0x80 != 0 {
+                        // Compact: [len_varint][alias_varint][name\0]
+                        let (width_val, consumed) = decode_varint(&data[pos..]).unwrap_or((0, 0));
                         pos += consumed;
-                        if pos >= data.len() { break; }
-
-                        let (alias_val, consumed) = match decode_varint(&data[pos..]) {
-                            Some(v) => v,
-                            None => break,
-                        };
-                        pos += consumed;
-                        if pos >= data.len() { break; }
-
-                        let (name_str, consumed) = self.read_cstring_from_slice(&data[pos..]);
-                        pos += consumed;
-
-                        (name_str, width_val, alias_val)
+                        if consumed == 0 { None }
+                        else {
+                            let (alias_val, consumed) = decode_varint(&data[pos..]).unwrap_or((0, 0));
+                            pos += consumed;
+                            if consumed == 0 { None }
+                            else {
+                                let (name_str, consumed) = self.read_cstring_from_slice(&data[pos..]);
+                                pos += consumed;
+                                Some((name_str, width_val, alias_val))
+                            }
+                        }
                     } else {
                         // Standard format: [name\0][len_varint][alias_varint]
                         let (name_str, consumed) = self.read_cstring_from_slice(&data[pos..]);
                         pos += consumed;
-                        if pos >= data.len() { break; }
-
-                        let (width_val, consumed) = match decode_varint(&data[pos..]) {
-                            Some(v) => v,
-                            None => break,
-                        };
+                        let (width_val, consumed) = decode_varint(&data[pos..]).unwrap_or((0, 0));
                         pos += consumed;
-
-                        let (alias_val, consumed) = match decode_varint(&data[pos..]) {
-                            Some(v) => v,
-                            None => break,
-                        };
+                        let (alias_val, consumed) = decode_varint(&data[pos..]).unwrap_or((0, 0));
                         pos += consumed;
-
-                        (name_str, width_val, alias_val)
+                        Some((name_str, width_val, alias_val))
                     };
 
-                    // Validate name
-                    let all_control = name.chars().all(|c| c.is_ascii_control());
-                    let is_valid = if name.is_empty() || all_control {
-                        false
-                    } else if alias > 0 && name.len() <= 3 {
-                        true
-                    } else {
-                        let printable = name.chars().filter(|c| c.is_ascii_graphic() || *c == ' ').count();
-                        printable >= name.len().saturating_sub(3)
-                    };
-
-                    if is_valid {
-                        let final_name = if alias > 0 && name.len() <= 3 {
-                            self.compact_aliases.push((fst_handle, alias));
-                            format!("@alias_{}", alias)
+                    if let Some((name, width, alias)) = result {
+                        let all_control = name.chars().all(|c| c.is_ascii_control());
+                        let is_valid = if name.is_empty() || all_control {
+                            false
+                        } else if alias > 0 && name.len() <= 3 {
+                            true
                         } else {
-                            name
+                            let printable = name.chars().filter(|c| c.is_ascii_graphic() || *c == ' ').count();
+                            printable >= name.len().saturating_sub(3)
                         };
-                        self.file.signals.push(SignalDecl {
-                            handle: fst_handle,
-                            name: final_name,
-                            width: width as u32,
-                            var_type: VarType::from_u8(code),
-                            direction,
-                        });
+
+                        if is_valid {
+                            let final_name = if alias > 0 && name.len() <= 3 {
+                                self.compact_aliases.push((fst_handle, alias));
+                                format!("@alias_{}", alias)
+                            } else {
+                                name
+                            };
+                            self.file.signals.push(SignalDecl {
+                                handle: fst_handle,
+                                name: final_name,
+                                width: width as u32,
+                                var_type: VarType::from_u8(code),
+                                direction,
+                            });
+                        }
                     }
                 }
                 // Unknown codes (30-251): compact alias data or non-HIER content

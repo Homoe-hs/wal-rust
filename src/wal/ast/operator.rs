@@ -108,7 +108,6 @@ pub enum Operator {
     IsInt,
     IsList,
     IsNull,
-    Convert,
     ConvertBinary,
     StringToInt,
     BitsToSint,
@@ -153,12 +152,6 @@ pub enum Operator {
     NewTrace,
     DumpTrace,
 
-    // TileLink analysis
-    TileLinkHandshakes,
-    TileLinkLatency,
-    TileLinkBandwidth,
-
-    /// String operations
     StringAppend,
 }
 
@@ -272,7 +265,6 @@ impl Operator {
             "list?" => Some(Operator::IsList),
             "null?" => Some(Operator::IsNull),
             "empty?" => Some(Operator::IsNull),
-            "convert" => Some(Operator::Convert),
             "convert/bin" => Some(Operator::ConvertBinary),
             "string->int" => Some(Operator::StringToInt),
             "bits->sint" => Some(Operator::BitsToSint),
@@ -317,11 +309,6 @@ impl Operator {
             "defsig" => Some(Operator::Defsig),
             "new-trace" => Some(Operator::NewTrace),
             "dump-trace" => Some(Operator::DumpTrace),
-
-            // TileLink analysis
-            "tl-handshakes" => Some(Operator::TileLinkHandshakes),
-            "tl-latency" => Some(Operator::TileLinkLatency),
-            "tl-bandwidth" => Some(Operator::TileLinkBandwidth),
 
             _ => None,
         }
@@ -418,7 +405,6 @@ impl Operator {
             Operator::IsInt => "int?",
             Operator::IsList => "list?",
             Operator::IsNull => "null?",
-            Operator::Convert => "convert",
             Operator::ConvertBinary => "convert/bin",
             Operator::StringToInt => "string->int",
             Operator::BitsToSint => "bits->sint",
@@ -455,9 +441,6 @@ impl Operator {
             Operator::Defsig => "defsig",
             Operator::NewTrace => "new-trace",
             Operator::DumpTrace => "dump-trace",
-            Operator::TileLinkHandshakes => "tl-handshakes",
-            Operator::TileLinkLatency => "tl-latency",
-            Operator::TileLinkBandwidth => "tl-bandwidth",
         }
     }
 }

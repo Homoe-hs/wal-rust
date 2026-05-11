@@ -1,11 +1,16 @@
 //! Trace container for managing multiple traces
+//!
+//! FST cache: loading a .vcd file automatically generates a .fst cache file
+//! in the same directory for faster subsequent access.
 
 use super::{Trace, TraceId, FindCondition};
 use super::vcd::VcdTrace;
 use super::fst::FstTrace;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::path::Path;
+use std::time::Duration;
 
 pub struct TraceContainer {
     traces: HashMap<TraceId, Box<dyn Trace>>,
@@ -26,7 +31,6 @@ impl TraceContainer {
         if fname.ends_with(".fst") {
             return Some("fst");
         }
-        // Magic-byte fallback: peek first bytes
         if let Ok(mut f) = std::fs::File::open(path) {
             use std::io::Read;
             let mut buf = [0u8; 16];
@@ -42,23 +46,115 @@ impl TraceContainer {
         None
     }
 
+    /// Check if .fst cache is fresh (exists and newer than .vcd)
+    fn cache_is_fresh(vcd_path: &Path, fst_path: &Path) -> bool {
+        if !fst_path.exists() { return false; }
+        let tmp_path = fst_path.with_extension("fst.tmp");
+        if tmp_path.exists() { return false; }
+        let vcd_mtime = match std::fs::metadata(vcd_path).and_then(|m| m.modified()) {
+            Ok(t) => t, Err(_) => return false,
+        };
+        let fst_mtime = match std::fs::metadata(fst_path).and_then(|m| m.modified()) {
+            Ok(t) => t, Err(_) => return false,
+        };
+        fst_mtime >= vcd_mtime
+    }
+
     pub fn load(&mut self, path: &Path, id: TraceId) -> Result<(), String> {
         let fmt = Self::detect_format(path)
             .ok_or_else(|| format!("Unsupported file format: {}", path.display()))?;
 
-        let trace: Box<dyn Trace> = match fmt {
-            "vcd" => {
-                let vcd_trace = VcdTrace::load(path, id.clone())?;
-                Box::new(vcd_trace)
-            }
+        match fmt {
+            "vcd" => self.load_vcd(path, id),
             "fst" => {
                 let fst_trace = FstTrace::load(path, id.clone())?;
-                Box::new(fst_trace)
+                self.traces.insert(id, Box::new(fst_trace));
+                Ok(())
             }
-            _ => return Err(format!("Unsupported file format: {}", path.display())),
-        };
+            _ => Err(format!("Unsupported file format: {}", path.display())),
+        }
+    }
 
-        self.traces.insert(id, trace);
+    fn load_vcd(&mut self, path: &Path, id: TraceId) -> Result<(), String> {
+        let fst_path = path.with_extension("fst");
+        let tmp_path = path.with_extension("fst.tmp");
+        let resume_path = path.with_extension("fst.resume");
+
+        // Fast path: FST cache is fresh
+        if Self::cache_is_fresh(path, &fst_path) {
+            match FstTrace::load(&fst_path, id.clone()) {
+                Ok(trace) => {
+                    self.traces.insert(id, Box::new(trace));
+                    return Ok(());
+                }
+                Err(e) => {
+                    eprintln!("[FST cache] Corrupted, falling back to VCD: {}", e);
+                    let _ = std::fs::remove_file(&fst_path);
+                }
+            }
+        }
+
+        // Load VCD trace for immediate use
+        let vcd_trace = VcdTrace::load(path, id.clone())?;
+        self.traces.insert(id.clone(), Box::new(vcd_trace));
+
+        // Spawn background conversion
+        let vcd_path = path.to_owned();
+        let fst_path = fst_path.to_owned();
+        let tmp_path = tmp_path.to_owned();
+        let resume_path = resume_path.to_owned();
+
+        std::thread::spawn(move || {
+            let file_size = std::fs::metadata(&vcd_path)
+                .map(|m| m.len())
+                .unwrap_or(0);
+
+            let progress = Arc::new(AtomicU64::new(0));
+            let prog = progress.clone();
+            let vcd_name = vcd_path.to_string_lossy().to_string();
+
+            // Progress reporter thread
+            std::thread::spawn(move || {
+                let mut last_pct: u8 = 0;
+                loop {
+                    let bytes = prog.load(Ordering::Relaxed);
+                    if bytes >= file_size { break; }
+                    if file_size > 0 {
+                        let pct = (bytes as f64 / file_size as f64 * 100.0).round() as u8;
+                        if pct > last_pct && pct % 5 == 0 {
+                            eprintln!("[FST cache] {}: {}% ({}/{})",
+                                vcd_name, pct, bytes, file_size);
+                            last_pct = pct;
+                        }
+                    }
+                    std::thread::sleep(Duration::from_secs(30));
+                }
+            });
+
+            eprintln!("[FST cache] Converting: {} → {}",
+                vcd_path.display(), fst_path.display());
+
+            match crate::vcd::convert::vcd_to_fst_streaming(
+                &vcd_path, &tmp_path, &resume_path, progress,
+            ) {
+                Ok(()) => {
+                    if let Err(e) = std::fs::rename(&tmp_path, &fst_path) {
+                        eprintln!("[FST cache] Rename failed: {}", e);
+                    } else {
+                        eprintln!("[FST cache] Done: {} ({} → FST)", 
+                            fst_path.display(),
+                            crate::vcd::convert::format_size(file_size));
+                    }
+                    let _ = std::fs::remove_file(&resume_path);
+                }
+                Err(e) => {
+                    eprintln!("[FST cache] Failed: {}", e);
+                    let _ = std::fs::remove_file(&tmp_path);
+                    let _ = std::fs::remove_file(&resume_path);
+                }
+            }
+        });
+
         Ok(())
     }
 
