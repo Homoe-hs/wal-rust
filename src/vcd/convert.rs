@@ -164,6 +164,27 @@ b11110000 #
     }
 
     #[test]
+    fn test_real_vcd_counter() {
+        let vcd_path = Path::new("test_data/counter.vcd");
+        if !vcd_path.exists() { return; }
+
+        let fst_path = std::env::temp_dir().join("test_counter_real.fst");
+        let resume = std::env::temp_dir().join("test_counter_real.resume");
+        let progress = Arc::new(AtomicU64::new(0));
+        vcd_to_fst_streaming(vcd_path, &fst_path, &resume, progress).unwrap();
+
+        let reader = FstReader::from_path(&fst_path).unwrap();
+        let names: std::collections::HashSet<&str> =
+            reader.file.signals.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains("counter_tb.count [7:0]"), "count signal");
+        assert!(names.contains("counter_tb.clk"), "clk signal");
+        assert!(names.contains("counter_tb.rst"), "rst signal");
+
+        let _ = std::fs::remove_file(&fst_path);
+        let _ = std::fs::remove_file(&resume);
+    }
+
+    #[test]
     fn test_vcd_to_fst_checkpoint_resume() {
         let vcd = br"$timescale 1 ns $end
 $scope module top $end
@@ -218,7 +239,7 @@ pub fn vcd_to_fst_streaming(
     vcd_path: &Path,
     fst_path: &Path,
     resume_path: &Path,
-    progress: Arc<AtomicU64>,
+    _progress: Arc<AtomicU64>,
 ) -> Result<(), String> {
     let data = mmap_or_read(vcd_path)?;
     let file_len = data.len();
@@ -241,6 +262,8 @@ pub fn vcd_to_fst_streaming(
     let mut in_skip = resume_offset > 0;
     let mut dumps_started = false;
     let mut header_done = false;
+    let mut in_directive_body = false;
+    let mut last_progress_pct: u8 = 0;
 
     while pos < file_len {
         let line_start = pos;
@@ -255,8 +278,10 @@ pub fn vcd_to_fst_streaming(
             }
         };
 
-        if line_start & 0xFFFF == 0 {
-            progress.store(line_start as u64, Ordering::Relaxed);
+        let pct = (line_start as f64 / file_len as f64 * 100.0).round() as u8;
+        if pct > last_progress_pct && pct % 5 == 0 {
+            eprintln!("[FST cache] {}%", pct);
+            last_progress_pct = pct;
         }
 
         let line = &data[line_start..line_end];
@@ -265,8 +290,15 @@ pub fn vcd_to_fst_streaming(
 
         match state {
             State::Header => {
+                if in_directive_body {
+                    if line.starts_with(b"$end") {
+                        in_directive_body = false;
+                    }
+                    continue;
+                }
                 if first == b'$' {
                     let s = std::str::from_utf8(line).unwrap_or("");
+                    let has_end = line.windows(4).any(|w| w == b"$end");
                     if s.starts_with("$scope") {
                         let parts: Vec<&str> = s.split_whitespace().collect();
                         if parts.len() >= 3 {
@@ -317,6 +349,8 @@ pub fn vcd_to_fst_streaming(
                         state = State::DumpVars;
                     } else if s.starts_with("$enddefinitions") {
                         header_done = true;
+                    } else if !has_end {
+                        in_directive_body = true;
                     }
                 } else if header_done && first != b'$' {
                     if first == b'#' {
@@ -393,7 +427,7 @@ pub fn vcd_to_fst_streaming(
         }
     }
 
-    progress.store(file_len as u64, Ordering::Relaxed);
+    _progress.store(file_len as u64, Ordering::Relaxed);
     writer.close().map_err(|e| format!("FST close: {}", e))?;
     let _ = fs::remove_file(resume_path);
     Ok(())

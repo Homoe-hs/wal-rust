@@ -8,18 +8,28 @@ use super::vcd::VcdTrace;
 use super::fst::FstTrace;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::AtomicU64;
 use std::path::Path;
 use std::time::Duration;
+use std::thread::JoinHandle;
 
 pub struct TraceContainer {
     traces: HashMap<TraceId, Box<dyn Trace>>,
+    cache_handles: Vec<JoinHandle<()>>,
 }
 
 impl TraceContainer {
     pub fn new() -> Self {
         Self {
             traces: HashMap::new(),
+            cache_handles: Vec::new(),
+        }
+    }
+
+    /// Wait for ongoing FST cache conversions to complete.
+    pub fn wait_for_fst_cache(&mut self) {
+        for h in self.cache_handles.drain(..) {
+            let _ = h.join();
         }
     }
 
@@ -104,32 +114,11 @@ impl TraceContainer {
         let tmp_path = tmp_path.to_owned();
         let resume_path = resume_path.to_owned();
 
-        std::thread::spawn(move || {
+        let handle = std::thread::spawn(move || {
             let file_size = std::fs::metadata(&vcd_path)
                 .map(|m| m.len())
                 .unwrap_or(0);
-
             let progress = Arc::new(AtomicU64::new(0));
-            let prog = progress.clone();
-            let vcd_name = vcd_path.to_string_lossy().to_string();
-
-            // Progress reporter thread
-            std::thread::spawn(move || {
-                let mut last_pct: u8 = 0;
-                loop {
-                    let bytes = prog.load(Ordering::Relaxed);
-                    if bytes >= file_size { break; }
-                    if file_size > 0 {
-                        let pct = (bytes as f64 / file_size as f64 * 100.0).round() as u8;
-                        if pct > last_pct && pct % 5 == 0 {
-                            eprintln!("[FST cache] {}: {}% ({}/{})",
-                                vcd_name, pct, bytes, file_size);
-                            last_pct = pct;
-                        }
-                    }
-                    std::thread::sleep(Duration::from_secs(30));
-                }
-            });
 
             eprintln!("[FST cache] Converting: {} → {}",
                 vcd_path.display(), fst_path.display());
@@ -141,9 +130,9 @@ impl TraceContainer {
                     if let Err(e) = std::fs::rename(&tmp_path, &fst_path) {
                         eprintln!("[FST cache] Rename failed: {}", e);
                     } else {
-                        eprintln!("[FST cache] Done: {} ({} → FST)", 
-                            fst_path.display(),
-                            crate::vcd::convert::format_size(file_size));
+                        let file_size_fmt = crate::vcd::convert::format_size(file_size);
+                        eprintln!("[FST cache] Done: {} ({} → FST)",
+                            fst_path.display(), file_size_fmt);
                     }
                     let _ = std::fs::remove_file(&resume_path);
                 }
@@ -154,6 +143,7 @@ impl TraceContainer {
                 }
             }
         });
+        self.cache_handles.push(handle);
 
         Ok(())
     }
