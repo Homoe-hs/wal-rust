@@ -4,13 +4,11 @@
 //! in the same directory for faster subsequent access.
 
 use super::{Trace, TraceId, FindCondition};
-use super::vcd::VcdTrace;
 use super::fst::FstTrace;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use std::sync::atomic::AtomicU64;
 use std::path::Path;
-use std::time::Duration;
 use std::thread::JoinHandle;
 
 pub struct TraceContainer {
@@ -109,7 +107,6 @@ impl TraceContainer {
             .map(|m| m.len())
             .unwrap_or(0);
         let progress = Arc::new(AtomicU64::new(0));
-        let prog = progress.clone();
 
         eprintln!("[FST cache] Converting: {} → {} ({})",
             path.display(), fst_path.display(),
