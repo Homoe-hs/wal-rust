@@ -8,7 +8,7 @@ use crate::fst::{FstWriter, FstOptions, VarType, ScopeType};
 
 const CHECKPOINT_INTERVAL: u64 = 1_000_000;
 
-fn mmap_or_read(path: &Path) -> Result<Vec<u8>, String> {
+pub(crate) fn mmap_or_read(path: &Path) -> Result<Vec<u8>, String> {
     let file = fs::File::open(path)
         .map_err(|e| format!("Failed to open {}: {}", path.display(), e))?;
     let len = file.metadata().map_err(|e| format!("Metadata error: {}", e))?.len() as usize;

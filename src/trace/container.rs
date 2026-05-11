@@ -87,8 +87,6 @@ impl TraceContainer {
 
     fn load_vcd(&mut self, path: &Path, id: TraceId) -> Result<(), String> {
         let fst_path = path.with_extension("fst");
-        let tmp_path = path.with_extension("fst.tmp");
-        let resume_path = path.with_extension("fst.resume");
 
         // Fast path: FST cache is fresh
         if Self::cache_is_fresh(path, &fst_path) {
@@ -104,46 +102,30 @@ impl TraceContainer {
             }
         }
 
-        // Load VCD trace for immediate use
-        let vcd_trace = VcdTrace::load(path, id.clone())?;
-        self.traces.insert(id.clone(), Box::new(vcd_trace));
+        // Synchronous parallel FST conversion, then load FST
+        let _ = std::fs::remove_file(&fst_path);
 
-        // Spawn background conversion
-        let vcd_path = path.to_owned();
-        let fst_path = fst_path.to_owned();
-        let tmp_path = tmp_path.to_owned();
-        let resume_path = resume_path.to_owned();
+        let file_size = std::fs::metadata(path)
+            .map(|m| m.len())
+            .unwrap_or(0);
+        let progress = Arc::new(AtomicU64::new(0));
+        let prog = progress.clone();
 
-        let handle = std::thread::spawn(move || {
-            let file_size = std::fs::metadata(&vcd_path)
-                .map(|m| m.len())
-                .unwrap_or(0);
-            let progress = Arc::new(AtomicU64::new(0));
+        eprintln!("[FST cache] Converting: {} → {} ({})",
+            path.display(), fst_path.display(),
+            crate::vcd::convert::format_size(file_size));
 
-            eprintln!("[FST cache] Converting: {} → {}",
-                vcd_path.display(), fst_path.display());
+        crate::vcd::parallel_convert::vcd_to_fst_parallel(
+            path, &fst_path, progress,
+        ).map_err(|e| format!("FST conversion failed: {}", e))?;
 
-            match crate::vcd::convert::vcd_to_fst_streaming(
-                &vcd_path, &tmp_path, &resume_path, progress,
-            ) {
-                Ok(()) => {
-                    if let Err(e) = std::fs::rename(&tmp_path, &fst_path) {
-                        eprintln!("[FST cache] Rename failed: {}", e);
-                    } else {
-                        let file_size_fmt = crate::vcd::convert::format_size(file_size);
-                        eprintln!("[FST cache] Done: {} ({} → FST)",
-                            fst_path.display(), file_size_fmt);
-                    }
-                    let _ = std::fs::remove_file(&resume_path);
-                }
-                Err(e) => {
-                    eprintln!("[FST cache] Failed: {}", e);
-                    let _ = std::fs::remove_file(&tmp_path);
-                    let _ = std::fs::remove_file(&resume_path);
-                }
-            }
-        });
-        self.cache_handles.push(handle);
+        let trace = FstTrace::load(&fst_path, id.clone())
+            .map_err(|e| format!("Failed to load converted FST: {}", e))?;
+        self.traces.insert(id, Box::new(trace));
+
+        eprintln!("[FST cache] Done: {} ({} → FST)",
+            fst_path.display(),
+            crate::vcd::convert::format_size(file_size));
 
         Ok(())
     }

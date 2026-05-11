@@ -448,6 +448,36 @@ impl<W: Write> FstWriter<W> {
     }
 
     /// Close the FST file and return statistics
+    /// Write a pre-built block (type + length prefix + body) directly to the output.
+    /// Used by parallel converter to inject 0x08 VcDataDynAlias2 blocks.
+    pub fn write_raw_block_data(&mut self, block_type: u8, body: &[u8]) -> Result<()> {
+        let mut buf = Vec::with_capacity(1 + 8 + body.len());
+        buf.push(block_type);
+        buf.extend_from_slice(&(body.len() as u64).to_le_bytes());
+        buf.extend_from_slice(body);
+        self.writer.write_all(&buf)?;
+        self.bytes_written += buf.len() as u64;
+        self.blocks_written += 1;
+        Ok(())
+    }
+
+    /// Close the FST file without flushing internal VCDATA blocks.
+    /// Used when external code has already written all VCDATA blocks.
+    pub fn close_external(mut self) -> Result<FstStats> {
+        self.write_geom_block()?;
+        self.write_hier_block()?;
+        self.writer.flush()?;
+        Ok(FstStats {
+            output_bytes: self.bytes_written,
+            blocks_written: self.blocks_written,
+            compression_ratio: 0.0,
+            signals: self.signals.len(),
+            scopes: self.scopes.len(),
+            timestamps: self.timestamps_count,
+            value_changes: self.value_changes_count,
+        })
+    }
+
     pub fn close(mut self) -> Result<FstStats> {
         // Flush any remaining data
         self.flush_block()?;

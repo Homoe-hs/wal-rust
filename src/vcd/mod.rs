@@ -29,6 +29,7 @@
 //! ```
 
 pub mod convert;
+pub mod parallel_convert;
 pub mod parser;
 pub mod reader;
 pub mod types;
