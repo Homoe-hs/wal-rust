@@ -624,49 +624,39 @@ impl Trace for VcdTrace {
             return Ok(vec![]);
         }
 
-        // Non-event signal: use parallel scan.
         use rayon::prelude::*;
 
         let target_id = self.signal_id_bytes.get(&sig_idx).cloned()
             .ok_or_else(|| "find_indices: signal ID bytes not found".to_string())?;
 
-        // Get raw mmap data pointer — drop RefCell borrow before parallel section
-        let (data_ptr, data_len, hdr_end) = {
-            let r = self.reader.borrow();
-            let (ptr, len) = r.as_data_ptr();
-            (ptr, len, self.header_end_offset as usize)
-        };
-        // SAFETY: mmap is read-only and lives as long as self
-        let data = unsafe { std::slice::from_raw_parts(data_ptr, data_len) };
-
+        // Get shared mmap via Arc — drop RefCell borrow before rayon parallel section
+        let shared_mmap = self.reader.borrow().data.clone();
         let id_len = target_id.len();
-        let n_threads = num_cpus::get().max(4);
-        let dump_len = data_len - hdr_end;
-        let chunk_size = dump_len / n_threads;
+        let hdr_end = self.header_end_offset as usize;
+        let data_len = shared_mmap.len();
 
-        // Build newline-aligned chunk boundaries (same strategy as load phase)
-        let first_ts = {
-            let mut p = hdr_end;
-            while p < data_len && data[p] != b'#' { p += 1; }
-            p
-        };
-        let mut boundaries = vec![first_ts];
+        let n_threads = num_cpus::get().max(4);
+        let dump_len = data_len.saturating_sub(hdr_end);
+        let chunk_size = dump_len / n_threads.max(1);
+
+        // Build newline-aligned chunk boundaries starting from hdr_end (includes $dumpvars)
+        let mut boundaries = vec![hdr_end];
         for i in 1..n_threads {
-            let mut p = first_ts + i * chunk_size;
+            let mut p = hdr_end + i * chunk_size;
             if p >= data_len { break; }
-            while p < data_len && data[p] != b'\n' { p += 1; }
+            while p < data_len && shared_mmap[p] != b'\n' { p += 1; }
             if p < data_len { p += 1; }
             if p >= data_len { break; }
             boundaries.push(p);
         }
         boundaries.push(data_len);
 
-        // Pre-compute ts_idx at each boundary (one linear pass)
+        // Pre-compute ts_idx at each boundary (one linear scan)
         let boundary_ts: Vec<usize> = {
             let mut ts = vec![0usize; boundaries.len()];
             let mut count = 0usize;
-            let mut bi = 1usize; // skip first boundary (ts=0)
-            for (i, &b) in data[hdr_end..].iter().enumerate() {
+            let mut bi = 1usize;
+            for (i, &b) in shared_mmap[hdr_end..].iter().enumerate() {
                 if b == b'#' { count += 1; }
                 while bi < boundaries.len() && hdr_end + i + 1 >= boundaries[bi] {
                     ts[bi] = count;
@@ -677,78 +667,72 @@ impl Trace for VcdTrace {
             ts
         };
 
-        let cond_ref = &cond;
-        let target_ref = &target_id;
-        let n_chunks = boundaries.len() - 1;
-        let results = std::thread::scope(|s| {
-            let mut handles = Vec::with_capacity(n_chunks);
-            for i in 0..n_chunks {
-                let start = boundaries[i];
-                let end = boundaries[i + 1];
-                let start_ts = boundary_ts[i];
-                let chunk = &data[start..end];
-                handles.push(s.spawn(move || {
-                    let mut local_indices = Vec::new();
-                    let mut current_val: Option<VcdValue> = None;
-                    let mut prev_bit: Option<u8> = None;
-                    let mut ts_idx = start_ts;
-                    let mut seen_first_ts = false;
+        // Build chunk descriptors for parallel processing
+        let chunks: Vec<(usize, usize, usize)> = (0..boundaries.len() - 1)
+            .map(|i| (boundaries[i], boundaries[i+1], boundary_ts[i]))
+            .collect();
 
-                    let mut lp = 0usize;
-                    while lp < chunk.len() {
-                        let line_start = lp;
-                        let line_end = match memchr::memchr(b'\n', &chunk[lp..]) {
-                            Some(nl) => { lp += nl; let end = lp; lp += 1; end }
-                            None => break,
-                        };
-                        let line = &chunk[line_start..line_end];
-                        if line.is_empty() { continue; }
+        // Parallel chunk scan using rayon — Arc<Mmap> is Sync so threads can share
+        let results: Vec<Vec<usize>> = chunks.par_iter().map(|&(start, end, start_ts)| {
+            let chunk = &shared_mmap[start..end];
+            let mut local_indices = Vec::new();
+            let mut current_val: Option<VcdValue> = None;
+            let mut prev_bit: Option<u8> = None;
+            let mut ts_idx = start_ts;
+            let mut seen_first_ts = false;
 
-                        let first = line[0];
-                        if first == b'#' {
-                            if seen_first_ts {
-                                if let Some(ref val) = current_val {
-                                    if find_cond_matches(val, prev_bit, cond_ref) {
-                                        local_indices.push(ts_idx);
-                                    }
-                                    prev_bit = val_to_bit(val);
-                                }
-                                ts_idx += 1;
-                            }
-                            seen_first_ts = true;
-                        } else if first != b'$' && line.len() > id_len {
-                            let id_start = line.len() - id_len;
-                            if &line[id_start..] == target_ref.as_slice() {
-                                let val = match first {
-                                    b'b' => {
-                                        let ve = id_start.saturating_sub(1);
-                                        let vs = if ve > 1 && line[ve] == b' ' { &line[1..ve] } else { &line[1..id_start] };
-                                        VcdValue::Vector(vs.to_vec())
-                                    }
-                                    b'r' => {
-                                        let vs = std::str::from_utf8(&line[1..id_start]).unwrap_or("0");
-                                        if let Ok(r) = vs.trim().parse::<f64>() { VcdValue::Real(r) } else { continue; }
-                                    }
-                                    _ => VcdValue::Bit(first),
-                                };
-                                current_val = Some(val);
-                            }
-                        }
-                    }
+            let mut lp = 0usize;
+            while lp < chunk.len() {
+                let line_start = lp;
+                let line_end = match memchr::memchr(b'\n', &chunk[lp..]) {
+                    Some(nl) => { lp += nl; let end = lp; lp += 1; end }
+                    None => break,
+                };
+                let line = &chunk[line_start..line_end];
+                if line.is_empty() { continue; }
 
+                let first = line[0];
+                if first == b'#' {
                     if seen_first_ts {
                         if let Some(ref val) = current_val {
-                            if find_cond_matches(val, prev_bit, cond_ref) {
+                            if find_cond_matches(val, prev_bit, &cond) {
                                 local_indices.push(ts_idx);
                             }
+                            prev_bit = val_to_bit(val);
                         }
+                        ts_idx += 1;
                     }
-
-                    local_indices
-                }));
+                    seen_first_ts = true;
+                } else if first != b'$' && line.len() > id_len {
+                    let id_start = line.len() - id_len;
+                    if &line[id_start..] == target_id.as_slice() {
+                        let val = match first {
+                            b'b' => {
+                                let ve = id_start.saturating_sub(1);
+                                let vs = if ve > 1 && line[ve] == b' ' { &line[1..ve] } else { &line[1..id_start] };
+                                VcdValue::Vector(vs.to_vec())
+                            }
+                            b'r' => {
+                                let vs = std::str::from_utf8(&line[1..id_start]).unwrap_or("0");
+                                if let Ok(r) = vs.trim().parse::<f64>() { VcdValue::Real(r) } else { continue; }
+                            }
+                            _ => VcdValue::Bit(first),
+                        };
+                        current_val = Some(val);
+                    }
+                }
             }
-            handles.into_iter().map(|h| h.join().unwrap()).collect::<Vec<_>>()
-        });
+
+            if seen_first_ts {
+                if let Some(ref val) = current_val {
+                    if find_cond_matches(val, prev_bit, &cond) {
+                        local_indices.push(ts_idx);
+                    }
+                }
+            }
+
+            local_indices
+        }).collect();
 
         let mut indices: Vec<usize> = results.into_iter().flatten().collect();
         indices.sort();

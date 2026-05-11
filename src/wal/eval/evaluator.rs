@@ -892,7 +892,7 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
         };
         if op != "=" { return None; }
         // Try (= (get "sig") val) or (= val (get "sig"))
-        for (a, b) in &[(0, 1), (1, 0)] {
+        for (a, b) in &[(0, 1), (1, 0), (1, 2)] {
             if let Value::List(inner) = &lst[*a] {
                 if inner.len() == 2 {
                     if let Value::Symbol(fn_sym) = &inner[0] {
@@ -1104,13 +1104,18 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
             };
             let total: usize = {
                 let t = self.traces.read().unwrap_or_else(|e| e.into_inner());
-                traces_ids.iter().filter_map(|tid| {
-                    t.get(tid).and_then(|tr| {
-                        let resolved = resolve_signal_name(&sig_name, &tr.signals())
+                let mut sum = 0usize;
+                for tid in &traces_ids {
+                    if let Some(tr) = t.get(tid) {
+                        let sigs = tr.signals();
+                        let resolved = resolve_signal_name(&sig_name, &sigs)
                             .unwrap_or_else(|| sig_name.clone());
-                        tr.find_indices(&resolved, cond.clone()).ok()
-                    })
-                }).map(|v| v.len()).sum()
+                        if let Ok(idxs) = tr.find_indices(&resolved, cond.clone()) {
+                            sum += idxs.len();
+                        }
+                    }
+                }
+                sum
             };
             return Ok(Value::Int(total as i64));
         }
@@ -1570,7 +1575,7 @@ mod tests {
 
 /// Resolve a signal name against a trace's signal list using the same fuzzy matching
 /// as `op_get`. Returns the full signal name if found.
-fn resolve_signal_name(name: &str, sigs: &[String]) -> Option<String> {
+pub fn resolve_signal_name(name: &str, sigs: &[String]) -> Option<String> {
     // 1. Exact match
     if let Some(s) = sigs.iter().find(|s| *s == name) {
         return Some(s.clone());

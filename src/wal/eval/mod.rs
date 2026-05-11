@@ -7,5 +7,5 @@ pub mod semantic;
 
 pub use environment::Environment;
 pub use dispatch::{Dispatcher, BuiltinFn};
-pub use evaluator::Evaluator;
+pub use evaluator::{Evaluator, resolve_signal_name};
 pub use semantic::{SemanticChecker, SemanticError};

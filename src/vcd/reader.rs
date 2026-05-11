@@ -5,6 +5,7 @@
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read, Seek};
 use std::path::Path;
+use std::sync::Arc;
 
 /// Compression format detection
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -115,7 +116,7 @@ impl<R: Read + Seek> Iterator for Lines<'_, R> {
 
 /// Memory-mapped file reader for VCD files (uncompressed only)
 pub struct MmapReader {
-    data: memmap2::Mmap,
+    pub data: Arc<memmap2::Mmap>,
     pos: usize,
     line: usize,
 }
@@ -141,7 +142,7 @@ impl MmapReader {
         }
 
         Ok(Self {
-            data: mmap,
+            data: Arc::new(mmap),
             pos: 0,
             line: 0,
         })

@@ -3,7 +3,7 @@
 //! load, unload, step, find, find/g, whenever, signal-width, sample-at, trim-trace, signal?
 
 use crate::wal::ast::{Value, WList, Operator, Symbol};
-use crate::wal::eval::{Environment, Dispatcher, Evaluator};
+use crate::wal::eval::{Environment, Dispatcher, Evaluator, resolve_signal_name};
 use crate::trace::{FindCondition, ScalarValue, Trace, TraceContainer};
 use std::path::Path;
 
@@ -188,6 +188,12 @@ fn op_find(args: &[Value], env: &mut Environment, eval: &mut Evaluator) -> Resul
     let cond = &args[0];
     let max_results = args.get(1).and_then(|v| match v { Value::Int(n) => Some(*n as usize), _ => None }).unwrap_or(usize::MAX);
 
+    // Fast path: simple condition → find_indices
+    if let Some(result) = try_find_indices_simple(cond, max_results, env) {
+        return result;
+    }
+
+    // Fallback: step-by-step scan
     if let Some(traces) = env.get_traces() {
         let mut traces = traces.write().unwrap_or_else(|e| e.into_inner());
         let mut found = Vec::new();
@@ -218,6 +224,39 @@ fn op_find(args: &[Value], env: &mut Environment, eval: &mut Evaluator) -> Resul
         )));
     }
     Ok(Value::List(WList::new()))
+}
+
+/// Try fast path for simple (= (get "sig") val) condition using find_indices
+fn try_find_indices_simple(cond: &Value, max_results: usize, env: &mut Environment) -> Option<Result<Value, String>> {
+    let (sig_name, target) = parse_simple_condition(cond)?;
+    let cond_enum = if target <= 1 && target >= 0 {
+        FindCondition::Value(target as u8)
+    } else {
+        FindCondition::ValueI64(target)
+    };
+
+    let traces = env.get_traces()?;
+    let first_trace_info = {
+        let t = traces.read().ok()?;
+        let tr = t.first_trace()?;
+        let sigs = tr.signals();
+        let resolved = resolve_signal_name(&sig_name, &sigs)
+            .unwrap_or_else(|| sig_name.clone());
+        (tr.id().clone(), resolved)
+    };
+    let (tid, resolved) = first_trace_info;
+
+    let indices = {
+        let t = traces.read().ok()?;
+        t.find_indices(&resolved, cond_enum).ok()?
+    };
+
+    let limited: Vec<Value> = indices.into_iter()
+        .take(max_results)
+        .map(|i| Value::Int(i as i64))
+        .collect();
+
+    Some(Ok(Value::List(WList::from_vec(limited))))
 }
 
 fn op_find_g(args: &[Value], env: &mut Environment, eval: &mut Evaluator) -> Result<Value, String> {
@@ -725,6 +764,16 @@ fn op_count(args: &[Value], env: &mut Environment, eval: &mut Evaluator) -> Resu
     ensure_arity(args, 1)?;
     let cond = &args[0];
 
+    // Fast path: simple condition → find_indices
+    if let Some(result) = try_find_indices_simple(cond, usize::MAX, env) {
+        match result {
+            Ok(Value::List(lst)) => return Ok(Value::Int(lst.len() as i64)),
+            Ok(other) => return Ok(other),
+            Err(e) => return Err(e),
+        }
+    }
+
+    // Fallback: step-by-step scan
     if let Some(traces) = env.get_traces() {
         let mut traces = traces.write().unwrap_or_else(|e| e.into_inner());
         let prev_indices = traces.indices();
@@ -791,8 +840,6 @@ pub fn register_signal(disp: &mut Dispatcher) {
     disp.register(Operator::Load, op_load);
     disp.register(Operator::Unload, op_unload);
     disp.register(Operator::Step, op_step);
-    disp.register(Operator::Find, op_find);
-    disp.register(Operator::FindG, op_find_g);
     disp.register(Operator::Whenever, op_whenever);
     disp.register(Operator::FoldSignal, op_fold_signal);
     disp.register(Operator::SignalWidth, op_signal_width);
@@ -805,6 +852,5 @@ pub fn register_signal(disp: &mut Dispatcher) {
     disp.register(Operator::Require, op_require);
     disp.register(Operator::LoadedTraces, op_loaded_traces);
     disp.register(Operator::RelEval, op_releval);
-    disp.register(Operator::Count, op_count);
     disp.register(Operator::Timeframe, op_timeframe);
 }

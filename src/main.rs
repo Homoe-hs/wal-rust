@@ -2,6 +2,11 @@
 //!
 //! High-performance command-line tool for WAL parsing, REPL, and waveform tools.
 
+use mimalloc::MiMalloc;
+
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
+
 mod cli;
 mod fst;
 mod vcd;
