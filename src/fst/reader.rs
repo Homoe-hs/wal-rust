@@ -857,35 +857,60 @@ impl<R: Read + Seek> FstReader<R> {
                     }
                 }
                 // Variable entry — var types are 0..29 (FST_VT_MIN..FST_VT_MAX)
-                // Format: var_type(1) + direction(1) + name(\0) + width(varint) + alias(varint)
+                // Standard format: [type][dir][name\0][len_varint][alias_varint]
+                // vcd2fst compact:  [type][dir][len_varint][alias_varint][name\0]
                 _ if code <= 29 => {
                     unknown_skip_count = 0;
-                    fst_handle += 1; // FST handles are 1-based
+                    fst_handle += 1;
                     if pos >= data.len() { break; }
+
                     let direction = data[pos];
                     pos += 1;
-                    let (name, consumed) = self.read_cstring_from_slice(&data[pos..]);
-                    pos += consumed;
                     if pos >= data.len() { break; }
 
-                    // Read width as varint
-                    let (width, consumed) = match decode_varint(&data[pos..]) {
-                        Some(v) => v,
-                        None => break,
-                    };
-                    pos += consumed;
+                    let (name, width, alias) = if pos < data.len() && data[pos] & 0x80 != 0 {
+                        // Compact: first byte has MSB set → it's a varint (length), not a name
+                        // Format: [len_varint][alias_varint][name\0]
+                        let (width_val, consumed) = match decode_varint(&data[pos..]) {
+                            Some(v) => v,
+                            None => break,
+                        };
+                        pos += consumed;
+                        if pos >= data.len() { break; }
 
-                    // Read alias handle as varint (Icarus format; 0 for non-alias)
-                    if pos >= data.len() { break; }
-                    let (alias, consumed) = match decode_varint(&data[pos..]) {
-                        Some(v) => v,
-                        None => break,
-                    };
-                    pos += consumed;
+                        let (alias_val, consumed) = match decode_varint(&data[pos..]) {
+                            Some(v) => v,
+                            None => break,
+                        };
+                        pos += consumed;
+                        if pos >= data.len() { break; }
 
-                    // Validate signal: name should be readable ASCII text
-                    // Compact aliases (alias > 0, short names) from vcd2fst are accepted
-                    // with a placeholder name so signal count stays accurate.
+                        let (name_str, consumed) = self.read_cstring_from_slice(&data[pos..]);
+                        pos += consumed;
+
+                        (name_str, width_val, alias_val)
+                    } else {
+                        // Standard format: [name\0][len_varint][alias_varint]
+                        let (name_str, consumed) = self.read_cstring_from_slice(&data[pos..]);
+                        pos += consumed;
+                        if pos >= data.len() { break; }
+
+                        let (width_val, consumed) = match decode_varint(&data[pos..]) {
+                            Some(v) => v,
+                            None => break,
+                        };
+                        pos += consumed;
+
+                        let (alias_val, consumed) = match decode_varint(&data[pos..]) {
+                            Some(v) => v,
+                            None => break,
+                        };
+                        pos += consumed;
+
+                        (name_str, width_val, alias_val)
+                    };
+
+                    // Validate name
                     let all_control = name.chars().all(|c| c.is_ascii_control());
                     let is_valid = if name.is_empty() || all_control {
                         false
