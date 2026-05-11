@@ -119,6 +119,32 @@ pub fn decode_signed_varint(buf: &[u8]) -> Option<(i64, usize)> {
     Some((n, consumed))
 }
 
+/// Encode FST signed varint (big-endian, sign-extended raw varint).
+/// Used by the DYNALIAS2 chain index table.
+/// Big-endian byte order: MSB 7-bit group first, LSB group last (without MSB flag).
+#[inline]
+pub fn encode_fst_svarint(v: i64) -> Vec<u8> {
+    let val = v as u64;
+    if val == 0 {
+        return vec![0x00];
+    }
+    let mut groups = Vec::new();
+    let mut tmp = val;
+    while tmp > 0 {
+        groups.push((tmp & 0x7F) as u8);
+        tmp >>= 7;
+    }
+    let mut buf = Vec::with_capacity(groups.len());
+    for i in (0..groups.len()).rev() {
+        if i > 0 {
+            buf.push(groups[i] | 0x80);
+        } else {
+            buf.push(groups[i]);
+        }
+    }
+    buf
+}
+
 /// Decode FST signed varint (NOT zigzag — sign-extended raw varint).
 /// The FST DYNALIAS2 format uses this for the chain index table.
 /// Uses u64 internally to avoid overflow, then casts to i64 (preserving bit pattern).
@@ -205,6 +231,18 @@ mod tests {
             let (decoded, _) = decode_varint(&delta).unwrap();
             assert_eq!(decoded, t - prev);
             prev = t;
+        }
+    }
+
+    #[test]
+    fn test_fst_svarint_roundtrip() {
+        let cases = [0i64, 1, -1, 127, -127, 128, -128, 255, 256, 1000, -1000,
+                     100000, 43981, 0xABCD, -43981, i64::MAX, i64::MIN];
+        for &n in &cases {
+            let encoded = encode_fst_svarint(n);
+            let (decoded, consumed) = decode_fst_svarint(&encoded).unwrap();
+            assert_eq!(n, decoded, "roundtrip failed for {}", n);
+            assert_eq!(encoded.len(), consumed);
         }
     }
 
