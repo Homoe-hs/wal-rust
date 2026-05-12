@@ -1,0 +1,11 @@
+;; FST 波形分析测试
+;; 用法: wal-rust run test_samples/test_fst_analysis.wal -l <波形.fst>
+
+(printf "=== FST 波形分析 ===\n")
+(printf "信号总数: %d\n" (length SIGNALS))
+
+(define clk (first SIGNALS))
+(printf "首个信号: %s\n" clk)
+
+(printf "波形时长: %d steps\n" MAX-INDEX)
+(printf "测试完成\n")
