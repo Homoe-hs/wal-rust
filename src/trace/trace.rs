@@ -10,6 +10,8 @@ pub enum FindCondition {
     Low,
     Value(u8),
     ValueI64(i64),
+    Neq(u8),
+    NeqI64(i64),
 }
 
 pub trait Trace {

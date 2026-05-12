@@ -881,8 +881,27 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
 
     /// Try to parse a simple condition pattern like (= (get "signal") value)
     /// Returns (signal_name, target_value) if matched.
-    fn parse_simple_condition(&self, expr: &Value) -> Option<(String, i64)> {
-        let lst = match expr {
+    /// Parse simple condition: (= (get "sig") val), (!= (get "sig") val), (not (= (get "sig") val))
+    /// Returns (signal_name, target_value, is_not)
+    fn parse_simple_condition(&self, expr: &Value) -> Option<(String, i64, bool)> {
+        // Check for (not (= ...)) wrapping
+        let inner = if let Value::List(lst) = expr {
+            if lst.len() == 2 {
+                if let Value::Symbol(s) = &lst[0] {
+                    if s.name == "not" {
+                        // (not <inner_expr>)
+                        Some((&lst[1], true))
+                    } else {
+                        None
+                    }
+                } else { None }
+            } else if lst.len() == 3 {
+                Some((expr, false))
+            } else { None }
+        } else { None };
+        let (target_expr, is_not) = inner?;
+
+        let lst = match target_expr {
             Value::List(lst) if lst.len() == 3 => lst,
             _ => return None,
         };
@@ -890,8 +909,12 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
             Value::Symbol(s) => s.name.as_str(),
             _ => return None,
         };
-        if op != "=" { return None; }
-        // Try (= (get "sig") val) or (= val (get "sig"))
+        // Accept = or !=
+        let negated_by_op = op == "!=";
+        if op != "=" && op != "!=" { return None; }
+        let effective_not = is_not ^ negated_by_op;
+
+        // Try (op (get "sig") val) or (op val (get "sig"))
         for (a, b) in &[(0, 1), (1, 0), (1, 2)] {
             if let Value::List(inner) = &lst[*a] {
                 if inner.len() == 2 {
@@ -906,7 +929,7 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
                                 Value::Int(i) => *i,
                                 _ => continue,
                             };
-                            return Some((sig, val));
+                            return Some((sig, val, effective_not));
                         }
                     }
                 }
@@ -960,13 +983,15 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
 
             let mut found: Vec<i64> = Vec::new();
 
-            // Fast path: try simple condition (= (get "sig") val)
+            // Fast path: try simple condition (= (get "sig") val), (!= ...), (not (= ...))
             // Uses trace.find_indices() for a parallel scan.
-            if let Some((sig_name, target)) = self.parse_simple_condition(&args[0]) {
-                let cond = if target <= 1 && target >= 0 {
-                    FindCondition::Value(target as u8)
+            if let Some((sig_name, target, is_not)) = self.parse_simple_condition(&args[0]) {
+                let cond: FindCondition = if is_not {
+                    if target <= 1 && target >= 0 { FindCondition::Neq(target as u8) }
+                    else { FindCondition::NeqI64(target) }
                 } else {
-                    FindCondition::ValueI64(target)
+                    if target <= 1 && target >= 0 { FindCondition::Value(target as u8) }
+                    else { FindCondition::ValueI64(target) }
                 };
                 if let Ok(t) = self.traces.read() {
                     for tid in &traces {
@@ -1045,6 +1070,38 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
             return Ok(Value::List(WList::new()));
         }
 
+        // Fast path: try simple condition (= (get "sig") val), (!= ...), (not (= ...))
+        if let Some((sig_name, target, is_not)) = self.parse_simple_condition(&args[0]) {
+            let cond: FindCondition = if is_not {
+                if target <= 1 && target >= 0 { FindCondition::Neq(target as u8) }
+                else { FindCondition::NeqI64(target) }
+            } else {
+                if target <= 1 && target >= 0 { FindCondition::Value(target as u8) }
+                else { FindCondition::ValueI64(target) }
+            };
+            let mut found = Vec::new();
+            if let Ok(t) = self.traces.read() {
+                for tid in &traces_ids {
+                    if let Some(tr) = t.get(tid) {
+                        if let Ok(idxs) = tr.find_indices(&resolve_signal_name(&sig_name, &tr.signals()).unwrap_or_else(|| sig_name.clone()), cond.clone()) {
+                            for &idx in &idxs {
+                                found.push(Value::Int(idx as i64));
+                            }
+                        }
+                    }
+                }
+            }
+            found.sort_by_key(|v| if let Value::Int(i) = v { *i } else { 0 });
+            found.dedup();
+            if let Ok(mut t) = self.traces.write() {
+                for (tid, idx) in &saved {
+                    let _ = t.set_index(tid, *idx);
+                }
+            }
+            return Ok(Value::List(WList::from_vec(found)));
+        }
+
+        // Slow path: step-by-step iteration
         let mut found = Vec::new();
         let mut ended = false;
         while !ended {
@@ -1095,12 +1152,14 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
             return Ok(Value::Int(0));
         }
 
-        // Fast path: try simple condition (= (get "sig") val)
-        if let Some((sig_name, target)) = self.parse_simple_condition(&args[0]) {
-            let cond = if target <= 1 && target >= 0 {
-                FindCondition::Value(target as u8)
+        // Fast path: try simple condition (= (get "sig") val), (!= ...), (not (= ...))
+        if let Some((sig_name, target, is_not)) = self.parse_simple_condition(&args[0]) {
+            let cond: FindCondition = if is_not {
+                if target <= 1 && target >= 0 { FindCondition::Neq(target as u8) }
+                else { FindCondition::NeqI64(target) }
             } else {
-                FindCondition::ValueI64(target)
+                if target <= 1 && target >= 0 { FindCondition::Value(target as u8) }
+                else { FindCondition::ValueI64(target) }
             };
             let total: usize = {
                 let t = self.traces.read().unwrap_or_else(|e| e.into_inner());
@@ -1161,13 +1220,15 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
             return Ok(Value::Nil);
         }
 
-        // Fast path: try simple condition (= (get "sig") val)
+        // Fast path: try simple condition (= (get "sig") val), (!= ...), (not (= ...))
         // Uses trace.find_indices() for a parallel scan.
-        if let Some((sig_name, target)) = self.parse_simple_condition(&args[0]) {
-            let cond = if target <= 1 && target >= 0 {
-                FindCondition::Value(target as u8)
+        if let Some((sig_name, target, is_not)) = self.parse_simple_condition(&args[0]) {
+            let cond: FindCondition = if is_not {
+                if target <= 1 && target >= 0 { FindCondition::Neq(target as u8) }
+                else { FindCondition::NeqI64(target) }
             } else {
-                FindCondition::ValueI64(target)
+                if target <= 1 && target >= 0 { FindCondition::Value(target as u8) }
+                else { FindCondition::ValueI64(target) }
             };
             let all_indices: Vec<usize> = {
                 let t = self.traces.read().unwrap_or_else(|e| e.into_inner());

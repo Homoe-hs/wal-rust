@@ -632,8 +632,18 @@ impl Trace for VcdTrace {
         // Event signal fast path: change points already recorded during load
         if self.event_signals.contains(&sig_idx) {
             if let Some(points) = self.event_change_points.get(&sig_idx) {
-                if matches!(&cond, FindCondition::Value(1) | FindCondition::ValueI64(1) | FindCondition::Rising) {
+                if matches!(&cond,
+                    FindCondition::Value(1) | FindCondition::ValueI64(1)
+                    | FindCondition::Rising | FindCondition::Neq(0)
+                    | FindCondition::NeqI64(0) | FindCondition::High)
+                {
                     return Ok(points.clone());
+                }
+                if matches!(&cond, FindCondition::Neq(1) | FindCondition::Low) {
+                    // All timestamps except event points
+                    let all: Vec<usize> = (0..=self.max_index).collect();
+                    let points_set: std::collections::HashSet<usize> = points.iter().copied().collect();
+                    return Ok(all.into_iter().filter(|i| !points_set.contains(i)).collect());
                 }
             }
             return Ok(vec![]);
@@ -768,6 +778,11 @@ fn find_cond_matches(val: &VcdValue, prev_bit: Option<u8>, cond: &FindCondition)
             bit == Some(*v) || (bit == Some(b'1') && *v == 1) || (bit == Some(b'0') && *v == 0)
         }
         FindCondition::ValueI64(target) => val.to_i64() == Some(*target),
+        FindCondition::Neq(v) => {
+            let bit = val.as_bit();
+            !(bit == Some(*v) || (bit == Some(b'1') && *v == 1) || (bit == Some(b'0') && *v == 0))
+        }
+        FindCondition::NeqI64(target) => val.to_i64() != Some(*target),
     }
 }
 

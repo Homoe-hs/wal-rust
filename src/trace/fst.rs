@@ -692,6 +692,21 @@ impl Trace for FstTrace {
                     };
                     int_val == Some(*target)
                 }
+                FindCondition::Neq(v) => {
+                    !(curr_bit == Some(*v) || (curr_bit == Some(b'1') && *v == 1) || (curr_bit == Some(b'0') && *v == 0))
+                }
+                FindCondition::NeqI64(target) => {
+                    let int_val = if val.len() == 1 {
+                        Some(if val[0] == b'1' { 1i64 } else { 0i64 })
+                    } else if val.iter().all(|&b| b == b'0' || b == b'1') {
+                        Some(val.iter().fold(0i64, |acc, &b|
+                            acc.overflowing_shl(1).0 | if b == b'1' { 1 } else { 0 }
+                        ))
+                    } else {
+                        None
+                    };
+                    int_val != Some(*target)
+                }
             };
 
             if matches_cond {
