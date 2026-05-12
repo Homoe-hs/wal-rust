@@ -853,4 +853,10 @@ pub fn register_signal(disp: &mut Dispatcher) {
     disp.register(Operator::LoadedTraces, op_loaded_traces);
     disp.register(Operator::RelEval, op_releval);
     disp.register(Operator::Timeframe, op_timeframe);
+    disp.register(Operator::Signals, op_signals);
+    disp.register(Operator::Index, op_index);
+    disp.register(Operator::MaxIndex, op_max_index);
+    disp.register(Operator::Ts, op_ts);
+    disp.register(Operator::TraceName, op_trace_name);
+    disp.register(Operator::TraceFile, op_trace_file);
 }
