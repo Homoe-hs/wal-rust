@@ -55,7 +55,7 @@ fn get_node_text(node: tree_sitter::Node, source: &str) -> String {
 }
 
 fn is_whitespace_or_comment(kind: &str) -> bool {
-    kind == "whitespace" || kind == "_comment"
+    kind == "whitespace" || kind == "_comment" || kind == "_line_comment"
 }
 
 fn is_anon_token(kind: &str) -> bool {

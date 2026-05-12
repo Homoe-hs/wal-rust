@@ -82,7 +82,7 @@ fn run_wal_file(path: &Path, load: &[PathBuf], code: Option<&str>) -> Result<(),
         line_number += 1;
         let trimmed = line.trim();
 
-        if trimmed.is_empty() || trimmed.starts_with(";;") {
+        if trimmed.is_empty() || trimmed.starts_with(';') {
             continue;
         }
 
@@ -99,7 +99,7 @@ fn run_wal_file(path: &Path, load: &[PathBuf], code: Option<&str>) -> Result<(),
             // Evaluate complete expressions as soon as paren_depth reaches 0
             if paren_depth == 0 && !in_string && !expr.trim().is_empty() {
                 let trimmed = expr.trim().to_string();
-                if !trimmed.is_empty() && !trimmed.starts_with(";;") {
+                if !trimmed.is_empty() && !trimmed.starts_with(';') {
                     match eval.eval(&trimmed) {
                         Ok(v) => {
                             if !matches!(v, wal::ast::Value::Nil) {
