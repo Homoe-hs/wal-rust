@@ -884,13 +884,21 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
     /// Parse simple condition: (= (get "sig") val), (!= (get "sig") val), (not (= (get "sig") val))
     /// Returns (signal_name, target_value, is_not)
     fn parse_simple_condition(&self, expr: &Value) -> Option<(String, i64, bool)> {
-        // Check for (not (= ...)) wrapping
+        // Check for (not <expr>) wrapping
+        // Also handles bare (get "sig") — a 2-element list starting with "get"
         let inner = if let Value::List(lst) = expr {
             if lst.len() == 2 {
                 if let Value::Symbol(s) = &lst[0] {
-                    if s.name == "not" {
-                        // (not <inner_expr>)
+                    if s.name == "not" || s.name == "!" {
                         Some((&lst[1], true))
+                    } else if s.name == "get" {
+                        // Bare (get "sig") — treat as (= (get "sig") 1)
+                        let sig = match &lst[1] {
+                            Value::String(s) => s.clone(),
+                            Value::Symbol(s) => s.name.clone(),
+                            _ => return None,
+                        };
+                        return Some((sig, 1, false));
                     } else {
                         None
                     }
@@ -901,6 +909,7 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
         } else { None };
         let (target_expr, is_not) = inner?;
 
+        // Handle (= (get "sig") val), (!= (get "sig") val)
         let lst = match target_expr {
             Value::List(lst) if lst.len() == 3 => lst,
             _ => return None,
@@ -909,12 +918,10 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
             Value::Symbol(s) => s.name.as_str(),
             _ => return None,
         };
-        // Accept = or !=
         let negated_by_op = op == "!=";
         if op != "=" && op != "!=" { return None; }
         let effective_not = is_not ^ negated_by_op;
 
-        // Try (op (get "sig") val) or (op val (get "sig"))
         for (a, b) in &[(0, 1), (1, 0), (1, 2)] {
             if let Value::List(inner) = &lst[*a] {
                 if inner.len() == 2 {
@@ -1067,6 +1074,99 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
             all.dedup();
             all
         }))
+    }
+
+    /// Decompose (whenever (= 1 1) (do (if cond set!) ...)) into independent count/find calls.
+    /// Returns true if the decomposition was applied.
+    fn decompose_whenever_do(&mut self, cond: &Value, body_args: &[Value], trace_ids: &[String]) -> Result<bool, String> {
+        let is_always_true = match cond {
+            Value::List(lst) if lst.len() == 3 => {
+                matches!(&lst[0], Value::Symbol(s) if s.name == "=")
+                    && matches!(&lst[1], Value::Int(1))
+                    && matches!(&lst[2], Value::Int(1))
+            }
+            _ => false,
+        };
+        if !is_always_true { return Ok(false); }
+
+        let do_list = if body_args.len() == 1 {
+            if let Value::List(lst) = &body_args[0] {
+                if lst.len() >= 2 && matches!(&lst[0], Value::Symbol(s) if s.name == "do") {
+                    &lst[1..]
+                } else { return Ok(false); }
+            } else { return Ok(false); }
+        } else { return Ok(false); };
+
+        let mut var_values: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+        let mut any_decomposed = false;
+
+        for expr in do_list {
+            let if_list = match expr {
+                Value::List(lst) if lst.len() >= 3 && matches!(&lst[0], Value::Symbol(s) if s.name == "if") => lst,
+                _ => continue,
+            };
+            let if_cond = &if_list[1];
+            let if_body = &if_list[2];
+
+            let set_var = match if_body {
+                Value::List(lst) if lst.len() == 3 && matches!(&lst[0], Value::Symbol(s) if s.name == "set!") => {
+                    match &lst[1] {
+                        Value::Symbol(s) => s.name.clone(),
+                        _ => continue,
+                    }
+                }
+                _ => continue,
+            };
+
+            // Try to get count for this condition — supports simple, &&, and ||
+            let count = self.try_count_condition(if_cond, trace_ids)?;
+            if let Some(c) = count {
+                var_values.insert(set_var, c);
+                any_decomposed = true;
+            }
+        }
+
+        if !any_decomposed { return Ok(false); }
+
+        for (var, val) in &var_values {
+            let _ = self.env.set(var, Value::Int(*val));
+        }
+        Ok(true)
+    }
+
+    /// Try to count a condition using any available fast path.
+    fn try_count_condition(&self, expr: &Value, trace_ids: &[String]) -> Result<Option<i64>, String> {
+        // Try simple condition first
+        if let Some((sig, target, is_not)) = self.parse_simple_condition(expr) {
+            let cond: FindCondition = if is_not {
+                if target <= 1 && target >= 0 { FindCondition::Neq(target as u8) }
+                else { FindCondition::NeqI64(target) }
+            } else {
+                if target <= 1 && target >= 0 { FindCondition::Value(target as u8) }
+                else { FindCondition::ValueI64(target) }
+            };
+            let mut total = 0usize;
+            if let Ok(t) = self.traces.read() {
+                for tid in trace_ids {
+                    if let Some(tr) = t.get(tid) {
+                        let sigs = tr.signals();
+                        let resolved = resolve_signal_name(&sig, &sigs)
+                            .unwrap_or_else(|| sig.clone());
+                        if let Ok(idxs) = tr.find_indices(&resolved, cond.clone()) {
+                            total += idxs.len();
+                        }
+                    }
+                }
+            }
+            return Ok(Some(total as i64));
+        }
+
+        // Try &&/|| decomposition
+        if let Some(result) = self.decompose_and_count(expr, trace_ids)? {
+            return Ok(Some(result));
+        }
+
+        Ok(None)
     }
 
     /// Fast-path: evaluate a simple (= (get "sig") val) condition at given index
@@ -1405,6 +1505,17 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
                 }
             }
             return Ok(result);
+        }
+
+        // Fast path 2: try decomposing (whenever (= 1 1) (do (if cond set!) ...))
+        if self.decompose_whenever_do(&args[0], &body_args, &traces_ids)? {
+            // Restore indices
+            for (tid, idx) in &saved {
+                if let Ok(mut t) = self.traces.write() {
+                    let _ = t.set_index(tid, *idx);
+                }
+            }
+            return Ok(Value::Nil);
         }
 
         // Reset all traces to start (fallback path)
