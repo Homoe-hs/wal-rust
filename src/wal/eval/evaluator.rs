@@ -938,6 +938,137 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
         None
     }
 
+    /// Try decomposing (&& ...) or (|| ...) for fast counting.
+    /// Each sub-condition that matches (=/!= (get "sig") val) uses find_indices.
+    /// For &&: verify remaining conditions on the smallest set of candidates.
+    /// For ||: union all matching indices.
+    fn decompose_and_count(&self, expr: &Value, trace_ids: &[String]) -> Result<Option<i64>, String> {
+        let lst = match expr {
+            Value::List(lst) if lst.len() == 3 => lst,
+            _ => return Ok(None),
+        };
+        let op = match &lst[0] {
+            Value::Symbol(s) => s.name.as_str(),
+            _ => return Ok(None),
+        };
+        if op != "&&" && op != "||" { return Ok(None); }
+        let is_and = op == "&&";
+
+        // Extract sub-conditions
+        let sub1 = &lst[1];
+        let sub2 = &lst[2];
+
+        // Try to find indices for each sub-condition
+        let mut idx_sets: Vec<Vec<usize>> = Vec::new();
+
+        for sub in [sub1, sub2] {
+            if let Some((sig, target, is_not)) = self.parse_simple_condition(sub) {
+                let cond: FindCondition = if is_not {
+                    if target <= 1 && target >= 0 { FindCondition::Neq(target as u8) }
+                    else { FindCondition::NeqI64(target) }
+                } else {
+                    if target <= 1 && target >= 0 { FindCondition::Value(target as u8) }
+                    else { FindCondition::ValueI64(target) }
+                };
+                if let Ok(t) = self.traces.read() {
+                    for tid in trace_ids {
+                        if let Some(tr) = t.get(tid) {
+                            let sigs = tr.signals();
+                            let resolved = resolve_signal_name(&sig, &sigs)
+                                .unwrap_or_else(|| sig.clone());
+                            if let Ok(idxs) = tr.find_indices(&resolved, cond.clone()) {
+                                idx_sets.push(idxs);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if idx_sets.is_empty() {
+            return Ok(None); // can't decompose
+        }
+
+        Ok(Some(if is_and {
+            idx_sets.sort_by_key(|s| s.len());
+            let mut candidates = std::mem::take(&mut idx_sets[0]);
+            if candidates.is_empty() { return Ok(Some(0)); }
+            if idx_sets.len() >= 2 {
+                let set2: std::collections::HashSet<usize> = idx_sets[1].iter().copied().collect();
+                candidates.retain(|i| set2.contains(i));
+            }
+            candidates.len() as i64
+        } else {
+            let mut all: Vec<usize> = Vec::new();
+            for s in &idx_sets { all.extend(s); }
+            all.sort();
+            all.dedup();
+            all.len() as i64
+        }))
+    }
+
+    /// Try decomposing (&& ...) or (|| ...) for fast find-indices.
+    fn decompose_and_find_indices(&self, expr: &Value, trace_ids: &[String]) -> Result<Option<Vec<usize>>, String> {
+        let lst = match expr {
+            Value::List(lst) if lst.len() == 3 => lst,
+            _ => return Ok(None),
+        };
+        let op = match &lst[0] {
+            Value::Symbol(s) => s.name.as_str(),
+            _ => return Ok(None),
+        };
+        if op != "&&" && op != "||" { return Ok(None); }
+        let is_and = op == "&&";
+
+        let sub1 = &lst[1];
+        let sub2 = &lst[2];
+        let mut idx_sets: Vec<Vec<usize>> = Vec::new();
+
+        for sub in [sub1, sub2] {
+            if let Some((sig, target, is_not)) = self.parse_simple_condition(sub) {
+                let cond: FindCondition = if is_not {
+                    if target <= 1 && target >= 0 { FindCondition::Neq(target as u8) }
+                    else { FindCondition::NeqI64(target) }
+                } else {
+                    if target <= 1 && target >= 0 { FindCondition::Value(target as u8) }
+                    else { FindCondition::ValueI64(target) }
+                };
+                if let Ok(t) = self.traces.read() {
+                    for tid in trace_ids {
+                        if let Some(tr) = t.get(tid) {
+                            let sigs = tr.signals();
+                            let resolved = resolve_signal_name(&sig, &sigs)
+                                .unwrap_or_else(|| sig.clone());
+                            if let Ok(idxs) = tr.find_indices(&resolved, cond.clone()) {
+                                idx_sets.push(idxs);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if idx_sets.is_empty() {
+            return Ok(None);
+        }
+
+        Ok(Some(if is_and {
+            idx_sets.sort_by_key(|s| s.len());
+            let mut candidates = std::mem::take(&mut idx_sets[0]);
+            if idx_sets.len() >= 2 {
+                let set2: std::collections::HashSet<usize> = idx_sets[1].iter().copied().collect();
+                candidates.retain(|i| set2.contains(i));
+            }
+            candidates
+        } else {
+            let mut all: Vec<usize> = Vec::new();
+            for s in &idx_sets { all.extend(s); }
+            all.sort();
+            all.dedup();
+            all
+        }))
+    }
+
     /// Fast-path: evaluate a simple (= (get "sig") val) condition at given index
     fn eval_simple_cond(&self, sig_name: &str, target: i64, idx: usize) -> bool {
         if let Ok(t) = self.traces.read() {
@@ -1011,6 +1142,17 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
                         found.into_iter().map(Value::Int).collect()
                     )));
                 }
+            }
+
+            // Fast path 2: try decomposing (&& ...) or (|| ...)
+            if let Some(indices) = self.decompose_and_find_indices(&args[0], &traces)? {
+                found = indices.into_iter().map(|i| i as i64).collect();
+                found.sort();
+                found.dedup();
+                if found.len() > max_results { found.truncate(max_results); }
+                return Ok(Value::List(WList::from_vec(
+                    found.into_iter().map(Value::Int).collect()
+                )));
             }
 
             // Fallback: evaluate condition at each step
@@ -1177,6 +1319,11 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
                 sum
             };
             return Ok(Value::Int(total as i64));
+        }
+
+        // Fast path 2: try decomposing (&& cond1 cond2) or (|| cond1 cond2)
+        if let Some(result) = self.decompose_and_count(&args[0], &traces_ids)? {
+            return Ok(Value::Int(result));
         }
 
         // Fallback: evaluate condition at each step
