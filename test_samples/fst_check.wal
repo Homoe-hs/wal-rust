@@ -1,6 +1,0 @@
-;; FST signal name verification
-(load "test_data/grp1_mpu7_timeout.fst")
-
-(printf "total signals: %d\n" (length SIGNALS))
-(printf "signal 0: %s\n" (list (get SIGNALS 0) 0))
-(printf "signal 1: %s\n" (list (list (get SIGNALS 0) (get SIGNALS 1)) 0))
