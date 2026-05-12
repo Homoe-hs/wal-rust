@@ -27,6 +27,7 @@ impl VcdValue {
     }
 
     /// Get width in bits
+    #[allow(dead_code)]
     pub fn width(&self) -> usize {
         match self {
             VcdValue::Bit(_) => 1,
@@ -117,15 +118,15 @@ pub enum VcdEvent {
     ScopeEnd,
     /// Variable declaration
     VarDecl {
-        id: String,
-        name: String,
+        #[allow(dead_code)] id: String,
+        #[allow(dead_code)] name: String,
         #[allow(dead_code)] width: u32,
         #[allow(dead_code)] var_type: String,
     },
     /// Timestamp marker
-    Timestamp(u64),
+    Timestamp(#[allow(dead_code)] u64),
     /// Value change for a signal (id is signal number for fast lookup)
-    ValueChange { id: u32, value: VcdValue },
+    ValueChange { #[allow(dead_code)] id: u32, #[allow(dead_code)] value: VcdValue },
     /// Dump vars marker
     DumpVars,
     /// Dump off marker

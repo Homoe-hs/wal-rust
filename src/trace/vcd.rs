@@ -35,6 +35,7 @@ pub struct VcdTrace {
     id: TraceId,
     filename: String,
     signals: Vec<String>,
+    #[allow(dead_code)]
     signal_ids: HashMap<u64, u32>,       // hash → index
     signal_id_bytes: HashMap<u32, Vec<u8>>, // index → VCD signal ID bytes (for fast matching)
     signal_widths: HashMap<u32, usize>,
@@ -355,6 +356,7 @@ impl VcdTrace {
     }
 
     /// On-demand find bit value at timestamp
+    #[allow(dead_code)]
     fn read_bit_value_at(&self, sig_idx: u32, target_timestamp: u64) -> Option<u8> {
         let mut reader = self.reader.borrow_mut();
 
@@ -427,6 +429,7 @@ fn parse_scope_name(line: &[u8]) -> Option<String> {
 
 /// Parse a $var declaration: extract (sig_hash, name, width)
 /// Format: $var wire 32 ! signal_name $end
+#[allow(dead_code)]
 fn parse_var_decl_fast(line: &[u8]) -> Option<(u64, String, usize)> {
     let (hash, name, width, _, _) = parse_var_decl_fast2(line)?;
     Some((hash, name, width))

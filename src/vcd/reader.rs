@@ -244,6 +244,7 @@ impl MmapReader {
 
     /// Get raw pointer and length of the mmap'd data (for parallel access)
     #[inline]
+    #[allow(dead_code)]
     pub fn as_data_ptr(&self) -> (*const u8, usize) {
         (self.data.as_ptr(), self.data.len())
     }

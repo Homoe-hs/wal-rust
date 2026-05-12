@@ -639,7 +639,7 @@ impl<R: Read + Seek> FstReader<R> {
         Ok(())
     }
 
-    fn read_header_block(&mut self, len: u64) -> io::Result<()> {
+    fn read_header_block(&mut self, _len: u64) -> io::Result<()> {
         let start_pos = self.reader.stream_position()?;
         self.file.header.start_time = self.read_u64()?;
         self.file.header.end_time = self.read_u64()?;

@@ -179,12 +179,14 @@ pub fn decode_fst_svarint(buf: &[u8]) -> Option<(i64, usize)> {
 
 /// Decode FST varint32 (same as decode_varint but returns u32)
 #[inline]
+#[allow(dead_code)]
 pub fn decode_fst_varint32(buf: &[u8]) -> Option<(u32, usize)> {
     let (val, consumed) = decode_varint(buf)?;
     Some((val as u32, consumed))
 }
 
 /// Read a FST signed varint from a reader
+#[allow(dead_code)]
 pub fn decode_fst_svarint_from_reader<R: std::io::Read>(reader: &mut R) -> Result<i64, String> {
     let mut buf = [0u8; 10];
     let mut pos = 0;

@@ -131,7 +131,7 @@ fn op_printf(args: &[Value], _env: &mut Environment, eval: &mut Evaluator) -> Re
         let chars: Vec<char> = fmt.chars().collect();
         while pos < chars.len() {
             if chars[pos] == '%' && pos + 1 < chars.len() {
-                let start = pos;
+                let _start = pos;
                 pos += 1; // skip %
                 // Parse flags
                 let mut flags = String::new();

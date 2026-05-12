@@ -27,6 +27,7 @@ struct BlockInfo {
     file_offset: u64,    // absolute position of block type byte
     block_len: u64,       // section_length (covers everything after type byte)
     /// Absolute file offset of the time section trailer (= type + 1 + block_len - 24)
+    #[allow(dead_code)]
     time_trailer_offset: u64,
     /// Compressed time data length (for computing index position)
     tsec_clen: u64,
@@ -45,6 +46,7 @@ pub struct FstTrace {
     block_index: Vec<BlockInfo>,
 
     // Pass 2: LRU caches
+    #[allow(dead_code)]
     block_cache: RefCell<lru::LruCache<usize, Vec<u8>>>,
     value_cache: RefCell<lru::LruCache<(u32, u64), Vec<u8>>>,
 
@@ -109,6 +111,7 @@ impl FstTrace {
         Ok(trace)
     }
 
+    #[allow(dead_code)]
     fn is_zlib(b0: u8, b1: u8) -> bool {
         b0 == 0x78 && (b1 == 0x01 || b1 == 0x5e || b1 == 0x9c || b1 == 0xda)
     }

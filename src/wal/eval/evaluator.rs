@@ -1170,6 +1170,7 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
     }
 
     /// Fast-path: evaluate a simple (= (get "sig") val) condition at given index
+    #[allow(dead_code)]
     fn eval_simple_cond(&self, sig_name: &str, target: i64, idx: usize) -> bool {
         if let Ok(t) = self.traces.read() {
             for tid in t.trace_ids() {
@@ -1230,7 +1231,7 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
                             // Resolve signal name via fuzzy matching (handles short names)
                             let resolved = resolve_signal_name(&sig_name, &tr.signals())
                                 .unwrap_or_else(|| sig_name.clone());
-                            if let Ok(mut idxs) = tr.find_indices(&resolved, cond.clone()) {
+                            if let Ok(idxs) = tr.find_indices(&resolved, cond.clone()) {
                                 found.extend(idxs.into_iter().map(|i| i as i64));
                             }
                         }
@@ -1784,7 +1785,7 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
 fn fuzzy_match_signal<'a>(name: &str, signals: &'a [String]) -> (Option<&'a String>, Vec<&'a String>) {
     let dot_name = format!(".{}", name);
     // 1. Exact or suffix match
-    let mut suffix: Vec<&'a String> = signals.iter().filter(|s| s.as_str() == name || s.ends_with(&dot_name)).collect();
+    let suffix: Vec<&'a String> = signals.iter().filter(|s| s.as_str() == name || s.ends_with(&dot_name)).collect();
     if suffix.len() == 1 { return (Some(suffix[0]), vec![]); }
     if suffix.len() > 1 { return (Some(suffix[0]), suffix); }
 

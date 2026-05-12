@@ -183,6 +183,7 @@ fn scalar_to_value(sv: ScalarValue) -> Value {
     }
 }
 
+#[allow(dead_code)]
 fn op_find(args: &[Value], env: &mut Environment, eval: &mut Evaluator) -> Result<Value, String> {
     ensure_arity_atleast(args, 1)?;
     let cond = &args[0];
@@ -244,7 +245,7 @@ fn try_find_indices_simple(cond: &Value, max_results: usize, env: &mut Environme
             .unwrap_or_else(|| sig_name.clone());
         (tr.id().clone(), resolved)
     };
-    let (tid, resolved) = first_trace_info;
+    let (_tid, resolved) = first_trace_info;
 
     let indices = {
         let t = traces.read().ok()?;
@@ -259,6 +260,7 @@ fn try_find_indices_simple(cond: &Value, max_results: usize, env: &mut Environme
     Some(Ok(Value::List(WList::from_vec(limited))))
 }
 
+#[allow(dead_code)]
 fn op_find_g(args: &[Value], env: &mut Environment, eval: &mut Evaluator) -> Result<Value, String> {
     ensure_arity(args, 1)?;
     let cond = &args[0];
@@ -760,6 +762,7 @@ fn extract_int(v: &Value) -> Result<i64, String> {
     }
 }
 
+#[allow(dead_code)]
 fn op_count(args: &[Value], env: &mut Environment, eval: &mut Evaluator) -> Result<Value, String> {
     ensure_arity(args, 1)?;
     let cond = &args[0];
