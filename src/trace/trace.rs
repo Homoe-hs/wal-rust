@@ -4,6 +4,15 @@ use std::collections::HashMap;
 
 pub type TraceId = String;
 
+/// A single entry in a batch find/index operation.
+#[derive(Debug, Clone)]
+pub enum BatchEntry {
+    /// Simple single-signal condition: signal must match condition
+    Simple(String, FindCondition),
+    /// AND of multiple signals: ALL must match their respective conditions
+    And(Vec<(String, FindCondition)>),
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum FindCondition {
     Rising,
@@ -28,8 +37,8 @@ pub trait Trace {
     fn set_index(&mut self, index: usize) -> Result<(), String>;
     fn index(&self) -> usize;
     fn find_indices(&self, name: &str, cond: FindCondition) -> Result<Vec<usize>, String>;
-    /// Batch find: single pass, multiple signals. Returns map from signal name to matching indices.
-    fn find_indices_batch(&self, signals: &[(String, FindCondition)]) -> Result<HashMap<String, Vec<usize>>, String>;
+    /// Batch find: single pass, multiple entries. Returns counts per entry in order.
+    fn find_indices_batch(&self, entries: &[BatchEntry]) -> Result<Vec<(String, Vec<usize>)>, String>;
 }
 
 #[derive(Debug, Clone, PartialEq)]

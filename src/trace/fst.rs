@@ -11,8 +11,8 @@
 
 use crate::fst::reader::{FstReader, FstFile};
 use crate::fst::varint::{decode_varint, decode_fst_svarint};
-use crate::trace::{Trace, TraceId, ScalarValue, FindCondition};
-use std::collections::HashMap;
+use crate::trace::{Trace, TraceId, ScalarValue, FindCondition, BatchEntry};
+use std::collections::{HashMap, HashSet};
 use std::cell::RefCell;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
@@ -722,11 +722,38 @@ impl Trace for FstTrace {
         Ok(indices)
     }
 
-    fn find_indices_batch(&self, signals: &[(String, FindCondition)]) -> Result<HashMap<String, Vec<usize>>, String> {
-        let mut results = HashMap::new();
-        for (name, cond) in signals {
-            if let Ok(indices) = self.find_indices(name, cond.clone()) {
-                results.insert(name.clone(), indices);
+    fn find_indices_batch(&self, entries: &[BatchEntry]) -> Result<Vec<(String, Vec<usize>)>, String> {
+        let mut results = Vec::new();
+        for entry in entries {
+            match entry {
+                BatchEntry::Simple(name, cond) => {
+                    let indices = self.find_indices(name, cond.clone()).unwrap_or_default();
+                    results.push((name.clone(), indices));
+                }
+                BatchEntry::And(subs) => {
+                    // Compute AND: find indices for each sub-signal, intersect
+                    if subs.is_empty() {
+                        results.push((format!("__and_{}", results.len()), vec![]));
+                        continue;
+                    }
+                    let mut sets: Vec<Vec<usize>> = Vec::new();
+                    for (name, cond) in subs {
+                        if let Ok(indices) = self.find_indices(name, cond.clone()) {
+                            sets.push(indices);
+                        }
+                    }
+                    if sets.is_empty() {
+                        results.push((format!("__and_{}", results.len()), vec![]));
+                    } else {
+                        sets.sort_by_key(|s| s.len());
+                        let mut base = sets[0].clone();
+                        for other in &sets[1..] {
+                            let set: std::collections::HashSet<usize> = other.iter().copied().collect();
+                            base.retain(|i| set.contains(i));
+                        }
+                        results.push((format!("__and_{}", results.len() - 1), base));
+                    }
+                }
             }
         }
         Ok(results)

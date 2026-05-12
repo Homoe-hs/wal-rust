@@ -1,4 +1,4 @@
-//! VCD trace implementation (two-pass scan + sparse index + LRU cache + memchr jump scan)
+//! VCD trace implementation (two-pass scan + sparse index + LRU cache + memchr jump scan + decoded signal cache)
 //!
 //! Optimized loading: zero-copy byte-parsing, packed signal IDs, pre-allocation.
 
@@ -6,14 +6,15 @@ use crate::trace::{Trace, TraceId, ScalarValue, FindCondition, BatchEntry};
 use crate::vcd::types::VcdValue;
 use std::cell::RefCell;
 use std::collections::{HashMap, BTreeMap, HashSet};
+use std::sync::{Arc, Mutex};
+use std::path::Path;
+
+const MAX_DECODED_SIGNALS: usize = 256;
 
 struct DecodedSignal {
     change_indices: Vec<u32>,
-    values: Vec<u8>,
-    width: u32,
+    values: Vec<VcdValue>,
 }
-use std::sync::Arc;
-use std::path::Path;
 
 /// LRU cache capacity (number of entries)
 fn adapt_lru_capacity(file_size: usize, signal_count: usize) -> usize {
@@ -60,7 +61,7 @@ pub struct VcdTrace {
 
     // Pass 2: LRU cache
     lru_cache: RefCell<lru::LruCache<(u32, u64), VcdValue>>,
-    signal_cache: RefCell<HashMap<u32, DecodedSignal>>,
+    signal_cache: Mutex<HashMap<u32, DecodedSignal>>,
 
     // Persistent mmap
     reader: RefCell<crate::vcd::reader::MmapReader>,
@@ -290,7 +291,7 @@ impl VcdTrace {
             signals, signal_ids, signal_id_bytes, signal_widths, name_to_idx, event_signals, event_change_points,
             timestamps, timestamp_offsets, sparse_index,
             lru_cache: RefCell::new(lru::LruCache::new(lru_cap)),
-            signal_cache: RefCell::new(HashMap::new()),
+            signal_cache: Mutex::new(HashMap::new()),
             reader: RefCell::new(reader),
             header_end_offset,
             scopes,
@@ -326,11 +327,9 @@ impl VcdTrace {
 
         // 2. Scan start: anchor TIMESTAMP's # line offset (not change point offset).
         //    This guarantees we start at a # line, not in the middle of value changes.
-        let anchor_ts = self.sparse_index.get(&sig_idx)
+        let scan_start = self.sparse_index.get(&sig_idx)
             .and_then(|idx_map| idx_map.range(..=target_timestamp).last())
-            .map(|(&ts, _)| ts);
-        let scan_start = anchor_ts
-            .and_then(|ts| self.timestamps.binary_search(&ts).ok())
+            .and_then(|(&ts, _)| self.timestamps.binary_search(&ts).ok())
             .and_then(|i| self.timestamp_offsets.get(i).copied())
             .unwrap_or(self.header_end_offset) as usize;
 
@@ -343,26 +342,43 @@ impl VcdTrace {
             data.len()
         };
 
-        if scan_start >= data.len() || scan_start >= scan_end {
-            return VcdValue::Bit(b'x');
-        }
-        if scan_end.saturating_sub(scan_start) > 1_000_000_000 {
-            return VcdValue::Bit(b'x');
+        // Fallback for huge sparse gaps
+        if scan_start >= data.len() || scan_start >= scan_end || scan_end.saturating_sub(scan_start) > 1_000_000_000 {
+            return self.read_signal_value_at_legacy(sig_idx, target_timestamp);
         }
 
-        // 3. memchr jump scan
+        // 3. memchr jump scan + collect changes for cache
         let region = &data[scan_start..scan_end];
         let mut last_value: Option<VcdValue> = None;
         let mut pos: usize = 0;
 
         while pos < region.len() {
-            let ts_start = match memchr::memchr(b'#', &region[pos..]) {
-                Some(p) => pos + p,
-                None => break,
+            // Find next '#' at line start (preceded by \n or at region start)
+            let ts_start = loop {
+                let p = match memchr::memchr(b'#', &region[pos..]) {
+                    Some(p) => p,
+                    None => break None,
+                };
+                let abs_p = pos + p;
+                if abs_p == 0 || region[abs_p - 1] == b'\n' {
+                    break Some(abs_p);
+                }
+                pos = abs_p + 1;
             };
-            let next_ts = memchr::memchr(b'#', &region[ts_start + 1..])
-                .map(|p| ts_start + 1 + p)
-                .unwrap_or(region.len());
+            let ts_start = match ts_start { Some(p) => p, None => break };
+
+            // Find next '#' at line start for block end
+            let mut search_pos = ts_start + 1;
+            let next_ts = loop {
+                let p = match memchr::memchr(b'#', &region[search_pos..]) {
+                    Some(p) => search_pos + p,
+                    None => break region.len(),
+                };
+                if region[p - 1] == b'\n' {
+                    break p;
+                }
+                search_pos = p + 1;
+            };
 
             let ts = parse_timestamp_fast(&region[ts_start..next_ts]);
             if ts > target_timestamp { break; }
@@ -381,6 +397,60 @@ impl VcdTrace {
             pos = next_ts;
         }
 
+        last_value.unwrap_or(VcdValue::Bit(b'x'))
+    }
+
+    fn read_signal_value_at_legacy(&self, sig_idx: u32, target_timestamp: u64) -> VcdValue {
+        let target_id = match self.signal_id_bytes.get(&sig_idx) {
+            Some(id) => id,
+            None => return VcdValue::Bit(b'x'),
+        };
+        let id_len = target_id.len();
+        let mut reader = self.reader.borrow_mut();
+
+        let start_offset = self
+            .sparse_index
+            .get(&sig_idx)
+            .and_then(|idx_map| idx_map.range(..=target_timestamp).last())
+            .map(|(_, &off)| off)
+            .unwrap_or(self.header_end_offset);
+
+        let _ = reader.seek_to(start_offset);
+        let mut last_value: Option<VcdValue> = None;
+
+        loop {
+            let line = match reader.read_line_bytes() {
+                Some(l) => l,
+                None => break,
+            };
+            if line.is_empty() { continue; }
+            let first = line[0];
+
+            if first == b'#' {
+                let ts = parse_timestamp_fast(line);
+                if ts > target_timestamp { break; }
+                if self.event_signals.contains(&sig_idx) {
+                    last_value = Some(VcdValue::Bit(b'0'));
+                }
+            } else if first != b'$' && line.len() > id_len {
+                let id_start = line.len() - id_len;
+                if &line[id_start..] == target_id.as_slice() {
+                    let val = match first {
+                        b'b' => {
+                            let ve = id_start.saturating_sub(1);
+                            let vs = if ve > 1 && line[ve] == b' ' { &line[1..ve] } else { &line[1..id_start] };
+                            VcdValue::Vector(vs.to_vec())
+                        }
+                        b'r' => {
+                            let vs = std::str::from_utf8(&line[1..id_start]).unwrap_or("0");
+                            if let Ok(r) = vs.trim().parse::<f64>() { VcdValue::Real(r) } else { continue; }
+                        }
+                        _ => VcdValue::Bit(first),
+                    };
+                    last_value = Some(val);
+                }
+            }
+        }
         last_value.unwrap_or(VcdValue::Bit(b'x'))
     }
 
@@ -425,6 +495,16 @@ impl VcdTrace {
             }
         }
         last_value
+    }
+
+    fn try_cache_decoded_signal(&self, sig_idx: u32, changes: &[(u32, VcdValue)]) {
+        if changes.len() < 2 { return; }
+        let mut cache = self.signal_cache.lock().unwrap();
+        if cache.len() >= MAX_DECODED_SIGNALS {
+            cache.clear();
+        }
+        let (ci, vals): (Vec<u32>, Vec<VcdValue>) = changes.iter().cloned().unzip();
+        cache.insert(sig_idx, DecodedSignal { change_indices: ci, values: vals });
     }
 }
 
@@ -730,9 +810,10 @@ impl Trace for VcdTrace {
             .collect();
 
         // Parallel chunk scan using rayon — Arc<Mmap> is Sync so threads can share
-        let results: Vec<Vec<usize>> = chunks.par_iter().map(|&(start, end, start_ts)| {
+        let results: Vec<(Vec<usize>, Vec<(u32, VcdValue)>)> = chunks.par_iter().map(|&(start, end, start_ts)| {
             let chunk = &shared_mmap[start..end];
             let mut local_indices = Vec::new();
+            let mut all_changes: Vec<(u32, VcdValue)> = Vec::new();
             let mut current_val: Option<VcdValue> = None;
             let mut prev_bit: Option<u8> = None;
             let mut ts_idx = start_ts;
@@ -775,6 +856,7 @@ impl Trace for VcdTrace {
                             }
                             _ => VcdValue::Bit(first),
                         };
+                        all_changes.push((ts_idx as u32, val.clone()));
                         current_val = Some(val);
                     }
                 }
@@ -788,12 +870,23 @@ impl Trace for VcdTrace {
                 }
             }
 
-            local_indices
+            (local_indices, all_changes)
         }).collect();
 
-        let mut indices: Vec<usize> = results.into_iter().flatten().collect();
+        let mut indices: Vec<usize> = Vec::new();
+        let mut all_changes: Vec<(u32, VcdValue)> = Vec::new();
+        for (idxs, changes) in results {
+            indices.extend(idxs);
+            all_changes.extend(changes);
+        }
         indices.sort();
         indices.dedup();
+        // Merge and sort changes (changes may overlap at chunk boundaries)
+        if all_changes.len() > 1 {
+            all_changes.sort_by_key(|(i, _)| *i);
+            all_changes.dedup_by_key(|(i, _)| *i);
+            self.try_cache_decoded_signal(sig_idx, &all_changes);
+        }
         Ok(indices)
     }
 

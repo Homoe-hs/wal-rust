@@ -4,7 +4,7 @@ use crate::wal::ast::{Value, Symbol, WList, Closure, Operator};
 use crate::wal::eval::{Environment, Dispatcher, SemanticChecker};
 use crate::wal::builtins;
 use crate::wal::builtins::special::quasiquote_eval;
-use crate::trace::{FindCondition, TraceContainer, SharedTraceContainer};
+use crate::trace::{FindCondition, BatchEntry, TraceContainer, SharedTraceContainer, ScalarValue};
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::{Arc, RwLock};
@@ -945,6 +945,65 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
         None
     }
 
+    /// Walk an expression and resolve variable references in (get <symbol>) calls.
+    /// Returns the expression with symbols replaced by their string values.
+    fn resolve_get_symbols(&self, expr: &Value) -> Value {
+        match expr {
+            Value::List(lst) => {
+                if lst.len() == 2 && matches!(&lst[0], Value::Symbol(s) if s.name == "get") {
+                    if let Value::Symbol(sym) = &lst[1] {
+                        if let Some(val) = self.env.lookup(&sym.name) {
+                            if matches!(val, Value::String(_)) {
+                                let items = vec![
+                                    Value::Symbol(Symbol::new("get".to_string())),
+                                    val,
+                                ];
+                                return Value::List(WList::from_vec(items));
+                            }
+                        }
+                    }
+                }
+                let resolved: Vec<Value> = lst.iter().map(|v| self.resolve_get_symbols(v)).collect();
+                Value::List(WList::from_vec(resolved))
+            }
+            other => other.clone(),
+        }
+    }
+
+    /// Build a FindCondition from target value and negation flag.
+    fn build_cond(target: i64, is_not: bool) -> FindCondition {
+        if is_not {
+            if target <= 1 && target >= 0 { FindCondition::Neq(target as u8) }
+            else { FindCondition::NeqI64(target) }
+        } else {
+            if target <= 1 && target >= 0 { FindCondition::Value(target as u8) }
+            else { FindCondition::ValueI64(target) }
+        }
+    }
+
+    /// Decompose (&& cond1 cond2 ...) into individual simple conditions.
+    /// Returns None if it can't be decomposed.
+    fn decompose_and_condition(&self, expr: &Value) -> Option<Vec<(String, FindCondition)>> {
+        let lst = match expr {
+            Value::List(lst) if lst.len() >= 3 => lst,
+            _ => return None,
+        };
+        let op = match &lst[0] {
+            Value::Symbol(s) => s.name.as_str(),
+            _ => return None,
+        };
+        if op != "&&" && op != "and" { return None; }
+        let mut subs = Vec::new();
+        for sub in lst.iter().skip(1) {
+            if let Some((sig, target, is_not)) = self.parse_simple_condition(sub) {
+                subs.push((sig, Self::build_cond(target, is_not)));
+            } else {
+                return None; // Can't decompose non-simple sub-condition
+            }
+        }
+        if subs.len() >= 2 { Some(subs) } else { None }
+    }
+
     /// Try decomposing (&& ...) or (|| ...) for fast counting.
     /// Each sub-condition that matches (=/!= (get "sig") val) uses find_indices.
     /// For &&: verify remaining conditions on the smallest set of candidates.
@@ -1395,54 +1454,60 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
             return Ok(Value::Int(0));
         }
 
-        // Batch mode: multiple conditions → single scan for all
+        // Batch mode: multiple conditions → single scan for all (including &&)
         if args.len() > 1 {
-            let mut batch: Vec<(String, FindCondition)> = Vec::new();
+            let mut batch_entries: Vec<BatchEntry> = Vec::new();
             for arg in args {
-                if let Some((sig, target, is_not)) = self.parse_simple_condition(arg) {
-                    let cond = if is_not {
-                        if target <= 1 && target >= 0 { FindCondition::Neq(target as u8) }
-                        else { FindCondition::NeqI64(target) }
-                    } else {
-                        if target <= 1 && target >= 0 { FindCondition::Value(target as u8) }
-                        else { FindCondition::ValueI64(target) }
-                    };
-                    batch.push((sig, cond));
+                // Resolve variable references in (get <symbol>) → (get "resolved_string")
+                let resolved_arg = self.resolve_get_symbols(arg);
+                if let Some((sig, target, is_not)) = self.parse_simple_condition(&resolved_arg) {
+                    batch_entries.push(BatchEntry::Simple(sig, Self::build_cond(target, is_not)));
+                } else if let Some(subs) = self.decompose_and_condition(&resolved_arg) {
+                    // (&& cond1 cond2 ...) → build And entry
+                    if subs.len() >= 2 {
+                        batch_entries.push(BatchEntry::And(subs));
+                    }
                 }
             }
-            if batch.len() >= 2 {
-                let mut result_map: Option<(Vec<String>, std::collections::HashMap<String, Vec<usize>>)> = None;
+            if batch_entries.len() >= 2 {
+                let mut result_counts: Vec<Value> = Vec::new();
                 {
                     let t = self.traces.read().unwrap_or_else(|e| e.into_inner());
                     for tid in &traces_ids {
                         if let Some(tr) = t.get(tid) {
                             let sigs = tr.signals();
-                            let mut resolved_names: Vec<String> = Vec::new();
-                            let resolved_batch: Vec<(String, FindCondition)> = batch.iter()
-                                .map(|(name, cond)| {
-                                    let r = resolve_signal_name(name, &sigs).unwrap_or_else(|| name.clone());
-                                    resolved_names.push(r.clone());
-                                    (r, cond.clone())
+                            // Resolve signal names in all entries
+                            let resolved_entries: Vec<BatchEntry> = batch_entries.iter()
+                                .map(|entry| match entry {
+                                    BatchEntry::Simple(name, cond) => {
+                                        let r = resolve_signal_name(name, &sigs).unwrap_or_else(|| name.clone());
+                                        BatchEntry::Simple(r, cond.clone())
+                                    }
+                                    BatchEntry::And(subs) => {
+                                        let resolved: Vec<(String, FindCondition)> = subs.iter()
+                                            .map(|(name, cond)| {
+                                                let r = resolve_signal_name(name, &sigs).unwrap_or_else(|| name.clone());
+                                                (r, cond.clone())
+                                            })
+                                            .collect();
+                                        BatchEntry::And(resolved)
+                                    }
                                 })
                                 .collect();
-                            if let Ok(map) = tr.find_indices_batch(&resolved_batch) {
-                                result_map = Some((resolved_names, map));
-                                break;
+                            if let Ok(results) = tr.find_indices_batch(&resolved_entries) {
+                                for (_, indices) in results {
+                                    result_counts.push(Value::Int(indices.len() as i64));
+                                }
+                                // Read guard dropped, restore indices
+                                if let Ok(mut tc) = self.traces.write() {
+                                    for (tid, idx) in &saved {
+                                        let _ = tc.set_index(tid, *idx);
+                                    }
+                                }
+                                return Ok(Value::List(WList::from_vec(result_counts)));
                             }
                         }
                     }
-                } // read guard dropped here
-                if let Some((resolved_names, result_map)) = result_map {
-                    let counts: Vec<Value> = resolved_names.iter()
-                        .map(|name| Value::Int(result_map.get(name).map_or(0, |v| v.len() as i64)))
-                        .collect();
-                    // Read guard is dropped, can now write
-                    if let Ok(mut tc) = self.traces.write() {
-                        for (tid, idx) in &saved {
-                            let _ = tc.set_index(tid, *idx);
-                        }
-                    }
-                    return Ok(Value::List(WList::from_vec(counts)));
                 }
             }
         }
@@ -1477,53 +1542,6 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
         // Fast path 2: try decomposing (&& cond1 cond2) or (|| cond1 cond2)
         if let Some(result) = self.decompose_and_count(&args[0], &traces_ids)? {
             return Ok(Value::Int(result));
-        }
-
-        // Batch mode: multiple conditions → single scan for all
-        if args.len() > 1 {
-            let mut batch: Vec<(String, FindCondition)> = Vec::new();
-            for arg in args {
-                if let Some((sig, target, is_not)) = self.parse_simple_condition(arg) {
-                    let cond = if is_not {
-                        if target <= 1 && target >= 0 { FindCondition::Neq(target as u8) }
-                        else { FindCondition::NeqI64(target) }
-                    } else {
-                        if target <= 1 && target >= 0 { FindCondition::Value(target as u8) }
-                        else { FindCondition::ValueI64(target) }
-                    };
-                    batch.push((sig, cond));
-                }
-            }
-            if batch.len() >= 2 {
-                // Resolve signal names
-                let mut resolved_batch: Vec<(String, FindCondition)> = Vec::new();
-                if let Ok(t) = self.traces.read() {
-                    for tid in &traces_ids {
-                        if let Some(tr) = t.get(tid) {
-                            let sigs = tr.signals();
-                            for (name, cond) in &batch {
-                                let r = resolve_signal_name(name, &sigs).unwrap_or_else(|| name.clone());
-                                resolved_batch.push((r, cond.clone()));
-                            }
-                        }
-                    }
-                }
-                if !resolved_batch.is_empty() {
-                    if let Ok(t) = self.traces.read() {
-                        for tid in &traces_ids {
-                            if let Some(tr) = t.get(tid) {
-                                if let Ok(result_map) = tr.find_indices_batch(&resolved_batch) {
-                                    let counts: Vec<Value> = batch.iter()
-                                        .map(|(name, _)| Value::Int(result_map.get(name).map_or(0, |v| v.len() as i64)))
-                                        .collect();
-                                    return Ok(Value::List(WList::from_vec(counts)));
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            // If batch fails, fall through to slow path with first argument only
         }
 
         // Fallback: evaluate condition at each step
