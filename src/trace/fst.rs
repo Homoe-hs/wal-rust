@@ -12,6 +12,7 @@
 use crate::fst::reader::{FstReader, FstFile};
 use crate::fst::varint::{decode_varint, decode_fst_svarint};
 use crate::trace::{Trace, TraceId, ScalarValue, FindCondition};
+use std::collections::HashMap;
 use std::cell::RefCell;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
@@ -719,6 +720,16 @@ impl Trace for FstTrace {
         }
 
         Ok(indices)
+    }
+
+    fn find_indices_batch(&self, signals: &[(String, FindCondition)]) -> Result<HashMap<String, Vec<usize>>, String> {
+        let mut results = HashMap::new();
+        for (name, cond) in signals {
+            if let Ok(indices) = self.find_indices(name, cond.clone()) {
+                results.insert(name.clone(), indices);
+            }
+        }
+        Ok(results)
     }
 }
 

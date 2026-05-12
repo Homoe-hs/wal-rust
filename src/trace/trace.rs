@@ -1,5 +1,7 @@
 //! Trace trait for waveform access
 
+use std::collections::HashMap;
+
 pub type TraceId = String;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -26,6 +28,8 @@ pub trait Trace {
     fn set_index(&mut self, index: usize) -> Result<(), String>;
     fn index(&self) -> usize;
     fn find_indices(&self, name: &str, cond: FindCondition) -> Result<Vec<usize>, String>;
+    /// Batch find: single pass, multiple signals. Returns map from signal name to matching indices.
+    fn find_indices_batch(&self, signals: &[(String, FindCondition)]) -> Result<HashMap<String, Vec<usize>>, String>;
 }
 
 #[derive(Debug, Clone, PartialEq)]

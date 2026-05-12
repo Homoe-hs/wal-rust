@@ -6,6 +6,7 @@ use crate::trace::{Trace, TraceId, ScalarValue, FindCondition};
 use crate::vcd::types::VcdValue;
 use std::cell::RefCell;
 use std::collections::{HashMap, BTreeMap, HashSet};
+use std::sync::Arc;
 use std::path::Path;
 
 /// LRU cache capacity (number of entries)
@@ -766,6 +767,186 @@ impl Trace for VcdTrace {
         indices.sort();
         indices.dedup();
         Ok(indices)
+    }
+
+    fn find_indices_batch(&self, signals: &[(String, FindCondition)]) -> Result<HashMap<String, Vec<usize>>, String> {
+        if signals.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        // Build signal lookup: VCD ID bytes → (signal_name_idx, condition)
+        struct BatchSig {
+            name: String,
+            cond: FindCondition,
+            #[allow(dead_code)]
+            sig_idx: u32,
+        }
+        let mut batch_sigs: Vec<BatchSig> = Vec::new();
+        let mut id_to_batch: HashMap<Vec<u8>, usize> = HashMap::new();
+
+        for (name, cond) in signals {
+            let sig_idx = match self.name_to_idx.get(name) {
+                Some(i) => *i,
+                None => continue,
+            };
+            let id_bytes = match self.signal_id_bytes.get(&sig_idx) {
+                Some(b) => b,
+                None => continue,
+            };
+            let batch_idx = batch_sigs.len();
+            id_to_batch.insert(id_bytes.clone(), batch_idx);
+            batch_sigs.push(BatchSig {
+                name: name.clone(),
+                cond: cond.clone(),
+                sig_idx,
+            });
+        }
+
+        if batch_sigs.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        use rayon::prelude::*;
+        let shared_mmap = self.reader.borrow().data.clone();
+        let hdr_end = self.header_end_offset as usize;
+        let data_len = shared_mmap.len();
+
+        let n_threads = num_cpus::get().max(4);
+        let dump_len = data_len.saturating_sub(hdr_end);
+        let chunk_size = dump_len / n_threads.max(1);
+        let mut boundaries = vec![hdr_end];
+        for i in 1..n_threads {
+            let mut p = hdr_end + i * chunk_size;
+            if p >= data_len { break; }
+            while p < data_len && shared_mmap[p] != b'\n' { p += 1; }
+            if p < data_len { p += 1; }
+            if p >= data_len { break; }
+            boundaries.push(p);
+        }
+        boundaries.push(data_len);
+
+        let boundary_ts: Vec<usize> = {
+            let mut ts = vec![0usize; boundaries.len()];
+            let mut count = 0usize;
+            let mut bi = 1usize;
+            for (i, &b) in shared_mmap[hdr_end..].iter().enumerate() {
+                if b == b'#' { count += 1; }
+                while bi < boundaries.len() && hdr_end + i + 1 >= boundaries[bi] {
+                    ts[bi] = count;
+                    bi += 1;
+                }
+                if bi >= boundaries.len() { break; }
+            }
+            ts
+        };
+
+        // Organize IDs by length for fast lookup: id_by_len[len] = vec![(id_bytes, batch_idx)]
+        let mut id_by_len: Vec<Vec<(Vec<u8>, usize)>> = vec![Vec::new(); 8];
+        for (id_bytes, &batch_idx) in &id_to_batch {
+            if id_bytes.len() < 8 {
+                id_by_len[id_bytes.len()].push((id_bytes.clone(), batch_idx));
+            }
+        }
+
+        let chunks: Vec<(usize, usize, usize)> = (0..boundaries.len() - 1)
+            .map(|i| (boundaries[i], boundaries[i+1], boundary_ts[i]))
+            .collect();
+
+        let batch_sigs_arc = Arc::new(batch_sigs);
+        let id_by_len_arc = Arc::new(id_by_len);
+
+        let results: Vec<Vec<Vec<usize>>> = chunks.par_iter().map(|&(start, end, start_ts)| {
+            let chunk = &shared_mmap[start..end];
+            let batch_count = batch_sigs_arc.len();
+            let mut local: Vec<Vec<usize>> = vec![Vec::new(); batch_count];
+            let mut current_vals: Vec<Option<VcdValue>> = vec![None; batch_count];
+            let mut prev_bits: Vec<Option<u8>> = vec![None; batch_count];
+            let mut ts_idx = start_ts;
+            let mut seen_first_ts = false;
+
+            let mut lp = 0usize;
+            while lp < chunk.len() {
+                let line_start = lp;
+                let line_end = match memchr::memchr(b'\n', &chunk[lp..]) {
+                    Some(nl) => { lp += nl; let end = lp; lp += 1; end }
+                    None => break,
+                };
+                let line = &chunk[line_start..line_end];
+                if line.is_empty() { continue; }
+                let first = line[0];
+
+                if first == b'#' {
+                    if seen_first_ts {
+                        for b in 0..batch_count {
+                            if let Some(ref val) = current_vals[b] {
+                                if find_cond_matches(val, prev_bits[b], &batch_sigs_arc[b].cond) {
+                                    local[b].push(ts_idx);
+                                }
+                                prev_bits[b] = val_to_bit(val);
+                            }
+                        }
+                        ts_idx += 1;
+                    }
+                    seen_first_ts = true;
+                } else if first != b'$' && !line.is_empty() {
+                    // Check IDs longest-first for unambiguous match
+                    let max_id_len = line.len().min(6);
+                    'idscan: for id_len in (1..max_id_len).rev() {
+                        let id_start = line.len() - id_len;
+                        let candidates = &id_by_len_arc[id_len];
+                        for (ref id_bytes, batch_idx) in candidates.iter() {
+                            let batch_idx = *batch_idx;
+                            if &line[id_start..] == id_bytes.as_slice() {
+                                let val = match first {
+                                    b'b' => {
+                                        let ve = id_start.saturating_sub(1);
+                                        let vs = if ve > 1 && line[ve] == b' ' { &line[1..ve] } else { &line[1..id_start] };
+                                        VcdValue::Vector(vs.to_vec())
+                                    }
+                                    b'r' => {
+                                        let vs = std::str::from_utf8(&line[1..id_start]).unwrap_or("0");
+                                        if let Ok(r) = vs.trim().parse::<f64>() { VcdValue::Real(r) } else { break 'idscan; }
+                                    }
+                                    _ => VcdValue::Bit(first),
+                                };
+                                current_vals[batch_idx] = Some(val);
+                                break 'idscan;
+                            }
+                        }
+                    }
+                }
+            }
+
+            if seen_first_ts {
+                for b in 0..batch_count {
+                    if let Some(ref val) = current_vals[b] {
+                        if find_cond_matches(val, prev_bits[b], &batch_sigs_arc[b].cond) {
+                            local[b].push(ts_idx);
+                        }
+                    }
+                }
+            }
+
+            local
+        }).collect();
+
+        // Merge per-batch results
+        let batch_count = batch_sigs_arc.len();
+        let mut merged: Vec<Vec<usize>> = vec![Vec::new(); batch_count];
+        for chunk_result in results {
+            for b in 0..batch_count {
+                merged[b].extend(chunk_result[b].iter());
+            }
+        }
+
+        let mut result_map = HashMap::new();
+        for (b, bs) in batch_sigs_arc.iter().enumerate() {
+            let mut idxs = std::mem::take(&mut merged[b]);
+            idxs.sort();
+            idxs.dedup();
+            result_map.insert(bs.name.clone(), idxs);
+        }
+        Ok(result_map)
     }
 }
 
