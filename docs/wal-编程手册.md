@@ -1339,18 +1339,25 @@ hi
 
 #### `count`
 
-**签名**: `(count cond)`  
+**签名**: `(count cond)` → `int`
+　　　　　`(count cond1 cond2 ...)` → `(int ...)`  [wal-rust only]
 **参数**:
 - `cond` (`any?`) — 条件表达式
-**返回值**: `int?`
+**返回值**: `int` 或 `(int ...)`
 **说明**: 
 - 特殊形式，cond 不预求值
-- 返回 cond 求值为真的 INDEX 数量
-- 有快速路径：`(= (get "sig") val)` 形式使用索引扫描
+- 单参数：返回 cond 求值为真的 INDEX 数量（所有 WAL 实现一致）
+- 多参数：返回列表，每个元素对应一个条件的计数
+- **wal-rust 特有优化**：多参数模式对所有信号进行**单次并行扫描**，
+  比 N 次独立 `find_indices` 快 ~17 倍（实测 43 信号从 1600s 降至 90s）
 - 遍历完成后恢复原始 INDEX
 **示例**:
 ```wal
+;; 单条件（标准 WAL）
 (count (= clk 1))
+
+;; 多条件批量（wal-rust only）
+(count (= (get "evt_rx_req") 1) (= (get "evt_send_resp") 1))
 ```
 
 #### `timeframe`
