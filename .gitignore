@@ -16,5 +16,4 @@ generate_5000.py
 vcd-samples/
 .memsearch/
 test_*.wal
-test_samples/fst_check.wal
 wal-rust

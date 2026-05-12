@@ -218,9 +218,11 @@ impl<R: Read + Seek> FstReader<R> {
             }
         }
 
-        // After processing all inline blocks, scan the tail for HIER blocks
-        // (vcd2fst appends signal metadata at the end of the file)
-        self.scan_tail_for_hier()?;
+        // Tail scan for HIER blocks — only if no signals found from inline blocks.
+        // vcd2fst files store signals at the tail; our own format has inline GEOM+HIER.
+        if self.file.signals.is_empty() {
+            self.scan_tail_for_hier()?;
+        }
         Ok(())
     }
 
@@ -455,7 +457,7 @@ impl<R: Read + Seek> FstReader<R> {
                     Some(name) => {
                         for sig in self.file.signals.iter_mut() {
                             if sig.handle == *our_handle {
-                                sig.name = format!("{}.{}", name, *our_handle);
+                                sig.name = name.clone();
                                 break;
                             }
                         }
@@ -475,7 +477,7 @@ impl<R: Read + Seek> FstReader<R> {
                 .unwrap_or_else(|| format!("@UNKNOWN_{}", parent_fst_handle));
             for sig in self.file.signals.iter_mut() {
                 if sig.handle == *our_handle {
-                    sig.name = format!("{}.{}", parent_name, *our_handle);
+                    sig.name = parent_name.clone();
                     break;
                 }
             }
@@ -497,7 +499,7 @@ impl<R: Read + Seek> FstReader<R> {
             let parent = &self.file.signals[parent_idx];
             self.file.signals.push(SignalDecl {
                 handle: (sig_count + i) as u32,
-                name: format!("@alias_{}", parent.handle),
+                name: parent.name.clone(),
                 width: parent.width,
                 var_type: parent.var_type,
                 direction: 0,

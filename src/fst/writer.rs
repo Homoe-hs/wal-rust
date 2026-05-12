@@ -6,7 +6,7 @@
 //! - Scope hierarchy
 //! - Value change emission
 
-use super::blocks::{encode_var_entry, encode_scope_entry, BlockWriter};
+use super::blocks::{encode_scope_entry, BlockWriter};
 use super::compress::{get_compressor, Compressor};
 use super::types::{BlockType, Compression, FstHeader, ScopeType, SignalDecl, VarType};
 use super::varint::{encode_varint, encode_fst_svarint};
@@ -548,16 +548,6 @@ impl<W: Write> FstWriter<W> {
         // Encode scope entries reverse for upscope
         for _ in &self.scopes {
             hier_data.push(0x03); // HIER_UPSCOPE
-        }
-
-        // Encode variables
-        for sig in &self.signals {
-            hier_data.extend_from_slice(&encode_var_entry(
-                sig.handle,
-                &sig.name,
-                sig.var_type,
-                sig.width,
-            ));
         }
 
         // Compress hierarchy
