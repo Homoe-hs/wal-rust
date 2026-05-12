@@ -1,33 +1,18 @@
-//! Trace container for managing multiple traces
-//!
-//! FST cache: loading a .vcd file automatically generates a .fst cache file
-//! in the same directory for faster subsequent access.
-
 use super::{Trace, TraceId, FindCondition};
+use super::vcd::VcdTrace;
 use super::fst::FstTrace;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
-use std::sync::atomic::AtomicU64;
 use std::path::Path;
-use std::thread::JoinHandle;
 
 pub struct TraceContainer {
     traces: HashMap<TraceId, Box<dyn Trace>>,
-    cache_handles: Vec<JoinHandle<()>>,
 }
 
 impl TraceContainer {
     pub fn new() -> Self {
         Self {
             traces: HashMap::new(),
-            cache_handles: Vec::new(),
-        }
-    }
-
-    /// Wait for ongoing FST cache conversions to complete.
-    pub fn wait_for_fst_cache(&mut self) {
-        for h in self.cache_handles.drain(..) {
-            let _ = h.join();
         }
     }
 
@@ -54,77 +39,23 @@ impl TraceContainer {
         None
     }
 
-    /// Check if .fst cache is fresh (exists and newer than .vcd)
-    fn cache_is_fresh(vcd_path: &Path, fst_path: &Path) -> bool {
-        if !fst_path.exists() { return false; }
-        let tmp_path = fst_path.with_extension("fst.tmp");
-        if tmp_path.exists() { return false; }
-        let vcd_mtime = match std::fs::metadata(vcd_path).and_then(|m| m.modified()) {
-            Ok(t) => t, Err(_) => return false,
-        };
-        let fst_mtime = match std::fs::metadata(fst_path).and_then(|m| m.modified()) {
-            Ok(t) => t, Err(_) => return false,
-        };
-        fst_mtime >= vcd_mtime
-    }
-
     pub fn load(&mut self, path: &Path, id: TraceId) -> Result<(), String> {
         let fmt = Self::detect_format(path)
             .ok_or_else(|| format!("Unsupported file format: {}", path.display()))?;
 
         match fmt {
-            "vcd" => self.load_vcd(path, id),
+            "vcd" => {
+                let trace = VcdTrace::load(path, id.clone())?;
+                self.traces.insert(id, Box::new(trace));
+                Ok(())
+            }
             "fst" => {
-                let fst_trace = FstTrace::load(path, id.clone())?;
-                self.traces.insert(id, Box::new(fst_trace));
+                let trace = FstTrace::load(path, id.clone())?;
+                self.traces.insert(id, Box::new(trace));
                 Ok(())
             }
             _ => Err(format!("Unsupported file format: {}", path.display())),
         }
-    }
-
-    fn load_vcd(&mut self, path: &Path, id: TraceId) -> Result<(), String> {
-        let fst_path = path.with_extension("fst");
-
-        // Fast path: FST cache is fresh
-        if Self::cache_is_fresh(path, &fst_path) {
-            match FstTrace::load(&fst_path, id.clone()) {
-                Ok(trace) => {
-                    self.traces.insert(id, Box::new(trace));
-                    return Ok(());
-                }
-                Err(e) => {
-                    eprintln!("[FST cache] Corrupted, falling back to VCD: {}", e);
-                    let _ = std::fs::remove_file(&fst_path);
-                }
-            }
-        }
-
-        // Synchronous parallel FST conversion, then load FST
-        let _ = std::fs::remove_file(&fst_path);
-
-        let file_size = std::fs::metadata(path)
-            .map(|m| m.len())
-            .unwrap_or(0);
-        let progress = Arc::new(AtomicU64::new(0));
-
-        eprintln!("[FST cache] Converting: {} → {} ({})",
-            path.display(), fst_path.display(),
-            crate::vcd::convert::format_size(file_size));
-
-        crate::vcd::parallel_convert::vcd_to_fst_parallel(
-            path, &fst_path, progress,
-        ).map_err(|e| format!("FST conversion failed: {}", e))?;
-
-        let trace = FstTrace::load(&fst_path, id.clone())
-            .map_err(|e| format!("Failed to load converted FST: {}", e))?;
-        self.traces.insert(id, Box::new(trace));
-
-        eprintln!("[FST cache] Done: {} ({} → FST)",
-            fst_path.display(),
-            crate::vcd::convert::format_size(file_size));
-
-        Ok(())
     }
 
     pub fn unload(&mut self, id: &TraceId) -> Result<(), String> {

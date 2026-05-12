@@ -53,11 +53,7 @@ fn init_eval_with_load(load: &[PathBuf]) -> Result<wal::eval::Evaluator, String>
 
 fn eval_wal_expr(code: &str, load: &[PathBuf]) -> Result<(), String> {
     let mut eval = init_eval_with_load(load)?;
-    let result = eval.eval(code);
-    if let Ok(mut tc) = eval.traces.write() {
-        tc.wait_for_fst_cache();
-    }
-    let val = result?;
+    let val = eval.eval(code)?;
     println!("=> {}", val);
     Ok(())
 }
@@ -69,9 +65,6 @@ fn run_wal_file(path: &Path, load: &[PathBuf], code: Option<&str>) -> Result<(),
     if let Some(code) = code {
         let result = eval.eval(code)?;
         println!("=> {}", result);
-        if let Ok(mut tc) = eval.traces.write() {
-            tc.wait_for_fst_cache();
-        }
         return Ok(());
     }
 
@@ -139,9 +132,6 @@ fn run_wal_file(path: &Path, load: &[PathBuf], code: Option<&str>) -> Result<(),
         }
     }
 
-    if let Ok(mut tc) = eval.traces.write() {
-        tc.wait_for_fst_cache();
-    }
     Ok(())
 }
 
