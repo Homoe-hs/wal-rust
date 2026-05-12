@@ -73,6 +73,20 @@ pub fn format_size(bytes: u64) -> String {
     format!("{:.1} {}", size, UNITS[unit_idx])
 }
 
+pub fn format_duration(secs: f64) -> String {
+    if secs < 0.001 {
+        format!("{:.1}µs", secs * 1_000_000.0)
+    } else if secs < 1.0 {
+        format!("{:.0}ms", secs * 1_000.0)
+    } else if secs < 60.0 {
+        format!("{:.1}s", secs)
+    } else {
+        let m = (secs / 60.0).floor() as u64;
+        let s = secs - (m as f64 * 60.0);
+        format!("{}m {:.0}s", m, s)
+    }
+}
+
 fn parse_value_change(line: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
     let len = line.len();
     if len < 2 { return None; }
