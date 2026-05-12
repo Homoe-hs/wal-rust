@@ -1,11 +1,17 @@
-//! VCD trace implementation (two-pass scan + sparse index + LRU cache)
+//! VCD trace implementation (two-pass scan + sparse index + LRU cache + memchr jump scan)
 //!
 //! Optimized loading: zero-copy byte-parsing, packed signal IDs, pre-allocation.
 
-use crate::trace::{Trace, TraceId, ScalarValue, FindCondition};
+use crate::trace::{Trace, TraceId, ScalarValue, FindCondition, BatchEntry};
 use crate::vcd::types::VcdValue;
 use std::cell::RefCell;
 use std::collections::{HashMap, BTreeMap, HashSet};
+
+struct DecodedSignal {
+    change_indices: Vec<u32>,
+    values: Vec<u8>,
+    width: u32,
+}
 use std::sync::Arc;
 use std::path::Path;
 
@@ -49,12 +55,12 @@ pub struct VcdTrace {
 
     // Pass 1: sparse index
     timestamps: Vec<u64>,
-    #[allow(dead_code)]
     timestamp_offsets: Vec<u64>,
     sparse_index: HashMap<u32, BTreeMap<u64, u64>>,
 
     // Pass 2: LRU cache
     lru_cache: RefCell<lru::LruCache<(u32, u64), VcdValue>>,
+    signal_cache: RefCell<HashMap<u32, DecodedSignal>>,
 
     // Persistent mmap
     reader: RefCell<crate::vcd::reader::MmapReader>,
@@ -284,6 +290,7 @@ impl VcdTrace {
             signals, signal_ids, signal_id_bytes, signal_widths, name_to_idx, event_signals, event_change_points,
             timestamps, timestamp_offsets, sparse_index,
             lru_cache: RefCell::new(lru::LruCache::new(lru_cap)),
+            signal_cache: RefCell::new(HashMap::new()),
             reader: RefCell::new(reader),
             header_end_offset,
             scopes,
@@ -301,58 +308,79 @@ impl VcdTrace {
         }
     }
 
-    /// On-demand: read signal value at a specific timestamp (optimized with direct byte match)
+    /// On-demand: read signal value at a specific timestamp (memchr jump scan + timestamp_offsets)
     fn read_signal_value_at(&self, sig_idx: u32, target_timestamp: u64) -> VcdValue {
         let target_id = match self.signal_id_bytes.get(&sig_idx) {
             Some(id) => id,
             None => return VcdValue::Bit(b'x'),
         };
         let id_len = target_id.len();
-        let mut reader = self.reader.borrow_mut();
+        let is_event = self.event_signals.contains(&sig_idx);
 
-        let start_offset = self
-            .sparse_index
-            .get(&sig_idx)
+        // 1. Target index and scan end
+        let target_idx = match self.timestamps.binary_search(&target_timestamp) {
+            Ok(i) => i,
+            Err(0) => return VcdValue::Bit(b'x'),
+            Err(i) => i - 1,
+        };
+
+        // 2. Scan start: anchor TIMESTAMP's # line offset (not change point offset).
+        //    This guarantees we start at a # line, not in the middle of value changes.
+        let anchor_ts = self.sparse_index.get(&sig_idx)
             .and_then(|idx_map| idx_map.range(..=target_timestamp).last())
-            .map(|(_, &off)| off)
-            .unwrap_or(self.header_end_offset);
+            .map(|(&ts, _)| ts);
+        let scan_start = anchor_ts
+            .and_then(|ts| self.timestamps.binary_search(&ts).ok())
+            .and_then(|i| self.timestamp_offsets.get(i).copied())
+            .unwrap_or(self.header_end_offset) as usize;
 
-        let _ = reader.seek_to(start_offset);
+        let next_ts_idx = target_idx + 1;
+        let mmap = self.reader.borrow().data.clone();
+        let data = &mmap[..];
+        let scan_end = if next_ts_idx < self.timestamps.len() {
+            self.timestamp_offsets[next_ts_idx] as usize
+        } else {
+            data.len()
+        };
+
+        if scan_start >= data.len() || scan_start >= scan_end {
+            return VcdValue::Bit(b'x');
+        }
+        if scan_end.saturating_sub(scan_start) > 1_000_000_000 {
+            return VcdValue::Bit(b'x');
+        }
+
+        // 3. memchr jump scan
+        let region = &data[scan_start..scan_end];
         let mut last_value: Option<VcdValue> = None;
+        let mut pos: usize = 0;
 
-        loop {
-            let line = match reader.read_line_bytes() {
-                Some(l) => l,
+        while pos < region.len() {
+            let ts_start = match memchr::memchr(b'#', &region[pos..]) {
+                Some(p) => pos + p,
                 None => break,
             };
-            if line.is_empty() { continue; }
-            let first = line[0];
+            let next_ts = memchr::memchr(b'#', &region[ts_start + 1..])
+                .map(|p| ts_start + 1 + p)
+                .unwrap_or(region.len());
 
-            if first == b'#' {
-                let ts = parse_timestamp_fast(line);
-                if ts > target_timestamp { break; }
-                if self.event_signals.contains(&sig_idx) {
-                    last_value = Some(VcdValue::Bit(b'0'));
-                }
-            } else if first != b'$' && line.len() > id_len {
-                let id_start = line.len() - id_len;
-                if &line[id_start..] == target_id.as_slice() {
-                    let val = match first {
-                        b'b' => {
-                            let ve = id_start.saturating_sub(1);
-                            let vs = if ve > 1 && line[ve] == b' ' { &line[1..ve] } else { &line[1..id_start] };
-                            VcdValue::Vector(vs.to_vec())
-                        }
-                        b'r' => {
-                            let vs = std::str::from_utf8(&line[1..id_start]).unwrap_or("0");
-                            if let Ok(r) = vs.trim().parse::<f64>() { VcdValue::Real(r) } else { continue; }
-                        }
-                        _ => VcdValue::Bit(first),
-                    };
+            let ts = parse_timestamp_fast(&region[ts_start..next_ts]);
+            if ts > target_timestamp { break; }
+
+            if is_event {
+                last_value = Some(VcdValue::Bit(b'0'));
+            }
+
+            let value_block = &region[ts_start + 1..next_ts];
+            if !value_block.is_empty() {
+                if let Some(val) = find_signal_in_block(value_block, target_id, id_len) {
                     last_value = Some(val);
                 }
             }
+
+            pos = next_ts;
         }
+
         last_value.unwrap_or(VcdValue::Bit(b'x'))
     }
 
@@ -769,12 +797,20 @@ impl Trace for VcdTrace {
         Ok(indices)
     }
 
-    fn find_indices_batch(&self, signals: &[(String, FindCondition)]) -> Result<HashMap<String, Vec<usize>>, String> {
+    fn find_indices_batch(&self, entries: &[BatchEntry]) -> Result<Vec<(String, Vec<usize>)>, String> {
+        // Extract simple conditions from entries
+        let signals: Vec<(String, FindCondition)> = entries.iter().filter_map(|e| {
+            if let BatchEntry::Simple(name, cond) = e {
+                Some((name.clone(), cond.clone()))
+            } else {
+                None
+            }
+        }).collect();
+
         if signals.is_empty() {
-            return Ok(HashMap::new());
+            return Ok(Vec::new());
         }
 
-        // Build signal lookup: VCD ID bytes → (signal_name_idx, condition)
         struct BatchSig {
             name: String,
             cond: FindCondition,
@@ -785,7 +821,7 @@ impl Trace for VcdTrace {
         let mut id_to_batch: HashMap<Vec<u8>, usize> = HashMap::new();
 
         for (name, cond) in signals {
-            let sig_idx = match self.name_to_idx.get(name) {
+            let sig_idx = match self.name_to_idx.get(&name) {
                 Some(i) => *i,
                 None => continue,
             };
@@ -803,7 +839,7 @@ impl Trace for VcdTrace {
         }
 
         if batch_sigs.is_empty() {
-            return Ok(HashMap::new());
+            return Ok(Vec::new());
         }
 
         use rayon::prelude::*;
@@ -939,14 +975,14 @@ impl Trace for VcdTrace {
             }
         }
 
-        let mut result_map = HashMap::new();
+        let mut result: Vec<(String, Vec<usize>)> = Vec::new();
         for (b, bs) in batch_sigs_arc.iter().enumerate() {
             let mut idxs = std::mem::take(&mut merged[b]);
             idxs.sort();
             idxs.dedup();
-            result_map.insert(bs.name.clone(), idxs);
+            result.push((bs.name.clone(), idxs));
         }
-        Ok(result_map)
+        Ok(result)
     }
 }
 
@@ -984,5 +1020,38 @@ fn value_to_scalar(val: &VcdValue) -> ScalarValue {
         VcdValue::Vector(v) => ScalarValue::Vector(v.clone()),
         VcdValue::Real(r) => ScalarValue::Real(*r),
     }
+}
+
+fn find_signal_in_block(block: &[u8], target_id: &[u8], id_len: usize) -> Option<VcdValue> {
+    let nl = memchr::memchr(b'\n', block)?;
+    let mut lp = nl + 1;
+    while lp < block.len() {
+        let line_end = match memchr::memchr(b'\n', &block[lp..]) {
+            Some(n) => lp + n,
+            None => block.len(),
+        };
+        let line = &block[lp..line_end];
+        if line.is_empty() { lp = line_end + 1; continue; }
+        if line.len() > id_len && line[0] != b'$' {
+            let id_start = line.len() - id_len;
+            if &line[id_start..] == target_id {
+                let val = match line[0] {
+                    b'b' => {
+                        let ve = id_start.saturating_sub(1);
+                        let vs = if ve > 1 && line[ve] == b' ' { &line[1..ve] } else { &line[1..id_start] };
+                        VcdValue::Vector(vs.to_vec())
+                    }
+                    b'r' => {
+                        let vs = std::str::from_utf8(&line[1..id_start]).unwrap_or("0");
+                        if let Ok(r) = vs.trim().parse::<f64>() { VcdValue::Real(r) } else { return None; }
+                    }
+                    other => VcdValue::Bit(other),
+                };
+                return Some(val);
+            }
+        }
+        lp = line_end + 1;
+    }
+    None
 }
 
