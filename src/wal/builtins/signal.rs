@@ -464,9 +464,16 @@ fn parse_simple_condition(expr: &Value) -> Option<(String, i64)> {
     None
 }
 
-fn op_get(args: &[Value], env: &mut Environment, _eval: &mut Evaluator) -> Result<Value, String> {
+fn op_get(args: &[Value], env: &mut Environment, eval: &mut Evaluator) -> Result<Value, String> {
     ensure_arity(args, 1)?;
     let name = extract_name(&args[0])?;
+
+    // Check virtual signals first
+    if env.is_virtual_signal(&name) {
+        if let Some(expr) = env.lookup(&name) {
+            return eval.eval_value_public(expr);
+        }
+    }
 
     // Try exact candidates with scope/group prepended
     let candidates = [

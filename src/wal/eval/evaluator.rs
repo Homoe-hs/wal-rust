@@ -90,6 +90,10 @@ impl Evaluator {
         };
 
         if let Some(v) = self.env.lookup(&name) {
+            // Virtual signals: re-evaluate at each access (dynamic computation)
+            if self.env.is_virtual_signal(&name) {
+                return self.eval_value(v);
+            }
             return Ok(v);
         }
 
@@ -321,10 +325,10 @@ impl Evaluator {
                 }
 
                 if let Some(op) = Operator::from_str(&s.name) {
-                    if op == Operator::Define {
+                    if op == Operator::Defsig {
+                        return self.eval_defsig(&rest);
+                    } else if op == Operator::Define {
                         return self.eval_define(&rest);
-                    } else if op == Operator::Set {
-                        return self.eval_set(&rest);
                     } else if op == Operator::If {
                         return self.eval_if(&rest);
                     } else if op == Operator::Case {
@@ -544,6 +548,21 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
             result = value;
         }
         Ok(result)
+    }
+
+    fn eval_defsig(&mut self, args: &[Value]) -> Result<Value, String> {
+        if args.len() != 2 {
+            return Err(format!("defsig expects 2 arguments, got {}", args.len()));
+        }
+        let name = match &args[0] {
+            Value::Symbol(s) => s.name.clone(),
+            Value::String(s) => s.clone(),
+            _ => return Err("defsig: first argument must be a symbol or string".to_string()),
+        };
+        // Store the UNEVALUATED expression
+        self.env.define(name.clone(), args[1].clone());
+        self.env.add_virtual_signal(&name);
+        Ok(Value::Nil)
     }
 
     fn eval_define(&mut self, args: &[Value]) -> Result<Value, String> {

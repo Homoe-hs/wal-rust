@@ -121,6 +121,11 @@ impl Environment {
         self.virtual_signals.insert(name.to_string());
     }
 
+    pub fn is_virtual_signal(&self, name: &str) -> bool {
+        self.virtual_signals.contains(name)
+            || self.parent.as_ref().map_or(false, |p| p.borrow().is_virtual_signal(name))
+    }
+
     pub fn virtual_signal_names(&self) -> Vec<String> {
         let mut names: Vec<String> = self.virtual_signals.iter().cloned().collect();
         if let Some(ref parent) = self.parent {
