@@ -11,9 +11,17 @@ use std::path::Path;
 
 const MAX_DECODED_SIGNALS: usize = 256;
 
+#[derive(Clone, Copy)]
+enum CacheType {
+    FullScan,
+    PartialScan(u32),
+}
+
 struct DecodedSignal {
     change_indices: Vec<u32>,
     values: Vec<VcdValue>,
+    full_scan: bool,
+    scanned_up_to: u32,
 }
 
 /// LRU cache capacity (number of entries)
@@ -497,14 +505,18 @@ impl VcdTrace {
         last_value
     }
 
-    fn try_cache_decoded_signal(&self, sig_idx: u32, changes: &[(u32, VcdValue)]) {
+    fn try_cache_decoded_signal(&self, sig_idx: u32, changes: &[(u32, VcdValue)], scan_type: CacheType) {
         if changes.len() < 2 { return; }
         let mut cache = self.signal_cache.lock().unwrap();
         if cache.len() >= MAX_DECODED_SIGNALS {
             cache.clear();
         }
         let (ci, vals): (Vec<u32>, Vec<VcdValue>) = changes.iter().cloned().unzip();
-        cache.insert(sig_idx, DecodedSignal { change_indices: ci, values: vals });
+        let (full_scan, scanned_up_to) = match scan_type {
+            CacheType::FullScan => (true, u32::MAX),
+            CacheType::PartialScan(end) => (false, end),
+        };
+        cache.insert(sig_idx, DecodedSignal { change_indices: ci, values: vals, full_scan, scanned_up_to });
     }
 }
 
@@ -694,9 +706,25 @@ impl Trace for VcdTrace {
                 name,
                 self.signals.iter().take(5).collect::<Vec<_>>()
             ))?;
+        let cache_key = (sig_idx, target_time);
+
+        // Check decoded signal cache
+        if let Some(ds) = self.signal_cache.lock().unwrap().get(&sig_idx) {
+            if ds.full_scan || (idx as u32) <= ds.scanned_up_to {
+                let val_idx = match ds.change_indices.binary_search(&(idx as u32)) {
+                    Ok(i) => i,           // exact match → value at this change
+                    Err(0) => return Ok(ScalarValue::Bit(b'x')), // before any change
+                    Err(i) => i - 1,       // between changes → previous value
+                };
+                if val_idx < ds.values.len() {
+                    let v = &ds.values[val_idx];
+                    self.lru_cache.borrow_mut().put(cache_key, v.clone());
+                    return Ok(value_to_scalar(v));
+                }
+            }
+        }
 
         // Check LRU cache
-        let cache_key = (sig_idx, target_time);
         if let Some(cached) = self.lru_cache.borrow_mut().get(&cache_key).cloned() {
             return Ok(value_to_scalar(&cached));
         }
@@ -885,7 +913,7 @@ impl Trace for VcdTrace {
         if all_changes.len() > 1 {
             all_changes.sort_by_key(|(i, _)| *i);
             all_changes.dedup_by_key(|(i, _)| *i);
-            self.try_cache_decoded_signal(sig_idx, &all_changes);
+            self.try_cache_decoded_signal(sig_idx, &all_changes, CacheType::FullScan);
         }
         Ok(indices)
     }

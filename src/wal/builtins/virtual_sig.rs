@@ -42,6 +42,50 @@ fn value_to_vcd_bit(v: &Value) -> (String, u32) {
     }
 }
 
+/// Extract all (get "signal_name") references from an expression tree.
+fn extract_get_signals(expr: &Value) -> Vec<String> {
+    let mut sigs = Vec::new();
+    extract_get_signals_inner(expr, &mut sigs);
+    sigs
+}
+fn extract_get_signals_inner(expr: &Value, out: &mut Vec<String>) {
+    match expr {
+        Value::List(lst) => {
+            if lst.len() == 2 {
+                if let Value::Symbol(s) = &lst[0] {
+                    if s.name == "get" {
+                        if let Value::String(name) = &lst[1] {
+                            out.push(name.clone());
+                            return;
+                        }
+                    }
+                }
+            }
+            for item in lst.iter() {
+                extract_get_signals_inner(item, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Pre-load signal change data for all referenced signals.
+/// This populates signal_cache with full_scan=true in VcdTrace,
+/// so subsequent signal_value() calls use O(log C) binary search.
+fn preload_signal_changes(eval: &mut Evaluator, sigs: &[(String, Value)]) {
+    let mut all_signals: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for (_, expr) in sigs {
+        for sig in extract_get_signals(expr) {
+            all_signals.insert(sig);
+        }
+    }
+    // Trigger find_indices for each signal — populates signal_cache
+    for sig in &all_signals {
+        // find all non-zero occurrences (this triggers a full parallel scan)
+        let _ = eval.eval(&format!("(find (!= (get {:?}) 0))", sig));
+    }
+}
+
 fn op_dump_trace(args: &[Value], env: &mut Environment, eval: &mut Evaluator) -> Result<Value, String> {
     ensure_arity(args, 1)?;
     let path = match &args[0] {
@@ -62,6 +106,12 @@ fn op_dump_trace(args: &[Value], env: &mut Environment, eval: &mut Evaluator) ->
         0
     };
 
+    // Phase 1: Pre-load signal changes into signal_cache (full_scan)
+    // This makes subsequent signal_value() calls O(log C) instead of O(N).
+    eprintln!("Pre-loading signal changes...");
+    preload_signal_changes(eval, &sigs);
+
+    // Phase 2: Determine widths and write VCD header
     let mut file = File::create(Path::new(&path))
         .map_err(|e| format!("dump-trace: cannot create '{}': {}", path, e))?;
 
@@ -69,7 +119,6 @@ fn op_dump_trace(args: &[Value], env: &mut Environment, eval: &mut Evaluator) ->
     writeln!(file, "$timescale 1ns $end").ok();
     writeln!(file, "$scope module virtual $end").ok();
 
-    // Write variable declarations (determine width from first evaluation)
     let mut handles: Vec<(String, u32, String, String)> = Vec::new();
     for (i, (name, expr)) in sigs.iter().enumerate() {
         let id = format!("s{}", i + 1);
@@ -86,7 +135,6 @@ fn op_dump_trace(args: &[Value], env: &mut Environment, eval: &mut Evaluator) ->
     writeln!(file, "$enddefinitions $end").ok();
     writeln!(file, "$dumpvars").ok();
 
-    // Write initial values from the setup phase
     for (id, _width, bits_str, _name) in &handles {
         if bits_str.len() == 1 {
             writeln!(file, "{}{}", bits_str, id).ok();
@@ -96,28 +144,33 @@ fn op_dump_trace(args: &[Value], env: &mut Environment, eval: &mut Evaluator) ->
     }
     writeln!(file, "$end").ok();
 
-    // Step through each index and record changes (incremental: only write when changed)
+    // Phase 3: Batch evaluate and dump
     let mut last_values: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     for (id, _width, bits_str, _name) in &handles {
         last_values.insert(id.clone(), bits_str.clone());
     }
 
-    if let Some(traces) = env.get_traces() {
-        let mut traces = traces.write().unwrap_or_else(|e| e.into_inner());
-        let saved = traces.indices();
+    if let Some(traces_rc) = env.get_traces() {
+        let saved = {
+            let mut traces = traces_rc.write().unwrap_or_else(|e| e.into_inner());
+            let saved = traces.indices();
+            for tid in traces.trace_ids().clone() {
+                let _ = traces.set_index(&tid, 0);
+            }
+            saved
+        };
 
-        // Reset to start
-        for tid in traces.trace_ids().clone() {
-            let _ = traces.set_index(&tid, 0);
-        }
-
+        eprintln!("Dumping {} indices, {} virtual signals...", max_idx, sigs.len());
         for idx in 1..=max_idx {
             writeln!(file, "#{}", idx).ok();
 
             let mut all_ended = true;
-            for tid in traces.trace_ids().clone() {
-                if let Some(t) = traces.get_mut(&tid) {
-                    if t.step(1).is_ok() { all_ended = false; }
+            {
+                let mut traces = traces_rc.write().unwrap_or_else(|e| e.into_inner());
+                for tid in traces.trace_ids().clone() {
+                    if let Some(t) = traces.get_mut(&tid) {
+                        if t.step(1).is_ok() { all_ended = false; }
+                    }
                 }
             }
             if all_ended { break; }
@@ -144,6 +197,7 @@ fn op_dump_trace(args: &[Value], env: &mut Environment, eval: &mut Evaluator) ->
             }
         }
 
+        let mut traces = traces_rc.write().unwrap_or_else(|e| e.into_inner());
         for (tid, idx) in saved {
             let _ = traces.set_index(&tid, idx);
         }
@@ -167,7 +221,6 @@ fn extract_symbol(v: &Value) -> Result<String, String> {
 }
 
 pub fn register_virtual(disp: &mut Dispatcher) {
-    // defsig is handled as a special form in Evaluator (not dispatched)
     disp.register(Operator::NewTrace, op_new_trace);
     disp.register(Operator::DumpTrace, op_dump_trace);
 }
