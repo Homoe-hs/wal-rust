@@ -228,21 +228,30 @@ fn op_find(args: &[Value], env: &mut Environment, eval: &mut Evaluator) -> Resul
 }
 
 /// Try fast path for simple (= (get "sig") val) condition using find_indices
-fn try_find_indices_simple(cond: &Value, max_results: usize, env: &mut Environment) -> Option<Result<Value, String>> {
+pub(crate) fn try_find_indices_simple(cond: &Value, max_results: usize, env: &mut Environment) -> Option<Result<Value, String>> {
+    // Edge/X conditions: (rising "sig"), (falling "sig"), (is-x "sig"),
+    // (is-z "sig"), (changes "sig")
+    if let Some((sig_name, cond_enum)) = parse_edge_condition(cond) {
+        return try_find_indices_enum(&sig_name, cond_enum, max_results, env);
+    }
     let (sig_name, target) = parse_simple_condition(cond)?;
     let cond_enum = if target <= 1 && target >= 0 {
         FindCondition::Value(target as u8)
     } else {
         FindCondition::ValueI64(target)
     };
+    try_find_indices_enum(&sig_name, cond_enum, max_results, env)
+}
+
+fn try_find_indices_enum(sig_name: &str, cond_enum: FindCondition, max_results: usize, env: &mut Environment) -> Option<Result<Value, String>> {
 
     let traces = env.get_traces()?;
     let first_trace_info = {
         let t = traces.read().ok()?;
         let tr = t.first_trace()?;
         let sigs = tr.signals();
-        let resolved = resolve_signal_name(&sig_name, &sigs)
-            .unwrap_or_else(|| sig_name.clone());
+        let resolved = resolve_signal_name(sig_name, &sigs)
+            .unwrap_or_else(|| sig_name.to_string());
         (tr.id().clone(), resolved)
     };
     let (_tid, resolved) = first_trace_info;
@@ -431,6 +440,31 @@ fn fuzzy_match_signal<'a>(name: &str, signals: &'a [String]) -> (Option<&'a Stri
 }
 
 /// Parse a simple condition expression like (= (get "signal") N)
+fn parse_edge_condition(expr: &Value) -> Option<(String, FindCondition)> {
+    let lst = match expr {
+        Value::List(lst) if lst.len() == 2 => lst,
+        _ => return None,
+    };
+    let op = match &lst.0[0] {
+        Value::Symbol(s) => s.name.as_str(),
+        _ => return None,
+    };
+    let cond = match op {
+        "rising" => FindCondition::Rising,
+        "falling" => FindCondition::Falling,
+        "is-x" => FindCondition::IsX,
+        "is-z" => FindCondition::IsZ,
+        "changes" => FindCondition::Changed,
+        _ => return None,
+    };
+    let sig = match &lst.0[1] {
+        Value::String(s) => s.clone(),
+        Value::Symbol(s) => s.name.clone(),
+        _ => return None,
+    };
+    Some((sig, cond))
+}
+
 fn parse_simple_condition(expr: &Value) -> Option<(String, i64)> {
     let lst = match expr {
         Value::List(lst) if lst.len() == 3 => lst,
@@ -660,6 +694,149 @@ fn op_trim_trace(args: &[Value], _env: &mut Environment, _eval: &mut Evaluator) 
     Ok(Value::Nil)
 }
 
+// ---- waveform-debug condition builtins -----------------------------------
+// (rising "sig") (falling "sig") (is-x "sig") (is-z "sig") (changes "sig")
+// Used inside count/find/whenever conditions; evaluate at the current INDEX.
+
+fn edge_value(name: &str, env: &mut Environment) -> Result<Option<(Option<u8>, Option<u8>)>, String> {
+    if let Some(traces) = env.get_traces() {
+        let traces = traces.read().unwrap_or_else(|e| e.into_inner());
+        if let Some(trace) = traces.first_trace() {
+            let idx = trace.index();
+            if idx == 0 {
+                return Ok(None);
+            }
+            let cur = trace.signal_value(name, idx).ok();
+            let prev = trace.signal_value(name, idx - 1).ok();
+            let cur_bit = cur.as_ref().and_then(|v| match v {
+                ScalarValue::Bit(b) => Some(*b),
+                ScalarValue::Vector(v) if v.len() == 1 => Some(v[0]),
+                _ => None,
+            });
+            let prev_bit = prev.as_ref().and_then(|v| match v {
+                ScalarValue::Bit(b) => Some(*b),
+                ScalarValue::Vector(v) if v.len() == 1 => Some(v[0]),
+                _ => None,
+            });
+            return Ok(Some((cur_bit, prev_bit)));
+        }
+    }
+    Ok(None)
+}
+
+fn scalar_is_zero(sv: Option<&ScalarValue>) -> Option<bool> {
+    let sv = sv?;
+    match sv {
+        ScalarValue::Bit(b) => Some(*b == b'0'),
+        ScalarValue::Vector(v) => {
+            if v.iter().all(|b| *b == b'0' || *b == b'1') {
+                Some(v.iter().all(|b| *b == b'0'))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+fn op_rising(args: &[Value], env: &mut Environment, _eval: &mut Evaluator) -> Result<Value, String> {
+    ensure_arity(args, 1)?;
+    let name = extract_name(&args[0])?;
+    if let Some(traces) = env.get_traces() {
+        let traces = traces.read().unwrap_or_else(|e| e.into_inner());
+        if let Some(trace) = traces.first_trace() {
+            let idx = trace.index();
+            if idx == 0 {
+                return Ok(Value::Bool(false));
+            }
+            let cur = trace.signal_value(&name, idx).ok();
+            let prev = trace.signal_value(&name, idx - 1).ok();
+            match (scalar_is_zero(prev.as_ref()), scalar_is_zero(cur.as_ref())) {
+                (Some(true), Some(false)) => return Ok(Value::Bool(true)),
+                _ => {}
+            }
+            if let (Some(ScalarValue::Bit(c)), Some(ScalarValue::Bit(p))) = (&cur, &prev) {
+                return Ok(Value::Bool(*c == b'1' && *p == b'0'));
+            }
+        }
+    }
+    Ok(Value::Bool(false))
+}
+
+fn op_falling(args: &[Value], env: &mut Environment, _eval: &mut Evaluator) -> Result<Value, String> {
+    ensure_arity(args, 1)?;
+    let name = extract_name(&args[0])?;
+    if let Some(traces) = env.get_traces() {
+        let traces = traces.read().unwrap_or_else(|e| e.into_inner());
+        if let Some(trace) = traces.first_trace() {
+            let idx = trace.index();
+            if idx == 0 {
+                return Ok(Value::Bool(false));
+            }
+            let cur = trace.signal_value(&name, idx).ok();
+            let prev = trace.signal_value(&name, idx - 1).ok();
+            match (scalar_is_zero(prev.as_ref()), scalar_is_zero(cur.as_ref())) {
+                (Some(false), Some(true)) => return Ok(Value::Bool(true)),
+                _ => {}
+            }
+            if let (Some(ScalarValue::Bit(c)), Some(ScalarValue::Bit(p))) = (&cur, &prev) {
+                return Ok(Value::Bool(*c == b'0' && *p == b'1'));
+            }
+        }
+    }
+    Ok(Value::Bool(false))
+}
+
+fn op_is_x(args: &[Value], env: &mut Environment, _eval: &mut Evaluator) -> Result<Value, String> {
+    ensure_arity(args, 1)?;
+    let name = extract_name(&args[0])?;
+    if let Some(traces) = env.get_traces() {
+        let traces = traces.read().unwrap_or_else(|e| e.into_inner());
+        if let Some(trace) = traces.first_trace() {
+            if let Ok(sv) = trace.signal_value(&name, trace.index()) {
+                let has_x = match &sv {
+                    ScalarValue::Bit(b) => *b == b'x',
+                    ScalarValue::Vector(v) => v.iter().any(|b| *b == b'x'),
+                    _ => false,
+                };
+                return Ok(Value::Bool(has_x));
+            }
+        }
+    }
+    Ok(Value::Bool(false))
+}
+
+fn op_is_z(args: &[Value], env: &mut Environment, _eval: &mut Evaluator) -> Result<Value, String> {
+    ensure_arity(args, 1)?;
+    let name = extract_name(&args[0])?;
+    if let Some(traces) = env.get_traces() {
+        let traces = traces.read().unwrap_or_else(|e| e.into_inner());
+        if let Some(trace) = traces.first_trace() {
+            if let Ok(sv) = trace.signal_value(&name, trace.index()) {
+                let has_z = match &sv {
+                    ScalarValue::Bit(b) => *b == b'z',
+                    ScalarValue::Vector(v) => v.iter().any(|b| *b == b'z'),
+                    _ => false,
+                };
+                return Ok(Value::Bool(has_z));
+            }
+        }
+    }
+    Ok(Value::Bool(false))
+}
+
+fn op_changes(args: &[Value], env: &mut Environment, _eval: &mut Evaluator) -> Result<Value, String> {
+    ensure_arity(args, 1)?;
+    let name = extract_name(&args[0])?;
+    match edge_value(&name, env)? {
+        Some((cur, prev)) => match (cur, prev) {
+            (Some(c), Some(p)) => Ok(Value::Bool(c != p)),
+            _ => Ok(Value::Bool(false)),
+        },
+        None => Ok(Value::Bool(false)),
+    }
+}
+
 fn op_signal_p(args: &[Value], env: &mut Environment, _eval: &mut Evaluator) -> Result<Value, String> {
     ensure_arity(args, 1)?;
     let name = extract_symbol(&args[0])?;
@@ -767,6 +944,10 @@ fn op_count(args: &[Value], env: &mut Environment, eval: &mut Evaluator) -> Resu
     ensure_arity(args, 1)?;
     let cond = &args[0];
 
+    if std::env::var("WAL_DEBUG_FIND").is_ok() {
+        eprintln!("op_count: cond={:?} edge={:?}", cond, parse_edge_condition(cond).map(|e| (e.0.clone(), e.1)));
+    }
+
     // Fast path: simple condition → find_indices
     if let Some(result) = try_find_indices_simple(cond, usize::MAX, env) {
         match result {
@@ -856,6 +1037,11 @@ pub fn register_signal(disp: &mut Dispatcher) {
     disp.register(Operator::LoadedTraces, op_loaded_traces);
     disp.register(Operator::RelEval, op_releval);
     disp.register(Operator::Timeframe, op_timeframe);
+    disp.register(Operator::Rising, op_rising);
+    disp.register(Operator::Falling, op_falling);
+    disp.register(Operator::IsX, op_is_x);
+    disp.register(Operator::IsZ, op_is_z);
+    disp.register(Operator::Changes, op_changes);
     disp.register(Operator::Signals, op_signals);
     disp.register(Operator::Index, op_index);
     disp.register(Operator::MaxIndex, op_max_index);

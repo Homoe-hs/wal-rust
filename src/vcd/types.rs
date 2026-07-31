@@ -16,6 +16,24 @@ pub enum VcdValue {
 }
 
 impl VcdValue {
+    /// True if any bit of this value is unknown (x/X)
+    pub fn has_x(&self) -> bool {
+        match self {
+            VcdValue::Bit(b) => *b == b'x' || *b == b'X',
+            VcdValue::Vector(v) => v.iter().any(|b| *b == b'x' || *b == b'X'),
+            _ => false,
+        }
+    }
+
+    /// True if any bit of this value is high-impedance (z/Z)
+    pub fn has_z(&self) -> bool {
+        match self {
+            VcdValue::Bit(b) => *b == b'z' || *b == b'Z',
+            VcdValue::Vector(v) => v.iter().any(|b| *b == b'z' || *b == b'Z'),
+            _ => false,
+        }
+    }
+
     /// Get the bit at position (0 = LSB)
     #[allow(dead_code)]
     pub fn bit_at(&self, pos: usize) -> u8 {

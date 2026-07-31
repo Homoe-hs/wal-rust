@@ -774,7 +774,9 @@ impl Trace for VcdTrace {
 
         let n_threads = num_cpus::get().max(4);
         let dump_len = data_len.saturating_sub(hdr_end);
-        let chunk_size = dump_len / n_threads.max(1);
+        // Minimum chunk size: tiny chunks fragment the scan and lose cross-chunk
+        // previous-value state (Rising/Falling/Changed conditions).
+        let chunk_size = (dump_len / n_threads.max(1)).max(64 * 1024);
 
         // Build newline-aligned chunk boundaries starting from hdr_end (includes $dumpvars).
         // IMPORTANT: a boundary must fall right BEFORE a '#' timestamp line, so that a
@@ -782,6 +784,7 @@ impl Trace for VcdTrace {
         // orphan value line at the start of a chunk corrupts the timestamp index
         // accounting of find_indices.
         let mut boundaries = vec![hdr_end];
+        let mut rewound: Vec<usize> = vec![0];
         for i in 1..n_threads {
             let mut p = hdr_end + i * chunk_size;
             if p >= data_len { break; }
@@ -794,15 +797,41 @@ impl Trace for VcdTrace {
                 if p >= data_len { break; }
                 if shared_mmap[p] == b'#' { break; }
             }
+            let mut rewound_ts = 0usize;
+            if p < data_len {
+                // Rewind to the previous '#' line start so this chunk carries the
+                // previous timestamp's value lines. The scan then seeds prev_val
+                // from them, making edge conditions (Rising/Falling/Changed)
+                // correct across chunk boundaries.
+                let mut q = p;
+                while q > hdr_end {
+                    let mut nl = q - 1;
+                    while nl > hdr_end && shared_mmap[nl] != b'\n' { nl -= 1; }
+                    if shared_mmap[nl] != b'\n' { break; }
+                    let line_start = nl + 1;
+                    if shared_mmap[line_start] == b'#' {
+                        q = line_start;
+                        break;
+                    }
+                    q = line_start;
+                }
+                rewound_ts = shared_mmap[q..p].iter().filter(|&&b| b == b'#').count();
+                p = q;
+            }
+
+
+
             boundaries.push(p);
+            rewound.push(rewound_ts);
         }
         boundaries.push(data_len);
 
-        // Pre-compute ts_idx at each boundary (one linear scan).
-        // Only '#' bytes at the START of a line are timestamps: '#' is also a
-        // legal VCD signal id character (e.g. "$var wire 3 # awsize_o"), so a
-        // naive byte scan over-counts. Also record the count BEFORE the boundary
-        // position so a boundary '#' line belongs to the following chunk.
+        // Pre-compute ts_idx at each boundary: number of '#' timestamp lines
+        // strictly before the boundary position. With rewind, a boundary sits at
+        // a '#' line start, so start_ts = count of '#' lines before it, and the
+        // chunk's scan index starts at start_ts - (rewound '#' count) ... the
+        // scan below derives its own index from the chunk's first '#' instead:
+        // boundary_ts[i] = ts index of the chunk's FIRST timestamp.
         let boundary_ts: Vec<usize> = {
             let mut ts = vec![0usize; boundaries.len()];
             let mut count = 0usize;
@@ -824,17 +853,20 @@ impl Trace for VcdTrace {
         };
 
         // Build chunk descriptors for parallel processing
-        let chunks: Vec<(usize, usize, usize)> = (0..boundaries.len() - 1)
-            .map(|i| (boundaries[i], boundaries[i+1], boundary_ts[i]))
+        let chunks: Vec<(usize, usize, usize, usize)> = (0..boundaries.len() - 1)
+            .map(|i| (boundaries[i], boundaries[i+1], boundary_ts[i], boundary_ts[i] + rewound[i]))
             .collect();
 
         // Parallel chunk scan using rayon — Arc<Mmap> is Sync so threads can share
-        let results: Vec<(Vec<usize>, Vec<(u32, VcdValue)>)> = chunks.par_iter().map(|&(start, end, start_ts)| {
+        if std::env::var("WAL_DEBUG_FIND").is_ok() {
+            eprintln!("find_indices({}, {:?}): chunks={:?}", name, cond, chunks.iter().map(|c| (c.0, c.1, c.2)).collect::<Vec<_>>());
+        }
+        let results: Vec<(Vec<usize>, Vec<(u32, VcdValue)>)> = chunks.par_iter().map(|&(start, end, start_ts, valid_from)| {
             let chunk = &shared_mmap[start..end];
             let mut local_indices = Vec::new();
             let mut all_changes: Vec<(u32, VcdValue)> = Vec::new();
             let mut current_val: Option<VcdValue> = None;
-            let mut prev_bit: Option<u8> = None;
+            let mut prev_val: Option<VcdValue> = None;
             let mut ts_idx = start_ts;
             let mut seen_first_ts = false;
 
@@ -852,10 +884,12 @@ impl Trace for VcdTrace {
                 if first == b'#' {
                     if seen_first_ts {
                         if let Some(ref val) = current_val {
-                            if find_cond_matches(val, prev_bit, &cond) {
-                                local_indices.push(ts_idx);
+                            if find_cond_matches(val, prev_val.as_ref(), &cond) {
+                                if ts_idx >= valid_from {
+                                    local_indices.push(ts_idx);
+                                }
                             }
-                            prev_bit = val_to_bit(val);
+                            prev_val = current_val.clone();
                         }
                         ts_idx += 1;
                     }
@@ -875,16 +909,26 @@ impl Trace for VcdTrace {
                             }
                             _ => VcdValue::Bit(first),
                         };
-                        all_changes.push((ts_idx as u32, val.clone()));
-                        current_val = Some(val);
+                        if !seen_first_ts {
+                            // Value line before the first '#' of this chunk: it
+                            // belongs to the previous timestamp (handled by the
+                            // previous chunk) — seed prev_val so edge conditions
+                            // (Rising/Falling/Changed) work across boundaries.
+                            prev_val = Some(val);
+                        } else {
+                            all_changes.push((ts_idx as u32, val.clone()));
+                            current_val = Some(val);
+                        }
                     }
                 }
             }
 
             if seen_first_ts {
                 if let Some(ref val) = current_val {
-                    if find_cond_matches(val, prev_bit, &cond) {
-                        local_indices.push(ts_idx);
+                    if find_cond_matches(val, prev_val.as_ref(), &cond) {
+                                if ts_idx >= valid_from {
+                                    local_indices.push(ts_idx);
+                                }
                     }
                 }
             }
@@ -961,29 +1005,43 @@ impl Trace for VcdTrace {
 
         let n_threads = num_cpus::get().max(4);
         let dump_len = data_len.saturating_sub(hdr_end);
-        let chunk_size = dump_len / n_threads.max(1);
+        // Minimum chunk size: tiny chunks fragment the scan and lose cross-chunk
+        // previous-value state (Rising/Falling/Changed conditions).
+        let chunk_size = (dump_len / n_threads.max(1)).max(64 * 1024);
         let mut boundaries = vec![hdr_end];
         for i in 1..n_threads {
             let mut p = hdr_end + i * chunk_size;
             if p >= data_len { break; }
-            while p < data_len && shared_mmap[p] != b'\n' { p += 1; }
-            if p < data_len { p += 1; }
-            if p >= data_len { break; }
+            loop {
+                match memchr::memchr(b'\n', &shared_mmap[p..data_len]) {
+                    Some(n) => p += n + 1,
+                    None => { p = data_len; break; }
+                }
+                if p >= data_len { break; }
+                if shared_mmap[p] == b'#' { break; }
+            }
             boundaries.push(p);
         }
         boundaries.push(data_len);
 
+        // Only '#' at line start counts (see find_indices); record count BEFORE
+        // the boundary position so a boundary '#' line belongs to the next chunk.
         let boundary_ts: Vec<usize> = {
             let mut ts = vec![0usize; boundaries.len()];
             let mut count = 0usize;
             let mut bi = 1usize;
-            for (i, &b) in shared_mmap[hdr_end..].iter().enumerate() {
-                if b == b'#' { count += 1; }
-                while bi < boundaries.len() && hdr_end + i + 1 >= boundaries[bi] {
+            let start = hdr_end;
+            for (i, &b) in shared_mmap[start..].iter().enumerate() {
+                while bi < boundaries.len() && start + i >= boundaries[bi] {
                     ts[bi] = count;
                     bi += 1;
                 }
-                if bi >= boundaries.len() { break; }
+                let line_start = i == 0 || shared_mmap[start + i - 1] == b'\n';
+                if line_start && b == b'#' { count += 1; }
+            }
+            while bi < boundaries.len() {
+                ts[bi] = count;
+                bi += 1;
             }
             ts
         };
@@ -1008,7 +1066,7 @@ impl Trace for VcdTrace {
             let batch_count = batch_sigs_arc.len();
             let mut local: Vec<Vec<usize>> = vec![Vec::new(); batch_count];
             let mut current_vals: Vec<Option<VcdValue>> = vec![None; batch_count];
-            let mut prev_bits: Vec<Option<u8>> = vec![None; batch_count];
+            let mut prev_vals: Vec<Option<VcdValue>> = vec![None; batch_count];
             let mut ts_idx = start_ts;
             let mut seen_first_ts = false;
 
@@ -1027,10 +1085,10 @@ impl Trace for VcdTrace {
                     if seen_first_ts {
                         for b in 0..batch_count {
                             if let Some(ref val) = current_vals[b] {
-                                if find_cond_matches(val, prev_bits[b], &batch_sigs_arc[b].cond) {
+                                if find_cond_matches(val, prev_vals[b].as_ref(), &batch_sigs_arc[b].cond) {
                                     local[b].push(ts_idx);
                                 }
-                                prev_bits[b] = val_to_bit(val);
+                                prev_vals[b] = current_vals[b].clone();
                             }
                         }
                         ts_idx += 1;
@@ -1057,7 +1115,12 @@ impl Trace for VcdTrace {
                                     }
                                     _ => VcdValue::Bit(first),
                                 };
-                                current_vals[batch_idx] = Some(val);
+                                if !seen_first_ts {
+                                    // orphan value line before first '#': previous timestamp value
+                                    prev_vals[batch_idx] = Some(val);
+                                } else {
+                                    current_vals[batch_idx] = Some(val);
+                                }
                                 break 'idscan;
                             }
                         }
@@ -1068,7 +1131,7 @@ impl Trace for VcdTrace {
             if seen_first_ts {
                 for b in 0..batch_count {
                     if let Some(ref val) = current_vals[b] {
-                        if find_cond_matches(val, prev_bits[b], &batch_sigs_arc[b].cond) {
+                        if find_cond_matches(val, prev_vals[b].as_ref(), &batch_sigs_arc[b].cond) {
                             local[b].push(ts_idx);
                         }
                     }
@@ -1099,10 +1162,37 @@ impl Trace for VcdTrace {
 }
 
 /// Check if current value matches the condition
-fn find_cond_matches(val: &VcdValue, prev_bit: Option<u8>, cond: &FindCondition) -> bool {
+fn vcd_is_zero(val: &VcdValue) -> Option<bool> {
+    match val {
+        VcdValue::Bit(b) => Some(*b == b'0'),
+        VcdValue::Vector(v) => {
+            if v.iter().all(|b| *b == b'0' || *b == b'1') {
+                Some(v.iter().all(|b| *b == b'0'))
+            } else {
+                None // contains x/z: not a defined zero
+            }
+        }
+        _ => None,
+    }
+}
+
+fn find_cond_matches(val: &VcdValue, prev_val: Option<&VcdValue>, cond: &FindCondition) -> bool {
+    let prev_bit = prev_val.and_then(|v| v.as_bit());
     match cond {
-        FindCondition::Rising => prev_bit == Some(b'0') && val.as_bit() == Some(b'1'),
-        FindCondition::Falling => prev_bit == Some(b'1') && val.as_bit() == Some(b'0'),
+        // Vector semantics: rising = previous value is 0, current is non-zero
+        // (defined); falling = the reverse. 1-bit signals behave as before.
+        FindCondition::Rising => {
+            match (prev_val.and_then(vcd_is_zero), vcd_is_zero(val)) {
+                (Some(true), Some(false)) => true,
+                _ => prev_bit == Some(b'0') && val.as_bit() == Some(b'1'),
+            }
+        }
+        FindCondition::Falling => {
+            match (prev_val.and_then(vcd_is_zero), vcd_is_zero(val)) {
+                (Some(false), Some(true)) => true,
+                _ => prev_bit == Some(b'1') && val.as_bit() == Some(b'0'),
+            }
+        }
         FindCondition::High => val.as_bit() == Some(b'1'),
         FindCondition::Low => val.as_bit() == Some(b'0'),
         FindCondition::Value(v) => {
@@ -1115,6 +1205,12 @@ fn find_cond_matches(val: &VcdValue, prev_bit: Option<u8>, cond: &FindCondition)
             !(bit == Some(*v) || (bit == Some(b'1') && *v == 1) || (bit == Some(b'0') && *v == 0))
         }
         FindCondition::NeqI64(target) => val.to_i64() != Some(*target),
+        FindCondition::IsX => val.has_x(),
+        FindCondition::IsZ => val.has_z(),
+        FindCondition::Changed => match prev_val {
+            Some(p) => p != val,
+            None => false,
+        },
     }
 }
 
@@ -1167,3 +1263,63 @@ fn find_signal_in_block(block: &[u8], target_id: &[u8], id_len: usize) -> Option
     None
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::trace::trace::FindCondition;
+
+    fn load_vcd(path: &str) -> VcdTrace {
+        VcdTrace::load(std::path::Path::new(path), "test".to_string()).unwrap()
+    }
+
+    #[test]
+    fn test_find_changed_vector() {
+        // mini.vcd: 1-bit clk(!) and a(")
+        let trace = load_vcd("/tmp/mini.vcd");
+        let sigs = trace.signals();
+        assert!(sigs.iter().any(|s| s.contains("a")), "a not found: {:?}", &sigs[..5]);
+        let name = sigs.iter().find(|s| s.ends_with("a")).unwrap().clone();
+        // a: #0=1, #20=0, #40=1 -> changes at ts 2 (index 1) and 4 (index 3)
+        let idx = trace.find_indices(&name, FindCondition::Changed).unwrap();
+        eprintln!("changes({}) = {:?}", name, idx);
+        assert!(idx.len() >= 1, "no changes detected");
+    }
+
+    #[test]
+    fn test_find_changed_9bit() {
+        let trace = load_vcd("/tmp/big.vcd");
+        let sigs = trace.signals();
+        let name = sigs.iter().find(|s| s.contains("v [")).unwrap().clone();
+        eprintln!("9bit signal: {}", name);
+        let idx = trace.find_indices(&name, FindCondition::Changed).unwrap();
+        eprintln!("changes(9bit {}) = {:?} (len {})", name, &idx[..idx.len().min(5)], idx.len());
+        // v changes 10 times (every 100 ts, value changes since it's i%512 pattern with varying bits)
+        assert!(idx.len() >= 1, "no changes on 9-bit vector");
+    }
+
+    #[test]
+    fn test_find_changed_runvcd() {
+        let trace = load_vcd("/home/hesheng/Projects/macro_trace/run.vcd");
+        let sigs = trace.signals();
+        let names: Vec<&String> = sigs.iter().filter(|s| s.contains("op_go_i [")).collect();
+        eprintln!("op_go_i signals: {:?}", names);
+        for n in names {
+            let idx = trace.find_indices(n, FindCondition::Changed).unwrap();
+            eprintln!("changes({}) len={}", n, idx.len());
+        }
+        let idx = trace.find_indices("tb_macro_trace.op_go_i", FindCondition::Changed);
+        eprintln!("fuzzy name: {:?}", idx.as_ref().map(|v| v.len()).unwrap_or(999));
+    }
+
+    #[test]
+    fn test_find_rising_vector() {
+        let trace = load_vcd("/tmp/mini.vcd");
+        let sigs = trace.signals();
+        let name = sigs.iter().find(|s| s.ends_with("a")).unwrap().clone();
+        // rising a at #40 (index 3)
+        let idx = trace.find_indices(&name, FindCondition::Rising).unwrap();
+        eprintln!("rising({}) = {:?}", name, idx);
+        assert!(!idx.is_empty(), "no rising detected");
+    }
+}

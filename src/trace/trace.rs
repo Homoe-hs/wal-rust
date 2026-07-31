@@ -23,6 +23,9 @@ pub enum FindCondition {
     ValueI64(i64),
     Neq(u8),
     NeqI64(i64),
+    IsX,
+    IsZ,
+    Changed,
 }
 
 pub trait Trace {

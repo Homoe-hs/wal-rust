@@ -672,6 +672,7 @@ impl Trace for FstTrace {
 
         // Walk all timestamps, reading values one by one (but LRU cache will help)
         // For a fully optimized chain-walking approach, see VcdTrace's single-pass scan.
+        let mut prev_val: Option<Vec<u8>> = None;
         for (i, &target_time) in self.timestamps.iter().enumerate() {
             let val = self.read_signal_value_at(sig.handle, target_time, sig.width);
             let curr_bit = if val.len() == 1 { Some(val[0]) } else { None };
@@ -696,6 +697,9 @@ impl Trace for FstTrace {
                     };
                     int_val == Some(*target)
                 }
+                FindCondition::IsX => val.iter().any(|b| *b == b'x' || *b == b'X'),
+                FindCondition::IsZ => val.iter().any(|b| *b == b'z' || *b == b'Z'),
+                FindCondition::Changed => prev_val.as_ref().map(|p| p != &val).unwrap_or(false),
                 FindCondition::Neq(v) => {
                     !(curr_bit == Some(*v) || (curr_bit == Some(b'1') && *v == 1) || (curr_bit == Some(b'0') && *v == 0))
                 }
@@ -717,6 +721,7 @@ impl Trace for FstTrace {
                 indices.push(i);
             }
             prev_bit = curr_bit;
+            prev_val = Some(val.clone());
         }
 
         Ok(indices)

@@ -125,6 +125,11 @@ pub enum Operator {
     TrimTrace,
     Count,
     Timeframe,
+    Rising,
+    Falling,
+    IsX,
+    IsZ,
+    Changes,
 
     // Scope/group operations
     Allscopes,
@@ -283,6 +288,11 @@ impl Operator {
             "trim-trace" => Some(Operator::TrimTrace),
             "count" => Some(Operator::Count),
             "timeframe" => Some(Operator::Timeframe),
+            "rising" => Some(Operator::Rising),
+            "falling" => Some(Operator::Falling),
+            "is-x" => Some(Operator::IsX),
+            "is-z" => Some(Operator::IsZ),
+            "changes" => Some(Operator::Changes),
 
             // Scope/group
             "all-scopes" => Some(Operator::Allscopes),
@@ -421,6 +431,11 @@ impl Operator {
             Operator::TrimTrace => "trim-trace",
             Operator::Count => "count",
             Operator::Timeframe => "timeframe",
+            Operator::Rising => "rising",
+            Operator::Falling => "falling",
+            Operator::IsX => "is-x",
+            Operator::IsZ => "is-z",
+            Operator::Changes => "changes",
             Operator::Allscopes => "all-scopes",
             Operator::Scoped => "scoped",
             Operator::ResolveScope => "resolve-scope",

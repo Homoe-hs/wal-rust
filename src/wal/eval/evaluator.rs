@@ -1516,6 +1516,24 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
             }
         }
 
+        // Fast path 0: builtins simple-condition fast path (covers (= ...) plus
+        // edge/X conditions: (rising/falling/changes/is-x/is-z "sig"))
+        if let Some(result) = crate::wal::builtins::signal::try_find_indices_simple(&args[0], usize::MAX, &mut self.env) {
+            match result {
+                Ok(Value::List(lst)) => {
+                    let n = lst.len() as i64;
+                    if let Ok(mut t) = self.traces.write() {
+                        for (tid, idx) in &saved {
+                            let _ = t.set_index(tid, *idx);
+                        }
+                    }
+                    return Ok(Value::Int(n));
+                }
+                Ok(other) => return Ok(other),
+                Err(_) => {}
+            }
+        }
+
         // Fast path: try simple condition (= (get "sig") val), (!= ...), (not (= ...))
         if let Some((sig_name, target, is_not)) = self.parse_simple_condition(&args[0]) {
             let cond: FindCondition = if is_not {
