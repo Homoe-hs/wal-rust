@@ -163,15 +163,20 @@ fn op_printf(args: &[Value], _env: &mut Environment, eval: &mut Evaluator) -> Re
                 let val = evaluated.get(arg_idx).map(|s| s.as_str()).unwrap_or("");
                 let formatted = match spec {
                     'd' | 'i' => {
-                        let n: i64 = val.parse().unwrap_or(0);
-                        if let Some(prec) = precision {
-                            format!("{:0>width$}", n.to_string(), width = prec)
-                        } else if flags.contains('0') && width > 0 {
-                            format!("{:0>width$}", n, width = width)
-                        } else if width > 0 {
-                            format!("{:>width$}", n, width = width)
-                        } else {
-                            n.to_string()
+                        match val.parse::<i64>() {
+                            Ok(n) => {
+                                if let Some(prec) = precision {
+                                    format!("{:0>width$}", n.to_string(), width = prec)
+                                } else if flags.contains('0') && width > 0 {
+                                    format!("{:0>width$}", n, width = width)
+                                } else if width > 0 {
+                                    format!("{:>width$}", n, width = width)
+                                } else {
+                                    n.to_string()
+                                }
+                            }
+                            // non-numeric value (e.g. a symbol): print it as-is
+                            Err(_) => val.to_string(),
                         }
                     }
                     's' => {
@@ -190,15 +195,34 @@ fn op_printf(args: &[Value], _env: &mut Environment, eval: &mut Evaluator) -> Re
                             None => n.to_string(),
                         }
                     }
-                    'x' => {
-                        let n: i64 = val.parse().unwrap_or(0);
-                        let s = format!("{:x}", n);
-                        if width > 0 && flags.contains('0') {
-                            format!("{:0>width$}", s, width = width)
-                        } else if width > 0 {
-                            format!("{:>width$}", s, width = width)
-                        } else {
-                            s
+                    'x' | 'h' => {
+                        match val.parse::<i64>() {
+                            Ok(n) => {
+                                let s = format!("{:x}", n);
+                                if width > 0 && flags.contains('0') {
+                                    format!("{:0>width$}", s, width = width)
+                                } else if width > 0 {
+                                    format!("{:>width$}", s, width = width)
+                                } else {
+                                    s
+                                }
+                            }
+                            Err(_) => val.to_string(),
+                        }
+                    }
+                    'b' => {
+                        match val.parse::<i64>() {
+                            Ok(n) => {
+                                let s = format!("{:b}", n);
+                                if width > 0 && flags.contains('0') {
+                                    format!("{:0>width$}", s, width = width)
+                                } else if width > 0 {
+                                    format!("{:>width$}", s, width = width)
+                                } else {
+                                    s
+                                }
+                            }
+                            Err(_) => val.to_string(),
                         }
                     }
                     '%' => "%".to_string(),

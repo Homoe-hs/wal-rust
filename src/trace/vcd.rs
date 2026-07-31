@@ -776,30 +776,49 @@ impl Trace for VcdTrace {
         let dump_len = data_len.saturating_sub(hdr_end);
         let chunk_size = dump_len / n_threads.max(1);
 
-        // Build newline-aligned chunk boundaries starting from hdr_end (includes $dumpvars)
+        // Build newline-aligned chunk boundaries starting from hdr_end (includes $dumpvars).
+        // IMPORTANT: a boundary must fall right BEFORE a '#' timestamp line, so that a
+        // value line always stays in the same chunk as its '#' line. Otherwise the
+        // orphan value line at the start of a chunk corrupts the timestamp index
+        // accounting of find_indices.
         let mut boundaries = vec![hdr_end];
         for i in 1..n_threads {
             let mut p = hdr_end + i * chunk_size;
             if p >= data_len { break; }
-            while p < data_len && shared_mmap[p] != b'\n' { p += 1; }
-            if p < data_len { p += 1; }
-            if p >= data_len { break; }
+            loop {
+                // skip to the start of the next line
+                match memchr::memchr(b'\n', &shared_mmap[p..data_len]) {
+                    Some(n) => p += n + 1,
+                    None => { p = data_len; break; }
+                }
+                if p >= data_len { break; }
+                if shared_mmap[p] == b'#' { break; }
+            }
             boundaries.push(p);
         }
         boundaries.push(data_len);
 
-        // Pre-compute ts_idx at each boundary (one linear scan)
+        // Pre-compute ts_idx at each boundary (one linear scan).
+        // Only '#' bytes at the START of a line are timestamps: '#' is also a
+        // legal VCD signal id character (e.g. "$var wire 3 # awsize_o"), so a
+        // naive byte scan over-counts. Also record the count BEFORE the boundary
+        // position so a boundary '#' line belongs to the following chunk.
         let boundary_ts: Vec<usize> = {
             let mut ts = vec![0usize; boundaries.len()];
             let mut count = 0usize;
             let mut bi = 1usize;
-            for (i, &b) in shared_mmap[hdr_end..].iter().enumerate() {
-                if b == b'#' { count += 1; }
-                while bi < boundaries.len() && hdr_end + i + 1 >= boundaries[bi] {
+            let start = hdr_end;
+            for (i, &b) in shared_mmap[start..].iter().enumerate() {
+                while bi < boundaries.len() && start + i >= boundaries[bi] {
                     ts[bi] = count;
                     bi += 1;
                 }
-                if bi >= boundaries.len() { break; }
+                let line_start = i == 0 || shared_mmap[start + i - 1] == b'\n';
+                if line_start && b == b'#' { count += 1; }
+            }
+            while bi < boundaries.len() {
+                ts[bi] = count;
+                bi += 1;
             }
             ts
         };

@@ -93,11 +93,10 @@ impl Evaluator {
             return Ok(v);
         }
 
-        if let Some(op) = Operator::from_str(&name) {
-            return Ok(Value::Symbol(Symbol::new(op.as_str())));
-        }
-
-        // Special variables (require trace access)
+        // Special variables (require trace access). Must be checked BEFORE
+        // Operator::from_str: bare INDEX/TS/etc. should evaluate to their
+        // numeric value, not to the operator symbol "INDEX" (which would
+        // silently format as 0 in printf %d).
         match name.as_str() {
             "INDEX" => {
                 if let Some(traces) = self.env.get_traces() {
@@ -232,6 +231,11 @@ impl Evaluator {
                 )));
             }
             _ => {}
+        }
+
+        // Bare operator name evaluates to its symbol (e.g. bare "count" -> count)
+        if let Some(op) = Operator::from_str(&name) {
+            return Ok(Value::Symbol(Symbol::new(op.as_str())));
         }
 
         // Try signal name auto-lookup from loaded traces
