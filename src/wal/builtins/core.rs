@@ -245,6 +245,70 @@ fn op_printf(args: &[Value], _env: &mut Environment, eval: &mut Evaluator) -> Re
     Ok(Value::Nil)
 }
 
+pub fn help_dispatch(args: &[Value], env: &mut Environment, eval: &mut Evaluator) -> Result<Value, String> {
+    op_help(args, env, eval)
+}
+
+fn op_help(args: &[Value], _env: &mut Environment, _eval: &mut Evaluator) -> Result<Value, String> {
+    let topic = args.first().and_then(|v| match v {
+        Value::String(s) => Some(s.clone()),
+        Value::Symbol(s) => Some(s.name.clone()),
+        _ => None,
+    });
+    let help_text = match topic.as_deref() {
+        Some("count") | Some("find") | Some("whenever") => {
+            "Condition queries over the waveform timeline.\n\
+             (count COND)            number of timestamps where COND is true\n\
+             (find COND)             indices where COND is true\n\
+             (whenever COND BODY)    evaluate BODY at each matching timestamp\n\
+             Fast path: (= (get \"sig\") N) uses a parallel chunk scan.\n\
+             Conditions: (= sig N) (rising sig) (falling sig) (changes sig)\n\
+                       (is-x sig) (is-z sig) (&& c1 c2) (|| c1 c2)".to_string()
+        }
+        Some("rising") | Some("falling") | Some("changes") => {
+            "Edge detection conditions.\n\
+             (rising \"sig\")   true when sig goes 0 -> non-zero\n\
+             (falling \"sig\")  true when sig goes non-zero -> 0\n\
+             (changes \"sig\")  true when sig value changes\n\
+             Vector signals compare whole-value zero/non-zero.\n\
+             Use inside count/find/whenever: (count (rising \"clk\"))".to_string()
+        }
+        Some("is-x") | Some("is-z") => {
+            "Unknown / high-impedance detection.\n\
+             (is-x \"sig\")  true when any bit is x/X (unknown)\n\
+             (is-z \"sig\")  true when any bit is z/Z (high-impedance)\n\
+             Typical: (count (is-x \"sig\")) to find corrupted regions.".to_string()
+        }
+        Some("get") | Some("sample-at") => {
+            "Signal value access.\n\
+             (get \"sig\")       value at current INDEX (scalar -> int, vector -> int)\n\
+             (sample-at sig N)  value at index N (signal name as bare symbol)".to_string()
+        }
+        Some("INDEX") | Some("TS") | Some("step") => {
+            "Trace navigation.\n\
+             INDEX        current timestamp index of the first trace\n\
+             TS           alias of INDEX\n\
+             MAX-INDEX    last valid index\n\
+             (step N)     advance all traces by N timestamps".to_string()
+        }
+        Some("SIGNALS") => {
+            "List all signals in the loaded traces: (SIGNALS)".to_string()
+        }
+        None => {
+            "WAL builtin reference.\n\
+             Query:    count find whenever rising falling changes is-x is-z\n\
+             Access:   get sample-at signal-width SIGNALS SCOPES\n\
+             Navigate: INDEX TS MAX-INDEX step\n\
+             Language: + - * / = != < > if do define set! fn map fold print printf\n\
+             Traces:   load unload\n\
+             Try (help \"count\") for details on a specific builtin.".to_string()
+        }
+        _ => format!("No help for '{}'. Try (help) for the overview.", topic.unwrap_or_default()),
+    };
+    println!("{}", help_text);
+    Ok(Value::Nil)
+}
+
 fn op_exit(args: &[Value], _env: &mut Environment, _eval: &mut Evaluator) -> Result<Value, String> {
     let code = if args.is_empty() {
         0

@@ -1022,6 +1022,7 @@ fn op_timeframe(args: &[Value], env: &mut Environment, eval: &mut Evaluator) -> 
 
 pub fn register_signal(disp: &mut Dispatcher) {
     disp.register(Operator::Load, op_load);
+    disp.register(Operator::Help, crate::wal::builtins::core::help_dispatch);
     disp.register(Operator::Unload, op_unload);
     disp.register(Operator::Step, op_step);
     disp.register(Operator::Whenever, op_whenever);

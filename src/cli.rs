@@ -19,13 +19,26 @@ use std::path::PathBuf;
                   - Supports files up to 150GB+ with <2GB memory footprint\n  \
                   - FST format read/write support\n  \
                   - Interactive REPL with rustyline",
-    after_help = "EXAMPLES:\n  \
-                  wal-rust repl\n  \
-                  wal-rust '(+ 1 2)'\n  \
-                  wal-rust '(step 100)'\n  \
-                  wal-rust script.wal\n  \
-                  wal-rust run -l trace.vcd script.wal\n  \
-                  wal-rust '(+ 1 2)' -l dump.vcd\n\n\
+    after_help = "QUICK START (waveform analysis):\n  \
+                  wal-rust -l trace.vcd '(SIGNALS)'                          # list signals\n  \
+                  wal-rust -l trace.vcd '(count (= (get \"clk\") 1))'          # count high cycles\n  \
+                  wal-rust -l trace.vcd '(find (= (get \"clk\") 1))'           # find indices\n  \
+                  wal-rust -l trace.vcd '(find (rising \"clk\"))'             # rising edges\n  \
+                  wal-rust -l trace.vcd '(count (is-x \"sig\"))'              # unknown bits\n  \
+                  wal-rust -l trace.vcd '(whenever (rising \"clk\") (printf \"%d\\n\" INDEX))'\n  \
+                  wal-rust repl                                            # interactive\n\n\
+                  QUICK START (scripts):\n  \
+                  (load \"trace.vcd\")\n  \
+                  (count (&& (= (get \"awvalid\") 1) (= (get \"awready\") 1)))  # handshakes\n  \
+                  (whenever (&& (= (get \"req\") 1) (= (get \"gnt\") 1))\n  \
+                    (printf \"grant at %0d\\n\" INDEX))\n\n\
+                  QUICK REFERENCE:\n  \
+                  count / find / whenever — condition queries (fast paths for (= sig N))\n  \
+                  rising / falling / changes — edge detection\n  \
+                  is-x / is-z — unknown / high-impedance detection\n  \
+                  get — signal value at current INDEX; sample-at — at given index\n  \
+                  SIGNALS / INDEX / TS / MAX-INDEX — special variables\n  \
+                  step — advance trace index; + - * / if do define set! — language\n\n\
                   See https://wal-lang.org for WAL language documentation."
 )]
 #[command(subcommand_required = false)]

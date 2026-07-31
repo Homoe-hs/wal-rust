@@ -116,6 +116,7 @@ pub enum Operator {
     IntToString,
 
     // Signal operations
+    Help,
     Find,
     FindG,
     Whenever,
@@ -165,6 +166,7 @@ impl Operator {
         match s {
             // Waveform
             "load" => Some(Operator::Load),
+            "help" => Some(Operator::Help),
             "unload" => Some(Operator::Unload),
             "step" => Some(Operator::Step),
             "eval-file" => Some(Operator::EvalFile),
@@ -327,6 +329,7 @@ impl Operator {
     pub fn as_str(&self) -> &'static str {
         match self {
             Operator::Load => "load",
+            Operator::Help => "help",
             Operator::Unload => "unload",
             Operator::Step => "step",
             Operator::EvalFile => "eval-file",
