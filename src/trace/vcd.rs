@@ -434,7 +434,7 @@ impl VcdTrace {
                 }
             } else if first != b'$' && line.len() > id_len {
                 let id_start = line.len() - id_len;
-                if &line[id_start..] == target_id.as_slice() {
+                if (line.len() == id_len + 1 || (id_start > 0 && line[id_start - 1] == b' ')) && &line[id_start..] == target_id.as_slice() {
                     let val = match first {
                         b'b' => {
                             let ve = id_start.saturating_sub(1);
@@ -853,19 +853,29 @@ impl Trace for VcdTrace {
         };
 
         // Build chunk descriptors for parallel processing
-        let chunks: Vec<(usize, usize, usize, usize)> = (0..boundaries.len() - 1)
-            .map(|i| (boundaries[i], boundaries[i+1], boundary_ts[i], boundary_ts[i] + rewound[i]))
+        let chunks: Vec<(usize, usize, usize, usize, Option<VcdValue>)> = (0..boundaries.len() - 1)
+            .map(|i| {
+                // seed: value of the target signal at the timestamp just before
+                // the chunk start (sparse signals keep their last value across
+                // timestamps with no records)
+                let seed = if boundary_ts[i] > 0 {
+                    self.read_signal_value_at(sig_idx, self.timestamps[boundary_ts[i] - 1])
+                } else {
+                    VcdValue::Bit(b'x')
+                };
+                (boundaries[i], boundaries[i+1], boundary_ts[i], boundary_ts[i] + rewound[i], Some(seed))
+            })
             .collect();
 
         // Parallel chunk scan using rayon — Arc<Mmap> is Sync so threads can share
         if std::env::var("WAL_DEBUG_FIND").is_ok() {
             eprintln!("find_indices({}, {:?}): chunks={:?}", name, cond, chunks.iter().map(|c| (c.0, c.1, c.2)).collect::<Vec<_>>());
         }
-        let results: Vec<(Vec<usize>, Vec<(u32, VcdValue)>)> = chunks.par_iter().map(|&(start, end, start_ts, valid_from)| {
+        let results: Vec<(Vec<usize>, Vec<(u32, VcdValue)>)> = chunks.par_iter().map(|&(start, end, start_ts, valid_from, ref seed)| {
             let chunk = &shared_mmap[start..end];
             let mut local_indices = Vec::new();
             let mut all_changes: Vec<(u32, VcdValue)> = Vec::new();
-            let mut current_val: Option<VcdValue> = None;
+            let mut current_val: Option<VcdValue> = seed.clone();
             let mut prev_val: Option<VcdValue> = None;
             let mut ts_idx = start_ts;
             let mut seen_first_ts = false;
@@ -896,7 +906,7 @@ impl Trace for VcdTrace {
                     seen_first_ts = true;
                 } else if first != b'$' && line.len() > id_len {
                     let id_start = line.len() - id_len;
-                    if &line[id_start..] == target_id.as_slice() {
+                    if (line.len() == id_len + 1 || (id_start > 0 && line[id_start - 1] == b' ')) && &line[id_start..] == target_id.as_slice() {
                         let val = match first {
                             b'b' => {
                                 let ve = id_start.saturating_sub(1);
@@ -1102,7 +1112,7 @@ impl Trace for VcdTrace {
                         let candidates = &id_by_len_arc[id_len];
                         for (ref id_bytes, batch_idx) in candidates.iter() {
                             let batch_idx = *batch_idx;
-                            if &line[id_start..] == id_bytes.as_slice() {
+                            if (line.len() == id_len + 1 || (id_start > 0 && line[id_start - 1] == b' ')) && &line[id_start..] == id_bytes.as_slice() {
                                 let val = match first {
                                     b'b' => {
                                         let ve = id_start.saturating_sub(1);
@@ -1242,7 +1252,7 @@ fn find_signal_in_block(block: &[u8], target_id: &[u8], id_len: usize) -> Option
         if line.is_empty() { lp = line_end + 1; continue; }
         if line.len() > id_len && line[0] != b'$' {
             let id_start = line.len() - id_len;
-            if &line[id_start..] == target_id {
+            if (line.len() == id_len + 1 || (id_start > 0 && line[id_start - 1] == b' ')) && &line[id_start..] == target_id {
                 let val = match line[0] {
                     b'b' => {
                         let ve = id_start.saturating_sub(1);
