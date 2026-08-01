@@ -980,7 +980,6 @@ impl Trace for VcdTrace {
         struct BatchSig {
             name: String,
             cond: FindCondition,
-            #[allow(dead_code)]
             sig_idx: u32,
         }
         let mut batch_sigs: Vec<BatchSig> = Vec::new();
@@ -1064,18 +1063,36 @@ impl Trace for VcdTrace {
             }
         }
 
-        let chunks: Vec<(usize, usize, usize)> = (0..boundaries.len() - 1)
-            .map(|i| (boundaries[i], boundaries[i+1], boundary_ts[i]))
+        let chunks: Vec<(usize, usize, usize, Vec<Option<VcdValue>>)> = (0..boundaries.len() - 1)
+            .map(|i| {
+                let seeds = if boundary_ts[i] > 0 {
+                    batch_sigs.iter().map(|bs| {
+                        if std::env::var("WAL_DEBUG_FIND").is_ok() {
+                            eprintln!("batch seed[{}] sig={}", i, bs.sig_idx);
+                        }
+                        Some(self.read_signal_value_at(bs.sig_idx, self.timestamps[boundary_ts[i] - 1]))
+                    }).collect()
+                } else {
+                    vec![None; batch_sigs.len()]
+                };
+                (boundaries[i], boundaries[i+1], boundary_ts[i], seeds)
+            })
             .collect();
 
         let batch_sigs_arc = Arc::new(batch_sigs);
         let id_by_len_arc = Arc::new(id_by_len);
 
-        let results: Vec<Vec<Vec<usize>>> = chunks.par_iter().map(|&(start, end, start_ts)| {
+        if std::env::var("WAL_DEBUG_FIND").is_ok() {
+            eprintln!("batch: chunks={} sigs={}", chunks.len(), batch_sigs_arc.len());
+        }
+        let results: Vec<Vec<Vec<usize>>> = chunks.iter().map(|&(start, end, start_ts, ref seeds)| {
             let chunk = &shared_mmap[start..end];
+            if std::env::var("WAL_DEBUG_FIND").is_ok() {
+                eprintln!("batch scan chunk start..{}", chunk.len());
+            }
             let batch_count = batch_sigs_arc.len();
             let mut local: Vec<Vec<usize>> = vec![Vec::new(); batch_count];
-            let mut current_vals: Vec<Option<VcdValue>> = vec![None; batch_count];
+            let mut current_vals: Vec<Option<VcdValue>> = seeds.clone();
             let mut prev_vals: Vec<Option<VcdValue>> = vec![None; batch_count];
             let mut ts_idx = start_ts;
             let mut seen_first_ts = false;
@@ -1148,8 +1165,14 @@ impl Trace for VcdTrace {
                 }
             }
 
+            if std::env::var("WAL_DEBUG_FIND").is_ok() {
+                eprintln!("batch scan done");
+            }
             local
         }).collect();
+        if std::env::var("WAL_DEBUG_FIND").is_ok() {
+            eprintln!("batch collect done: {}", results.len());
+        }
 
         // Merge per-batch results
         let batch_count = batch_sigs_arc.len();

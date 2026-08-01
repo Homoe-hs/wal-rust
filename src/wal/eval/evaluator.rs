@@ -1475,6 +1475,7 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
             }
             if batch_entries.len() >= 2 {
                 let mut result_counts: Vec<Value> = Vec::new();
+                let mut batch_counts: Option<Vec<Value>> = None;
                 {
                     let t = self.traces.read().unwrap_or_else(|e| e.into_inner());
                     for tid in &traces_ids {
@@ -1499,19 +1500,23 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
                                 })
                                 .collect();
                             if let Ok(results) = tr.find_indices_batch(&resolved_entries) {
-                                for (_, indices) in results {
-                                    result_counts.push(Value::Int(indices.len() as i64));
-                                }
-                                // Read guard dropped, restore indices
-                                if let Ok(mut tc) = self.traces.write() {
-                                    for (tid, idx) in &saved {
-                                        let _ = tc.set_index(tid, *idx);
-                                    }
-                                }
-                                return Ok(Value::List(WList::from_vec(result_counts)));
+                                let counts: Vec<Value> = results.iter()
+                                    .map(|(_, indices)| Value::Int(indices.len() as i64))
+                                    .collect();
+                                batch_counts = Some(counts);
+                                break;
                             }
                         }
                     }
+                }
+                if let Some(counts) = batch_counts {
+                    // read guard dropped; restore indices under a fresh write lock
+                    if let Ok(mut tc) = self.traces.write() {
+                        for (tid, idx) in &saved {
+                            let _ = tc.set_index(tid, *idx);
+                        }
+                    }
+                    return Ok(Value::List(WList::from_vec(counts)));
                 }
             }
         }
