@@ -31,12 +31,76 @@ fn adapt_lru_capacity(file_size: usize, signal_count: usize) -> usize {
 
 /// Hash a signal ID from raw bytes (e.g. "!" → 0x21, "ab" → 0x6162)
 #[inline(always)]
+pub(crate) fn build_ts_store(ts: Vec<u64>) -> TsStore {
+    if ts.len() >= 2 {
+        let step = ts[1] - ts[0];
+        let mut uniform = step > 0;
+        if uniform {
+            for i in 2..ts.len() {
+                if ts[i] - ts[i - 1] != step {
+                    uniform = false;
+                    break;
+                }
+            }
+        }
+        if uniform && step > 0 {
+            return TsStore::Uniform { start: ts[0], step, count: ts.len() as u64 };
+        }
+    }
+    TsStore::Dense(ts)
+}
+
 fn hash_sig_id(bytes: &[u8]) -> u64 {
     let mut h: u64 = 0;
     for &b in bytes {
         h = (h << 8) | (b as u64);
     }
     h
+}
+
+/// Compact timestamp storage. Industrial VCD files usually have strictly
+/// uniform timestamp spacing (fixed simulator step), which compresses to
+/// O(1) memory regardless of file size; non-uniform traces fall back to a
+/// dense vector.
+enum TsStore {
+    Uniform { start: u64, step: u64, count: u64 },
+    Dense(Vec<u64>),
+}
+
+impl TsStore {
+    fn len(&self) -> usize {
+        match self {
+            TsStore::Uniform { count, .. } => *count as usize,
+            TsStore::Dense(v) => v.len(),
+        }
+    }
+    fn get(&self, i: usize) -> u64 {
+        match self {
+            TsStore::Uniform { start, step, .. } => start + (i as u64) * step,
+            TsStore::Dense(v) => v[i],
+        }
+    }
+    /// binary search; returns Ok(idx) on exact match, Err(insertion point)
+    fn search(&self, t: u64) -> Result<usize, usize> {
+        match self {
+            TsStore::Uniform { start, step, count } => {
+                if t < *start {
+                    return Err(0);
+                }
+                let n = *count;
+                let span = (t - start) / step;
+                if span >= n {
+                    return Err(n as usize);
+                }
+                if start + span * step == t {
+                    Ok(span as usize)
+                } else {
+                    Err(span as usize + 1)
+                }
+            }
+            TsStore::Dense(v) => v.binary_search(&t),
+        }
+    }
 }
 
 pub struct VcdTrace {
@@ -55,7 +119,7 @@ pub struct VcdTrace {
     event_change_points: HashMap<u32, Vec<usize>>,
 
     // Pass 1: sparse index
-    timestamps: Vec<u64>,
+    timestamps: TsStore,
     timestamp_offsets: Vec<u64>,
     sparse_index: HashMap<u32, BTreeMap<u64, u64>>,
 
@@ -280,16 +344,31 @@ impl VcdTrace {
         }
 
         let signal_ids = Arc::try_unwrap(signal_ids_arc).unwrap_or_else(|arc| (*arc).clone());
+        // Sample offsets: keep every 64th. read_signal_value_at locates exact
+        // '#' lines with a short memchr scan from the sampled anchor.
+        let timestamp_offsets: Vec<u64> = timestamp_offsets.iter().step_by(64).copied().collect();
         let max_index = if timestamps.is_empty() { 0 } else { timestamps.len() - 1 };
         let lru_cap = std::num::NonZeroUsize::new(adapt_lru_capacity(file_len, signals.len() as usize))
             .unwrap_or(std::num::NonZeroUsize::MIN);
 
+        // Release file pages touched by the full PASS-1b scan: queries re-read
+        // on demand. Keeps steady-state RSS at heap size, not file size.
+        unsafe {
+            let data = reader.data();
+            libc::madvise(data.as_ptr() as *mut libc::c_void, data.len(), libc::MADV_DONTNEED);
+        }
         reader.seek_to(0).map_err(|e| format!("Seek error: {}", e))?;
 
+        if std::env::var("WAL_DEBUG_FIND").is_ok() {
+            let sparse_entries: usize = sparse_index.values().map(|m| m.len()).sum();
+            let event_entries: usize = event_change_ts.values().map(|v| v.len()).sum();
+            eprintln!("load: ts={} offsets={} sparse_entries={} event_entries={} signals={}",
+                      timestamps.len(), timestamp_offsets.len(), sparse_entries, event_entries, signals.len());
+        }
         Ok(VcdTrace {
             id, filename,
             signals, signal_ids, signal_id_bytes, signal_widths, name_to_idx, event_signals, event_change_points,
-            timestamps, timestamp_offsets, sparse_index,
+            timestamps: build_ts_store(timestamps), timestamp_offsets, sparse_index,
             lru_cache: RefCell::new(lru::LruCache::new(lru_cap)),
             signal_cache: Mutex::new(HashMap::new()),
             reader: RefCell::new(reader),
@@ -302,14 +381,36 @@ impl VcdTrace {
     /// Find the index of a given timestamp (returns nearest <= target)
     #[allow(dead_code)]
     fn find_timestamp_index(&self, target: u64) -> usize {
-        match self.timestamps.binary_search(&target) {
+        match self.timestamps.search(target) {
             Ok(i) => i,
             Err(0) => 0,
             Err(i) => i - 1,
         }
     }
 
-    /// On-demand: read signal value at a specific timestamp (memchr jump scan + timestamp_offsets)
+    /// Sampled offset anchor for a timestamp index: the '#' line of the
+    /// timestamp at (idx >> 6) * 64 (<= idx). Exact lines are located by a
+    /// short memchr scan from this anchor.
+    fn ts_line_anchor(&self, ts_idx: usize) -> u64 {
+        let b = ts_idx >> 6;
+        if b < self.timestamp_offsets.len() {
+            self.timestamp_offsets[b]
+        } else {
+            *self.timestamp_offsets.last().unwrap_or(&(self.header_end_offset as u64))
+        }
+    }
+    /// Sampled offset anchor strictly after a timestamp index (next sample).
+    /// Returns u64::MAX when past the last sample (caller uses file end).
+    fn ts_end_anchor(&self, ts_idx: usize) -> u64 {
+        let b = (ts_idx >> 6) + 1;
+        if b < self.timestamp_offsets.len() {
+            self.timestamp_offsets[b]
+        } else {
+            u64::MAX
+        }
+    }
+
+    /// On-demand: read signal value at a specific timestamp (memchr jump scan + sampled offsets)
     fn read_signal_value_at(&self, sig_idx: u32, target_timestamp: u64) -> VcdValue {
         let target_id = match self.signal_id_bytes.get(&sig_idx) {
             Some(id) => id,
@@ -319,7 +420,7 @@ impl VcdTrace {
         let is_event = self.event_signals.contains(&sig_idx);
 
         // 1. Target index and scan end
-        let target_idx = match self.timestamps.binary_search(&target_timestamp) {
+        let target_idx = match self.timestamps.search(target_timestamp) {
             Ok(i) => i,
             Err(0) => return VcdValue::Bit(b'x'),
             Err(i) => i - 1,
@@ -327,23 +428,41 @@ impl VcdTrace {
 
         // 2. Scan start: anchor TIMESTAMP's # line offset (not change point offset).
         //    This guarantees we start at a # line, not in the middle of value changes.
-        let scan_start = self.sparse_index.get(&sig_idx)
-            .and_then(|idx_map| idx_map.range(..=target_timestamp).last())
-            .and_then(|(&ts, _)| self.timestamps.binary_search(&ts).ok())
-            .and_then(|i| self.timestamp_offsets.get(i).copied())
+        let sparse_anchor = self.sparse_index.get(&sig_idx)
+            .and_then(|idx_map| idx_map.range(..=target_timestamp).last());
+        let scan_start = sparse_anchor
+            .and_then(|(&ts, _)| self.timestamps.search(ts).ok())
+            .map(|i| self.ts_line_anchor(i))
             .unwrap_or(self.header_end_offset) as usize;
+        if std::env::var("WAL_DEBUG_FIND").is_ok() && sparse_anchor.is_none() {
+            eprintln!("no sparse anchor for sig={} ts={}", sig_idx, target_timestamp);
+        }
 
         let next_ts_idx = target_idx + 1;
         let mmap = self.reader.borrow().data.clone();
         let data = &mmap[..];
         let scan_end = if next_ts_idx < self.timestamps.len() {
-            self.timestamp_offsets[next_ts_idx] as usize
+            let e = self.ts_end_anchor(next_ts_idx);
+            if e == u64::MAX { data.len() } else { e as usize }
         } else {
             data.len()
         };
 
+        if std::env::var("WAL_DEBUG_FIND").is_ok() && scan_end.saturating_sub(scan_start) > 1_000_000 {
+            eprintln!("read region huge: sig={} ts={} scan_start={} scan_end={} region={}",
+                      sig_idx, target_timestamp, scan_start, scan_end,
+                      scan_end.saturating_sub(scan_start));
+        }
         // Fallback for huge sparse gaps
         if scan_start >= data.len() || scan_start >= scan_end || scan_end.saturating_sub(scan_start) > 1_000_000_000 {
+            if std::env::var("WAL_DEBUG_FIND").is_ok() {
+                static LEGACY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                let n = LEGACY.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if n < 10 {
+                    eprintln!("read legacy fallback: sig={} scan_start={} scan_end={} len={}",
+                              sig_idx, scan_start, scan_end, data.len());
+                }
+            }
             return self.read_signal_value_at_legacy(sig_idx, target_timestamp);
         }
 
@@ -687,7 +806,7 @@ impl Trace for VcdTrace {
             ));
         };
 
-        let target_time = self.timestamps[idx];
+        let target_time = self.timestamps.get(idx);
         let sig_idx = self.name_to_idx.get(name).copied()
             .ok_or_else(|| format!(
                 "signal '{}' not found. Available signals (first 5): {:?}",
@@ -738,8 +857,21 @@ impl Trace for VcdTrace {
     }
 
     fn find_indices(&self, name: &str, cond: FindCondition) -> Result<Vec<usize>, String> {
+        if std::env::var("WAL_DEBUG_FIND").is_ok() {
+            eprintln!("find_indices enter: {}", name);
+        }
         let sig_idx = self.name_to_idx.get(name).copied()
             .ok_or_else(|| format!("Unknown signal: {}", name))?;
+        if std::env::var("WAL_DEBUG_FIND").is_ok() {
+            eprintln!("  sig_idx={} id={:?} anchors={}",
+                      sig_idx,
+                      self.signal_id_bytes.get(&sig_idx),
+                      self.sparse_index.get(&sig_idx).map(|m| m.len()).unwrap_or(0));
+            let idb = self.signal_id_bytes.get(&sig_idx).cloned().unwrap_or_default();
+            let h = crate::trace::vcd::hash_sig_id(&idb);
+            eprintln!("  hash={:#x} sid has it: {}", h,
+                      self.signal_ids.get(&h).copied() == Some(sig_idx));
+        }
 
         // Event signal fast path: change points already recorded during load
         if self.event_signals.contains(&sig_idx) {
@@ -859,7 +991,10 @@ impl Trace for VcdTrace {
                 // the chunk start (sparse signals keep their last value across
                 // timestamps with no records)
                 let seed = if boundary_ts[i] > 0 {
-                    self.read_signal_value_at(sig_idx, self.timestamps[boundary_ts[i] - 1])
+                    if std::env::var("WAL_DEBUG_FIND").is_ok() {
+                        eprintln!("seed[{}] ts={}", i, self.timestamps.get(boundary_ts[i] - 1));
+                    }
+                    self.read_signal_value_at(sig_idx, self.timestamps.get(boundary_ts[i] - 1))
                 } else {
                     VcdValue::Bit(b'x')
                 };
@@ -1070,7 +1205,7 @@ impl Trace for VcdTrace {
                         if std::env::var("WAL_DEBUG_FIND").is_ok() {
                             eprintln!("batch seed[{}] sig={}", i, bs.sig_idx);
                         }
-                        Some(self.read_signal_value_at(bs.sig_idx, self.timestamps[boundary_ts[i] - 1]))
+                        Some(self.read_signal_value_at(bs.sig_idx, self.timestamps.get(boundary_ts[i] - 1)))
                     }).collect()
                 } else {
                     vec![None; batch_sigs.len()]
