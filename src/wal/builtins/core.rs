@@ -261,6 +261,8 @@ fn op_help(args: &[Value], _env: &mut Environment, _eval: &mut Evaluator) -> Res
              (count COND)            number of timestamps where COND is true\n\
              (find COND)             indices where COND is true\n\
              (whenever COND BODY)    evaluate BODY at each matching timestamp\n\
+             (whenever \"changed\" SIG COND BODY)\n\
+                                    iterate only over timestamps where SIG changes\n\
              Fast path: (= (get \"sig\") N) uses a parallel chunk scan.\n\
              Conditions: (= sig N) (rising sig) (falling sig) (changes sig)\n\
                        (is-x sig) (is-z sig) (&& c1 c2) (|| c1 c2)".to_string()
@@ -281,8 +283,9 @@ fn op_help(args: &[Value], _env: &mut Environment, _eval: &mut Evaluator) -> Res
         }
         Some("get") | Some("sample-at") => {
             "Signal value access.\n\
-             (get \"sig\")       value at current INDEX (scalar -> int, vector -> int)\n\
-             (sample-at sig N)  value at index N (signal name as bare symbol)".to_string()
+             (get \"sig\")          value at current INDEX (scalar -> int, vector -> int)\n\
+             (get \"sig\" hi lo)    bit slice [hi:lo] inclusive, MSB=hi\n\
+             (sample-at sig N)     value at index N (signal name as bare symbol)".to_string()
         }
         Some("INDEX") | Some("TS") | Some("step") => {
             "Trace navigation.\n\

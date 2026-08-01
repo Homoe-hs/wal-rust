@@ -29,9 +29,28 @@ fn adapt_lru_capacity(file_size: usize, signal_count: usize) -> usize {
     (base * file_factor).max(50_000).min(5_000_000) as usize
 }
 
-/// Hash a signal ID from raw bytes (e.g. "!" → 0x21, "ab" → 0x6162)
-#[inline(always)]
-pub(crate) fn build_ts_store(ts: Vec<u64>) -> TsStore {
+/// True for real VCD timestamp lines ("#<digits>"). Icarus Verilog dumps
+/// 1-bit value lines like "#%" (value '#' + id) that start with '#' but are
+/// not timestamps; treating them as timestamps duplicates an entry.
+#[inline]
+fn is_ts_line(line: &[u8]) -> bool {
+    line.len() > 1 && line[1..].iter().all(|c| c.is_ascii_digit())
+}
+
+/// Line-scoped check at absolute position `pos` in `data` (up to the next '\n').
+#[inline]
+fn is_ts_line_at(data: &[u8], pos: usize) -> bool {
+    let line_end = memchr::memchr(b'\n', &data[pos..])
+        .map(|n| pos + n)
+        .unwrap_or(data.len());
+    is_ts_line(&data[pos..line_end])
+}
+
+fn build_ts_store(ts: Vec<u64>) -> TsStore {
+    if std::env::var("WAL_DEBUG_FIND").is_ok() {
+        eprintln!("build_ts_store: len={} first={:?} last={:?}",
+                  ts.len(), ts.iter().take(5).collect::<Vec<_>>(), ts.iter().rev().take(3).collect::<Vec<_>>());
+    }
     if ts.len() >= 2 {
         let step = ts[1] - ts[0];
         let mut uniform = step > 0;
@@ -222,7 +241,11 @@ impl VcdTrace {
         let n_threads = num_cpus::get();
         let chunk_size = dump_len / n_threads;
 
-        // Find chunk boundaries at newlines
+        // Find chunk boundaries at timestamp-line starts. A boundary must fall
+        // exactly at a '#' line start (never inside a value block), so each
+        // timestamp's value lines stay in the same chunk as their '#' line —
+        // otherwise a '#' line straddling a boundary is counted twice (one
+        // timestamp duplicated in the merged ts array).
         let mut boundaries = vec![actual_start];
         for i in 1..n_threads {
             let mut p = actual_start + i * chunk_size;
@@ -234,7 +257,17 @@ impl VcdTrace {
             }
             if p < data.len() { p += 1; } // skip newline
             if p >= data.len() { break; } // don't push past the end
-            boundaries.push(p);
+            // advance to the next real '#' timestamp line start
+            while p < data.len() {
+                if data[p] == b'#' && is_ts_line_at(data, p) {
+                    break;
+                }
+                match memchr::memchr(b'\n', &data[p..]) {
+                    Some(n) => p += n + 1,
+                    None => { p = data.len(); break; }
+                }
+            }
+            if p < data.len() { boundaries.push(p); }
         }
         boundaries.push(data.len());
 
@@ -280,9 +313,14 @@ impl VcdTrace {
                     let first = line[0];
                     match first {
                         b'#' => {
-                            current_timestamp = parse_timestamp_fast(line);
-                            ts.push(current_timestamp);
-                            ts_offsets.push(base_offset + line_start as u64);
+                            // only real timestamp lines: '#<digits>'. Icarus dumps
+                            // 1-bit value lines like "#%" (value '#' + id) which
+                            // start with '#' but are NOT timestamps.
+                            if line.len() > 1 && line[1..].iter().all(|c| c.is_ascii_digit()) {
+                                current_timestamp = parse_timestamp_fast(line);
+                                ts.push(current_timestamp);
+                                ts_offsets.push(base_offset + line_start as u64);
+                            }
                         }
                         b'$' => {}
                         _ => {
@@ -306,6 +344,14 @@ impl VcdTrace {
                 (ts, ts_offsets, si, event_cp)
             })
             .collect();
+
+        if std::env::var("WAL_DEBUG_FIND").is_ok() {
+            for (i, r) in results.iter().enumerate() {
+                eprintln!("  pass1b chunk{}: ts={:?} offs0={}",
+                          i, r.0.iter().take(3).collect::<Vec<_>>(),
+                          r.1.first().copied().unwrap_or(0));
+            }
+        }
 
         // ====== MERGE RESULTS ======
         let mut timestamps: Vec<u64> = Vec::with_capacity(est_ts);
@@ -428,12 +474,20 @@ impl VcdTrace {
 
         // 2. Scan start: anchor TIMESTAMP's # line offset (not change point offset).
         //    This guarantees we start at a # line, not in the middle of value changes.
+        if std::env::var("WAL_DEBUG_FIND").is_ok() {
+            eprintln!("read_signal_value_at: sig={} target_ts={} target_idx={}", sig_idx, target_timestamp, target_idx);
+        }
         let sparse_anchor = self.sparse_index.get(&sig_idx)
             .and_then(|idx_map| idx_map.range(..=target_timestamp).last());
         let scan_start = sparse_anchor
             .and_then(|(&ts, _)| self.timestamps.search(ts).ok())
             .map(|i| self.ts_line_anchor(i))
             .unwrap_or(self.header_end_offset) as usize;
+        if std::env::var("WAL_DEBUG_FIND").is_ok() {
+            eprintln!("  sparse_anchor={:?} scan_start={} scan_end={}",
+                sparse_anchor.map(|(&ts, &off)| (ts, off)), scan_start,
+                self.ts_end_anchor(target_idx + 1));
+        }
         if std::env::var("WAL_DEBUG_FIND").is_ok() && sparse_anchor.is_none() {
             eprintln!("no sparse anchor for sig={} ts={}", sig_idx, target_timestamp);
         }
@@ -545,7 +599,7 @@ impl VcdTrace {
             if line.is_empty() { continue; }
             let first = line[0];
 
-            if first == b'#' {
+            if first == b'#' && is_ts_line(line) {
                 let ts = parse_timestamp_fast(line);
                 if ts > target_timestamp { break; }
                 if self.event_signals.contains(&sig_idx) {
@@ -596,7 +650,7 @@ impl VcdTrace {
             if line.is_empty() { continue; }
             let first = line[0];
 
-            if first == b'#' {
+            if first == b'#' && is_ts_line(line) {
                 let ts = parse_timestamp_fast(line);
                 if ts > target_timestamp { break; }
                 if self.event_signals.contains(&sig_idx) {
@@ -975,7 +1029,9 @@ impl Trace for VcdTrace {
                     bi += 1;
                 }
                 let line_start = i == 0 || shared_mmap[start + i - 1] == b'\n';
-                if line_start && b == b'#' { count += 1; }
+                if line_start && b == b'#' && is_ts_line_at(&shared_mmap, start + i) {
+                    count += 1;
+                }
             }
             while bi < boundaries.len() {
                 ts[bi] = count;
@@ -1026,7 +1082,7 @@ impl Trace for VcdTrace {
                 if line.is_empty() { continue; }
 
                 let first = line[0];
-                if first == b'#' {
+                if first == b'#' && is_ts_line(line) {
                     if seen_first_ts {
                         if let Some(ref val) = current_val {
                             if find_cond_matches(val, prev_val.as_ref(), &cond) {
@@ -1089,6 +1145,9 @@ impl Trace for VcdTrace {
         }
         indices.sort();
         indices.dedup();
+        if std::env::var("WAL_DEBUG_FIND").is_ok() {
+            eprintln!("  find_indices result ({}): {:?}", indices.len(), indices.iter().take(20).collect::<Vec<_>>());
+        }
         // Merge and sort changes (changes may overlap at chunk boundaries)
         if all_changes.len() > 1 {
             all_changes.sort_by_key(|(i, _)| *i);
@@ -1181,7 +1240,9 @@ impl Trace for VcdTrace {
                     bi += 1;
                 }
                 let line_start = i == 0 || shared_mmap[start + i - 1] == b'\n';
-                if line_start && b == b'#' { count += 1; }
+                if line_start && b == b'#' && is_ts_line_at(&shared_mmap, start + i) {
+                    count += 1;
+                }
             }
             while bi < boundaries.len() {
                 ts[bi] = count;
@@ -1243,7 +1304,7 @@ impl Trace for VcdTrace {
                 if line.is_empty() { continue; }
                 let first = line[0];
 
-                if first == b'#' {
+                if first == b'#' && is_ts_line(line) {
                     if seen_first_ts {
                         for b in 0..batch_count {
                             if let Some(ref val) = current_vals[b] {

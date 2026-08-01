@@ -231,7 +231,13 @@ fn op_find(args: &[Value], env: &mut Environment, eval: &mut Evaluator) -> Resul
 pub(crate) fn try_find_indices_simple(cond: &Value, max_results: usize, env: &mut Environment) -> Option<Result<Value, String>> {
     // Edge/X conditions: (rising "sig"), (falling "sig"), (is-x "sig"),
     // (is-z "sig"), (changes "sig")
+    if std::env::var("WAL_DEBUG_FIND").is_ok() {
+        eprintln!("try_find_indices_simple: cond={:?}", cond);
+    }
     if let Some((sig_name, cond_enum)) = parse_edge_condition(cond) {
+        if std::env::var("WAL_DEBUG_FIND").is_ok() {
+            eprintln!("  edge cond: {} {:?}", sig_name, cond_enum);
+        }
         return try_find_indices_enum(&sig_name, cond_enum, max_results, env);
     }
     let (sig_name, target) = parse_simple_condition(cond)?;
@@ -319,8 +325,18 @@ fn op_find_g(args: &[Value], env: &mut Environment, eval: &mut Evaluator) -> Res
 
 fn op_whenever(args: &[Value], env: &mut Environment, eval: &mut Evaluator) -> Result<Value, String> {
     ensure_arity_atleast(args, 2)?;
-    let cond = &args[0];
-    let body = &args[1..];
+
+    // (whenever "changed" "sig" COND BODY...) — iterate only over timestamps
+    // where "sig" changes value (edge-triggered sampling).
+    let changed_mode = matches!(&args[0], Value::String(s) if s == "changed");
+    let (cond, body) = if changed_mode {
+        if args.len() < 3 {
+            return Err("(whenever \"changed\" \"sig\" COND BODY...) expected".to_string());
+        }
+        (&args[2], &args[3..])
+    } else {
+        (&args[0], &args[1..])
+    };
 
     if let Some(traces) = env.get_traces() {
         // Save current indices
@@ -334,6 +350,50 @@ fn op_whenever(args: &[Value], env: &mut Environment, eval: &mut Evaluator) -> R
         };
 
         let mut result = Value::Nil;
+
+        // Changed-mode: iterate over the signal's change points only
+        if changed_mode {
+            let sig_name = match &args[1] {
+                Value::String(s) => s.clone(),
+                Value::Symbol(s) => s.name.clone(),
+                _ => return Err("(whenever \"changed\" \"sig\" ...) signal name expected".to_string()),
+            };
+            if let Some(trace) = {
+                let t = traces.read().unwrap_or_else(|e| e.into_inner());
+                t.first_trace().map(|tr| (tr.id().clone(), tr.signals()))
+            } {
+                let (tid, sigs) = trace;
+                let (resolved, _candidates) = fuzzy_match_signal(&sig_name, &sigs);
+                if let Some(resolved) = resolved {
+                    if let Ok(indices) = {
+                        let t = traces.read().unwrap_or_else(|e| e.into_inner());
+                        t.find_indices(resolved, FindCondition::Changed)
+                    } {
+                        for &idx in &indices {
+                            {
+                                let mut t = traces.write().unwrap_or_else(|e| e.into_inner());
+                                let _ = t.set_index(&tid, idx);
+                            }
+                            if eval.eval_value_public(cond.clone())?.is_truthy() {
+                                for b in body {
+                                    result = eval.eval_value_public(b.clone())?;
+                                }
+                            }
+                        }
+                        // Restore original indices
+                        {
+                            let mut t = traces.write().unwrap_or_else(|e| e.into_inner());
+                            for (tid, &idx) in tids.iter().zip(prev_idx_values.iter()) {
+                                let _ = t.set_index(tid, idx);
+                            }
+                        }
+                        return Ok(result);
+                    }
+                }
+            }
+            let _ = cond;
+            return Err(format!("whenever \"changed\": signal '{}' not found.", sig_name));
+        }
 
         // Fast path: try simple condition (= (get "sig") val) → use find_indices
         if let Some((sig_name, target)) = parse_simple_condition(cond) {
@@ -499,8 +559,22 @@ fn parse_simple_condition(expr: &Value) -> Option<(String, i64)> {
 }
 
 fn op_get(args: &[Value], env: &mut Environment, _eval: &mut Evaluator) -> Result<Value, String> {
-    ensure_arity(args, 1)?;
+    // (get "sig")          full value at current INDEX
+    // (get "sig" hi lo)    bit slice [hi:lo] inclusive (MSB hi, LSB lo)
+    if args.len() != 1 && args.len() != 3 {
+        return Err("(get \"sig\") or (get \"sig\" hi lo) expected".to_string());
+    }
     let name = extract_name(&args[0])?;
+    let (hi, lo) = if args.len() == 3 {
+        let hi_v = extract_int(&args[1])?;
+        let lo_v = extract_int(&args[2])?;
+        if hi_v < lo_v || lo_v < 0 || hi_v > 63 {
+            return Err(format!("invalid bit slice [{}:{}]", hi_v, lo_v));
+        }
+        (hi_v as u32, lo_v as u32)
+    } else {
+        (63, 0)
+    };
 
     // Try exact candidates with scope/group prepended
     let candidates = [
@@ -514,7 +588,7 @@ fn op_get(args: &[Value], env: &mut Environment, _eval: &mut Evaluator) -> Resul
         if let Some(trace) = traces.first_trace() {
             for candidate in &candidates {
                 match trace.signal_value(candidate, trace.index()) {
-                    Ok(sv) => return Ok(scalar_to_value(sv)),
+                    Ok(sv) => return Ok(slice_value(sv, hi, lo)),
                     Err(_) => continue,
                 }
             }
@@ -527,7 +601,7 @@ fn op_get(args: &[Value], env: &mut Environment, _eval: &mut Evaluator) -> Resul
             }
             if let Some(matched) = matched {
                 if let Ok(sv) = trace.signal_value(matched, trace.index()) {
-                    return Ok(scalar_to_value(sv));
+                    return Ok(slice_value(sv, hi, lo));
                 }
             }
             let preview: Vec<&str> = sigs.iter().take(5).map(|s| s.as_str()).collect();
@@ -536,6 +610,38 @@ fn op_get(args: &[Value], env: &mut Environment, _eval: &mut Evaluator) -> Resul
         }
     }
     Err(format!("signal '{}' not found.", name))
+}
+
+/// Bit-slice a ScalarValue: extract bits [hi:lo] (inclusive, MSB=hi).
+fn slice_value(sv: ScalarValue, hi: u32, lo: u32) -> Value {
+    if hi == 63 && lo == 0 {
+        return scalar_to_value(sv);
+    }
+    match sv {
+        ScalarValue::Bit(b) => {
+            if lo == 0 {
+                Value::Int(if b == b'1' { 1 } else { 0 })
+            } else {
+                Value::Int(0)
+            }
+        }
+        ScalarValue::Vector(v) => {
+            // v[0] is the MSB of the signal (same convention as wal's to_int)
+            let width = v.len() as u32;
+            if lo >= width {
+                return Value::Int(0);
+            }
+            let h = hi.min(width - 1);
+            let mut acc: i64 = 0;
+            for bit in (lo..=h).rev() {
+                let idx = (width - 1 - bit) as usize;
+                let b = *v.get(idx).unwrap_or(&b'0');
+                acc = (acc << 1) | if b == b'1' { 1 } else { 0 };
+            }
+            Value::Int(acc)
+        }
+        ScalarValue::Real(r) => Value::Float(r),
+    }
 }
 
 fn op_releval(args: &[Value], env: &mut Environment, eval: &mut Evaluator) -> Result<Value, String> {
@@ -828,13 +934,35 @@ fn op_is_z(args: &[Value], env: &mut Environment, _eval: &mut Evaluator) -> Resu
 fn op_changes(args: &[Value], env: &mut Environment, _eval: &mut Evaluator) -> Result<Value, String> {
     ensure_arity(args, 1)?;
     let name = extract_name(&args[0])?;
-    match edge_value(&name, env)? {
-        Some((cur, prev)) => match (cur, prev) {
-            (Some(c), Some(p)) => Ok(Value::Bool(c != p)),
-            _ => Ok(Value::Bool(false)),
-        },
-        None => Ok(Value::Bool(false)),
+    if let Some(traces) = env.get_traces() {
+        let traces = traces.read().unwrap_or_else(|e| e.into_inner());
+        if let Some(trace) = traces.first_trace() {
+            let idx = trace.index();
+            if idx == 0 {
+                return Ok(Value::Bool(false));
+            }
+            // same resolution as (get): exact candidates + fuzzy fallback
+            let resolved = {
+                let sigs = trace.signals();
+                let candidates = [
+                    name.clone(),
+                    format!("{}{}", env.get_scope(), name),
+                    format!("{}{}", env.get_group(), name),
+                ];
+                candidates.iter().find(|c| sigs.iter().any(|s| s == *c))
+                    .cloned()
+                    .or_else(|| fuzzy_match_signal(&name, &sigs).0.cloned())
+                    .unwrap_or(name.clone())
+            };
+            let cur = trace.signal_value(&resolved, idx).ok();
+            let prev = trace.signal_value(&resolved, idx - 1).ok();
+            // whole-value comparison (vectors included)
+            if let (Some(c), Some(p)) = (cur, prev) {
+                return Ok(Value::Bool(c != p));
+            }
+        }
     }
+    Ok(Value::Bool(false))
 }
 
 fn op_signal_p(args: &[Value], env: &mut Environment, _eval: &mut Evaluator) -> Result<Value, String> {
