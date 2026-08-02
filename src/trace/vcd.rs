@@ -114,9 +114,16 @@ impl VcdTrace {
                 Some(l) => l, None => break,
             };
             if line.is_empty() { continue; }
-            if line[0] == b'$' {
-                if line.len() > 4 && line[1] == b'v' && line[2] == b'a' && line[3] == b'r' {
-                    if let Some((sig_hash, short_name, width, id_bytes, is_event)) = parse_var_decl_fast2(line) {
+            // Verilator 等工具生成的 VCD header 行首带缩进空白（" $scope..."），
+            // 先跳过空白再匹配 $ 指令，否则 header 全部被跳过导致 0 信号
+            let mut ls = 0;
+            while ls < line.len() && (line[ls] == b' ' || line[ls] == b'\t') {
+                ls += 1;
+            }
+            let hl = &line[ls..];
+            if !hl.is_empty() && hl[0] == b'$' {
+                if hl.len() > 4 && hl[1] == b'v' && hl[2] == b'a' && hl[3] == b'r' {
+                    if let Some((sig_hash, short_name, width, id_bytes, is_event)) = parse_var_decl_fast2(hl) {
                         let idx = signals.len() as u32;
                         // Build full hierarchical name from scope stack
                         let full_name = if scope_stack.is_empty() {
@@ -131,16 +138,16 @@ impl VcdTrace {
                         signal_widths.insert(idx, width);
                         if is_event { event_signals.insert(idx); }
                     }
-                } else if line.starts_with(b"$scope") {
+                } else if hl.starts_with(b"$scope") {
                     // $scope module name $end → push scope name
-                    if let Some(scope_name) = parse_scope_name(line) {
+                    if let Some(scope_name) = parse_scope_name(hl) {
                         scope_stack.push(scope_name);
                         scopes.push(scope_stack.join("."));
                     }
-                } else if line.starts_with(b"$upscope") {
+                } else if hl.starts_with(b"$upscope") {
                     scope_stack.pop();
-                } else if line.starts_with(b"$enddefinitions") {
-                    header_end_offset = line_offset + line.len() as u64 + 1;
+                } else if hl.starts_with(b"$enddefinitions") {
+                    header_end_offset = line_offset + hl.len() as u64 + 1;
                     break;
                 }
             }
@@ -1116,12 +1123,22 @@ fn find_cond_matches(val: &VcdValue, prev_bit: Option<u8>, cond: &FindCondition)
         FindCondition::Low => val.as_bit() == Some(b'0'),
         FindCondition::Value(v) => {
             let bit = val.as_bit();
-            bit == Some(*v) || (bit == Some(b'1') && *v == 1) || (bit == Some(b'0') && *v == 0)
+            if bit.is_some() {
+                bit == Some(*v) || (bit == Some(b'1') && *v == 1) || (bit == Some(b'0') && *v == 0)
+            } else {
+                // Vector signal: compare as integer (e.g. 4-bit "0001" == 1)
+                val.to_i64() == Some(*v as i64)
+            }
         }
         FindCondition::ValueI64(target) => val.to_i64() == Some(*target),
         FindCondition::Neq(v) => {
             let bit = val.as_bit();
-            !(bit == Some(*v) || (bit == Some(b'1') && *v == 1) || (bit == Some(b'0') && *v == 0))
+            if bit.is_some() {
+                !(bit == Some(*v) || (bit == Some(b'1') && *v == 1) || (bit == Some(b'0') && *v == 0))
+            } else {
+                // Vector signal: compare as integer
+                val.to_i64() != Some(*v as i64)
+            }
         }
         FindCondition::NeqI64(target) => val.to_i64() != Some(*target),
     }
