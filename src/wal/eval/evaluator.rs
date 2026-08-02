@@ -1601,7 +1601,13 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
         if args.len() < 2 {
             return Err("whenever expects at least 2 arguments".to_string());
         }
-        let body_args: Vec<Value> = args[1..].to_vec();
+        // Changed mode: (whenever "changed" "sig" COND BODY...) — iterate only
+        // over timestamps where "sig" changes value (edge-triggered sampling).
+        let changed_mode = matches!(&args[0], Value::String(s) if s == "changed");
+        if changed_mode && args.len() < 3 {
+            return Err("(whenever \"changed\" \"sig\" COND BODY...) expected".to_string());
+        }
+        let body_args: Vec<Value> = if changed_mode { args[3..].to_vec() } else { args[1..].to_vec() };
 
         let saved: Vec<(String, usize)>;
         let traces_ids: Vec<String>;
@@ -1610,6 +1616,44 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
             saved = traces_ids.iter().filter_map(|tid| t.get(tid).map(|tr| (tid.clone(), tr.index()))).collect();
         } else {
             return Ok(Value::Nil);
+        }
+
+        // Changed-mode fast path: iterate over the signal's change points.
+        if changed_mode {
+            let sig_name = match &args[1] {
+                Value::String(s) => s.clone(),
+                Value::Symbol(s) => s.name.clone(),
+                _ => return Err("whenever \"changed\": signal name expected".to_string()),
+            };
+            let all_indices: Vec<usize> = {
+                let t = self.traces.read().unwrap_or_else(|e| e.into_inner());
+                traces_ids.iter().filter_map(|tid| {
+                    t.get(tid).and_then(|tr| {
+                        let resolved = resolve_signal_name(&sig_name, &tr.signals())
+                            .unwrap_or_else(|| sig_name.clone());
+                        tr.find_indices(&resolved, FindCondition::Changed).ok()
+                    })
+                }).flatten().collect()
+            };
+            let mut result = Value::Nil;
+            for &idx in &all_indices {
+                if let Ok(mut t) = self.traces.write() {
+                    for tid in &traces_ids {
+                        let _ = t.set_index(tid, idx);
+                    }
+                }
+                if self.eval_value(args[2].clone())?.is_truthy() {
+                    for b in &body_args {
+                        result = self.eval_value(b.clone())?;
+                    }
+                }
+            }
+            for (tid, idx) in &saved {
+                if let Ok(mut t) = self.traces.write() {
+                    let _ = t.set_index(tid, *idx);
+                }
+            }
+            return Ok(result);
         }
 
         // Fast path: try simple condition (= (get "sig") val), (!= ...), (not (= ...))

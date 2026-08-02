@@ -364,6 +364,9 @@ fn op_whenever(args: &[Value], env: &mut Environment, eval: &mut Evaluator) -> R
             } {
                 let (tid, sigs) = trace;
                 let (resolved, _candidates) = fuzzy_match_signal(&sig_name, &sigs);
+                if std::env::var("WAL_DEBUG_FIND").is_ok() {
+                    eprintln!("whenever changed: sig={} resolved={:?} sigs_len={}", sig_name, resolved, sigs.len());
+                }
                 if let Some(resolved) = resolved {
                     if let Ok(indices) = {
                         let t = traces.read().unwrap_or_else(|e| e.into_inner());
@@ -568,12 +571,12 @@ fn op_get(args: &[Value], env: &mut Environment, _eval: &mut Evaluator) -> Resul
     let (hi, lo) = if args.len() == 3 {
         let hi_v = extract_int(&args[1])?;
         let lo_v = extract_int(&args[2])?;
-        if hi_v < lo_v || lo_v < 0 || hi_v > 63 {
+        if hi_v < lo_v || lo_v < 0 || hi_v > 1023 {
             return Err(format!("invalid bit slice [{}:{}]", hi_v, lo_v));
         }
         (hi_v as u32, lo_v as u32)
     } else {
-        (63, 0)
+        (1023, 0)
     };
 
     // Try exact candidates with scope/group prepended
