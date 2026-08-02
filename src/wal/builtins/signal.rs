@@ -561,13 +561,21 @@ fn parse_simple_condition(expr: &Value) -> Option<(String, i64)> {
     None
 }
 
-fn op_get(args: &[Value], env: &mut Environment, _eval: &mut Evaluator) -> Result<Value, String> {
+fn op_get(args: &[Value], env: &mut Environment, eval: &mut Evaluator) -> Result<Value, String> {
     // (get "sig")          full value at current INDEX
     // (get "sig" hi lo)    bit slice [hi:lo] inclusive (MSB hi, LSB lo)
     if args.len() != 1 && args.len() != 3 {
         return Err("(get \"sig\") or (get \"sig\" hi lo) expected".to_string());
     }
     let name = extract_name(&args[0])?;
+
+    // Check virtual signals first
+    if env.is_virtual_signal(&name) {
+        if let Some(expr) = env.lookup(&name) {
+            return eval.eval_value_public(expr);
+        }
+    }
+
     let (hi, lo) = if args.len() == 3 {
         let hi_v = extract_int(&args[1])?;
         let lo_v = extract_int(&args[2])?;
@@ -578,6 +586,13 @@ fn op_get(args: &[Value], env: &mut Environment, _eval: &mut Evaluator) -> Resul
     } else {
         (1023, 0)
     };
+
+    // Check virtual signals first
+    if env.is_virtual_signal(&name) {
+        if let Some(expr) = env.lookup(&name) {
+            return eval.eval_value_public(expr);
+        }
+    }
 
     // Try exact candidates with scope/group prepended
     let candidates = [

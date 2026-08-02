@@ -54,6 +54,7 @@ lru = "0.12"
 # Parallel processing
 rayon = "1.10"
 num_cpus = "1.16"
+wellen = "0.20.5"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"

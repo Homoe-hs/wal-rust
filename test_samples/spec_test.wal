@@ -393,6 +393,28 @@
 (defsig v_clk (get "counter_tb.clk"))
 (print "  virtual signals: " VIRTUAL-SIGNALS)
 
+;; Verify bare symbol access
+(set-index 0)
+(assert-equal (get "counter_tb.clk") v_clk "v_clk should match clk at index 0")
+
+;; Verify dynamic evaluation: step changes v_clk value
+(step 1)
+(assert-equal (get "counter_tb.clk") v_clk "v_clk should track clk after step")
+
+;; Verify VIRTUAL-SIGNALS contains the virtual signal name
+(define vsigs (VIRTUAL-SIGNALS))
+(assert-equal (length vsigs) 1 "should have 1 virtual signal")
+(assert-equal (first vsigs) "v_clk" "virtual signal name should be v_clk")
+
+;; Verify conditional expressions in defsig
+(defsig v_high (> (get "counter_tb.count [7:0]") 200))
+(set-index 100)
+(define cnt200 (get "counter_tb.count [7:0]"))
+(print "  at idx=100: count=" cnt200 " v_high=" v_high)
+(set-index 0)
+(define cnt0 (get "counter_tb.count [7:0]"))
+(print "  at idx=0: count=" cnt0 " v_high=" v_high)
+
 ;; ================================================================
 ;; SUMMARY
 ;; ================================================================
