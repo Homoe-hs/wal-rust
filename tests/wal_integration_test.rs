@@ -1,4 +1,6 @@
 use std::path::Path;
+mod common;
+use common::*;
 use wal_rust::trace::{Trace, VcdTrace, ScalarValue, TraceContainer, FindCondition};
 
 fn load(vcd: &str) -> VcdTrace {
@@ -23,7 +25,7 @@ fn sig_val(t: &VcdTrace, name: &str, idx: usize) -> u8 {
 
 #[test]
 fn test_count_single_clk() {
-    let t = load("test_data/counter.vcd");
+    let t = load(&counter_vcd_path().to_string_lossy());
     let r = resolve(&t, "counter_tb.clk");
     let n = t.find_indices(&r, FindCondition::Value(1)).unwrap().len();
     assert!(n > 0);
@@ -31,7 +33,7 @@ fn test_count_single_clk() {
 
 #[test]
 fn test_count_neq_equals_eq() {
-    let t = load("test_data/counter.vcd");
+    let t = load(&counter_vcd_path().to_string_lossy());
     let r = resolve(&t, "counter_tb.clk");
     let eq = t.find_indices(&r, FindCondition::Value(1)).unwrap().len();
     let neq = t.find_indices(&r, FindCondition::Neq(0)).unwrap().len();
@@ -40,7 +42,7 @@ fn test_count_neq_equals_eq() {
 
 #[test]
 fn test_count_and_intersection() {
-    let t = load("test_data/counter.vcd");
+    let t = load(&counter_vcd_path().to_string_lossy());
     let c = resolve(&t, "counter_tb.clk");
     let r_name = resolve(&t, "counter_tb.rst");
     let ci: std::collections::HashSet<usize> =
@@ -55,7 +57,7 @@ fn test_count_and_intersection() {
 
 #[test]
 fn test_find_rising_edge() {
-    let t = load("test_data/counter.vcd");
+    let t = load(&counter_vcd_path().to_string_lossy());
     let r = resolve(&t, "counter_tb.clk");
     let idxs = t.find_indices(&r, FindCondition::Rising).unwrap();
     assert!(!idxs.is_empty());
@@ -65,7 +67,7 @@ fn test_find_rising_edge() {
 
 #[test]
 fn test_step_increases_index() {
-    let mut t = load("test_data/counter.vcd");
+    let mut t = load(&counter_vcd_path().to_string_lossy());
     assert_eq!(t.index(), 0);
     t.step(100).unwrap();
     assert_eq!(t.index(), 100);
@@ -75,7 +77,7 @@ fn test_step_increases_index() {
 
 #[test]
 fn test_signal_value_after_step() {
-    let mut t = load("test_data/counter.vcd");
+    let mut t = load(&counter_vcd_path().to_string_lossy());
     let r = resolve(&t, "counter_tb.clk");
     let v0 = sig_val(&t, &r, 0);
     assert_eq!(v0, b'0', "clk[0]=0");
@@ -88,27 +90,27 @@ fn test_signal_value_after_step() {
 
 #[test]
 fn test_signals_list_not_empty() {
-    let t = load("test_data/counter.vcd");
+    let t = load(&counter_vcd_path().to_string_lossy());
     let sigs = t.signals();
     assert_eq!(sigs.len(), 6);
 }
 
 #[test]
 fn test_signal_width() {
-    let t = load("test_data/counter.vcd");
+    let t = load(&counter_vcd_path().to_string_lossy());
     let r = resolve(&t, "counter_tb.clk");
     assert_eq!(t.signal_width(&r).unwrap(), 1);
 }
 
 #[test]
 fn test_max_index() {
-    let t = load("test_data/counter.vcd");
+    let t = load(&counter_vcd_path().to_string_lossy());
     assert_eq!(t.max_index(), 522);
 }
 
 #[test]
 fn test_first_signal() {
-    let t = load("test_data/counter.vcd");
+    let t = load(&counter_vcd_path().to_string_lossy());
     assert_eq!(t.signals()[0], "counter_tb.count [7:0]");
 }
 
@@ -159,7 +161,7 @@ fn test_hash_signal_in_value_data() {
 
 #[test]
 fn test_strobe_toggle_boundaries() {
-    let p = Path::new("test_data/test_pyvcd_100M.vcd");
+    let p = &pyvcd_vcd_path();
     if !p.exists() { return; }
     let t = load(p.to_str().unwrap());
     let sigs = t.signals();
@@ -176,37 +178,37 @@ fn test_strobe_toggle_boundaries() {
 
 #[test]
 fn test_edge_cases_load() {
-    let t = load("test_data/edge_cases.vcd");
+    let t = load(&edge_cases_path().to_string_lossy());
     assert!(!t.signals().is_empty());
 }
 
 #[test]
 fn test_real_values_load() {
-    let t = load("test_data/edge_real_values.vcd");
+    let t = load(&edge_real_values_path().to_string_lossy());
     assert!(!t.signals().is_empty());
 }
 
 #[test]
 fn test_multi_scope_load() {
-    let t = load("test_data/edge_multi_scope.vcd");
+    let t = load(&edge_multi_scope_path().to_string_lossy());
     assert!(!t.signals().is_empty());
 }
 
 #[test]
 fn test_large_vectors_load() {
-    let t = load("test_data/edge_large_vectors.vcd");
+    let t = load(&edge_large_vectors_path().to_string_lossy());
     assert!(!t.signals().is_empty());
 }
 
 #[test]
 fn test_empty_time_load() {
-    let t = load("test_data/edge_empty_time.vcd");
+    let t = load(&edge_empty_time_path().to_string_lossy());
     assert!(t.signals().len() >= 2);
 }
 
 #[test]
 fn test_no_signals_load() {
-    let t = load("test_data/edge_no_signals.vcd");
+    let t = load(&edge_no_signals_path().to_string_lossy());
     assert!(t.signals().is_empty());
 }
 
@@ -217,8 +219,8 @@ fn test_container_load_multiple() {
     let mut c = TraceContainer::new();
     let a = "a".to_string();
     let b = "b".to_string();
-    assert!(c.load(Path::new("test_data/counter.vcd"), a.clone()).is_ok());
-    assert!(c.load(Path::new("test_data/edge_cases.vcd"), b.clone()).is_ok());
+    assert!(c.load(&counter_vcd_path(), a.clone()).is_ok());
+    assert!(c.load(&edge_cases_path(), b.clone()).is_ok());
     assert!(c.get(&a).is_some());
     assert!(c.get(&b).is_some());
     let all = c.all_signals();
@@ -229,7 +231,7 @@ fn test_container_load_multiple() {
 fn test_container_unload() {
     let mut c = TraceContainer::new();
     let x = "x".to_string();
-    c.load(Path::new("test_data/counter.vcd"), x.clone()).unwrap();
+    c.load(&counter_vcd_path(), x.clone()).unwrap();
     assert!(c.get(&x).is_some());
     c.unload(&x).unwrap();
     assert!(c.get(&x).is_none());
@@ -239,7 +241,7 @@ fn test_container_unload() {
 
 #[test]
 fn test_find_indices_then_signal_value() {
-    let t = load("test_data/counter.vcd");
+    let t = load(&counter_vcd_path().to_string_lossy());
     let r = resolve(&t, "counter_tb.clk");
 
     let idxs = t.find_indices(&r, FindCondition::Rising).unwrap();
@@ -251,7 +253,7 @@ fn test_find_indices_then_signal_value() {
 
 #[test]
 fn test_neq_consistency_multiple_signals() {
-    let t = load("test_data/counter.vcd");
+    let t = load(&counter_vcd_path().to_string_lossy());
     let sigs = t.signals();
     for name in &["counter_tb.clk", "counter_tb.rst", "counter_tb.uut.clk"] {
         let r = resolve(&t, name);
@@ -268,7 +270,7 @@ fn test_virtual_signal_bare_symbol() {
     use wal_rust::wal::eval::Evaluator;
     use wal_rust::wal::ast::Value;
     let mut eval = Evaluator::new();
-    eval.load_trace("test_data/counter.vcd", "test").unwrap();
+    eval.load_trace(&counter_vcd_path().to_string_lossy(), "test").unwrap();
 
     eval.eval("(defsig v_clk (get \"counter_tb.clk\"))").unwrap();
     let val = eval.eval("v_clk").unwrap();
@@ -284,7 +286,7 @@ fn test_virtual_signal_get() {
     use wal_rust::wal::eval::Evaluator;
     use wal_rust::wal::ast::Value;
     let mut eval = Evaluator::new();
-    eval.load_trace("test_data/counter.vcd", "test").unwrap();
+    eval.load_trace(&counter_vcd_path().to_string_lossy(), "test").unwrap();
 
     eval.eval("(defsig v_clk (get \"counter_tb.clk\"))").unwrap();
     let val = eval.eval("(get \"v_clk\")").unwrap();
@@ -300,7 +302,7 @@ fn test_virtual_signals_list() {
     use wal_rust::wal::eval::Evaluator;
     use wal_rust::wal::ast::Value;
     let mut eval = Evaluator::new();
-    eval.load_trace("test_data/counter.vcd", "test").unwrap();
+    eval.load_trace(&counter_vcd_path().to_string_lossy(), "test").unwrap();
 
     eval.eval("(defsig v_a (get \"counter_tb.clk\"))").unwrap();
     eval.eval("(defsig v_b (get \"counter_tb.rst\"))").unwrap();
@@ -316,7 +318,7 @@ fn test_virtual_signal_conditional_expr() {
     use wal_rust::wal::eval::Evaluator;
     use wal_rust::wal::ast::Value;
     let mut eval = Evaluator::new();
-    eval.load_trace("test_data/counter.vcd", "test").unwrap();
+    eval.load_trace(&counter_vcd_path().to_string_lossy(), "test").unwrap();
 
     // defsig with a comparison (> count 200)
     eval.eval("(defsig v_high (> (get \"counter_tb.count [7:0]\") 200))").unwrap();

@@ -9,6 +9,7 @@
 pub mod cli;
 pub mod fst;
 pub mod vcd;
+pub mod tests_fixtures;
 pub mod wal;
 pub mod trace;
 

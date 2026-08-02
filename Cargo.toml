@@ -1,9 +1,9 @@
 [package]
 name = "wal-rust"
-version = "0.10.10"
+version = "0.11.0"
 authors = ["He Sheng && Deepseek"]
 edition = "2021"
-rust-version = "1.70"
+rust-version = "1.90"
 description = "WAL: Waveform Analysis Language - High-performance parser, REPL, and waveform tools"
 license = "MIT OR Apache-2.0"
 repository = ""

@@ -180,13 +180,39 @@ b11110000 #
 
     #[test]
     fn test_real_vcd_counter() {
-        let vcd_path = Path::new("test_data/counter.vcd");
-        if !vcd_path.exists() { return; }
+        // Self-contained counter waveform (same contract as test_data/counter.vcd)
+        let vcd = "$timescale 1ns $end\n\
+                   $scope module counter_tb $end\n\
+                   $var wire 8 ! count [7:0] $end\n\
+                   $var wire 1 # clk $end\n\
+                   $var wire 1 $ rst $end\n\
+                   $scope module uut $end\n\
+                   $var wire 1 % clk $end\n\
+                   $upscope $end\n\
+                   $upscope $end\n\
+                   $enddefinitions $end\n\
+                   $dumpvars\n\
+                   #0\n\
+                   b00000000 !\n\
+                   0#\n\
+                   1$\n\
+                   $end\n\
+                   #10\n\
+                   1#\n\
+                   b00000001 !\n\
+                   0$\n\
+                   $end\n\
+                   #20\n\
+                   0#\n\
+                   b00000010 !\n\
+                   $end\n";
+        let vcd_path = std::env::temp_dir().join("test_counter_embedded.vcd");
+        std::fs::write(&vcd_path, vcd).unwrap();
 
         let fst_path = std::env::temp_dir().join("test_counter_real.fst");
         let resume = std::env::temp_dir().join("test_counter_real.resume");
         let progress = Arc::new(AtomicU64::new(0));
-        vcd_to_fst_streaming(vcd_path, &fst_path, &resume, progress).unwrap();
+        vcd_to_fst_streaming(&vcd_path, &fst_path, &resume, progress).unwrap();
 
         let reader = FstReader::from_path(&fst_path).unwrap();
         let names: std::collections::HashSet<&str> =
@@ -194,7 +220,9 @@ b11110000 #
         assert!(names.contains("counter_tb.count [7:0]"), "count signal");
         assert!(names.contains("counter_tb.clk"), "clk signal");
         assert!(names.contains("counter_tb.rst"), "rst signal");
+        assert!(names.contains("counter_tb.uut.clk"), "uut clk signal");
 
+        let _ = std::fs::remove_file(&vcd_path);
         let _ = std::fs::remove_file(&fst_path);
         let _ = std::fs::remove_file(&resume);
     }
