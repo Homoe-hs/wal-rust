@@ -100,8 +100,8 @@ pub enum VarType {
     VcdReg = 5,
     /// VCD port
     VcdPort = 18,
-    /// Integer
-    Integer = 29,
+    /// VCD integer (FST_VT_VCD_INTEGER = 1)
+    Integer = 1,
     /// Real number
     Real = 3,
     /// String
@@ -110,7 +110,7 @@ pub enum VarType {
     SvBit = 22,
     /// SystemVerilog logic
     SvLogic = 23,
-    /// SystemVerilog integer
+    /// SystemVerilog integer (FST_VT_SV_INT = 24)
     SvInt = 24,
 }
 

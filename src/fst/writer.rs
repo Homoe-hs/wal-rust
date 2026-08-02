@@ -6,8 +6,7 @@
 //! - Scope hierarchy
 //! - Value change emission
 
-use super::blocks::{encode_scope_entry, BlockWriter};
-use super::compress::{get_compressor, Compressor};
+use super::blocks::BlockWriter;
 use super::types::{BlockType, Compression, FstHeader, ScopeType, SignalDecl, VarType};
 use super::varint::{encode_varint, encode_fst_svarint};
 use std::collections::BTreeMap;
@@ -19,6 +18,13 @@ struct BlockEntry {
     handle: u32,
     time_idx: u32,
     value: Vec<u8>,
+}
+
+/// Standard FST hierarchy entry, recorded in emission order (per fstapi)
+enum HierEvent {
+    Scope { scope_type: ScopeType, name: String },
+    Upscope,
+    Var { name: String, width: u32, var_type: VarType },
 }
 
 /// FST_RCV_STR — lookup for multi-state values, from fstapi.c
@@ -59,13 +65,18 @@ pub struct FstStats {
 pub struct FstWriter<W: Write> {
     writer: BufWriter<W>,
     opts: FstOptions,
-    compressor: Box<dyn Compressor>,
 
     // File state
     header: FstHeader,
     scopes: Vec<String>,
     signals: Vec<SignalDecl>,
     name_to_handle: BTreeMap<String, u32>,
+    /// Standard hierarchy entries (scopes + vars) in emission order
+    hier_events: Vec<HierEvent>,
+    /// Current value per signal (for checkpoints), updated on emit
+    current_values: Vec<Vec<u8>>,
+    /// Value snapshot at the start of the current block (checkpoint data)
+    block_checkpoint: Vec<Vec<u8>>,
 
     // Current block being built (0x08 VcDataDynAlias2 format)
     block_timestamps: Vec<u64>,
@@ -92,15 +103,16 @@ impl FstWriter<File> {
 impl<W: Write> FstWriter<W> {
     /// Create from an existing writer
     pub fn from_writer(writer: W, opts: FstOptions) -> Result<Self> {
-        let compressor = get_compressor(opts.compression);
         let mut w = Self {
             writer: BufWriter::new(writer),
             opts: opts.clone(),
-            compressor,
             header: FstHeader::default(),
             scopes: Vec::new(),
             signals: Vec::new(),
             name_to_handle: BTreeMap::new(),
+            hier_events: Vec::new(),
+            current_values: Vec::new(),
+            block_checkpoint: Vec::new(),
             block_timestamps: Vec::with_capacity(1024 * 1024 / 32),
             block_entries: Vec::with_capacity(1024 * 1024 / 16),
             current_block_time_begin: 0,
@@ -132,6 +144,14 @@ impl<W: Write> FstWriter<W> {
             var_type: vartype,
             direction: 0,
         });
+        self.hier_events.push(HierEvent::Var {
+            name: name.to_string(),
+            width,
+            var_type: vartype,
+        });
+        // Initial value per fstapi: all-x
+        self.current_values.push(vec![b'x'; width as usize]);
+        self.block_checkpoint.push(vec![b'x'; width as usize]);
 
         handle
     }
@@ -142,13 +162,18 @@ impl<W: Write> FstWriter<W> {
     }
 
     /// Push a scope onto the hierarchy
-    pub fn push_scope(&mut self, name: &str, _st: ScopeType) {
+    pub fn push_scope(&mut self, name: &str, st: ScopeType) {
         self.scopes.push(name.to_string());
+        self.hier_events.push(HierEvent::Scope {
+            scope_type: st,
+            name: name.to_string(),
+        });
     }
 
     /// Pop the current scope
     pub fn pop_scope(&mut self) {
         self.scopes.pop();
+        self.hier_events.push(HierEvent::Upscope);
     }
 
     /// Set the timescale exponent (10^n seconds)
@@ -187,10 +212,32 @@ impl<W: Write> FstWriter<W> {
     #[inline]
     pub fn emit_value_change(&mut self, handle: u32, value: &[u8]) {
         let time_idx = self.current_time_idx();
+        // Normalize to the declared width (VCD semantics: value is left-padded with '0')
+        let width = self.signals
+            .get(handle.saturating_sub(1) as usize)
+            .map(|s| s.width as usize)
+            .unwrap_or_else(|| value.len());
+        let mut v = value.to_vec();
+        if v.len() < width {
+            let mut padded = vec![b'0'; width - v.len()];
+            padded.extend_from_slice(&v);
+            v = padded;
+        } else if v.len() > width {
+            v.drain(..v.len() - width);
+        }
+
+        // Snapshot the checkpoint at the start of each block
+        if self.block_entries.is_empty() {
+            self.block_checkpoint = self.current_values.clone();
+        }
+        if let Some(cur) = self.current_values.get_mut(handle.saturating_sub(1) as usize) {
+            *cur = v.clone();
+        }
+
         self.block_entries.push(BlockEntry {
             handle,
             time_idx,
-            value: value.to_vec(),
+            value: v,
         });
         self.value_changes_count += 1;
 
@@ -283,11 +330,18 @@ impl<W: Write> FstWriter<W> {
                     }
                     chain_raw[h].extend_from_slice(&packed);
                 } else {
-                    // Non-binary vector: LSB=1, tdelta=vli>>1, then varint(len)+literal
+                    // Non-binary vector: LSB=1, tdelta=vli>>1, then exactly `width` literal chars
+                    // (per fstapi: the value is written raw, no length prefix)
                     let vli = (tdelta as u64) << 1 | 1;
                     chain_raw[h].extend_from_slice(&encode_varint(vli));
-                    chain_raw[h].extend_from_slice(&encode_varint(val.len() as u64));
-                    chain_raw[h].extend_from_slice(val);
+                    let mut v = val.clone();
+                    if v.len() < width as usize {
+                        let mut padded = vec![b'0'; width as usize - v.len()];
+                        padded.extend_from_slice(&v);
+                        v = padded;
+                    }
+                    v.truncate(width as usize);
+                    chain_raw[h].extend_from_slice(&v);
                 }
             }
         }
@@ -312,7 +366,8 @@ impl<W: Write> FstWriter<W> {
             };
             let destlen = raw.len() as u64;
 
-            chain_offsets[h] = chain_data_area.len() as u64;
+            // Offsets are relative to vc_start (the packtype byte occupies offset 0)
+            chain_offsets[h] = chain_data_area.len() as u64 + 1;
             let dest_buf = encode_varint(destlen);
             chain_data_area.extend_from_slice(&dest_buf);
             chain_data_area.extend_from_slice(&compressed);
@@ -320,36 +375,25 @@ impl<W: Write> FstWriter<W> {
         }
 
         // -- 3. Index table (DYNALIAS2) --
+        // One entry per signal handle (1..=max_handle), per fstapi fstWriterFlushContextPrivate:
+        //   even (LSB=0) = skip N handles with no data: varint(N << 1)
+        //   odd + positive = chain offset delta: svarint((delta << 1) | 1)
+        //   odd + zero = repeat previous alias: svarint(1)
+        //   odd + negative = alias: svarint(((-alias-1) << 1) | 1)
+        // Signed varints are sign-extended LEB128.
         let mut idx_buf = Vec::new();
-        // We need to handle max_handle + 1 entries
-        let idx_limit = (max_handle as usize).min(chain_offsets.len() - 1);
         let mut pval: u64 = 0;
-        // Note: dynalias2 uses an accumulator where the indices alternate
-        // between "skip" (even) and "chain" (odd) encoded entries.
-        // Simple approach: emit one entry per handle, using even=skip, odd=chain
-
-        // Actually, for a simpler approach, let me iterate and emit per-handle.
-        // We need the three varint types described by DYNALIAS2:
-        //   even (LSB=0) = skip N handles: encode_fst_svarint((N << 1) as i64)
-        //   odd + positive(LSB=1, val>0) = real chain: encode_fst_svarint(((delta) << 1) | 1)
-        //   odd + negative(LSB=1, val<0) = alias: encode_fst_svarint(((-alias_idx-1) << 1) | 1)
-        //   odd + zero(LSB=1, val=0) = prev_alias repeat: encode_fst_svarint(1) ??
-
-        // Let me implement a simplified version: no skip, emit one entry per handle
-        // For handles with data: chain delta offset
-        // For handles without: skip entry
-
-        let mut h = 0usize;
-        while h <= idx_limit {
+        let mut h = 1usize; // handles are 1-based
+        while h <= max_h {
             if !chain_has_data[h] {
                 // Skip: count how many consecutive handles without data
                 let mut skip = 0usize;
-                while h <= idx_limit && !chain_has_data[h] {
+                while h <= max_h && !chain_has_data[h] {
                     skip += 1;
                     h += 1;
                 }
                 if skip > 0 {
-                    idx_buf.extend_from_slice(&encode_fst_svarint((skip as i64) << 1));
+                    idx_buf.extend_from_slice(&encode_varint((skip as u64) << 1));
                 }
                 continue;
             }
@@ -358,8 +402,6 @@ impl<W: Write> FstWriter<W> {
             pval = chain_offsets[h];
             let sval = (raw_delta as i64) << 1 | 1;
             idx_buf.extend_from_slice(&encode_fst_svarint(sval));
-            // Record the chain length for the PREVIOUS entry
-            // For the first real entry, length is computed at the end
             h += 1;
         }
 
@@ -368,12 +410,27 @@ impl<W: Write> FstWriter<W> {
 
         let chain_clen = idx_buf.len() as u64;
 
-        // -- 4. Checkpoint (minimal) --
+        // -- 4. Checkpoint (per fstapi fstWriterEmitSectionHeader):
+        // [maxvalpos varint][frame_clen varint][frame_maxhandle varint][values]
+        // values = one entry per signal: `width` literal chars (real: 8-byte f64 NaN)
+        let mut cp_data = Vec::new();
+        for (i, sig) in self.signals.iter().enumerate() {
+            if matches!(sig.var_type, VarType::Real) {
+                cp_data.extend_from_slice(&f64::NAN.to_le_bytes());
+            } else if sig.width > 0 {
+                let v = self.block_checkpoint.get(i)
+                    .cloned()
+                    .unwrap_or_else(|| vec![b'x'; sig.width as usize]);
+                cp_data.extend_from_slice(&v);
+            }
+            // variable-length signals (width 0) have no checkpoint value
+        }
+        let maxvalpos = cp_data.len() as u64;
         let mut cp_buf = Vec::new();
-        cp_buf.extend_from_slice(&encode_varint(0)); // maxvalpos
-        cp_buf.extend_from_slice(&encode_varint(0)); // frame_clen
+        cp_buf.extend_from_slice(&encode_varint(maxvalpos)); // maxvalpos = uncompressed length
+        cp_buf.extend_from_slice(&encode_varint(maxvalpos)); // frame_clen (raw = uncompressed)
         cp_buf.extend_from_slice(&encode_varint(max_handle as u64)); // frame_maxhandle
-        // no checkpoint data
+        cp_buf.extend_from_slice(&cp_data);
 
         // -- 5. VC header --
         let mut vc_buf = Vec::new();
@@ -386,10 +443,10 @@ impl<W: Write> FstWriter<W> {
             + time_comp.len() + 24,
         );
 
-        // HDR24: begin_time, end_time, mem_required
-        body.extend_from_slice(&self.current_block_time_begin.to_le_bytes());
-        body.extend_from_slice(&self.header.end_time.to_le_bytes());
-        body.extend_from_slice(&mem_required.to_le_bytes());
+        // HDR24: begin_time, end_time, mem_required (big-endian per FST format)
+        body.extend_from_slice(&self.current_block_time_begin.to_be_bytes());
+        body.extend_from_slice(&self.header.end_time.to_be_bytes());
+        body.extend_from_slice(&mem_required.to_be_bytes());
 
         // Checkpoint
         body.extend_from_slice(&cp_buf);
@@ -402,14 +459,14 @@ impl<W: Write> FstWriter<W> {
 
         // Index table
         body.extend_from_slice(&idx_buf);
-        body.extend_from_slice(&chain_clen.to_le_bytes());
+        body.extend_from_slice(&chain_clen.to_be_bytes());
 
         // Time section
         body.extend_from_slice(&time_comp);
-        // Trailer
-        body.extend_from_slice(&tsec_uclen.to_le_bytes());
-        body.extend_from_slice(&tsec_clen.to_le_bytes());
-        body.extend_from_slice(&tsec_nitems.to_le_bytes());
+        // Trailer (big-endian per FST format)
+        body.extend_from_slice(&tsec_uclen.to_be_bytes());
+        body.extend_from_slice(&tsec_clen.to_be_bytes());
+        body.extend_from_slice(&tsec_nitems.to_be_bytes());
 
         // Now fix up the last chain's length: chain_lengths[last_real] = chain_data_area end - its offset
         // This is used by the reader's "chain_table_lengths[last] = indx_pntr - 8 - vc_start - chain_table[last]"
@@ -417,11 +474,13 @@ impl<W: Write> FstWriter<W> {
         // chain_end = indx_pntr - 8 - vc_start = indx_pos - vc_start = total chain data bytes
         // So the last chain length is implicitly computed from (indx_pos - chain_offsets[last])
 
-        // Build final block: [0x08][section_length:le u64][body]
-        let section_length = body.len() as u64;
+        // Build final block: [0x08][section_length:be u64][body]
+        // section_length covers the whole section after the type byte, including
+        // the length field itself (per fstapi: endpos - section_start)
+        let section_length = body.len() as u64 + 8;
         let mut block = Vec::with_capacity(1 + 8 + body.len());
         block.push(0x08);
-        block.extend_from_slice(&section_length.to_le_bytes());
+        block.extend_from_slice(&section_length.to_be_bytes());
         block.extend_from_slice(&body);
 
         Ok(block)
@@ -453,7 +512,7 @@ impl<W: Write> FstWriter<W> {
     pub fn write_raw_block_data(&mut self, block_type: u8, body: &[u8]) -> Result<()> {
         let mut buf = Vec::with_capacity(1 + 8 + body.len());
         buf.push(block_type);
-        buf.extend_from_slice(&(body.len() as u64).to_le_bytes());
+        buf.extend_from_slice(&(body.len() as u64).to_be_bytes());
         buf.extend_from_slice(body);
         self.writer.write_all(&buf)?;
         self.bytes_written += buf.len() as u64;
@@ -508,57 +567,73 @@ impl<W: Write> FstWriter<W> {
         })
     }
 
-    /// Write header block (placeholder, will be overwritten on close)
+    /// Write header block (standard FST: [0x00][section_length=329][fields])
     fn write_header_block(&mut self) -> Result<()> {
         let mut block = BlockWriter::new(BlockType::Hdr);
         block.write_header(&self.header, 0, 0, 0, 0);
-        let block_bytes = block.finalize();
+        let block_bytes = block.finalize_with_section_length(329);
         self.writer.write_all(&block_bytes)?;
         self.bytes_written += block_bytes.len() as u64;
         self.blocks_written += 1;
         Ok(())
     }
 
-    /// Write geometry block
+    /// Write geometry block (standard FST: [0x03][section_length=24+data][uclen][max][varints])
     fn write_geom_block(&mut self) -> Result<()> {
         let mut block = BlockWriter::new(BlockType::Geom);
         block.write_geom(&self.signals, self.signals.len() as u64);
-        let block_bytes = block.finalize();
+        let section_length = block.finalize_len_plus(8); // 16 prefix + data + section_length field
+        let block_bytes = block.finalize_with_section_length(section_length);
         self.writer.write_all(&block_bytes)?;
         self.bytes_written += block_bytes.len() as u64;
         self.blocks_written += 1;
         Ok(())
     }
 
-    /// Write hierarchy block
+    /// Write hierarchy block (standard FST, per fstapi):
+    /// [type:0x06][section_length:8][uncompressed_length:8][raw LZ4 data]
+    /// Entries: 0xFE scope [scope_type][name cstr][component cstr],
+    ///          0xFF upscope,
+    ///          var [var_type][direction][name cstr][length varint][alias varint]
     fn write_hier_block(&mut self) -> Result<()> {
         let mut hier_data = Vec::new();
 
-        // Reconstruct scope stack to encode hierarchy
-        let mut scope_path: Vec<&str> = Vec::new();
-        for scope_name in &self.scopes {
-            // Build the full path incrementally
-            scope_path.push(scope_name);
-            // Encode scope entry with just the name part
-            hier_data.extend_from_slice(&encode_scope_entry(
-                scope_name,
-                ScopeType::VcdModule,
-            ));
+        for ev in &self.hier_events {
+            match ev {
+                HierEvent::Scope { scope_type, name } => {
+                    hier_data.push(0xFE); // HIERARCHY_TPE_VCD_SCOPE
+                    hier_data.push(*scope_type as u8);
+                    hier_data.extend_from_slice(name.as_bytes());
+                    hier_data.push(0); // name terminator
+                    hier_data.push(0); // empty component (terminator)
+                }
+                HierEvent::Upscope => {
+                    hier_data.push(0xFF); // HIERARCHY_TPE_VCD_UP_SCOPE
+                }
+                HierEvent::Var { name, width, var_type } => {
+                    hier_data.push(*var_type as u8);
+                    hier_data.push(0); // direction
+                    hier_data.extend_from_slice(name.as_bytes());
+                    hier_data.push(0); // name terminator
+                    hier_data.extend_from_slice(&encode_varint(*width as u64));
+                    hier_data.extend_from_slice(&encode_varint(0)); // alias
+                }
+            }
         }
-        // Encode scope entries reverse for upscope
-        for _ in &self.scopes {
-            hier_data.push(0x03); // HIER_UPSCOPE
-        }
 
-        // Compress hierarchy
-        let compressed = self.compressor.compress(&hier_data);
+        // Raw LZ4 block (no size prefix — the section header carries the sizes)
+        let compressed = lz4_flex::block::compress(&hier_data);
+        let uclen = hier_data.len() as u64;
+        let clen = compressed.len() as u64;
 
-        let mut block = BlockWriter::new(BlockType::HierLz4);
-        block.write_bytes(&compressed);
-        let block_bytes = block.finalize();
+        let mut block = Vec::with_capacity(1 + 8 + 8 + compressed.len());
+        block.push(0x06); // HIER_LZ4
+        block.extend_from_slice(&(clen + 16).to_be_bytes()); // section_length
+        block.extend_from_slice(&uclen.to_be_bytes()); // uncompressed_length
+        block.extend_from_slice(&compressed);
 
-        self.writer.write_all(&block_bytes)?;
-        self.bytes_written += block_bytes.len() as u64;
+        self.writer.write_all(&block)?;
+        self.bytes_written += block.len() as u64;
         self.blocks_written += 1;
         Ok(())
     }

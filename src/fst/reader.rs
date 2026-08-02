@@ -21,44 +21,40 @@ use std::fs::File;
 use std::io::{self, BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
 
-/// Detect FST endianness from header block.
-/// Returns true if big-endian, false if little-endian.
-/// Uses the endian_check field (PI=LE, e=BE) and file size as sanity check.
+/// Detect FST layout from the header.
+/// Returns true for the Icarus-style layout (u64s big-endian, geom/hier metadata
+/// stored at the tail of the file), false for the standard inline layout
+/// (u64s big-endian, blocks in order — fstapi / vcd2fst style) and legacy walconv.
 fn detect_endianness(data: &[u8], file_size: u64) -> bool {
     if data.len() < 9 {
-        return false; // can't detect, assume LE
+        return false;
     }
+
+    // The endian marker is authoritative when present:
+    // standard FST (fstapi) = Euler's number e; legacy walconv = pi.
+    if data.len() >= 33 {
+        let endian_le = f64::from_bits(u64::from_le_bytes(data[25..33].try_into().unwrap()));
+        let endian_be = f64::from_bits(u64::from_be_bytes(data[25..33].try_into().unwrap()));
+        // e / pi in native order → standard inline layout (u64 fields are big-endian)
+        if (endian_le - 2.718281828459045).abs() < 0.001
+            || (endian_le - 3.141592653589793).abs() < 0.001
+        {
+            return false;
+        }
+        // e reversed → Icarus-style file with big-endian u64s
+        if (endian_be - 2.718281828459045).abs() < 0.001 {
+            return true;
+        }
+    }
+
+    // No marker: fall back to the block_len heuristic.
     let le_len = u64::from_le_bytes(data[1..9].try_into().unwrap());
     let be_len = u64::from_be_bytes(data[1..9].try_into().unwrap());
-    
-    // Prefer the block_len that fits within the file
     let le_ok = le_len < file_size;
     let be_ok = be_len < file_size;
-    
-    if le_ok && !be_ok {
-        return false; // LE is valid, BE is not → LE
-    }
     if be_ok && !le_ok {
-        return true;  // BE is valid, LE is not → BE
+        return true;
     }
-    
-    // Both or neither valid — check endian field in header body
-    if data.len() >= 33 {
-        let endian_check = u64::from_le_bytes(data[25..33].try_into().unwrap());
-        let endian_f64 = f64::from_bits(endian_check);
-        // PI = 3.14159... in LE: header read as LE gives correct value
-        // e = 2.71828... in LE: header read as LE gives e
-    
-        // If endian_check reads as a reasonable float, LE is correct
-        if (endian_f64 - 3.141592653589793).abs() < 0.001 {
-            return false; // PI → LE (walconv-like)
-        }
-        if (endian_f64 - 2.718281828459045).abs() < 0.001 {
-            return true;  // e → BE (Icarus-like)
-        }
-    }
-    
-    // Default: assume LE
     false
 }
 
@@ -161,6 +157,7 @@ impl<R: Read + Seek> FstReader<R> {
                 continue;
             }
 
+
             // For BE files: after HDR, peek ahead to detect format.
             // Icarus: metadata (GEOM+HIER) is at the tail of the file.
             // vcd2fst: VCDATA blocks are inline; HIER may be at the tail.
@@ -198,8 +195,9 @@ impl<R: Read + Seek> FstReader<R> {
                 0xFE => self.read_zwrapper_block(block_len),
                 _ => {
                     // Unknown block type: skip the full block body to maintain stream sync
-                    if block_len > 0 {
-                        self.reader.seek(SeekFrom::Current(block_len as i64))?;
+                    // (section_length includes the length field itself)
+                    if block_len > 8 {
+                        self.reader.seek(SeekFrom::Current((block_len - 8) as i64))?;
                     }
                     Ok(())
                 }
@@ -597,34 +595,24 @@ impl<R: Read + Seek> FstReader<R> {
     }
 
     fn read_u64(&mut self) -> io::Result<u64> {
+        // FST format stores u64 fields big-endian (fstapi fstWriterUint64)
         let mut buf = [0u8; 8];
         self.reader.read_exact(&mut buf)?;
-        if self.big_endian {
-            Ok(u64::from_be_bytes(buf))
-        } else {
-            Ok(u64::from_le_bytes(buf))
-        }
+        Ok(u64::from_be_bytes(buf))
     }
 
     #[allow(dead_code)]
     fn read_u32(&mut self) -> io::Result<u32> {
         let mut buf = [0u8; 4];
         self.reader.read_exact(&mut buf)?;
-        if self.big_endian {
-            Ok(u32::from_be_bytes(buf))
-        } else {
-            Ok(u32::from_le_bytes(buf))
-        }
+        Ok(u32::from_be_bytes(buf))
     }
 
     fn read_u32_from_slice(&self, data: &[u8]) -> u32 {
+        // Legacy walconv custom geometry entries store u32s little-endian
         if data.len() < 4 { return 0; }
         let buf: [u8; 4] = data[..4].try_into().unwrap();
-        if self.big_endian {
-            u32::from_be_bytes(buf)
-        } else {
-            u32::from_le_bytes(buf)
-        }
+        u32::from_le_bytes(buf)
     }
 
     fn read_bytes(&mut self, len: usize) -> io::Result<Vec<u8>> {
@@ -635,12 +623,15 @@ impl<R: Read + Seek> FstReader<R> {
 
     fn skip_block(&mut self, len: u64) -> io::Result<()> {
         let pos = self.reader.stream_position()?;
-        self.reader.seek(SeekFrom::Start(pos + len))?;
+        // section_length includes the length field itself (8 bytes)
+        self.reader.seek(SeekFrom::Start(pos + len.saturating_sub(8)))?;
         Ok(())
     }
 
     fn read_header_block(&mut self, _len: u64) -> io::Result<()> {
         let start_pos = self.reader.stream_position()?;
+        // NOTE: the header's section_length field doubles as the block length,
+        // already consumed by read_file — read the fields directly.
         self.file.header.start_time = self.read_u64()?;
         self.file.header.end_time = self.read_u64()?;
         let _endian_check = self.read_u64()?;
@@ -658,26 +649,18 @@ impl<R: Read + Seek> FstReader<R> {
         }
         self.file.header.version = String::from_utf8_lossy(&version).to_string();
 
-        let mut date = vec![0u8; 128];
+        // Standard FST header: date is 119 bytes (FST_HDR_DATE_SIZE), followed by
+        // file_type (1) and time_zero (8). Older walconv files used 128-byte dates.
+        let mut date = vec![0u8; 119];
         self.reader.read_exact(&mut date)?;
         if let Some(pos) = date.iter().position(|&b| b == 0) {
             date.truncate(pos);
         }
         self.file.header.date = String::from_utf8_lossy(&date).to_string();
 
-        // FST header block body: 8 u64 + 1 i8 + 128 version + 128 date = 321 bytes.
-        // Some generators (e.g. Icarus) write incorrect block_len (e.g. 1).
-        // Some generators (vcd2fst) write padded block_len (e.g. 329).
-        // The actual header body is always 321 bytes — don't seek more.
-        // If we read less than 321 bytes (Icarus), skip remaining.
-        const HEADER_BODY_SIZE: u64 = 321;
-        let current_pos = self.reader.stream_position()?;
-        let bytes_read = current_pos - start_pos;
-        if bytes_read < HEADER_BODY_SIZE {
-            self.reader.seek(SeekFrom::Current((HEADER_BODY_SIZE - bytes_read) as i64))?;
-        }
-        // Note: if len > HEADER_BODY_SIZE, the extra bytes are NOT header padding.
-        // They are the start of the next block (vcd2fst may over-count).
+        // file_type (1) + time_zero (8) — completes the standard 321-byte field block
+        let _file_type = self.read_u8()?;
+        let _time_zero = self.read_u64()?;
         Ok(())
     }
 
@@ -693,8 +676,8 @@ impl<R: Read + Seek> FstReader<R> {
         }
         let start_pos = self.reader.stream_position()?;
 
-        // Read section_length and uncompressed_length
-        let _section_length = self.read_u64()?;
+        // Read section_length (doubles as block length, already consumed by read_file)
+        // and uncompressed_length
         let uncompressed_length = self.read_u64()?;
 
         // Check if the remaining data is zlib-compressed (Icarus FST format)
@@ -703,7 +686,7 @@ impl<R: Read + Seek> FstReader<R> {
             return Ok(());
         }
 
-        let geom_data: Vec<u8> = if uncompressed_length > 0
+        let (geom_max_handle, geom_data): (u64, Vec<u8>) = if uncompressed_length > 0
             && remaining < uncompressed_length
             && remaining < 5000
         {
@@ -716,7 +699,7 @@ impl<R: Read + Seek> FstReader<R> {
                 let mut decoder = ZlibDecoder::new(&compressed[..]);
                 let mut output = Vec::new();
                 match decoder.read_to_end(&mut output) {
-                    Ok(_) => output,
+                    Ok(_) => (0, output),
                     Err(_) => {
                         // Icarus GEOM compressed format not fully supported
                         // (stores handle map instead of signal entries)
@@ -724,32 +707,32 @@ impl<R: Read + Seek> FstReader<R> {
                     }
                 }
             } else {
-                compressed // treat as raw data
+                (0, compressed) // treat as raw data
             }
         } else {
-            // Read max_handle (only present for walconv format, not Icarus)
-            if remaining >= 8 {
-                let _max_handle = self.read_u64()?;
-            }
-            self.read_bytes(remaining.saturating_sub(8) as usize)?
+            // max_handle follows section_length + uncompressed_length (standard FST)
+            let max_handle = if remaining >= 8 {
+                self.read_u64()?
+            } else {
+                0
+            };
+            let geom_data2 = self.read_bytes(remaining.saturating_sub(8) as usize)?;
+            (max_handle, geom_data2)
         };
 
         // Parse signal entries from geom_data.
         // Two formats:
-        //   walconv (LE): [handle:4][name_len:1][name][type:1][dir:1][width:4]...
-        //   Icarus  (BE): varint-encoded signal lengths (reals encoded as 0,
-        //                  zero-length strings as 0xFFFFFFFF)
-        // Detect format by checking if this is a LE file (walconv) or BE file (Icarus).
-        if self.big_endian {
-            // Icarus format: GEOM stores varint-encoded lengths only.
-            // The real signal info (names, types, widths) comes from the HIER block.
-            // Skip GEOM parsing for Icarus.
-        } else {
-            // walconv format: parse signal entries
-            self.parse_geom_entries(&geom_data);
+        //   standard (fstapi): varint per signal (width, 1-based; 0 = real; 0xFFFFFFFF = varlen)
+        //   walconv (LE legacy): [handle:4][name_len:1][name][type:1][dir:1][width:4]...
+        // Try the standard parse first: it must consume the whole buffer with exactly
+        // max_handle entries and sane widths; fall back to the legacy custom format.
+        if !self.parse_standard_geom(&geom_data, geom_max_handle) {
+            if !self.big_endian {
+                self.parse_geom_entries(&geom_data);
+            }
         }
 
-        let end_pos = start_pos + len as u64;
+        let end_pos = start_pos + len.saturating_sub(8); // section_length includes itself
         if self.reader.stream_position()? != end_pos {
             self.reader.seek(SeekFrom::Start(end_pos))?;
         }
@@ -790,6 +773,40 @@ impl<R: Read + Seek> FstReader<R> {
 
     /// Parse GEOM signal entries in walconv format.
     /// Each entry: handle(4) + name_len(varint) + name + type(1) + dir(1) + width(4)
+    /// Parse standard FST geometry: one varint per signal (bit width 1-based,
+    /// 0 = real, 0xFFFFFFFF = variable length). Returns false when the data does
+    /// not parse as standard entries (legacy walconv custom format).
+    fn parse_standard_geom(&mut self, data: &[u8], max_handle: u64) -> bool {
+        let mut pos = 0usize;
+        let mut parsed = 0u64;
+        while pos < data.len() {
+            let (val, consumed) = match decode_varint(&data[pos..]) {
+                Some(v) if v.1 > 0 => v,
+                _ => return false,
+            };
+            pos += consumed;
+            let (width, var_type) = if val == 0 {
+                (8, VarType::Real) // reals are stored as 8-byte doubles
+            } else if val == u32::MAX as u64 {
+                (0, VarType::GenString) // variable-length signal
+            } else {
+                (val, VarType::VcdWire)
+            };
+            if width > 1 << 24 {
+                return false; // sanity: garbage data
+            }
+            self.file.signals.push(SignalDecl {
+                handle: parsed as u32 + 1,
+                name: String::new(),
+                width: width as u32,
+                var_type,
+                direction: 0,
+            });
+            parsed += 1;
+        }
+        parsed == max_handle
+    }
+
     fn parse_geom_entries(&mut self, data: &[u8]) {
         let mut pos = 0usize;
         while pos + 6 <= data.len() {
@@ -834,7 +851,7 @@ impl<R: Read + Seek> FstReader<R> {
     }
 
     fn read_hier_block(&mut self, len: u64) -> io::Result<()> {
-        let data = self.read_bytes(len as usize)?;
+        let data = self.read_bytes(len.saturating_sub(8) as usize)?;
         // Only parse if block contains SCOPE markers (real HIER data)
         // vcd2fst may use 0x04 type for non-HIER compact alias data
         if data.contains(&0xFE) {
@@ -844,11 +861,23 @@ impl<R: Read + Seek> FstReader<R> {
     }
 
     fn read_hier_lz4_block(&mut self, len: u64) -> io::Result<()> {
-        let compressed = self.read_bytes(len as usize)?;
-        match lz4_flex::block::decompress_size_prepended(&compressed) {
-            Ok(decompressed) => self.parse_hier_data(&decompressed),
-            Err(_) => Ok(()), // skip if decompression fails (false block detection)
+        // The data after the block length is [uncompressed_length:8][raw LZ4 block];
+        // len includes the length field itself
+        let data = self.read_bytes(len.saturating_sub(8) as usize)?;
+        let decompressed = if len >= 16 {
+            let uncompressed = u64::from_be_bytes(data[0..8].try_into().unwrap()) as usize;
+            let payload = &data[8..];
+            match lz4_flex::block::decompress(payload, uncompressed) {
+                Ok(out) if out.len() == uncompressed => Some(out),
+                _ => lz4_flex::block::decompress_size_prepended(&data).ok(),
+            }
+        } else {
+            lz4_flex::block::decompress_size_prepended(&data).ok()
+        };
+        if let Some(decompressed) = decompressed {
+            self.parse_hier_data(&decompressed)?;
         }
+        Ok(())
     }
 
     fn read_hier_lz4duo_block(&mut self, len: u64) -> io::Result<()> {
@@ -961,13 +990,36 @@ impl<R: Read + Seek> FstReader<R> {
                             } else {
                                 name
                             };
-                            self.file.signals.push(SignalDecl {
-                                handle: fst_handle,
-                                name: final_name,
-                                width: width as u32,
-                                var_type: VarType::from_u8(code),
-                                direction,
-                            });
+                            // Rebuild the full hierarchical name from the scope stack
+                            let full_name = if scope_stack.is_empty() {
+                                final_name.clone()
+                            } else {
+                                let path = scope_stack
+                                    .iter()
+                                    .map(|&i| self.file.scopes[i].name.as_str())
+                                    .collect::<Vec<_>>()
+                                    .join(".");
+                                format!("{}.{}", path, final_name)
+                            };
+                            // Merge with the geometry entry (standard FST: geom has widths,
+                            // hier has names). Update by handle if present.
+                            let existing = self.file.signals.iter_mut().find(|s| s.handle == fst_handle);
+                            if let Some(existing) = existing {
+                                existing.name = full_name;
+                                existing.var_type = VarType::from_u8(code);
+                                existing.direction = direction;
+                                if existing.width == 0 {
+                                    existing.width = width as u32;
+                                }
+                            } else {
+                                self.file.signals.push(SignalDecl {
+                                    handle: fst_handle,
+                                    name: full_name,
+                                    width: width as u32,
+                                    var_type: VarType::from_u8(code),
+                                    direction,
+                                });
+                            }
                         }
                     }
                 }
@@ -1116,12 +1168,19 @@ mod tests {
 
     #[test]
     fn test_detect_endianness_be() {
-        // Icarus-style: block_len(BE)=329, endian_check=e
+        // Standard inline layout: block_len(BE)=329, endian_check=e in native order → NOT icarus-tail
         let mut buf = vec![0x00u8]; // block type
         buf.extend_from_slice(&329u64.to_be_bytes()); // BE block_len = 329
         buf.extend_from_slice(&[0u8; 16]); // start_time, end_time (zeros)
-        buf.extend_from_slice(&f64::to_le_bytes(2.718281828459045)); // endian_check = e (always LE)
-        assert_eq!(detect_endianness(&buf, 10000), true);
+        buf.extend_from_slice(&f64::to_le_bytes(2.718281828459045)); // endian_check = e
+        assert_eq!(detect_endianness(&buf, 10000), false);
+
+        // Icarus tail layout: endian_check = e reversed (big-endian byte order)
+        let mut buf2 = vec![0x00u8];
+        buf2.extend_from_slice(&329u64.to_be_bytes());
+        buf2.extend_from_slice(&[0u8; 16]);
+        buf2.extend_from_slice(&f64::to_be_bytes(2.718281828459045));
+        assert_eq!(detect_endianness(&buf2, 10000), true);
     }
 
     #[test]
@@ -1133,87 +1192,100 @@ mod tests {
 
     #[test]
     fn test_reader_roundtrip_le() {
-        // Write an LE FST with known signals, read it back
+        // Write a standard-format FST (big-endian u64 fields) with known signals, read it back
         let mut data = Vec::new();
-        
+
         // Header block
         data.push(0x00); // block type
-        
-        // We'll write the block_len after we compute it
-        let hdr_pos = data.len();
-        data.extend_from_slice(&[0u8; 8]); // placeholder
-        
-        let hdr_body_start = data.len();
-        data.extend_from_slice(&0u64.to_le_bytes()); // start_time
-        data.extend_from_slice(&100u64.to_le_bytes()); // end_time
-        data.extend_from_slice(&f64::to_le_bytes(3.141592653589793)); // endian_check = PI → LE
+
+        // Standard header: [section_length=329][start][end][endian_test=e][mem][scopes][vars]
+        // [max_handle][sections][timescale][version:128][date:119][file_type][time_zero]
+        data.extend_from_slice(&329u64.to_be_bytes()); // section_length
+        data.extend_from_slice(&0u64.to_be_bytes()); // start_time
+        data.extend_from_slice(&100u64.to_be_bytes()); // end_time
+        data.extend_from_slice(&f64::to_le_bytes(2.718281828459045)); // endian_check = e (LE)
         data.extend_from_slice(&[0u8; 8]); // mem_used
-        data.extend_from_slice(&1u64.to_le_bytes()); // scope_count
-        data.extend_from_slice(&1u64.to_le_bytes()); // var_count
-        data.extend_from_slice(&0u64.to_le_bytes()); // max_handle
-        data.extend_from_slice(&0u64.to_le_bytes()); // vc_count
+        data.extend_from_slice(&1u64.to_be_bytes()); // scope_count
+        data.extend_from_slice(&1u64.to_be_bytes()); // var_count
+        data.extend_from_slice(&1u64.to_be_bytes()); // max_handle
+        data.extend_from_slice(&0u64.to_be_bytes()); // vc_count
         data.push(0i8 as u8); // timescale_exp
         data.extend_from_slice(&[0u8; 128]); // version
-        data.extend_from_slice(&[0u8; 128]); // date
-        
-        let hdr_body_len = (data.len() - hdr_body_start) as u64;
-        data[hdr_pos..hdr_pos+8].copy_from_slice(&hdr_body_len.to_le_bytes());
-        
-        // GEOM block
+        data.extend_from_slice(&[0u8; 119]); // date
+        data.push(0u8); // file_type
+        data.extend_from_slice(&0u64.to_be_bytes()); // time_zero
+
+        // GEOM block (standard): [section_length=24+data][uclen][max_handle][varint widths]
         data.push(0x03); // block type
-        let geom_pos = data.len();
-        data.extend_from_slice(&[0u8; 8]); // placeholder
-        
-        let geom_body_start = data.len();
-        data.extend_from_slice(&0u64.to_le_bytes()); // section_length
-        data.extend_from_slice(&0u64.to_le_bytes()); // uncompressed_length
-        data.extend_from_slice(&0u64.to_le_bytes()); // max_handle
-        data.extend_from_slice(&0u32.to_le_bytes()); // handle
-        data.push(5u8); // name_len = 5
-        data.extend_from_slice(b"hello"); // name
-        data.push(16u8); // var_type = VcdWire
-        data.push(0u8); // direction
-        data.extend_from_slice(&1u32.to_le_bytes()); // width
-        
-        let geom_body_len = (data.len() - geom_body_start) as u64;
-        data[geom_pos..geom_pos+8].copy_from_slice(&geom_body_len.to_le_bytes());
-        
+        let geom_body_start = data.len() + 8;
+        data.extend_from_slice(&[0u8; 8]); // section_length placeholder
+        data.extend_from_slice(&1u64.to_be_bytes()); // uncompressed_length
+        data.extend_from_slice(&1u64.to_be_bytes()); // max_handle
+        data.push(1u8); // width = 1 (varint)
+        let geom_len = (data.len() - geom_body_start + 8) as u64; // include section_length field
+        data[geom_body_start - 8..geom_body_start].copy_from_slice(&geom_len.to_be_bytes());
+
+        // HIER block: type 0x04 (uncompressed): [0xFE scope][0x10 wire var]
+        let hier_data = vec![
+            0xFE,       // FST_ST_VCD_SCOPE
+            0x00,       // scope_type = module
+            b't', b'o', b'p', 0x00, // scope_name = "top"
+            0x00,       // scope_comp (empty)
+            16,         // FST_VT_VCD_WIRE = var_type
+            0x00,       // direction
+            b'h', b'e', b'l', b'l', b'o', 0x00, // name = "hello"
+            0x01,       // width = 1 (varint)
+            0x00,       // alias_handle = 0 (varint, non-alias)
+            0xFF,       // FST_ST_VCD_UPSCOPE
+        ];
+        data.push(0x04);
+        data.extend_from_slice(&((hier_data.len() + 8) as u64).to_be_bytes());
+        data.extend_from_slice(&hier_data);
+
         let cursor = Cursor::new(data);
         let reader = FstReader::from_reader(cursor).unwrap();
         assert_eq!(reader.file.header.end_time, 100);
         assert_eq!(reader.file.signals.len(), 1);
-        assert_eq!(reader.file.signals[0].name, "hello");
+        assert_eq!(reader.file.signals[0].name, "top.hello");
+        assert_eq!(reader.file.signals[0].width, 1);
+        assert_eq!(reader.file.scopes.len(), 1);
+        assert_eq!(reader.file.scopes[0].name, "top");
     }
 
     #[test]
     fn test_reader_roundtrip_be() {
-        // Write a BE FST with known signals, read it back
+        // Write a big-endian FST with known signals, read it back
         let mut data = Vec::new();
-        
+
         // Header block
         data.push(0x00); // block type
-        
-        let hdr_pos = data.len();
-        data.extend_from_slice(&[0u8; 8]); // placeholder
-        
-        let hdr_body_start = data.len();
+
+        data.extend_from_slice(&329u64.to_be_bytes()); // section_length
         data.extend_from_slice(&0u64.to_be_bytes()); // start_time
         data.extend_from_slice(&200u64.to_be_bytes()); // end_time
-        // endian_check = e (always stored as LE)
-        data.extend_from_slice(&f64::to_le_bytes(2.718281828459045));
+        data.extend_from_slice(&f64::to_le_bytes(2.718281828459045)); // endian_check = e (LE)
         data.extend_from_slice(&[0u8; 8]); // mem_used
         data.extend_from_slice(&1u64.to_be_bytes()); // scope_count
         data.extend_from_slice(&1u64.to_be_bytes()); // var_count
-        data.extend_from_slice(&0u64.to_be_bytes()); // max_handle
+        data.extend_from_slice(&1u64.to_be_bytes()); // max_handle
         data.extend_from_slice(&0u64.to_be_bytes()); // vc_count
         data.push(0i8 as u8); // timescale_exp
         data.extend_from_slice(&[0u8; 128]); // version
-        data.extend_from_slice(&[0u8; 128]); // date
-        
-        let hdr_body_len = (data.len() - hdr_body_start) as u64;
-        data[hdr_pos..hdr_pos+8].copy_from_slice(&hdr_body_len.to_be_bytes());
-        
-        // HIER block (Icarus format: 0xFE = scope, var types 0-29 = variable entries)
+        data.extend_from_slice(&[0u8; 119]); // date
+        data.push(0u8); // file_type
+        data.extend_from_slice(&0u64.to_be_bytes()); // time_zero
+
+        // GEOM block (standard): [section_length][uclen][max_handle][varint widths]
+        data.push(0x03); // block type
+        let geom_body_start = data.len() + 8;
+        data.extend_from_slice(&[0u8; 8]); // section_length placeholder
+        data.extend_from_slice(&1u64.to_be_bytes()); // uncompressed_length
+        data.extend_from_slice(&1u64.to_be_bytes()); // max_handle
+        data.push(2u8); // width = 2 (varint)
+        let geom_len = (data.len() - geom_body_start + 8) as u64; // include section_length field
+        data[geom_body_start - 8..geom_body_start].copy_from_slice(&geom_len.to_be_bytes());
+
+        // HIER block (standard: 0xFE = scope, var types 0-29 = variable entries)
         let hier_data = vec![
             0xFE,       // FST_ST_VCD_SCOPE
             0x00,       // scope_type = module
@@ -1228,14 +1300,14 @@ mod tests {
         ];
         // HIER block: type 0x04 (HIER uncompressed), BE_len = data length
         data.push(0x04);
-        data.extend_from_slice(&(hier_data.len() as u64).to_be_bytes());
+        data.extend_from_slice(&((hier_data.len() + 8) as u64).to_be_bytes());
         data.extend_from_slice(&hier_data);
-        
+
         let cursor = Cursor::new(data);
         let reader = FstReader::from_reader(cursor).unwrap();
         assert_eq!(reader.file.header.end_time, 200);
         assert_eq!(reader.file.signals.len(), 1);
-        assert_eq!(reader.file.signals[0].name, "world");
+        assert_eq!(reader.file.signals[0].name, "top.world");
         assert_eq!(reader.file.signals[0].width, 2);
         assert_eq!(reader.file.scopes.len(), 1);
         assert_eq!(reader.file.scopes[0].name, "top");
@@ -1244,16 +1316,16 @@ mod tests {
     #[test]
     fn test_detect_endianness_from_header() {
         // Test using the actual detect_endianness helper
-        // LE file: block_len LE fits, endian_check = PI
+        // LE file: block_len LE fits, endian_check = e (standard LE)
         let mut le_data = vec![0x00u8; 33];
         le_data[1..9].copy_from_slice(&100u64.to_le_bytes());
-        le_data[25..33].copy_from_slice(&f64::to_le_bytes(3.141592653589793));
+        le_data[25..33].copy_from_slice(&f64::to_le_bytes(2.718281828459045));
         assert!(!detect_endianness(&le_data, 1000));
 
-        // BE file: block_len BE fits, endian_check = e (in LE)
+        // BE file: block_len BE fits, endian_check = e reversed (standard BE)
         let mut be_data = vec![0x00u8; 33];
         be_data[1..9].copy_from_slice(&100u64.to_be_bytes());
-        be_data[25..33].copy_from_slice(&f64::to_le_bytes(2.718281828459045));
+        be_data[25..33].copy_from_slice(&f64::to_be_bytes(2.718281828459045));
         assert!(detect_endianness(&be_data, 1000));
     }
 }

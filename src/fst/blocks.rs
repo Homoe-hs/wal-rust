@@ -40,10 +40,10 @@ impl BlockWriter {
         self.buf.extend_from_slice(&v.to_le_bytes());
     }
 
-    /// Write a little-endian u64
+    /// Write a big-endian u64 (FST format stores u64 fields big-endian)
     #[inline]
     pub fn write_u64(&mut self, v: u64) {
-        self.buf.extend_from_slice(&v.to_le_bytes());
+        self.buf.extend_from_slice(&v.to_be_bytes());
     }
 
     /// Write a signed i8
@@ -78,13 +78,16 @@ impl BlockWriter {
         self.buf.push(0);
     }
 
-    /// Write header block
+    /// Write header block (standard FST, per fstapi fstWriterEmitHdrBytes).
+    /// The block's [type][section_length] prefix is added by finalize().
+    /// Fields: [start:8][end:8][endian_test:8][mem_used:8][scopes:8][vars:8]
+    /// [max_handle:8][sections:8][timescale:1][version:128][date:119][file_type:1][time_zero:8]
     pub fn write_header(&mut self, hdr: &FstHeader, scope_count: u64, var_count: u64, max_handle: u64, vc_count: u64) {
         self.write_u64(hdr.start_time);
         self.write_u64(hdr.end_time);
-        // Endian test value (pi) - required by FST format specification
+        // Endian test value: Euler's number e (FST_DOUBLE_ENDTEST), native (LE) byte order
         #[allow(clippy::approx_constant)]
-        self.write_bytes(&3.14159265358979f64.to_le_bytes());
+        self.write_bytes(&2.7182818284590452354f64.to_le_bytes());
         self.write_u64(0); // mem_used - deprecated
         self.write_u64(scope_count);
         self.write_u64(var_count);
@@ -96,36 +99,40 @@ impl BlockWriter {
         let version_len = hdr.version.as_bytes().len().min(127);
         version_bytes[..version_len].copy_from_slice(&hdr.version.as_bytes()[..version_len]);
         self.write_bytes(&version_bytes);
-        // Date (128 bytes, null-padded)
-        let mut date_bytes = [0u8; 128];
-        let date_len = hdr.date.as_bytes().len().min(127);
+        // Date (119 bytes, null-padded — FST_HDR_DATE_SIZE)
+        let mut date_bytes = [0u8; 119];
+        let date_len = hdr.date.as_bytes().len().min(118);
         date_bytes[..date_len].copy_from_slice(&hdr.date.as_bytes()[..date_len]);
         self.write_bytes(&date_bytes);
+        self.write_u8(0); // file_type: FST_FT_VERILOG
+        self.write_u64(0); // time_zero
     }
 
-    /// Write geometry block (signal metadata)
+    /// Write geometry block (standard FST, per fstapi fstWriterClose).
+    /// The block's [type][section_length] prefix is added by finalize();
+    /// section_length = 24 + data length.
+    /// Data: [uncompressed_length:8][max_handle:8][one varint per signal]
+    /// Signal varints: bit width (1-based), 0 = real, 0xFFFFFFFF = variable length.
     pub fn write_geom(&mut self, signals: &[SignalDecl], max_handle: u64) {
         // Reserve space for header (will fill in later)
         let header_start = self.buf.len();
-        self.write_u64(0); // section_length placeholder
         self.write_u64(0); // uncompressed_length placeholder
         self.write_u64(max_handle);
 
-        // Write signal array
+        // Standard geometry: one varint per signal
         for sig in signals {
-            self.write_u32(sig.handle);
-            self.write_varint(sig.name.len() as u64);
-            self.write_bytes(sig.name.as_bytes());
-            self.write_u8(sig.var_type as u8);
-            self.write_u8(0); // direction (placeholder)
-            self.write_u32(sig.width);
+            if matches!(sig.var_type, VarType::Real) {
+                self.write_varint(0);
+            } else if sig.width == 0 {
+                self.write_varint(u32::MAX as u64);
+            } else {
+                self.write_varint(sig.width as u64);
+            }
         }
 
-        // Fill in actual lengths
-        let data_len = self.buf.len() - header_start - 24; // subtract header
-        let uncompressed = data_len as u64;
-        self.write_u64_at(header_start, uncompressed + 24);
-        self.write_u64_at(header_start + 8, uncompressed);
+        // Fill in the uncompressed length (varint data only, excluding the two u64 prefixes)
+        let data_len = (self.buf.len() - header_start - 16) as u64;
+        self.write_u64_at(header_start, data_len);
     }
 
     /// Write hierarchy block (scopes and variables)
@@ -155,15 +162,33 @@ impl BlockWriter {
 
         let mut result = Vec::with_capacity(1 + 8 + block_data_len);
         result.push(block_type);
-        result.extend_from_slice(&(block_data_len as u64).to_le_bytes());
+        result.extend_from_slice(&(block_data_len as u64).to_be_bytes());
         result.extend_from_slice(&self.buf[1..]);
 
         result
     }
 
+    /// Finalize with an explicit section length.
+    /// Standard FST section lengths include the section-length field itself
+    /// (e.g. header: 329 = 8 + 321 fields; geometry: 24 + data).
+    pub fn finalize_with_section_length(self, section_length: u64) -> Vec<u8> {
+        let block_type = self.buf[0];
+        let mut result = Vec::with_capacity(1 + 8 + self.buf.len() - 1);
+        result.push(block_type);
+        result.extend_from_slice(&section_length.to_be_bytes());
+        result.extend_from_slice(&self.buf[1..]);
+        result
+    }
+
+    /// Body length + the section-length field itself (8 bytes)
+    #[inline]
+    pub fn finalize_len_plus(&self, extra: u64) -> u64 {
+        (self.buf.len() as u64 - 1) + extra
+    }
+
     /// Write a u64 at a specific offset (for filling in placeholders)
     fn write_u64_at(&mut self, offset: usize, v: u64) {
-        self.buf[offset..offset + 8].copy_from_slice(&v.to_le_bytes());
+        self.buf[offset..offset + 8].copy_from_slice(&v.to_be_bytes());
     }
 
     /// Get current position
@@ -210,11 +235,11 @@ mod tests {
         let block = bw.finalize();
 
         assert_eq!(block[0], BlockType::Geom as u8);
-        let len = u64::from_le_bytes(block[1..9].try_into().unwrap());
+        let len = u64::from_be_bytes(block[1..9].try_into().unwrap());
         assert_eq!(len, 13); // 8 + 5 bytes
         // Block structure: [type(1)] [length(8)] [data(length)]
-        // data = u64(42) + "hello" = [42, 0,0,0,0,0,0,0, 104,101,108,108,111]
-        assert_eq!(&block[9..], &[42, 0, 0, 0, 0, 0, 0, 0, 104, 101, 108, 108, 111]);
+        // data = u64(42, big-endian) + "hello" = [0,0,0,0,0,0,0,42, 104,101,108,108,111]
+        assert_eq!(&block[9..], &[0, 0, 0, 0, 0, 0, 0, 42, 104, 101, 108, 108, 111]);
     }
 
     #[test]

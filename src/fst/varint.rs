@@ -119,62 +119,51 @@ pub fn decode_signed_varint(buf: &[u8]) -> Option<(i64, usize)> {
     Some((n, consumed))
 }
 
-/// Encode FST signed varint (big-endian, sign-extended raw varint).
+/// Encode FST signed varint (sign-extended LEB128, per fstapi fstWriterSVarint).
 /// Used by the DYNALIAS2 chain index table.
-/// Big-endian byte order: MSB 7-bit group first, LSB group last (without MSB flag).
+/// Groups are little-endian; the sign lives in bit 6 of the terminal byte.
 #[inline]
 pub fn encode_fst_svarint(v: i64) -> Vec<u8> {
-    let val = v as u64;
-    if val == 0 {
-        return vec![0x00];
-    }
-    let mut groups = Vec::new();
-    let mut tmp = val;
-    while tmp > 0 {
-        groups.push((tmp & 0x7F) as u8);
-        tmp >>= 7;
-    }
-    let mut buf = Vec::with_capacity(groups.len());
-    for i in (0..groups.len()).rev() {
-        if i > 0 {
-            buf.push(groups[i] | 0x80);
-        } else {
-            buf.push(groups[i]);
+    let mut buf = Vec::with_capacity(10);
+    let mut val = v;
+    loop {
+        let mut byte = (val as u8) | 0x80;
+        val >>= 7;
+        // stop when the remaining value fits in the sign bit
+        let done = ((val == 0) && (byte & 0x40 == 0)) || ((val == -1) && (byte & 0x40 != 0));
+        if done {
+            byte &= 0x7F;
+            buf.push(byte);
+            break;
         }
+        buf.push(byte);
     }
     buf
 }
 
-/// Decode FST signed varint (NOT zigzag — sign-extended raw varint).
+/// Decode FST signed varint (sign-extended LEB128, per fstapi fstGetSVarint64).
 /// The FST DYNALIAS2 format uses this for the chain index table.
-/// Uses u64 internally to avoid overflow, then casts to i64 (preserving bit pattern).
 #[inline]
 pub fn decode_fst_svarint(buf: &[u8]) -> Option<(i64, usize)> {
-    if buf.is_empty() {
-        return None;
-    }
-
-    let mut pos = 0;
-    while pos < buf.len() && buf[pos] & 0x80 != 0 {
-        pos += 1;
-    }
-    if pos >= buf.len() {
-        return None;
-    }
-    let consumed = pos + 1;
-
-    let mut result: u64 = 0;
+    let mut result: i64 = 0;
     let mut shift = 0;
+    let mut pos = 0;
     loop {
-        result |= ((buf[pos] & 0x7F) as u64) << shift;
-        if pos == 0 {
-            break;
-        }
-        pos -= 1;
+        let b = *buf.get(pos)?;
+        result |= ((b & 0x7F) as i64) << shift;
+        pos += 1;
         shift += 7;
+        if b & 0x80 == 0 {
+            // sign extend from bit 6 of the terminal byte (shift = bits consumed so far)
+            if shift < 64 && b & 0x40 != 0 {
+                result |= -(1i64 << shift);
+            }
+            return Some((result, pos));
+        }
+        if shift > 63 {
+            return None;
+        }
     }
-
-    Some((result as i64, consumed))
 }
 
 /// Decode FST varint32 (same as decode_varint but returns u32)
