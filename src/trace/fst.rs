@@ -65,12 +65,22 @@ fn find_cond_matches(sv: &SignalValue, prev_bit: Option<u8>, cond: &FindConditio
         FindCondition::High => curr_bit == Some(b'1'),
         FindCondition::Low => curr_bit == Some(b'0'),
         FindCondition::Value(v) => {
-            curr_bit == Some(*v) || (curr_bit == Some(b'1') && *v == 1) || (curr_bit == Some(b'0') && *v == 0)
+            if let Some(bit) = curr_bit {
+                bit == *v || (bit == b'1' && *v == 1) || (bit == b'0' && *v == 0)
+            } else {
+                // Vector signal: compare as integer (e.g. 4-bit "0001" == 1)
+                sv_to_i64(sv) == Some(*v as i64)
+            }
         }
         FindCondition::ValueI64(target) => sv_to_i64(sv) == Some(*target),
         FindCondition::Neq(v) => {
             let bit = sv_as_bit(sv);
-            !(bit == Some(*v) || (bit == Some(b'1') && *v == 1) || (bit == Some(b'0') && *v == 0))
+            if bit.is_some() {
+                !(bit == Some(*v) || (bit == Some(b'1') && *v == 1) || (bit == Some(b'0') && *v == 0))
+            } else {
+                // Vector signal: compare as integer
+                sv_to_i64(sv) != Some(*v as i64)
+            }
         }
         FindCondition::NeqI64(target) => sv_to_i64(sv) != Some(*target),
     }
