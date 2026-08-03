@@ -64,8 +64,25 @@ fn op_let(args: &[Value], env: &mut Environment, eval: &mut Evaluator) -> Result
     ensure_arity_atleast(args, 1)?;
     let mut new_env = env.child();
 
-    let bindings = match &args[0] {
-        Value::List(list) => list.0.clone(),
+    // Accept both standard ((x v) (y w)) and flat (x v y w) binding forms.
+    let bindings: Vec<Value> = match &args[0] {
+        Value::List(list) => {
+            let items = &list.0;
+            let all_pairs = !items.is_empty()
+                && items.iter().all(|it| matches!(it, Value::List(pair) if pair.0.len() == 2));
+            if all_pairs {
+                let mut flat = Vec::with_capacity(items.len() * 2);
+                for it in items {
+                    if let Value::List(pair) = it {
+                        flat.push(pair.0[0].clone());
+                        flat.push(pair.0[1].clone());
+                    }
+                }
+                flat
+            } else {
+                items.clone()
+            }
+        }
         _ => return Err("let expects list of bindings".to_string()),
     };
 

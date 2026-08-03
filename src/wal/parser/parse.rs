@@ -125,9 +125,15 @@ pub fn expr_from_node(node: tree_sitter::Node, source: &str) -> Result<Value, St
             let text = get_node_text(node, source);
             Ok(Value::Symbol(Symbol::new(text)))
         }
-        "int" | "dec_int" => {
+        "int" | "dec_int" | "hex_int" | "bin_int" => {
             let text = get_node_text(node, source);
-            let n: i64 = text.parse().map_err(|e| format!("Invalid integer '{}': {}", text, e))?;
+            let n: i64 = if let Some(hex) = text.strip_prefix("0x") {
+                i64::from_str_radix(hex, 16)
+            } else if let Some(bin) = text.strip_prefix("0b") {
+                i64::from_str_radix(bin, 2)
+            } else {
+                text.parse()
+            }.map_err(|e| format!("Invalid integer '{}': {}", text, e))?;
             Ok(Value::Int(n))
         }
         "float" => {

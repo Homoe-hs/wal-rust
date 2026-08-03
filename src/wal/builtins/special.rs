@@ -105,7 +105,7 @@ fn op_fn(args: &[Value], env: &mut Environment, _eval: &mut Evaluator) -> Result
     Ok(Value::Closure(closure))
 }
 
-fn op_defmacro(args: &[Value], env: &mut Environment, _eval: &mut Evaluator) -> Result<Value, String> {
+pub(crate) fn op_defmacro(args: &[Value], env: &mut Environment, _eval: &mut Evaluator) -> Result<Value, String> {
     ensure_arity_atleast(args, 3)?;
     let name = extract_symbol(&args[0])?;
     let args_list = match &args[1] {

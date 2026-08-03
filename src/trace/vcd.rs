@@ -1547,14 +1547,38 @@ mod tests {
         VcdTrace::load(std::path::Path::new(path), "test".to_string()).unwrap()
     }
 
+    fn make_mini_vcd() -> std::path::PathBuf {
+        // mini.vcd: 1-bit clk(!) and a("), 4 timestamps
+        let p = std::env::temp_dir().join(format!("wal_mini_{}.vcd", std::process::id()));
+        std::fs::write(&p, "$timescale 1ns $end\n\
+$scope module top $end\n\
+$var wire 1 ! clk $end\n\
+$var wire 1 \" a $end\n\
+$upscope $end\n\
+$enddefinitions $end\n\
+$dumpvars\n\
+#0\n\
+0!\n\
+1\"\n\
+$end\n\
+#20\n\
+1!\n\
+0\"\n\
+$end\n\
+#40\n\
+0!\n\
+1\"\n\
+$end\n").unwrap();
+        p
+    }
+
     #[test]
     fn test_find_changed_vector() {
-        // mini.vcd: 1-bit clk(!) and a(")
-        let trace = load_vcd("/tmp/mini.vcd");
+        // a: #0=1, #20=0, #40=1 -> changes at ts 2 (index 1) and 4 (index 3)
+        let trace = load_vcd(make_mini_vcd().to_str().unwrap());
         let sigs = trace.signals();
         assert!(sigs.iter().any(|s| s.contains("a")), "a not found: {:?}", &sigs[..5]);
         let name = sigs.iter().find(|s| s.ends_with("a")).unwrap().clone();
-        // a: #0=1, #20=0, #40=1 -> changes at ts 2 (index 1) and 4 (index 3)
         let idx = trace.find_indices(&name, FindCondition::Changed).unwrap();
         eprintln!("changes({}) = {:?}", name, idx);
         assert!(idx.len() >= 1, "no changes detected");
@@ -1562,19 +1586,31 @@ mod tests {
 
     #[test]
     fn test_find_changed_9bit() {
-        let trace = load_vcd("/tmp/big.vcd");
+        // 9-bit vector v changes every 100 ts
+        let p = std::env::temp_dir().join(format!("wal_big_{}.vcd", std::process::id()));
+        let mut vcd = String::from("$timescale 1ns $end\n$scope module top $end\n$var wire 9 ! v [8:0] $end\n$upscope $end\n$enddefinitions $end\n$dumpvars\n#0\nb000000000 !\n$end\n");
+        for t in (100..2000).step_by(100) {
+            vcd.push_str(&format!("#{}\nb{:09b} !\n$end\n", t, (t / 100) % 512));
+        }
+        std::fs::write(&p, vcd).unwrap();
+        let trace = load_vcd(p.to_str().unwrap());
         let sigs = trace.signals();
         let name = sigs.iter().find(|s| s.contains("v [")).unwrap().clone();
         eprintln!("9bit signal: {}", name);
         let idx = trace.find_indices(&name, FindCondition::Changed).unwrap();
         eprintln!("changes(9bit {}) = {:?} (len {})", name, &idx[..idx.len().min(5)], idx.len());
-        // v changes 10 times (every 100 ts, value changes since it's i%512 pattern with varying bits)
         assert!(idx.len() >= 1, "no changes on 9-bit vector");
     }
 
     #[test]
     fn test_find_changed_runvcd() {
-        let trace = load_vcd("/home/hesheng/Projects/macro_trace/run.vcd");
+        // Requires the macro_trace TB dump; skip when not present
+        let path = std::path::Path::new("/home/hesheng/Projects/macro_trace/run.vcd");
+        if !path.exists() {
+            eprintln!("SKIP: macro_trace run.vcd not found");
+            return;
+        }
+        let trace = load_vcd(path.to_str().unwrap());
         let sigs = trace.signals();
         let names: Vec<&String> = sigs.iter().filter(|s| s.contains("op_go_i [")).collect();
         eprintln!("op_go_i signals: {:?}", names);
@@ -1588,7 +1624,7 @@ mod tests {
 
     #[test]
     fn test_find_rising_vector() {
-        let trace = load_vcd("/tmp/mini.vcd");
+        let trace = load_vcd(make_mini_vcd().to_str().unwrap());
         let sigs = trace.signals();
         let name = sigs.iter().find(|s| s.ends_with("a")).unwrap().clone();
         // rising a at #40 (index 3)

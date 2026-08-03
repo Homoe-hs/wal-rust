@@ -105,14 +105,21 @@ fn op_dela(args: &[Value], _env: &mut Environment, _eval: &mut Evaluator) -> Res
 
 fn op_mapa(args: &[Value], _env: &mut Environment, eval: &mut Evaluator) -> Result<Value, String> {
     ensure_arity(args, 2)?;
-    let arr = extract_list(&args[0])?;
-    let func = &args[1];
+    // Accept both (mapa array f) and (mapa f array) orders
+    let is_func = |v: &Value| matches!(v, Value::Closure(_) | Value::Macro(_) | Value::Symbol(_));
+    let (arr, func) = if is_func(&args[0]) && matches!(&args[1], Value::List(_)) {
+        (args[1].clone(), args[0].clone())
+    } else {
+        (args[0].clone(), args[1].clone())
+    };
+    let arr = extract_list(&arr)
+        .map_err(|_| "mapa expects (mapa array f) — array first, function second".to_string())?;
     let mut result = Vec::new();
     for i in (0..arr.len()).step_by(2) {
         if i + 1 < arr.len() {
             let key = arr[i].clone();
             let val = arr[i + 1].clone();
-            let mapped_val = match func {
+            let mapped_val = match &func {
                 Value::Closure(c) => {
                     eval.eval_closure(c.clone(), &[key.clone(), val])?
                 }

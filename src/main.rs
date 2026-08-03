@@ -72,7 +72,10 @@ fn run_wal_file(path: &Path, load: &[PathBuf], code: Option<&str>) -> Result<(),
     let source = std::fs::read_to_string(path)
         .map_err(|e| format!("Failed to read file: {}", e))?;
 
-    // Handle multi-line expressions by accumulating them across lines
+    // Handle multi-line expressions by accumulating them across lines.
+    // Comments (; to end of line, outside strings) are stripped per line so
+    // they never leak into the accumulated expression; lines are joined with
+    // '\n' so a trailing ';' keeps its line-comment semantics.
     let mut expr = String::new();
     let mut paren_depth = 0;
     let mut line_number = 0;
@@ -80,13 +83,22 @@ fn run_wal_file(path: &Path, load: &[PathBuf], code: Option<&str>) -> Result<(),
 
     for line in source.lines() {
         line_number += 1;
-        let trimmed = line.trim();
 
+        // Strip trailing comment (outside strings)
+        let mut in_str = false;
+        let mut effective = String::with_capacity(line.len());
+        for ch in line.chars() {
+            if ch == '"' { in_str = !in_str; }
+            if ch == ';' && !in_str { break; }
+            effective.push(ch);
+        }
+
+        let trimmed = effective.trim();
         if trimmed.is_empty() || trimmed.starts_with(';') {
             continue;
         }
 
-        for ch in line.chars() {
+        for ch in effective.chars() {
             expr.push(ch);
             if ch == '"' { in_string = !in_string; }
             if !in_string {
@@ -96,10 +108,13 @@ fn run_wal_file(path: &Path, load: &[PathBuf], code: Option<&str>) -> Result<(),
                     _ => {}
                 }
             }
-            // Evaluate complete expressions as soon as paren_depth reaches 0
+            // Evaluate complete expressions as soon as paren_depth reaches 0.
+            // Only bracketed expressions are evaluated mid-line; bare atoms
+            // (numbers/symbols like 0x1F) are evaluated at end of line so
+            // they are not chopped up character by character.
             if paren_depth == 0 && !in_string && !expr.trim().is_empty() {
                 let trimmed = expr.trim().to_string();
-                if !trimmed.is_empty() && !trimmed.starts_with(';') {
+                if !trimmed.is_empty() && !trimmed.starts_with(';') && trimmed.starts_with('(') {
                     match eval.eval(&trimmed) {
                         Ok(v) => {
                             if !matches!(v, wal::ast::Value::Nil) {
@@ -112,14 +127,37 @@ fn run_wal_file(path: &Path, load: &[PathBuf], code: Option<&str>) -> Result<(),
                             }
                         }
                     }
+                    expr.clear();
                 }
-                expr.clear();
             }
         }
 
-        // Add space between lines for proper tokenization (continues multi-line expr)
+        // A bare (unbracketed) expression on its own line is complete at
+        // end of line: evaluate it now instead of merging with next lines.
+        if paren_depth == 0 && !in_string && !expr.trim().is_empty()
+            && !expr.trim_start().starts_with('(')
+        {
+            let bare = expr.trim().to_string();
+            if !bare.is_empty() && !bare.starts_with(';') {
+                match eval.eval(&bare) {
+                    Ok(v) => {
+                        if !matches!(v, wal::ast::Value::Nil) {
+                            println!("{}", v);
+                        }
+                    }
+                    Err(e) => {
+                        if !e.starts_with("exit:") {
+                            eprintln!("Error on line {}: {}", line_number, e);
+                        }
+                    }
+                }
+            }
+            expr.clear();
+        }
+
+        // Add a newline between lines (keeps ';' line-comment semantics)
         if !in_string && paren_depth != 0 {
-            expr.push(' ');
+            expr.push('\n');
         }
     }
 

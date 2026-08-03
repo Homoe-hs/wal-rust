@@ -333,6 +333,10 @@ impl Evaluator {
                         return self.eval_defsig(&rest);
                     } else if op == Operator::Define {
                         return self.eval_define(&rest);
+                    } else if op == Operator::Set {
+                        return self.eval_set(&rest);
+                    } else if op == Operator::Defmacro {
+                        return self.eval_defmacro(&rest);
                     } else if op == Operator::If {
                         return self.eval_if(&rest);
                     } else if op == Operator::Case {
@@ -797,8 +801,8 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
             Value::List(list) => list.0.clone(),
             _ => return Err("let expects list of bindings".to_string()),
         };
-        // Support both (let (x 1 y 2) body) and (let ([x 1] [y 2]) body) formats
-        if bindings.len() >= 2 && bindings.iter().all(|b| matches!(b, Value::List(p) if p.len() == 2)) {
+        // Support both (let (x 1 y 2) body) and (let ((x 1) (y 2)) body) formats
+        if !bindings.is_empty() && bindings.iter().all(|b| matches!(b, Value::List(p) if p.len() == 2)) {
             for pair in &bindings {
                 if let Value::List(pair_lst) = pair {
                     let name = match &pair_lst[0] {
@@ -1825,6 +1829,41 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
     }
 
     // set! macro: (set! x val) -> (set x val)
+    /// defmacro special form: (defmacro name (args...) body...) —
+    /// name and arguments are literal, body is stored unevaluated.
+    fn eval_defmacro(&mut self, args: &[Value]) -> Result<Value, String> {
+        if args.len() < 3 {
+            return Err("defmacro expects at least (name (args...) body)".to_string());
+        }
+        let name = match &args[0] {
+            Value::Symbol(s) => s.name.clone(),
+            _ => return Err("defmacro expects symbol name".to_string()),
+        };
+        let args_list = match &args[1] {
+            Value::List(lst) => lst.0.iter().filter_map(|v| {
+                if let Value::Symbol(s) = v {
+                    Some(s.clone())
+                } else {
+                    None
+                }
+            }).collect(),
+            Value::Symbol(s) => vec![s.clone()],
+            _ => return Err("defmacro expects argument list".to_string()),
+        };
+        let mut body = args[2].clone();
+        for arg in &args[3..] {
+            body = Value::List(WList::from_vec(vec![body, arg.clone()]));
+        }
+        let macro_obj = crate::wal::ast::Macro::new(
+            Rc::new(RefCell::new(self.env.clone())),
+            args_list,
+            body,
+        ).with_name(&name);
+        let value = Value::Macro(macro_obj);
+        self.env.define(name, value.clone());
+        Ok(value)
+    }
+
     fn eval_set_macro(&mut self, args: &[Value]) -> Result<Value, String> {
         if args.len() != 2 {
             return Err("set! expects 2 arguments".to_string());
