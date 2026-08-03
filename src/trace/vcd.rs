@@ -161,6 +161,9 @@ pub struct VcdTrace {
     // Scopes
     scopes: Vec<String>,
 
+    // Timescale exponent (10^n seconds), parsed from $timescale
+    timescale_exp: Option<i8>,
+
     // Runtime
     current_index: usize,
     max_index: usize,
@@ -190,6 +193,7 @@ impl VcdTrace {
         // Track $scope / $upscope for hierarchical signal names
         let mut scope_stack: Vec<String> = Vec::new();
         let mut scopes: Vec<String> = Vec::new();
+        let mut timescale_exp: Option<i8> = None;
 
         loop {
             let line_offset = reader.current_offset();
@@ -227,6 +231,8 @@ impl VcdTrace {
                         scope_stack.push(scope_name);
                         scopes.push(scope_stack.join("."));
                     }
+                } else if hl.starts_with(b"$timescale") {
+                    timescale_exp = crate::vcd::convert::parse_timescale(hl);
                 } else if hl.starts_with(b"$upscope") {
                     scope_stack.pop();
                 } else if hl.starts_with(b"$enddefinitions") {
@@ -343,7 +349,8 @@ impl VcdTrace {
                                 if let Some(&sig_idx) = sid.get(&sig_hash) {
                                     let count = change_counts.entry(sig_idx).or_insert(0);
                                     *count += 1;
-                                    if *count % sparse_interval == 0 {
+                                    // Always anchor the first record; then sample every sparse_interval
+                                    if *count == 1 || *count % sparse_interval == 0 {
                                         si.entry(sig_idx)
                                             .or_default()
                                             .insert(current_timestamp, base_offset + line_start as u64);
@@ -435,6 +442,7 @@ impl VcdTrace {
             reader: RefCell::new(reader),
             header_end_offset,
             scopes,
+            timescale_exp,
             current_index: 0, max_index,
         })
     }
@@ -1423,6 +1431,45 @@ impl Trace for VcdTrace {
         }
         Ok(result)
     }
+
+    fn timestamp_at(&self, index: usize) -> Option<u64> {
+        if index < self.timestamps.len() { Some(self.timestamps.get(index)) } else { None }
+    }
+
+    fn timescale_exp(&self) -> Option<i8> {
+        self.timescale_exp
+    }
+
+    fn change_points(&self, name: &str) -> Result<Vec<(usize, ScalarValue)>, String> {
+        let sig_idx = self.name_to_idx.get(name)
+            .ok_or_else(|| format!("Unknown signal: {}", name))?;
+        // Event signals: change points already recorded during load
+        if let Some(points) = self.event_change_points.get(sig_idx) {
+            let mut out = Vec::with_capacity(points.len());
+            for &i in points {
+                let idx = i as usize;
+                let sv = self.signal_value(name, idx)?;
+                out.push((idx, sv));
+            }
+            return Ok(out);
+        }
+        // find_indices(Changed) skips the first record (no previous value);
+        // prepend it via the sparse index.
+        let mut changes = self.find_indices(name, FindCondition::Changed)?;
+        let first_ts = self.sparse_index.get(sig_idx)
+            .and_then(|m| m.keys().next().copied());
+        if let Some(ts) = first_ts {
+            let first_idx = self.find_timestamp_index(ts);
+            if changes.first() != Some(&first_idx) {
+                changes.insert(0, first_idx);
+            }
+        }
+        let mut out = Vec::with_capacity(changes.len());
+        for &i in &changes {
+            out.push((i, self.signal_value(name, i)?));
+        }
+        Ok(out)
+    }
 }
 
 /// Check if current value matches the condition
@@ -1537,7 +1584,6 @@ fn find_signal_in_block(block: &[u8], target_id: &[u8], id_len: usize) -> Option
     None
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1549,7 +1595,10 @@ mod tests {
 
     fn make_mini_vcd() -> std::path::PathBuf {
         // mini.vcd: 1-bit clk(!) and a("), 4 timestamps
-        let p = std::env::temp_dir().join(format!("wal_mini_{}.vcd", std::process::id()));
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let uniq = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let p = std::env::temp_dir().join(format!("wal_mini_{}_{}.vcd", std::process::id(), uniq));
         std::fs::write(&p, "$timescale 1ns $end\n\
 $scope module top $end\n\
 $var wire 1 ! clk $end\n\

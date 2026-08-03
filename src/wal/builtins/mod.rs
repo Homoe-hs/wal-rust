@@ -9,6 +9,7 @@ pub mod bitwise;
 pub mod array;
 pub mod scope;
 pub mod virtual_sig;
+pub mod wave;
 pub mod special;
 
 pub use core::register_core;
@@ -20,6 +21,7 @@ pub use bitwise::register_bitwise;
 pub use array::register_array;
 pub use scope::register_scope;
 pub use virtual_sig::register_virtual;
+pub use wave::register_wave;
 pub use special::register_special;
 
 use super::eval::Dispatcher;
@@ -34,5 +36,6 @@ pub fn register_all(disp: &mut Dispatcher) {
     register_array(disp);
     register_scope(disp);
     register_virtual(disp);
+    register_wave(disp);
     register_special(disp);
 }

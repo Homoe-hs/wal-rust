@@ -44,7 +44,7 @@ fn update_checkpoint(path: &Path, offset: u64) -> Result<(), String> {
         .map_err(|e| format!("Failed to write checkpoint: {}", e))
 }
 
-fn parse_timescale(line: &[u8]) -> Option<i8> {
+pub(crate) fn parse_timescale(line: &[u8]) -> Option<i8> {
     let s = std::str::from_utf8(line).ok()?;
     let parts: Vec<&str> = s.split_whitespace().collect();
     if parts.len() < 3 { return None; }

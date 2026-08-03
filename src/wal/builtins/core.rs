@@ -136,7 +136,8 @@ fn op_printf(args: &[Value], _env: &mut Environment, eval: &mut Evaluator) -> Re
     let fmt = extract_string(&args[0])?;
     let mut evaluated = Vec::new();
     for v in &args[1..] {
-        evaluated.push(format!("{}", eval.eval_value_public(v.clone())?));
+        // Args arrive pre-evaluated through the dispatcher; format directly.
+        evaluated.push(format!("{}", v));
     }
     // Handle escape sequences in format string
     let fmt = fmt.replace("\\n", "\n").replace("\\t", "\t").replace("\\\"", "\"");
@@ -315,13 +316,21 @@ fn op_help(args: &[Value], _env: &mut Environment, _eval: &mut Evaluator) -> Res
             "List all signals in the loaded traces: (SIGNALS)".to_string()
         }
         None => {
-            "WAL builtin reference.\n\
-             Query:    count find whenever rising falling changes is-x is-z\n\
-             Access:   get sample-at signal-width SIGNALS SCOPES\n\
-             Navigate: INDEX TS MAX-INDEX step\n\
-             Language: + - * / = != < > if do define set! fn map fold print printf\n\
-             Traces:   load unload\n\
-             Try (help \"count\") for details on a specific builtin.".to_string()
+            let mut text = String::from(
+                "WAL builtin reference.\n\
+                 Query:    count find whenever rising falling changes is-x is-z\n\
+                 Access:   get sample-at signal-width SIGNALS SCOPES\n\
+                 Navigate: INDEX TS MAX-INDEX step\n\
+                 Language: + - * / = != < > if do define set! fn map fold print printf\n\
+                 Traces:   load unload\n\
+                 Time queries:\n",
+            );
+            for line in crate::wal::builtins::wave::operator_help_lines() {
+                text.push_str(&line);
+                text.push('\n');
+            }
+            text.push_str("Try (help \"count\") or (doc \"getwave\") for a specific builtin.");
+            text
         }
         _ => format!("No help for '{}'. Try (help) for the overview.", topic.unwrap_or_default()),
     };

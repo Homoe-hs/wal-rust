@@ -302,4 +302,39 @@ impl Trace for FstTrace {
         }
         Ok(results)
     }
+
+    fn timestamp_at(&self, index: usize) -> Option<u64> {
+        self.timestamps.get(index).copied()
+    }
+
+    fn timescale_exp(&self) -> Option<i8> {
+        let wf = self.wf.borrow();
+        let ts = wf.hierarchy().timescale()?;
+        let exp = match ts.unit {
+            wellen::TimescaleUnit::Seconds => 0,
+            wellen::TimescaleUnit::MilliSeconds => -3,
+            wellen::TimescaleUnit::MicroSeconds => -6,
+            wellen::TimescaleUnit::NanoSeconds => -9,
+            wellen::TimescaleUnit::PicoSeconds => -12,
+            wellen::TimescaleUnit::FemtoSeconds => -15,
+            wellen::TimescaleUnit::AttoSeconds => -18,
+            wellen::TimescaleUnit::ZeptoSeconds => -21,
+            wellen::TimescaleUnit::Unknown => return None,
+        };
+        Some(exp)
+    }
+
+    fn change_points(&self, name: &str) -> Result<Vec<(usize, ScalarValue)>, String> {
+        let sig_ref = self.ensure_loaded(name)?;
+        let wf = self.wf.borrow();
+        let sig = wf.get_signal(sig_ref)
+            .ok_or_else(|| format!("Signal data not loaded: {}", name))?;
+        let mut out = Vec::new();
+        for (time_idx, sv) in sig.iter_changes() {
+            let idx = time_idx as usize;
+            if idx > self.max_index() { break; }
+            out.push((idx, value_to_scalar(&sv)));
+        }
+        Ok(out)
+    }
 }

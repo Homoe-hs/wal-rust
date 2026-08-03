@@ -42,6 +42,16 @@ pub trait Trace {
     fn find_indices(&self, name: &str, cond: FindCondition) -> Result<Vec<usize>, String>;
     /// Batch find: single pass, multiple entries. Returns counts per entry in order.
     fn find_indices_batch(&self, entries: &[BatchEntry]) -> Result<Vec<(String, Vec<usize>)>, String>;
+
+    /// Raw timestamp (in the file's native time unit) at the given index.
+    fn timestamp_at(&self, index: usize) -> Option<u64>;
+
+    /// All change points of a signal as (index, value), including the first
+    /// record (unlike `find_indices` with `Changed`, which skips it).
+    fn change_points(&self, name: &str) -> Result<Vec<(usize, ScalarValue)>, String>;
+
+    /// Timescale exponent: the time unit is 10^n seconds (None if unknown).
+    fn timescale_exp(&self) -> Option<i8>;
 }
 
 #[derive(Debug, Clone, PartialEq)]

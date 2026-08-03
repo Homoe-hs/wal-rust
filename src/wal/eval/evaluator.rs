@@ -71,9 +71,48 @@ fn collect_top_level_sexprs(node: tree_sitter::Node) -> Vec<tree_sitter::Node> {
     result
 }
 
+/// Build the "unknown operator" error, suggesting close matches (Levenshtein
+/// distance ≤ 2, or substring containment) among known operators.
+fn unknown_operator_error(name: &str) -> String {
+    let known: Vec<&str> = Operator::ALL_NAMES.iter().copied().collect();
+    let mut suggestions: Vec<&str> = Vec::new();
+    for k in known {
+        if k == name { continue; }
+        if lev_distance(name, k) <= 2 || (k.contains(name) && name.len() >= 3) || (name.contains(k) && k.len() >= 4) {
+            suggestions.push(k);
+        }
+    }
+    suggestions.sort();
+    suggestions.dedup();
+    let mut msg = format!("Unknown operator or function: {}", name);
+    if !suggestions.is_empty() {
+        msg.push_str(&format!(
+            ". Did you mean: {}?",
+            suggestions.iter().take(5).cloned().collect::<Vec<_>>().join(", ")
+        ));
+    }
+    msg.push_str(". Try (help) for the operator list.");
+    msg
+}
+
+fn lev_distance(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    for (i, ca) in a.iter().enumerate() {
+        let mut cur = vec![i + 1];
+        for (j, cb) in b.iter().enumerate() {
+            let cost = if ca == cb { 0 } else { 1 };
+            cur.push((prev[j] + 1).min(cur[j] + 1).min(prev[j + 1] + cost));
+        }
+        prev = cur;
+    }
+    prev[b.len()]
+}
+
 impl Evaluator {
 
-    pub fn eval_value(&mut self, value: Value) -> Result<Value, String> {
+pub fn eval_value(&mut self, value: Value) -> Result<Value, String> {
         match value {
             Value::Symbol(s) => self.eval_symbol(s),
             Value::List(lst) => self.eval_list(lst),
@@ -425,9 +464,8 @@ impl Evaluator {
                         _ => Ok(v),
                     }
                 } else {
-                    Err(format!("Unknown operator or function: {}", s.name))
-                }
-            }
+                    Err(unknown_operator_error(&s.name))
+                }            }
             Value::List(ref inner) => {
                 // Evaluate the inner list as a whole expression (handles fn/closure creation)
                 let first_val = self.eval_value(Value::List(inner.clone()))?;
@@ -444,12 +482,16 @@ impl Evaluator {
                         return self.eval_macro(m, &args);
                     }
                     _ => {
+                        // The head evaluated to a plain value (not a closure):
+                        // treat as a data list, evaluating the remaining elements
+                        // once. Do NOT recurse into eval_list — that would loop
+                        // forever on nested data lists such as ((1 2) (3 4)).
                         let mut evaluated = Vec::new();
                         evaluated.push(first_val);
                         for v in lst.0.iter().skip(1) {
                             evaluated.push(self.eval_value(v.clone())?);
                         }
-                        self.eval_list(WList::from_vec(evaluated))
+                        Ok(Value::List(WList::from_vec(evaluated)))
                     }
                 }
             }

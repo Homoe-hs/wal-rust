@@ -1,0 +1,25 @@
+$version WAL virtual trace $end
+$timescale 1ns $end
+$scope module virtual $end
+$var reg 32 s1 vh [31:0] $end
+$upscope $end
+$enddefinitions $end
+$dumpvars
+b00000000000000000000000000000000s1
+$end
+#1
+#2
+#3
+#4
+#5
+#6
+#7
+#8
+#9
+#10
+#11
+#12
+#13
+#14
+#15
+#16

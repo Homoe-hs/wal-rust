@@ -22,7 +22,31 @@ fn op_load(args: &[Value], env: &mut Environment, _eval: &mut Evaluator) -> Resu
 
     if let Some(traces) = env.get_traces() {
         let mut traces = traces.write().unwrap_or_else(|e| e.into_inner());
+        let tid2 = tid.clone();
         traces.load(Path::new(&path), tid)?;
+        // Load summary: time range, signal count, timescale
+        if let Some(tr) = traces.get(&tid2) {
+            let n = tr.max_index();
+            let t0 = tr.timestamp_at(0);
+            let t1 = tr.timestamp_at(n);
+            let unit = match tr.timescale_exp() {
+                Some(0) => "s", Some(-3) => "ms", Some(-6) => "us",
+                Some(-9) => "ns", Some(-12) => "ps", Some(-15) => "fs",
+                _ => "?",
+            };
+            match (t0, t1) {
+                (Some(a), Some(b)) => eprintln!(
+                    "loaded {}: {} signals, {} timestamps, t=[{}{}, {}{}], timescale 10^{}s",
+                    path, tr.signals().len(), n + 1, a, unit, b, unit,
+                    tr.timescale_exp().map(|e| e.to_string()).unwrap_or_else(|| "?".into())
+                ),
+                _ => eprintln!(
+                    "loaded {}: {} signals, timescale 10^{}s",
+                    path, tr.signals().len(),
+                    tr.timescale_exp().map(|e| e.to_string()).unwrap_or_else(|| "?".into())
+                ),
+            }
+        }
     }
     Ok(Value::Nil)
 }
