@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# pre-commit hook: auto-increment the Cargo.toml patch version on every
+# commit, unless the version was already changed in this commit.
+#
+#   ../../0.11.2  →  0.11.3  →  0.11.4  ...
+#
+# Explicit version bumps (e.g. 0.11.2 -> 0.12.0 for a feature release) are
+# left alone because Cargo.toml is staged by then.
+#
+# Enable with:  git config core.hooksPath .githooks
+set -euo pipefail
+
+TOML="$(git rev-parse --show-toplevel)/Cargo.toml"
+
+# If Cargo.toml is already staged (version touched by the commit), do nothing.
+if ! git diff --cached --quiet -- Cargo.toml; then
+    exit 0
+fi
+if [[ ! -f "$TOML" ]]; then
+    exit 0
+fi
+
+VER="$(sed -n 's/^version = "\([0-9.]*\)"/\1/p' "$TOML" | head -1)"
+if [[ -z "$VER" ]]; then
+    exit 0
+fi
+IFS='.' read -r MAJOR MINOR PATCH <<<"$VER"
+NEW="$MAJOR.$MINOR.$((PATCH + 1))"
+
+sed -i "s/^version = \"$VER\"/version = \"$NEW\"/" "$TOML"
+git add "$TOML"
+echo "auto-bump: wal-rust $VER -> $NEW"
