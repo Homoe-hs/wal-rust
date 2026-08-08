@@ -323,6 +323,9 @@ fn op_help(args: &[Value], _env: &mut Environment, _eval: &mut Evaluator) -> Res
                  Navigate: INDEX TS MAX-INDEX step\n\
                  Language: + - * / = != < > if do define set! fn map fold print printf\n\
                  Traces:   load unload\n\
+                 NOTE: getwave/wave/at/edges return timestamps in the waveform's\n\
+                 NATIVE unit (ps/ns/... per the file timescale; see the load summary).\n\
+                 Use (period)/(freq)/(fmt-time) for seconds/human units.\n\
                  Time queries:\n",
             );
             for line in crate::wal::builtins::wave::operator_help_lines() {

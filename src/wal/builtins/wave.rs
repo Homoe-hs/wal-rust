@@ -480,7 +480,10 @@ const DOCS: &[(&str, &str)] = &[
     ("period", "(period \"clk\") → average clock period in seconds"),
     ("freq", "(freq \"clk\") → clock frequency in Hz"),
     ("save", "(save \"out.csv\" \"sig\"...) → export time/value columns to CSV"),
+    ("fmt-time", "(fmt-time t) → t formatted with the waveform's timescale unit (e.g. 1.06ms)"),
     ("doc", "(doc \"cmd\") → one-line documentation for a command"),
+    // NOTE: keep the unit semantics visible in (help) as well.
+    ("timescale", "Times are in the waveform's NATIVE unit: raw numbers from getwave/wave/at/edges are ps/ns/... per the file's $timescale (see the load summary). Only period/freq and fmt-time convert to seconds / human units."),
 ];
 
 fn op_doc(args: &[Value], _env: &mut Environment, _eval: &mut Evaluator) -> Result<Value, String> {
@@ -494,6 +497,37 @@ fn op_doc(args: &[Value], _env: &mut Environment, _eval: &mut Evaluator) -> Resu
         println!("No docs for '{}'. Try (help) for the operator list.", topic);
     }
     Ok(Value::Nil)
+}
+
+/// Format a raw timestamp (native time units) into a human-readable string
+/// using the waveform's timescale, e.g. 1060000ps -> "1.06ms".
+fn format_timestamp(t: u64, exp: Option<i8>) -> String {
+    let exp = exp.unwrap_or(-12) as i64;
+    // seconds = t * 10^exp
+    let seconds = t as f64 * 10f64.powi(exp as i32);
+    const UNITS: &[(&str, f64)] = &[
+        ("s", 1e0), ("ms", 1e-3), ("us", 1e-6), ("ns", 1e-9), ("ps", 1e-12), ("fs", 1e-15),
+    ];
+    for (name, scale) in UNITS {
+        if seconds.abs() >= *scale {
+            let v = seconds / scale;
+            if v.abs() >= 1.0 || *name == "fs" {
+                return format!("{:.2}{}", v, name);
+            }
+        }
+    }
+    format!("{:.2}s", seconds)
+}
+
+fn op_fmt_time(args: &[Value], env: &mut Environment, _eval: &mut Evaluator) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err("(fmt-time t) expected".to_string());
+    }
+    let t = extract_int(&args[0])? as u64;
+    with_first_trace(env, |tr| {
+        let s = format_timestamp(t, tr.timescale_exp());
+        Ok(Value::String(s))
+    })
 }
 
 /// List every operator with a one-line usage hint (used by (help) and startup).
@@ -520,4 +554,5 @@ pub fn register_wave(disp: &mut Dispatcher) {
     disp.register(Operator::Freq, op_freq);
     disp.register(Operator::Save, op_save);
     disp.register(Operator::Doc, op_doc);
+    disp.register(Operator::FmtTime, op_fmt_time);
 }
