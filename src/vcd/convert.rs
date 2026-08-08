@@ -47,10 +47,20 @@ fn update_checkpoint(path: &Path, offset: u64) -> Result<(), String> {
 pub(crate) fn parse_timescale(line: &[u8]) -> Option<i8> {
     let s = std::str::from_utf8(line).ok()?;
     let parts: Vec<&str> = s.split_whitespace().collect();
-    if parts.len() < 3 { return None; }
-    let num: u32 = parts[1].parse().ok()?;
-    let unit = parts[2].to_lowercase();
-    let exp = match unit.as_str() {
+    if parts.len() < 2 { return None; }
+    // Both "$timescale 1 ns $end" (iverilog) and "$timescale 1ns $end" (verilator)
+    let raw = parts[1].to_lowercase();
+    let (num_str, unit_str): (String, String) = if raw.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false) {
+        // split digits from unit suffix, e.g. "1ps", "10ns", "0.1us"
+        match raw.find(|c: char| !c.is_ascii_digit() && c != '.') {
+            Some(i) => (raw[..i].to_string(), raw[i..].to_string()),
+            None => (raw.clone(), String::new()),
+        }
+    } else {
+        (raw.clone(), parts.get(2).map(|u| u.to_lowercase()).unwrap_or_default())
+    };
+    let num: f64 = num_str.parse().ok()?;
+    let exp = match unit_str.trim() {
         "s" => 0,
         "ms" => -3,
         "us" => -6,
@@ -294,7 +304,10 @@ pub fn vcd_to_fst_streaming(
         .map_err(|e| format!("FST writer init: {}", e))?;
     writer.set_version("wal-rust vcd2fst");
 
-    let mut signal_map: HashMap<Vec<u8>, u32> = HashMap::new();
+    // iverilog 会对不同 scope 的同名信号(如 TB 顶层 wire 与 DUT 输入端口)
+    // 复用同一个 VCD id, 因此一个 id 可能对应多个 FST handle,
+    // 值变化必须广播到所有 handle, 否则先声明(或后声明)的信号会恒为初值
+    let mut signal_map: HashMap<Vec<u8>, Vec<u32>> = HashMap::new();
     let mut prev_values: HashMap<u32, Vec<u8>> = HashMap::new();
 
     #[derive(PartialEq)]
@@ -371,7 +384,7 @@ pub fn vcd_to_fst_streaming(
                                         &name, width,
                                         VarType::from_vcd_type(parts[1], width),
                                     );
-                                    signal_map.insert(id_bytes, handle);
+                                    signal_map.entry(id_bytes).or_default().push(handle);
                                 }
                             }
                         }
@@ -407,10 +420,12 @@ pub fn vcd_to_fst_streaming(
                             dumps_started = true;
                         }
                         if let Some((id, val)) = parse_value_change(line) {
-                            if let Some(&handle) = signal_map.get(&id) {
-                                if prev_values.get(&handle).map_or(true, |pv| pv.as_slice() != val) {
-                                    writer.emit_value_change(handle, &val);
-                                    prev_values.insert(handle, val);
+                            if let Some(handles) = signal_map.get(&id) {
+                                for &handle in handles {
+                                    if prev_values.get(&handle).map_or(true, |pv| pv.as_slice() != val) {
+                                        writer.emit_value_change(handle, &val);
+                                        prev_values.insert(handle, val.clone());
+                                    }
                                 }
                             }
                         }
@@ -429,10 +444,12 @@ pub fn vcd_to_fst_streaming(
                         dumps_started = true;
                     }
                     if let Some((id, val)) = parse_value_change(line) {
-                        if let Some(&handle) = signal_map.get(&id) {
-                            if prev_values.get(&handle).map_or(true, |pv| pv.as_slice() != val) {
-                                writer.emit_value_change(handle, &val);
-                                prev_values.insert(handle, val);
+                        if let Some(handles) = signal_map.get(&id) {
+                            for &handle in handles {
+                                if prev_values.get(&handle).map_or(true, |pv| pv.as_slice() != val) {
+                                    writer.emit_value_change(handle, &val);
+                                    prev_values.insert(handle, val.clone());
+                                }
                             }
                         }
                     }
@@ -458,10 +475,12 @@ pub fn vcd_to_fst_streaming(
                     }
                 } else if first != b'$' {
                     if let Some((id, val)) = parse_value_change(line) {
-                        if let Some(&handle) = signal_map.get(&id) {
-                            if prev_values.get(&handle).map_or(true, |pv| pv.as_slice() != val) {
-                                writer.emit_value_change(handle, &val);
-                                prev_values.insert(handle, val);
+                        if let Some(handles) = signal_map.get(&id) {
+                            for &handle in handles {
+                                if prev_values.get(&handle).map_or(true, |pv| pv.as_slice() != val) {
+                                    writer.emit_value_change(handle, &val);
+                                    prev_values.insert(handle, val.clone());
+                                }
                             }
                         }
                     }
