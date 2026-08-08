@@ -110,7 +110,7 @@ fn op_do(args: &[Value], _env: &mut Environment, eval: &mut Evaluator) -> Result
     Ok(result)
 }
 
-fn op_while(args: &[Value], _env: &mut Environment, eval: &mut Evaluator) -> Result<Value, String> {
+pub(crate) fn op_while(args: &[Value], _env: &mut Environment, eval: &mut Evaluator) -> Result<Value, String> {
     ensure_arity(args, 2)?;
     let mut result = Value::Nil;
     while eval.eval_value_public(args[0].clone())?.is_truthy() {

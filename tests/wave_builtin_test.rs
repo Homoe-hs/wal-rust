@@ -80,6 +80,21 @@ fn test_unknown_operator_suggestion() {
 }
 
 #[test]
+fn test_while_special_form() {
+    // while must be lazy: cond/body re-evaluated per iteration, set! advances
+    let mut eval = new_eval(&fst_fixture_path());
+    eval_str(&mut eval, "(define j 0)");
+    eval_str(&mut eval, "(while (< j 3) (set! j (+ j 1)))");
+    assert_eq!(eval_str(&mut eval, "j"), "3");
+    // nested set! inside while body
+    eval_str(&mut eval, "(define acc 0)");
+    eval_str(&mut eval, "(define i 0)");
+    eval_str(&mut eval, "(while (< i 5) (set! acc (+ acc i)) (set! i (+ i 1)))");
+    assert_eq!(eval_str(&mut eval, "acc"), "10");
+    assert_eq!(eval_str(&mut eval, "i"), "5");
+}
+
+#[test]
 fn test_save_csv() {
     let mut eval = new_eval(&fst_fixture_path());
     let out = std::env::temp_dir().join(format!("wal_save_test_{}.csv", std::process::id()));

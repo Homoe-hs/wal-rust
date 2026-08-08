@@ -376,6 +376,10 @@ pub fn eval_value(&mut self, value: Value) -> Result<Value, String> {
                         return self.eval_set(&rest);
                     } else if op == Operator::Defmacro {
                         return self.eval_defmacro(&rest);
+                    } else if op == Operator::While {
+                        // while is a special form: cond/body must not be
+                        // pre-evaluated (re-evaluated per iteration)
+                        return self.eval_while(&rest);
                     } else if op == Operator::If {
                         return self.eval_if(&rest);
                     } else if op == Operator::Case {
@@ -1904,6 +1908,21 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
         let value = Value::Macro(macro_obj);
         self.env.define(name, value.clone());
         Ok(value)
+    }
+
+    /// while special form: (while cond body...) — cond and all body forms
+    /// are re-evaluated on every iteration (no pre-evaluation).
+    fn eval_while(&mut self, args: &[Value]) -> Result<Value, String> {
+        if args.len() < 2 {
+            return Err(format!("while expects (cond body...), got {} args", args.len()));
+        }
+        let mut result = Value::Nil;
+        while self.eval_value(args[0].clone())?.is_truthy() {
+            for body in &args[1..] {
+                result = self.eval_value(body.clone())?;
+            }
+        }
+        Ok(result)
     }
 
     fn eval_set_macro(&mut self, args: &[Value]) -> Result<Value, String> {
