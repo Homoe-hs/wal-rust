@@ -359,6 +359,31 @@ fn op_assert_eq(args: &[Value], env: &mut Environment, _eval: &mut Evaluator) ->
     })
 }
 
+/// Average rising-edge interval of a clock signal in the waveform's native
+/// time units. Returns None when there are not enough edges.
+fn avg_rise_period_native(tr: &dyn Trace, sig: &str) -> Result<Option<f64>, String> {
+    let points = tr.change_points(sig)?;
+    let mut prev_rise: Option<u64> = None;
+    let mut total = 0u64;
+    let mut n = 0u64;
+    for (idx, sv) in &points {
+        let is_rise = match sv {
+            ScalarValue::Bit(b) => *b == b'1',
+            ScalarValue::Vector(v) if v.len() == 1 => v[0] == b'1',
+            _ => continue,
+        };
+        if is_rise {
+            let t = tr.timestamp_at(*idx).unwrap_or(0);
+            if let Some(p) = prev_rise {
+                total += t - p;
+                n += 1;
+            }
+            prev_rise = Some(t);
+        }
+    }
+    if n == 0 { Ok(None) } else { Ok(Some(total as f64 / n as f64)) }
+}
+
 fn op_period(args: &[Value], env: &mut Environment, _eval: &mut Evaluator) -> Result<Value, String> {
     if args.len() < 1 || args.len() > 2 {
         return Err("(period \"clk\") expected".to_string());
@@ -366,35 +391,11 @@ fn op_period(args: &[Value], env: &mut Environment, _eval: &mut Evaluator) -> Re
     let name = extract_string(&args[0])?;
     with_first_trace(env, |tr| {
         let sig = resolve_signal(tr, &name)?;
-        let points = tr.change_points(&sig)?;
-        let times: Vec<u64> = points.iter().map(|(idx, _)| tr.timestamp_at(*idx).unwrap_or(0)).collect();
-        if times.len() < 3 {
-            return Err(format!("period: not enough edges for {}", sig));
-        }
-        // Average over all rise-to-rise intervals
-        let mut prev_rise: Option<u64> = None;
-        let mut total = 0u64;
-        let mut n = 0u64;
-        for (i, &t) in times.iter().enumerate() {
-            let is_rise = match points[i].1 {
-                ScalarValue::Bit(b) => b == b'1',
-                _ => continue,
-            };
-            if is_rise {
-                if let Some(p) = prev_rise {
-                    total += t - p;
-                    n += 1;
-                }
-                prev_rise = Some(t);
-            }
-        }
-        if n == 0 {
-            return Err(format!("period: no rising edges for {}", sig));
-        }
+        let period_native = avg_rise_period_native(tr, &sig)?
+            .ok_or_else(|| format!("period: not enough rising edges for {}", sig))?;
         let exp = tr.timescale_exp().unwrap_or(-9) as i64;
         let scale = 10f64.powi(exp as i32);
-        let seconds = (total as f64 / n as f64) * scale;
-        Ok(Value::Float(seconds))
+        Ok(Value::Float(period_native * scale))
     })
 }
 
@@ -480,7 +481,7 @@ const DOCS: &[(&str, &str)] = &[
     ("period", "(period \"clk\") → average clock period in seconds"),
     ("freq", "(freq \"clk\") → clock frequency in Hz"),
     ("save", "(save \"out.csv\" \"sig\"...) → export time/value columns to CSV"),
-    ("fmt-time", "(fmt-time t) → t formatted with the waveform's timescale unit (e.g. 1.06ms)"),
+    ("fmt-time", "(fmt-time t [\"clk\"]) → t formatted with the waveform's timescale (e.g. 1.06ms); with a clock signal: \"beat N (1.06ms)\""),
     ("doc", "(doc \"cmd\") → one-line documentation for a command"),
     // NOTE: keep the unit semantics visible in (help) as well.
     ("timescale", "Times are in the waveform's NATIVE unit: raw numbers from getwave/wave/at/edges are ps/ns/... per the file's $timescale (see the load summary). Only period/freq and fmt-time convert to seconds / human units."),
@@ -520,13 +521,26 @@ fn format_timestamp(t: u64, exp: Option<i8>) -> String {
 }
 
 fn op_fmt_time(args: &[Value], env: &mut Environment, _eval: &mut Evaluator) -> Result<Value, String> {
-    if args.len() != 1 {
-        return Err("(fmt-time t) expected".to_string());
+    if args.len() < 1 || args.len() > 2 {
+        return Err("(fmt-time t [\"clk\"]) expected".to_string());
     }
     let t = extract_int(&args[0])? as u64;
     with_first_trace(env, |tr| {
-        let s = format_timestamp(t, tr.timescale_exp());
-        Ok(Value::String(s))
+        let exp = tr.timescale_exp();
+        // Beat mode: (fmt-time t "clk") → "beat N (human time)"
+        if let Some(clk_arg) = args.get(1) {
+            let clk = extract_string(clk_arg)?;
+            let sig = resolve_signal(tr, &clk)?;
+            if let Some(period) = avg_rise_period_native(tr, &sig)? {
+                let beats = (t as f64 / period).round() as i64;
+                return Ok(Value::String(format!(
+                    "beat {} ({})",
+                    beats,
+                    format_timestamp(t, exp)
+                )));
+            }
+        }
+        Ok(Value::String(format_timestamp(t, exp)))
     })
 }
 
