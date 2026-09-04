@@ -476,6 +476,7 @@ const DOCS: &[(&str, &str)] = &[
     ("count-edges", "(count-edges \"sig\" [t0 t1]) → number of changes in window"),
     ("edges", "(edges \"sig\" [t0 t1]) → change timestamps in window"),
     ("find-sig", "(find-sig \"pattern\") → signal names containing the substring"),
+    ("take", "(take n list) → first n elements; e.g. (take 5 (find-sig \"clk\")) or (take 5 SIGNALS)"),
     ("search", "(search \"sig\" \"101\" [t0 t1]) → timestamps where the bit pattern occurs"),
     ("assert-eq", "(assert-eq \"sig\" t0 t1 v) → true if the signal equals v throughout [t0,t1]"),
     ("period", "(period \"clk\") → average clock period in seconds"),

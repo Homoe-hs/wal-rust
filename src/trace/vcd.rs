@@ -1220,7 +1220,10 @@ impl Trace for VcdTrace {
             sig_idx: u32,
         }
         let mut batch_sigs: Vec<BatchSig> = Vec::new();
-        let mut id_to_batch: HashMap<Vec<u8>, usize> = HashMap::new();
+        // A signal may appear in several conditions with different values
+        // (e.g. (count (= s 1) (= s 0))); each id must keep ALL batch indices,
+        // not just the last one (the old single-usize map dropped counts).
+        let mut id_to_batch: HashMap<Vec<u8>, Vec<usize>> = HashMap::new();
 
         for (name, cond) in signals {
             let sig_idx = match self.name_to_idx.get(&name) {
@@ -1232,7 +1235,7 @@ impl Trace for VcdTrace {
                 None => continue,
             };
             let batch_idx = batch_sigs.len();
-            id_to_batch.insert(id_bytes.clone(), batch_idx);
+            id_to_batch.entry(id_bytes.clone()).or_default().push(batch_idx);
             batch_sigs.push(BatchSig {
                 name: name.clone(),
                 cond: cond.clone(),
@@ -1296,9 +1299,11 @@ impl Trace for VcdTrace {
 
         // Organize IDs by length for fast lookup: id_by_len[len] = vec![(id_bytes, batch_idx)]
         let mut id_by_len: Vec<Vec<(Vec<u8>, usize)>> = vec![Vec::new(); 8];
-        for (id_bytes, &batch_idx) in &id_to_batch {
+        for (id_bytes, batch_idxs) in &id_to_batch {
             if id_bytes.len() < 8 {
-                id_by_len[id_bytes.len()].push((id_bytes.clone(), batch_idx));
+                for &b in batch_idxs {
+                    id_by_len[id_bytes.len()].push((id_bytes.clone(), b));
+                }
             }
         }
 
@@ -1366,29 +1371,36 @@ impl Trace for VcdTrace {
                     'idscan: for id_len in (1..max_id_len).rev() {
                         let id_start = line.len() - id_len;
                         let candidates = &id_by_len_arc[id_len];
+                        // Same signal may carry several conditions → apply the
+                        // value to EVERY batch slot that shares this id.
+                        let mut matched: Vec<usize> = Vec::new();
                         for (ref id_bytes, batch_idx) in candidates.iter() {
-                            let batch_idx = *batch_idx;
                             if (line.len() == id_len + 1 || (id_start > 0 && line[id_start - 1] == b' ')) && &line[id_start..] == id_bytes.as_slice() {
-                                let val = match first {
-                                    b'b' => {
-                                        let ve = id_start.saturating_sub(1);
-                                        let vs = if ve > 1 && line[ve] == b' ' { &line[1..ve] } else { &line[1..id_start] };
-                                        VcdValue::Vector(vs.to_vec())
-                                    }
-                                    b'r' => {
-                                        let vs = std::str::from_utf8(&line[1..id_start]).unwrap_or("0");
-                                        if let Ok(r) = vs.trim().parse::<f64>() { VcdValue::Real(r) } else { break 'idscan; }
-                                    }
-                                    _ => VcdValue::Bit(first),
-                                };
+                                matched.push(*batch_idx);
+                            }
+                        }
+                        if !matched.is_empty() {
+                            let val = match first {
+                                b'b' => {
+                                    let ve = id_start.saturating_sub(1);
+                                    let vs = if ve > 1 && line[ve] == b' ' { &line[1..ve] } else { &line[1..id_start] };
+                                    VcdValue::Vector(vs.to_vec())
+                                }
+                                b'r' => {
+                                    let vs = std::str::from_utf8(&line[1..id_start]).unwrap_or("0");
+                                    if let Ok(r) = vs.trim().parse::<f64>() { VcdValue::Real(r) } else { break 'idscan; }
+                                }
+                                _ => VcdValue::Bit(first),
+                            };
+                            for &batch_idx in &matched {
                                 if !seen_first_ts {
                                     // orphan value line before first '#': previous timestamp value
-                                    prev_vals[batch_idx] = Some(val);
+                                    prev_vals[batch_idx] = Some(val.clone());
                                 } else {
-                                    current_vals[batch_idx] = Some(val);
+                                    current_vals[batch_idx] = Some(val.clone());
                                 }
-                                break 'idscan;
                             }
+                            break 'idscan;
                         }
                     }
                 }
@@ -1430,6 +1442,66 @@ impl Trace for VcdTrace {
             result.push((bs.name.clone(), idxs));
         }
         Ok(result)
+    }
+
+    /// Single-pass top-`k` by value-change count (no per-signal scans), so
+    /// waves with 90k+ signals answer instantly.
+    fn signal_change_counts_top(&self, k: usize) -> Vec<(String, usize)> {
+        let data = self.reader.borrow().data.clone();
+        let hdr = self.header_end_offset as usize;
+        let dump = &data[hdr..];
+
+        let mut id_to_idx: HashMap<Vec<u8>, u32> = HashMap::with_capacity(self.signal_id_bytes.len());
+        let mut idx_to_name: HashMap<u32, &str> = HashMap::with_capacity(self.name_to_idx.len());
+        for (idx, idb) in &self.signal_id_bytes {
+            id_to_idx.insert(idb.clone(), *idx);
+        }
+        for (name, idx) in &self.name_to_idx {
+            idx_to_name.insert(*idx, name.as_str());
+        }
+
+        let mut counts: HashMap<u32, usize> = HashMap::new();
+        let mut i = 0usize;
+        while i < dump.len() {
+            let line_start = i;
+            let line_end = match memchr::memchr(b'\n', &dump[i..]) {
+                Some(nl) => {
+                    i += nl;
+                    let e = i;
+                    i += 1;
+                    e
+                }
+                None => break,
+            };
+            let line = &dump[line_start..line_end];
+            if line.is_empty() {
+                continue;
+            }
+            let first = line[0];
+            // value lines: 0/1/x/z/b/r (case-insensitive bits)
+            if !matches!(first, b'0' | b'1' | b'x' | b'X' | b'z' | b'Z' | b'b' | b'B' | b'r' | b'R') {
+                continue;
+            }
+            let id: &[u8] = if matches!(first, b'b' | b'B' | b'r' | b'R') {
+                match line.iter().rposition(|&c| c == b' ') {
+                    Some(pos) => &line[pos + 1..],
+                    None => continue,
+                }
+            } else {
+                &line[1..]
+            };
+            if let Some(&idx) = id_to_idx.get(id) {
+                *counts.entry(idx).or_insert(0) += 1;
+            }
+        }
+
+        let mut v: Vec<(String, usize)> = counts
+            .into_iter()
+            .filter_map(|(idx, c)| idx_to_name.get(&idx).map(|n| (n.to_string(), c)))
+            .collect();
+        v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        v.truncate(k);
+        v
     }
 
     fn timestamp_at(&self, index: usize) -> Option<u64> {

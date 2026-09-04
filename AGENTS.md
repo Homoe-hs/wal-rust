@@ -29,7 +29,7 @@ Subcommands: `run`, `repl`. Flags: `-l <waveform>` (repeatable), `-c <code>` (in
 |-----|---------|--------|
 | `src/wal/` | AST, tree-sitter parser, Evaluator, builtins (11 modules) | 5,200 |
 | `src/vcd/` | VCD parser (mmap + memchr + two-pass) | 2,100 |
-| `src/fst/` | FST reader/writer (LE/BE auto-detect, LZ4/zlib) | 2,700 |
+| `src/fst/` | FST writer (wellen reads via `src/trace/fst.rs`; legacy reader retired) | 2,700 |
 | `src/trace/` | `Trace` trait, `VcdTrace`, `FstTrace`, `TraceContainer` | 2,150 |
 | `tests/` | Rust integration & correctness tests (5 files, ~860 lines) | 860 |
 | `test_data/` | VCD/FST test files (counter.vcd 11K, pyvcd_100M 107MB, edge cases) | — |
@@ -38,7 +38,7 @@ Subcommands: `run`, `repl`. Flags: `-l <waveform>` (repeatable), `-c <code>` (in
 ## Architecture notes
 
 - **tree-sitter parser**: `build.rs` compiles `tree-sitter-wal/src/parser.c`. First build compiles C code.
-- **FST endian auto-detect**: PI bytes → LE, e bytes → BE. No user config.
+- **FST read backend**: wellen (`wellen::simple::read` in `src/trace/fst.rs`); the legacy hand-rolled reader was retired (only the writer stays: `src/fst/writer.rs` + vcd→fst convert tests).
 - **Dispatcher pattern** for builtins: (1) write handler in `src/wal/builtins/xxx.rs` (2) register in `builtins/mod.rs::register_all()` (3) optional `Operator` enum variant in `ast/operator.rs`.
 - **Global allocator**: `mimalloc` in `src/main.rs` (no `#[global_allocator]` elsewhere).
 - **VCD trace loading**: two-pass. Pass 1a scans header (sequential). Pass 1b scans dump in parallel chunks (Rayon). Builds sparse index per signal.

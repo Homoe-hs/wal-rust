@@ -52,6 +52,21 @@ pub trait Trace {
 
     /// Timescale exponent: the time unit is 10^n seconds (None if unknown).
     fn timescale_exp(&self) -> Option<i8>;
+
+    /// Top-`k` signals by number of value changes. Default: per-signal
+    /// change_points (fine for small signal sets); VCD overrides this with a
+    /// single-pass counter so 90k-signal waves stay fast.
+    fn signal_change_counts_top(&self, k: usize) -> Vec<(String, usize)> {
+        let mut counts: Vec<(String, usize)> = Vec::new();
+        for s in self.signals() {
+            if let Ok(cp) = self.change_points(&s) {
+                counts.push((s, cp.len()));
+            }
+        }
+        counts.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        counts.truncate(k);
+        counts
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]

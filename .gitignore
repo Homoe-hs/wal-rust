@@ -17,3 +17,6 @@ vcd-samples/
 .memsearch/
 test_*.wal
 wal-rust
+
+# local cargo home (read-only ~/.cargo workaround)
+.cargo-home/

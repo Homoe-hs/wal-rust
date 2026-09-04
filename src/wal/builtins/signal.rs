@@ -251,8 +251,44 @@ fn op_find(args: &[Value], env: &mut Environment, eval: &mut Evaluator) -> Resul
     Ok(Value::List(WList::new()))
 }
 
+/// Resolve symbol signal names inside a condition AST to their string
+/// bindings, e.g. `(define s "tb.top.sig")` then `(count (= (get s) 1))`.
+/// `count`/`find` are special forms and see the UNevaluated AST, so a bare
+/// symbol `s` would otherwise miss the fast path (full per-step scan =
+/// hang on big waves) or be matched as the literal name "s".
+/// Ops with a signal-name argument: get, is-x, is-z, rising, falling, changes.
+pub(crate) fn resolve_cond_names(expr: &Value, env: &Environment) -> Value {
+    if let Value::List(lst) = expr {
+        if lst.len() >= 2 {
+            if let Value::Symbol(f) = &lst.0[0] {
+                if matches!(
+                    f.name.as_str(),
+                    "get" | "is-x" | "is-z" | "rising" | "falling" | "changes"
+                ) {
+                    if let Value::Symbol(sym) = &lst.0[1] {
+                        if let Some(val) = env.lookup(&sym.name) {
+                            if matches!(val, Value::String(_)) {
+                                let mut items = lst.0.clone();
+                                items[1] = val.clone();
+                                return Value::List(WList::from_vec(items));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let resolved: Vec<Value> = lst.0.iter().map(|v| resolve_cond_names(v, env)).collect();
+        return Value::List(WList::from_vec(resolved));
+    }
+    expr.clone()
+}
+
 /// Try fast path for simple (= (get "sig") val) condition using find_indices
 pub(crate) fn try_find_indices_simple(cond: &Value, max_results: usize, env: &mut Environment) -> Option<Result<Value, String>> {
+    // Resolve symbol names (variable indirection) so the fast path applies
+    // for e.g. (define s "sig") + (count (= (get s) 1)).
+    let resolved = resolve_cond_names(cond, env);
+    let cond = &resolved;
     // Edge/X conditions: (rising "sig"), (falling "sig"), (is-x "sig"),
     // (is-z "sig"), (changes "sig")
     if std::env::var("WAL_DEBUG_FIND").is_ok() {
@@ -646,8 +682,23 @@ fn op_get(args: &[Value], env: &mut Environment, eval: &mut Evaluator) -> Result
                     return Ok(slice_value(sv, hi, lo));
                 }
             }
-            let preview: Vec<&str> = sigs.iter().take(5).map(|s| s.as_str()).collect();
-            return Err(format!("signal '{}' not found. Available signals (first 5): {:?}",
+            // 最近似候选: 编辑距离/包含关系排序(与 FST 侧提示一致)
+            let preview: Vec<String> = {
+                let mut scored: Vec<(usize, &String)> = sigs.iter()
+                    .map(|s| {
+                        // score against the full name and its last component:
+                        // the common "tb_x.dut." prefix dominates full-name
+                        // distance, so the leaf name is the useful part.
+                        let leaf = s.rsplit('.').next().unwrap_or(s.as_str());
+                        let d_full = lev_distance_local(name.as_str(), s.as_str());
+                        let d_leaf = lev_distance_local(name.as_str(), leaf);
+                        (d_full.min(d_leaf), s)
+                    })
+                    .collect();
+                scored.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(b.1)));
+                scored.iter().take(5).map(|(_, s)| (*s).clone()).collect()
+            };
+            return Err(format!("signal '{}' not found. Closest signals: {:?}",
                 name, preview));
         }
     }
@@ -1219,4 +1270,19 @@ pub fn register_signal(disp: &mut Dispatcher) {
     disp.register(Operator::Ts, op_ts);
     disp.register(Operator::TraceName, op_trace_name);
     disp.register(Operator::TraceFile, op_trace_file);
+}
+/// Local Levenshtein distance (for "closest signal" hints on not-found).
+fn lev_distance_local(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    for (i, ca) in a.iter().enumerate() {
+        let mut cur = vec![i + 1];
+        for (j, cb) in b.iter().enumerate() {
+            let cost = if ca == cb { 0 } else { 1 };
+            cur.push((prev[j] + 1).min(cur[j] + 1).min(prev[j + 1] + cost));
+        }
+        prev = cur;
+    }
+    prev[b.len()]
 }

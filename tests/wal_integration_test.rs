@@ -337,3 +337,98 @@ fn test_virtual_signal_conditional_expr() {
     // This depends on VCD content — just verify it evaluates without error
     assert!(val2 == Value::Bool(true) || val2 == Value::Bool(false));
 }
+
+// ---------- Regression: count/find fast paths with symbol indirection ----------
+// (define s "sig") + (count (= (get s) 1)) must take the fast path (find_indices)
+// instead of the per-step fallback that hangs on big waves. And
+// (count cond1 cond2) on the SAME signal must count BOTH conditions (the VCD
+// batch mapper used to drop every condition but the last one).
+
+#[test]
+fn test_count_defined_symbol_takes_fast_path() {
+    use wal_rust::wal::eval::Evaluator;
+    use wal_rust::wal::ast::{Value, WList};
+    let mut eval = Evaluator::new();
+    eval.load_trace(&counter_vcd_path().to_string_lossy(), "test").unwrap();
+
+    eval.eval("(define s \"counter_tb.clk\")").unwrap();
+
+    // Defining a symbol and using it must give the same count as a literal.
+    let via_literal = eval.eval("(count (= (get \"counter_tb.clk\") 1))").unwrap();
+    let via_symbol = eval.eval("(count (= (get s) 1))").unwrap();
+    assert_eq!(via_literal, via_symbol, "symbol indirection must hit the same fast path");
+
+    // and != 0 must also work through the symbol
+    let neq = eval.eval("(count (!= (get s) 0))").unwrap();
+    assert!(matches!(neq, Value::Int(_)));
+}
+
+#[test]
+fn test_count_batch_same_signal_two_conditions() {
+    use wal_rust::wal::eval::Evaluator;
+    use wal_rust::wal::ast::{Value, WList};
+    let mut eval = Evaluator::new();
+    eval.load_trace(&counter_vcd_path().to_string_lossy(), "test").unwrap();
+
+    // Two conditions on the SAME signal in one batch: both must be counted;
+    // before the fix the first condition came back 0 (VCD id map overwrite).
+    let v = eval.eval("(count (= (get \"counter_tb.clk\") 1) (= (get \"counter_tb.clk\") 0))").unwrap();
+    let t = load(&counter_vcd_path().to_string_lossy());
+    let r = resolve(&t, "counter_tb.clk");
+    let n1 = t.find_indices(&r, FindCondition::Value(1)).unwrap().len();
+    let n0 = t.find_indices(&r, FindCondition::Value(0)).unwrap().len();
+    assert!(n1 > 0 && n0 > 0, "test VCD must contain both values");
+    let expected = Value::List(WList::from_vec(vec![
+        Value::Int(n1 as i64),
+        Value::Int(n0 as i64),
+    ]));
+    assert_eq!(v, expected, "batch with same signal twice must keep both counts");
+}
+
+#[test]
+fn test_find_defined_symbol_takes_fast_path() {
+    use wal_rust::wal::eval::Evaluator;
+    use wal_rust::wal::ast::Value;
+    let mut eval = Evaluator::new();
+    eval.load_trace(&counter_vcd_path().to_string_lossy(), "test").unwrap();
+    eval.eval("(define s \"counter_tb.clk\")").unwrap();
+    let n = eval.eval("(length (find (= (get s) 1)))").unwrap();
+    let t = load(&counter_vcd_path().to_string_lossy());
+    let r = resolve(&t, "counter_tb.clk");
+    let n1 = t.find_indices(&r, FindCondition::Value(1)).unwrap().len();
+    assert_eq!(n, Value::Int(n1 as i64));
+}
+
+// ---------- Feedback-driven fixes: take / &&-bool / bounded print ----------
+
+#[test]
+fn test_take_operator() {
+    use wal_rust::wal::eval::Evaluator;
+    use wal_rust::wal::ast::{Value, WList};
+    let mut eval = Evaluator::new();
+    eval.load_trace(&counter_vcd_path().to_string_lossy(), "test").unwrap();
+    let v = eval.eval("(take 2 (list 1 2 3))").unwrap();
+    assert_eq!(v, Value::List(WList::from_vec(vec![Value::Int(1), Value::Int(2)])));
+    // SIGNALS is a first-class list: take must work on it directly
+    let v = eval.eval("(take 2 SIGNALS)").unwrap();
+    if let Value::List(l) = &v {
+        assert_eq!(l.len(), 2);
+    } else {
+        panic!("take on SIGNALS must return a list, got {:?}", v);
+    }
+}
+
+#[test]
+fn test_and_or_return_bool() {
+    use wal_rust::wal::eval::Evaluator;
+    use wal_rust::wal::ast::Value;
+    let mut eval = Evaluator::new();
+    eval.load_trace(&counter_vcd_path().to_string_lossy(), "test").unwrap();
+    assert_eq!(eval.eval("(&& 1 1 0)").unwrap(), Value::Bool(false));
+    assert_eq!(eval.eval("(&& 1 1)").unwrap(), Value::Bool(true));
+    assert_eq!(eval.eval("(|| 0 0)").unwrap(), Value::Bool(false));
+    assert_eq!(eval.eval("(|| 0 1)").unwrap(), Value::Bool(true));
+    // conditions in count must still work with bool results
+    let n = eval.eval("(count (&& (= (get \"counter_tb.clk\") 1) (!= (get \"counter_tb.rst\") 1)))").unwrap();
+    assert!(matches!(n, Value::Int(_)));
+}

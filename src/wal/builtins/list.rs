@@ -397,4 +397,23 @@ pub fn register_list(disp: &mut Dispatcher) {
     disp.register(Operator::Third, op_third);
     disp.register(Operator::IsNull, op_is_null);
     disp.register(Operator::Range, op_range);
+    disp.register(Operator::Take, op_take);
+}
+
+/// (take n list) → first n elements (works on any list, including SIGNALS:
+/// `(take 5 SIGNALS)` or `(take 5 (find-sig "clk"))`)
+fn op_take(args: &[Value], _env: &mut Environment, _eval: &mut Evaluator) -> Result<Value, String> {
+    ensure_arity(args, 2)?;
+    let n = match &args[0] {
+        Value::Int(v) => *v,
+        _ => return Err("take: first argument must be an integer".to_string()),
+    };
+    let list = match &args[1] {
+        Value::List(l) => l,
+        _ => return Err("take: second argument must be a list".to_string()),
+    };
+    let n = n.max(0) as usize;
+    Ok(Value::List(WList::from_vec(
+        list.iter().take(n).cloned().collect::<Vec<Value>>(),
+    )))
 }

@@ -496,10 +496,10 @@ fn op_and(args: &[Value], _env: &mut Environment, eval: &mut Evaluator) -> Resul
     for arg in args {
         let result = eval.eval_value_public(arg.clone())?;
         if !result.is_truthy() {
-            return Ok(Value::Int(0));
+            return Ok(Value::Bool(false));
         }
     }
-    Ok(Value::Int(1))
+    Ok(Value::Bool(true))
 }
 
 fn op_or(args: &[Value], _env: &mut Environment, eval: &mut Evaluator) -> Result<Value, String> {
@@ -507,10 +507,10 @@ fn op_or(args: &[Value], _env: &mut Environment, eval: &mut Evaluator) -> Result
     for arg in args {
         let result = eval.eval_value_public(arg.clone())?;
         if result.is_truthy() {
-            return Ok(Value::Int(1));
+            return Ok(Value::Bool(true));
         }
     }
-    Ok(Value::Int(0))
+    Ok(Value::Bool(false))
 }
 
 fn ensure_arity(args: &[Value], expected: usize) -> Result<(), String> {

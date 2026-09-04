@@ -57,6 +57,10 @@ pub struct Args {
     )]
     pub load: Vec<PathBuf>,
 
+    /// Stop at the first script error instead of continuing (CI-friendly)
+    #[arg(long = "halt-on-error", global = true, help = "Stop at the first script error instead of continuing")]
+    pub halt_on_error: bool,
+
     #[command(subcommand)]
     pub command: Option<Command>,
 }
@@ -79,6 +83,49 @@ pub enum Command {
                       Features line editing, history, and tab completion."
     )]
     Repl,
+
+    /// Count timestamps where a signal equals a value (default 1)
+    #[command(about = "Count signal==VALUE timestamps:\nwal-rust count <wave> <signal> [value]")]
+    Count(CountArgs),
+
+    /// List signal names containing a pattern
+    #[command(about = "List signal names matching a substring:\nwal-rust sigs <wave> <pattern> [limit]")]
+    Sigs(SigsArgs),
+
+    /// Top signals by number of value changes
+    #[command(about = "Most-active signals (by change count):\nwal-rust topsig <wave> [limit]")]
+    Topsig(TopsigArgs),
+}
+
+#[derive(Parser, Debug)]
+pub struct CountArgs {
+    /// VCD/FST waveform path
+    pub wave: PathBuf,
+    /// Signal name (exact or unique substring)
+    pub sig: String,
+    /// Value to count (timestamps where signal == VALUE); default 1
+    #[arg(default_value_t = 1)]
+    pub value: i64,
+}
+
+#[derive(Parser, Debug)]
+pub struct SigsArgs {
+    /// VCD/FST waveform path
+    pub wave: PathBuf,
+    /// Substring to match against signal names
+    pub pattern: String,
+    /// Max names to print (default 50; 0 = all)
+    #[arg(default_value_t = 50)]
+    pub limit: usize,
+}
+
+#[derive(Parser, Debug)]
+pub struct TopsigArgs {
+    /// VCD/FST waveform path
+    pub wave: PathBuf,
+    /// Max top signals to show (default 10)
+    #[arg(default_value_t = 10)]
+    pub limit: usize,
 }
 
 #[derive(Parser, Debug)]
@@ -111,6 +158,7 @@ pub enum ExecMode {
         path: PathBuf,
         load: Vec<PathBuf>,
         code: Option<String>,
+        halt_on_error: bool,
     },
     /// Evaluate a WAL expression directly
     EvalExpr {
@@ -119,6 +167,23 @@ pub enum ExecMode {
     },
     /// Start the interactive REPL
     Repl,
+    /// count <wave> <sig> [value]
+    Count {
+        wave: PathBuf,
+        sig: String,
+        value: i64,
+    },
+    /// sigs <wave> <pattern> [limit]
+    Sigs {
+        wave: PathBuf,
+        pattern: String,
+        limit: usize,
+    },
+    /// topsig <wave> [limit]
+    Topsig {
+        wave: PathBuf,
+        limit: usize,
+    },
 }
 
 impl Args {
@@ -130,8 +195,12 @@ impl Args {
                     path: r.file,
                     load: r.load,
                     code: r.code,
+                    halt_on_error: self.halt_on_error,
                 },
                 Command::Repl => ExecMode::Repl,
+                Command::Count(c) => ExecMode::Count { wave: c.wave, sig: c.sig, value: c.value },
+                Command::Sigs(s) => ExecMode::Sigs { wave: s.wave, pattern: s.pattern, limit: s.limit },
+                Command::Topsig(t) => ExecMode::Topsig { wave: t.wave, limit: t.limit },
             };
         }
 
@@ -151,6 +220,7 @@ impl Args {
                         path: PathBuf::from(&trimmed),
                         load,
                         code: None,
+                        halt_on_error: self.halt_on_error,
                     }
                 }
             }

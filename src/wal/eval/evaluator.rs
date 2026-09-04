@@ -76,7 +76,7 @@ fn collect_top_level_sexprs(node: tree_sitter::Node) -> Vec<tree_sitter::Node> {
 fn unknown_operator_error(name: &str) -> String {
     let known: Vec<&str> = Operator::ALL_NAMES.iter().copied().collect();
     let mut suggestions: Vec<&str> = Vec::new();
-    for k in known {
+    for k in known.iter().copied() {
         if k == name { continue; }
         if lev_distance(name, k) <= 2 || (k.contains(name) && name.len() >= 3) || (name.contains(k) && k.len() >= 4) {
             suggestions.push(k);
@@ -90,6 +90,22 @@ fn unknown_operator_error(name: &str) -> String {
             ". Did you mean: {}?",
             suggestions.iter().take(5).cloned().collect::<Vec<_>>().join(", ")
         ));
+    } else {
+        // No close match under the strict rule: still offer the nearest few.
+        let mut dists: Vec<(usize, &str)> = known
+            .iter()
+            .map(|k| (lev_distance(name, k), *k))
+            .filter(|(d, _)| *d <= 5)
+            .collect();
+        dists.sort();
+        dists.dedup();
+        dists.truncate(3);
+        if !dists.is_empty() {
+            msg.push_str(&format!(
+                ". Closest matches: {}",
+                dists.iter().map(|(_, k)| *k).collect::<Vec<_>>().join(", ")
+            ));
+        }
     }
     msg.push_str(". Try (help) for the operator list.");
     msg
@@ -1021,26 +1037,7 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
     /// Walk an expression and resolve variable references in (get <symbol>) calls.
     /// Returns the expression with symbols replaced by their string values.
     fn resolve_get_symbols(&self, expr: &Value) -> Value {
-        match expr {
-            Value::List(lst) => {
-                if lst.len() == 2 && matches!(&lst[0], Value::Symbol(s) if s.name == "get") {
-                    if let Value::Symbol(sym) = &lst[1] {
-                        if let Some(val) = self.env.lookup(&sym.name) {
-                            if matches!(val, Value::String(_)) {
-                                let items = vec![
-                                    Value::Symbol(Symbol::new("get".to_string())),
-                                    val,
-                                ];
-                                return Value::List(WList::from_vec(items));
-                            }
-                        }
-                    }
-                }
-                let resolved: Vec<Value> = lst.iter().map(|v| self.resolve_get_symbols(v)).collect();
-                Value::List(WList::from_vec(resolved))
-            }
-            other => other.clone(),
-        }
+        crate::wal::builtins::signal::resolve_cond_names(expr, &self.env)
     }
 
     /// Build a FindCondition from target value and negation flag.
@@ -1347,9 +1344,13 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
 
             let mut found: Vec<i64> = Vec::new();
 
+            // Resolve symbol names so (define s "sig") + (find (= (get s) 1))
+            // takes the fast paths below instead of the per-step fallback.
+            let resolved_cond = self.resolve_get_symbols(&args[0]);
+
             // Fast path: try simple condition (= (get "sig") val), (!= ...), (not (= ...))
             // Uses trace.find_indices() for a parallel scan.
-            if let Some((sig_name, target, is_not)) = self.parse_simple_condition(&args[0]) {
+            if let Some((sig_name, target, is_not)) = self.parse_simple_condition(&resolved_cond) {
                 let cond: FindCondition = if is_not {
                     if target <= 1 && target >= 0 { FindCondition::Neq(target as u8) }
                     else { FindCondition::NeqI64(target) }
@@ -1378,7 +1379,7 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
             }
 
             // Fast path 2: try decomposing (&& ...) or (|| ...)
-            if let Some(indices) = self.decompose_and_find_indices(&args[0], &traces)? {
+            if let Some(indices) = self.decompose_and_find_indices(&resolved_cond, &traces)? {
                 found = indices.into_iter().map(|i| i as i64).collect();
                 found.sort();
                 found.dedup();
@@ -1395,7 +1396,7 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
             };
             let mut ended = false;
             while !ended && found.len() < max_results {
-                match self.eval_value(args[0].clone())? {
+                match self.eval_value(resolved_cond.clone())? {
                     Value::Bool(true) => {
                         let t = self.traces.read().unwrap_or_else(|e| e.into_inner());
                         for tid in &traces {
@@ -1592,7 +1593,8 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
 
         // Fast path 0: builtins simple-condition fast path (covers (= ...) plus
         // edge/X conditions: (rising/falling/changes/is-x/is-z "sig"))
-        if let Some(result) = crate::wal::builtins::signal::try_find_indices_simple(&args[0], usize::MAX, &mut self.env) {
+        let resolved_cond = self.resolve_get_symbols(&args[0]);
+        if let Some(result) = crate::wal::builtins::signal::try_find_indices_simple(&resolved_cond, usize::MAX, &mut self.env) {
             match result {
                 Ok(Value::List(lst)) => {
                     let n = lst.len() as i64;
@@ -1609,7 +1611,7 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
         }
 
         // Fast path: try simple condition (= (get "sig") val), (!= ...), (not (= ...))
-        if let Some((sig_name, target, is_not)) = self.parse_simple_condition(&args[0]) {
+        if let Some((sig_name, target, is_not)) = self.parse_simple_condition(&resolved_cond) {
             let cond: FindCondition = if is_not {
                 if target <= 1 && target >= 0 { FindCondition::Neq(target as u8) }
                 else { FindCondition::NeqI64(target) }
@@ -1636,7 +1638,7 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
         }
 
         // Fast path 2: try decomposing (&& cond1 cond2) or (|| cond1 cond2)
-        if let Some(result) = self.decompose_and_count(&args[0], &traces_ids)? {
+        if let Some(result) = self.decompose_and_count(&resolved_cond, &traces_ids)? {
             return Ok(Value::Int(result));
         }
 
@@ -1644,7 +1646,7 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
         let mut count: i64 = 0;
         let mut ended = false;
         while !ended {
-            if self.eval_value(args[0].clone())?.is_truthy() {
+            if self.eval_value(resolved_cond.clone())?.is_truthy() {
                 count += 1;
             }
             let mut any_ended = true;
