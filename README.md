@@ -230,6 +230,9 @@ wal-rust repl                                 # interactive
 (map (fn [x] (+ x 1)) (list 1 2 3))    ;; => (2 3 4)
 (map + (list 1 2 3) (list 4 5 6))      ;; => (5 7 9)
 
+;; Comprehension (official WAL docs style; multi-binding = zip)
+(for/list [x (list 1 2 3)] (* x 2))          ;; => (2 4 6)
+
 ;; Fold / Reduce
 (fold + 0 (list 1 2 3 4))              ;; => 10
 ```
@@ -260,6 +263,7 @@ wal-rust repl                                 # interactive
 (list? (list 1 2))     ;; true
 (null? ())             ;; true
 (empty? ())            ;; true
+(boolean? #t)          ;; true
 
 ;; Conversions
 (convert/bin 10)       ;; => "1010"
@@ -359,6 +363,12 @@ These work with actual timestamps (in the waveform's native unit; use
 (period "clk")                      ;; average clock period (seconds)
 (freq "clk")                        ;; clock frequency (Hz)
 ```
+
+`(count cond)` / `(find cond)` sample **signal change points** (fast, single-pass
+mmap), which matches debugging intuition. The official WAL semantics (evaluate at
+**every** index) are available as `(count/step cond)` / `(find/step cond)` — use
+them when you need per-timestamp truth (they scan index-by-index, so large waves
+are slower). `(whenever ...)` stays per-index with the `"changed"` sampling mode.
 
 Big list results are rendered bounded (`(...(N items))`), so `(print SIGNALS)`
 on a 90k-signal wave stays terminal-friendly.

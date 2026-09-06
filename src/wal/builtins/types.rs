@@ -48,6 +48,11 @@ fn op_list_p(args: &[Value], _env: &mut Environment, _eval: &mut Evaluator) -> R
     Ok(all_satisfy(args, |v| matches!(v, Value::List(_))))
 }
 
+fn op_bool_p(args: &[Value], _env: &mut Environment, _eval: &mut Evaluator) -> Result<Value, String> {
+    ensure_arity_atleast(args, 1)?;
+    Ok(all_satisfy(args, |v| matches!(v, Value::Bool(_))))
+}
+
 fn op_convert_binary(args: &[Value], _env: &mut Environment, _eval: &mut Evaluator) -> Result<Value, String> {
     if args.len() < 1 || args.len() > 2 {
         return Err(format!("convert/bin expects 1 or 2 arguments, got {}", args.len()));
@@ -176,6 +181,7 @@ pub fn register_types(disp: &mut Dispatcher) {
     disp.register(Operator::IsString, op_string_p);
     disp.register(Operator::IsInt, op_int_p);
     disp.register(Operator::IsList, op_list_p);
+    disp.register(Operator::IsBool, op_bool_p);
     disp.register(Operator::ConvertBinary, op_convert_binary);
     disp.register(Operator::StringToInt, op_string_to_int);
     disp.register(Operator::BitsToSint, op_bits_to_sint);

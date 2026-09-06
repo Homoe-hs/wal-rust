@@ -432,3 +432,52 @@ fn test_and_or_return_bool() {
     let n = eval.eval("(count (&& (= (get \"counter_tb.clk\") 1) (!= (get \"counter_tb.rst\") 1)))").unwrap();
     assert!(matches!(n, Value::Int(_)));
 }
+
+// ---------- wal-lang.org 0.8.2 coverage: boolean? / for/list / count/step ----------
+
+#[test]
+fn test_boolean_predicate() {
+    use wal_rust::wal::eval::Evaluator;
+    use wal_rust::wal::ast::Value;
+    let mut eval = Evaluator::new();
+    eval.load_trace(&counter_vcd_path().to_string_lossy(), "test").unwrap();
+    assert_eq!(eval.eval("(boolean? #t)").unwrap(), Value::Bool(true));
+    assert_eq!(eval.eval("(boolean? #f)").unwrap(), Value::Bool(true));
+    assert_eq!(eval.eval("(boolean? 1)").unwrap(), Value::Bool(false));
+    assert_eq!(eval.eval("(bool? (&& #t #t))").unwrap(), Value::Bool(true));
+}
+
+#[test]
+fn test_for_list_comprehension() {
+    use wal_rust::wal::eval::Evaluator;
+    use wal_rust::wal::ast::{Value, WList};
+    let mut eval = Evaluator::new();
+    eval.load_trace(&counter_vcd_path().to_string_lossy(), "test").unwrap();
+    // single binding (official docs example shape)
+    let v = eval.eval("(for/list [x (list 1 2 3)] (* x 2))").unwrap();
+    assert_eq!(v, Value::List(WList::from_vec(vec![
+        Value::Int(2), Value::Int(4), Value::Int(6)
+    ])));
+    // multiple bindings = zip
+    let v = eval.eval("(for/list [x (list 1 2 3)] [y (list 10 20 30)] (+ x y))").unwrap();
+    assert_eq!(v, Value::List(WList::from_vec(vec![
+        Value::Int(11), Value::Int(22), Value::Int(33)
+    ])));
+}
+
+#[test]
+fn test_count_step_and_find_step() {
+    use wal_rust::wal::eval::Evaluator;
+    use wal_rust::wal::ast::{Value, WList};
+    let mut eval = Evaluator::new();
+    eval.load_trace(&counter_vcd_path().to_string_lossy(), "test").unwrap();
+    // counter fixture: 523 timestamps (max_index 522) — step scan visits all
+    let all = eval.eval("(count/step (= 1 1))").unwrap();
+    assert_eq!(all, Value::Int(523));
+    let found = eval.eval("(find/step (= 1 1))").unwrap();
+    if let Value::List(l) = &found {
+        assert_eq!(l.len(), 523);
+    } else {
+        panic!("find/step must return a list, got {:?}", found);
+    }
+}

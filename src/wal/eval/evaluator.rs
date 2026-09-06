@@ -365,10 +365,7 @@ pub fn eval_value(&mut self, value: Value) -> Result<Value, String> {
                 if s.name == "set!" {
                     return self.eval_set_macro(&rest);
                 }
-                // Handle for/list macro: (for/list (x lst) body...) -> for expanded form
-                if s.name == "for/list" {
-                    return self.eval_for_list_macro(&rest);
-                }
+
                 // Handle timeframe special form (body not pre-evaluated)
                 if s.name == "timeframe" {
                     return self.eval_timeframe(&rest);
@@ -426,6 +423,12 @@ pub fn eval_value(&mut self, value: Value) -> Result<Value, String> {
                         return self.eval_count(&rest);
                     } else if op == Operator::Whenever {
                         return self.eval_whenever(&rest);
+                    } else if op == Operator::CountStep {
+                        return self.eval_count_step(&rest);
+                    } else if op == Operator::FindStep {
+                        return self.eval_find_step(&rest);
+                    } else if op == Operator::ForList {
+                        return self.eval_for_list(&rest);
                     } else if op == Operator::Fn {
                         // fn is a special form — create closure, then call with remaining args
                         if rest.len() <= 2 {
@@ -1668,6 +1671,123 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
         Ok(Value::Int(count))
     }
 
+    /// Official-WAL semantics: evaluate cond at EVERY waveform index.
+    fn step_scan(&mut self, cond: &Value) -> Result<(Vec<usize>, usize), String> {
+        let (ids, saved): (Vec<String>, Vec<(String, usize)>) = {
+            if let Ok(t) = self.traces.read() {
+                let ids = t.trace_ids();
+                let saved = ids
+                    .iter()
+                    .filter_map(|tid| t.get(tid).map(|tr| (tid.clone(), tr.index())))
+                    .collect();
+                (ids, saved)
+            } else {
+                return Err("no traces loaded".to_string());
+            }
+        };
+        if ids.is_empty() {
+            return Ok((Vec::new(), 0));
+        }
+        let mut found = Vec::new();
+        let mut count = 0usize;
+        let mut ended = false;
+        while !ended {
+            if self.eval_value(cond.clone())?.is_truthy() {
+                count += 1;
+                if let Ok(t) = self.traces.read() {
+                    if let Some(tr) = t.get(&ids[0]) {
+                        found.push(tr.index());
+                    }
+                }
+            }
+            let mut any_ended = true;
+            if let Ok(mut t) = self.traces.write() {
+                for tid in &ids {
+                    if let Some(tr) = t.get_mut(tid) {
+                        if tr.step(1).is_ok() {
+                            any_ended = false;
+                        }
+                    }
+                }
+            }
+            ended = any_ended;
+        }
+        if let Ok(mut t) = self.traces.write() {
+            for (tid, idx) in &saved {
+                let _ = t.set_index(tid, *idx);
+            }
+        }
+        Ok((found, count))
+    }
+
+    /// (count/step cond) — number of indices where cond is true (per-step scan).
+    fn eval_count_step(&mut self, args: &[Value]) -> Result<Value, String> {
+        if args.is_empty() {
+            return Err("count/step expects at least 1 argument (a condition)".to_string());
+        }
+        let (_, count) = self.step_scan(&args[0])?;
+        Ok(Value::Int(count as i64))
+    }
+
+    /// (find/step cond) — indices where cond is true (per-step scan).
+    fn eval_find_step(&mut self, args: &[Value]) -> Result<Value, String> {
+        if args.is_empty() {
+            return Err("find/step expects at least 1 argument (a condition)".to_string());
+        }
+        let (found, _) = self.step_scan(&args[0])?;
+        Ok(Value::List(WList::from_vec(
+            found.into_iter().map(|i| Value::Int(i as i64)).collect(),
+        )))
+    }
+
+    /// (for/list [x xs] [y ys]... body+) — comprehension; multiple bindings
+    /// iterate in zip over their collections; collects the last body result
+    /// per iteration (official WAL docs example).
+    fn eval_for_list(&mut self, args: &[Value]) -> Result<Value, String> {
+        if args.len() < 2 {
+            return Err("(for/list [x xs] [y ys] ... body+) expected".to_string());
+        }
+        let mut bindings: Vec<(String, Vec<Value>)> = Vec::new();
+        let mut body_start: Option<usize> = None;
+        for (i, a) in args.iter().enumerate() {
+            if let Value::List(pair) = a {
+                if pair.0.len() == 2 {
+                    if let Value::Symbol(sym) = &pair.0[0] {
+                        let coll = self.eval_value(pair.0[1].clone())?;
+                        if let Value::List(l) = coll {
+                            bindings.push((sym.name.clone(), l.0.clone()));
+                            body_start = Some(i + 1);
+                            continue;
+                        }
+                    }
+                }
+            }
+            break;
+        }
+        let body_start =
+            body_start.ok_or("for/list: bindings must be [symbol collection] pairs")?;
+        let body = &args[body_start..];
+        if body.is_empty() {
+            return Err("for/list: body expression required".to_string());
+        }
+        let n = bindings.iter().map(|(_, v)| v.len()).min().unwrap_or(0);
+        let mut out = Vec::with_capacity(n);
+        for i in 0..n {
+            let mut new_env = self.env.child();
+            for (name, vals) in &bindings {
+                new_env.define(name.clone(), vals[i].clone());
+            }
+            let saved_env = std::mem::replace(&mut self.env, new_env);
+            let mut result = Value::Nil;
+            for arg in body {
+                result = self.eval_value(arg.clone())?;
+            }
+            self.env = saved_env;
+            out.push(result);
+        }
+        Ok(Value::List(WList::from_vec(out)))
+    }
+
     fn eval_whenever(&mut self, args: &[Value]) -> Result<Value, String> {
         if args.len() < 2 {
             return Err("whenever expects at least 2 arguments".to_string());
@@ -1940,31 +2060,6 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
     }
 
     // for/list macro: (for/list (x lst) body...) -> map or similar iteration
-    fn eval_for_list_macro(&mut self, args: &[Value]) -> Result<Value, String> {
-        if args.len() < 2 {
-            return Err("for/list expects at least binding and body".to_string());
-        }
-        // (for/list (x lst) body...) -> (map (fn (x) body...) lst)
-        let binding = match &args[0] {
-            Value::List(lst) if lst.len() == 2 => lst.clone(),
-            _ => return Err("for/list: first argument must be (var list)".to_string()),
-        };
-        let var = binding.0[0].clone();
-        let lst_expr = binding.0[1].clone();
-        let body = Value::List(WList::from_vec(args[1..].to_vec()));
-        let fn_expr = Value::List(WList::from_vec(vec![
-            Value::Symbol(Symbol::new("fn")),
-            Value::List(WList::from_vec(vec![var])),
-            body,
-        ]));
-        let map_expr = Value::List(WList::from_vec(vec![
-            Value::Symbol(Symbol::new("map")),
-            fn_expr,
-            lst_expr,
-        ]));
-        self.eval_value(map_expr)
-    }
-
     // timeframe special form: (timeframe body...) — save/restore INDEX
     fn eval_timeframe(&mut self, args: &[Value]) -> Result<Value, String> {
         if args.is_empty() {
