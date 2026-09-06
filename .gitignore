@@ -20,3 +20,6 @@ wal-rust
 
 # local cargo home (read-only ~/.cargo workaround)
 .cargo-home/
+
+# local tooling (zig, caches)
+.tools/

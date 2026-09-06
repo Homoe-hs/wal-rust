@@ -360,7 +360,7 @@ the VCD→FST converter.
 | walconv (standard) | Little-endian | ✅ Full: signal names, hierarchy, VCDATA, ZWRAP |
 | Icarus Verilog | Big-endian | ✅ Full: gzip HIER after GEOM, signal names, scopes |
 | GTKWave examples | Big-endian | ✅ Verified: des.fst, transaction.fst, 10 test files |
-| vcd2fst (GTKWave) | Big-endian | ⚠️ Wellen-based decoding; re-verify against new backend |
+| vcd2fst (GTKWave) | Big-endian | ✅ Verified (2026-09-06): names/values decode via wellen; width suffix normalized (`sig [7:0]` → `sig` + width metadata) |
 
 ---
 
