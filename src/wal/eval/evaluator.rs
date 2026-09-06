@@ -1070,6 +1070,8 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
         for sub in lst.iter().skip(1) {
             if let Some((sig, target, is_not)) = self.parse_simple_condition(sub) {
                 subs.push((sig, Self::build_cond(target, is_not)));
+            } else if let Some((sig, e)) = crate::wal::builtins::signal::parse_edge_condition(sub) {
+                subs.push((sig, e));
             } else {
                 return None; // Can't decompose non-simple sub-condition
             }
@@ -1100,24 +1102,37 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
         // Try to find indices for each sub-condition
         let mut idx_sets: Vec<Vec<usize>> = Vec::new();
 
+        // Each sub-condition must produce a find_indices set: `(= (get s) v)`
+        // via parse_simple_condition, edge predicates (is-x/is-z/rising/…)
+        // via parse_edge_condition. ANY unparseable sub means we cannot
+        // decompose — bail to the fallback (count must not silently drop a
+        // predicate; the 152GB round reported && ... is-x being ignored).
         for sub in [sub1, sub2] {
-            if let Some((sig, target, is_not)) = self.parse_simple_condition(sub) {
-                let cond: FindCondition = if is_not {
-                    if target <= 1 && target >= 0 { FindCondition::Neq(target as u8) }
-                    else { FindCondition::NeqI64(target) }
+            let (sig, cond): (String, FindCondition) =
+                if let Some((sig, target, is_not)) = self.parse_simple_condition(sub) {
+                    let cond = if is_not {
+                        if target <= 1 && target >= 0 { FindCondition::Neq(target as u8) }
+                        else { FindCondition::NeqI64(target) }
+                    } else {
+                        if target <= 1 && target >= 0 { FindCondition::Value(target as u8) }
+                        else { FindCondition::ValueI64(target) }
+                    };
+                    (sig, cond)
+                } else if let Some((sig, e)) = crate::wal::builtins::signal::parse_edge_condition(sub) {
+                    (sig, e)
                 } else {
-                    if target <= 1 && target >= 0 { FindCondition::Value(target as u8) }
-                    else { FindCondition::ValueI64(target) }
+                    return Ok(None); // unknown sub → fallback step scan
                 };
-                if let Ok(t) = self.traces.read() {
-                    for tid in trace_ids {
-                        if let Some(tr) = t.get(tid) {
-                            let sigs = tr.signals();
-                            let resolved = resolve_signal_name(&sig, &sigs)
-                                .unwrap_or_else(|| sig.clone());
-                            if let Ok(idxs) = tr.find_indices(&resolved, cond.clone()) {
-                                idx_sets.push(idxs);
-                            }
+            if let Ok(t) = self.traces.read() {
+                for tid in trace_ids {
+                    if let Some(tr) = t.get(tid) {
+                        let sigs = tr.signals();
+                        let resolved = resolve_signal_name(&sig, &sigs)
+                            .unwrap_or_else(|| sig.clone());
+                        if let Ok(idxs) = tr.find_indices(&resolved, cond.clone()) {
+                            idx_sets.push(idxs);
+                        } else {
+                            idx_sets.push(Vec::new());
                         }
                     }
                 }

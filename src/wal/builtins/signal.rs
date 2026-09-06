@@ -556,7 +556,7 @@ fn fuzzy_match_signal<'a>(name: &str, signals: &'a [String]) -> (Option<&'a Stri
 }
 
 /// Parse a simple condition expression like (= (get "signal") N)
-fn parse_edge_condition(expr: &Value) -> Option<(String, FindCondition)> {
+pub(crate) fn parse_edge_condition(expr: &Value) -> Option<(String, FindCondition)> {
     let lst = match expr {
         Value::List(lst) if lst.len() == 2 => lst,
         _ => return None,

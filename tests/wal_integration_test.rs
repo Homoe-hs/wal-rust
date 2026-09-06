@@ -511,3 +511,26 @@ fn test_get_x_aware_vector() {
     assert_eq!(eval.eval("(count (= (get \"t.v\") 0))").unwrap(), Value::Int(0));
     let _ = std::fs::remove_file(&p);
 }
+
+// ---------- P0-a regression: compound conditions must keep is-x/is-z ----------
+// (&& ... (is-x s)) used to silently drop the predicate (count = left over);
+// decompose paths now support edge predicates and bail on unknown subs.
+
+#[test]
+fn test_compound_is_x_preserved() {
+    use wal_rust::wal::eval::Evaluator;
+    use wal_rust::wal::ast::Value;
+    let dir = std::env::temp_dir();
+    let p = dir.join("wal_p0a.vcd");
+    std::fs::write(&p, "$timescale 1ns $end\n$scope module t $end\n$var wire 1 ! en $end\n$var wire 4 \" v $end\n$enddefinitions $end\n#0\nb0 !\nb0001 \"\n#10\nb1 !\nbxxxxx \"\n#20\nb1 !\nb0010 \"\n").unwrap();
+    let mut eval = Evaluator::new();
+    eval.load_trace(&p.to_string_lossy(), "test").unwrap();
+    // en=1 at #10/#20; v has x at #10 only
+    // (&& (= en 1) (is-x v)) → only #10 → 1 (was 2 before the fix: is-x dropped)
+    assert_eq!(eval.eval("(count (&& (= (get \"t.en\") 1) (is-x \"t.v\")))").unwrap(), Value::Int(1));
+    // (|| (is-x v) (= en 1)) → #10/#20 → 2
+    assert_eq!(eval.eval("(count (|| (is-x \"t.v\") (= (get \"t.en\") 1)))").unwrap(), Value::Int(2));
+    // edge predicate inside &&
+    assert_eq!(eval.eval("(count (&& (rising \"t.en\") (is-x \"t.v\")))").unwrap(), Value::Int(1));
+    let _ = std::fs::remove_file(&p);
+}
