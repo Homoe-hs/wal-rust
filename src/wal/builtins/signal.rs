@@ -527,7 +527,7 @@ fn op_whenever(args: &[Value], env: &mut Environment, eval: &mut Evaluator) -> R
 
 /// Signal name resolution: returns (selected_signal, all_substring_matches for warning)
 /// Returns empty candidates vec for exact/suffix matches (no ambiguity).
-fn fuzzy_match_signal<'a>(name: &str, signals: &'a [String]) -> (Option<&'a String>, Vec<&'a String>) {
+pub(crate) fn fuzzy_match_signal<'a>(name: &str, signals: &'a [String]) -> (Option<&'a String>, Vec<&'a String>) {
     // 1. Exact match
     if let Some(s) = signals.iter().find(|s| s.as_str() == name) {
         return (Some(s), vec![]);

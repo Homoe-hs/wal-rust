@@ -260,3 +260,56 @@ fn test_wellen_backend_glitch_same_index() {
 
     let _ = std::fs::remove_file(&path);
 }
+
+/// Regression (152GB round §8.4 #1): the initial 'x' sample (before the first
+/// change) must be shared by every read path — get returns x from index 0,
+/// is-x counts the initial x-run, and edge conditions do NOT fire on the x-run.
+#[test]
+fn test_wellen_backend_initial_x_semantics() {
+    let path = temp_fst_path("initx");
+    let mut w = FstWriter::create(&path, FstOptions::default()).unwrap();
+    w.push_scope("top", ScopeType::VcdModule);
+    let clk = w.create_var("clk", 1, VarType::VcdWire);
+    let v = w.create_var("v", 8, VarType::VcdWire);
+    w.pop_scope();
+    w.emit_time_change(0);        // no value at t=0: initial x
+    w.emit_time_change(100);
+    w.emit_value_change(clk, b"1");
+    w.emit_value_change(v, b"00001111");
+    w.emit_time_change(200);
+    w.emit_value_change(clk, b"0");
+    w.emit_value_change(v, b"00000000");
+    w.close().unwrap();
+
+    let trace = FstTrace::load(&path, "t".to_string()).unwrap();
+    assert_eq!(trace.max_index(), 2);
+
+    // Initial x at index 0 (before any change).
+    assert_bit(&trace, "top.clk", 0, b'x');
+    assert_vector(&trace, "top.v", 0, b"xxxxxxxx");
+    assert_bit(&trace, "top.clk", 1, b'1');
+    assert_vector(&trace, "top.v", 1, b"00001111");
+
+    // is-x counts the initial x-run (index 0) only.
+    assert_eq!(
+        trace.find_indices("top.v", FindCondition::IsX).unwrap(),
+        vec![0]
+    );
+    // No rising from the x-run (edge conditions need a real previous value).
+    assert!(trace.find_indices("top.clk", FindCondition::Rising).unwrap().is_empty());
+    assert_eq!(
+        trace.find_indices("top.clk", FindCondition::ValueI64(1)).unwrap(),
+        vec![1]
+    );
+    assert_eq!(
+        trace.find_indices("top.clk", FindCondition::ValueI64(0)).unwrap(),
+        vec![0, 2]
+    );
+    // changes: x→1 at idx1, 1→0 at idx2.
+    assert_eq!(
+        trace.find_indices("top.clk", FindCondition::Changed).unwrap(),
+        vec![1, 2]
+    );
+
+    let _ = std::fs::remove_file(&path);
+}

@@ -366,6 +366,15 @@ pub fn eval_value(&mut self, value: Value) -> Result<Value, String> {
                     return self.eval_set_macro(&rest);
                 }
 
+                // Uppercase specials without an Operator entry: a zero-arg call
+                // form (SCOPES)/(CG)/… equals the bare symbol (like SIGNALS).
+                if rest.is_empty() && matches!(s.name.as_str(),
+                    "SCOPES" | "CG" | "CS" | "SIGNALS-NO-ALIAS"
+                    | "LOCAL-SIGNALS" | "LOCAL-SCOPES" | "VIRTUAL-SIGNALS")
+                {
+                    return self.eval_symbol(s.clone());
+                }
+
                 // Handle timeframe special form (body not pre-evaluated)
                 if s.name == "timeframe" {
                     return self.eval_timeframe(&rest);

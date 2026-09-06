@@ -319,7 +319,7 @@ fn op_help(args: &[Value], _env: &mut Environment, _eval: &mut Evaluator) -> Res
             let mut text = String::from(
                 "WAL builtin reference.\n\
                  Query:    count find whenever rising falling changes is-x is-z\n\
-                 Access:   get sample-at signal-width SIGNALS SCOPES\n\
+                 Access:   get sample-at signal-width SIGNALS all-scopes\n\
                  Navigate: INDEX TS MAX-INDEX step\n\
                  Language: + - * / = != < > if do define set! fn map fold print printf\n\
                  Traces:   load unload\n\

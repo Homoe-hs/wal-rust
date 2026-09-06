@@ -49,3 +49,43 @@ VCD 同构造同样命中过 — 同一缺陷,只是 FST 侧"扫描后回写 IND
 
 > 注: 0.11.15 的 delta-cycle 修复与 0.11.16 的扫描起点修复互相独立;
 > 内测"0/1/3 次 get 后 301/184"的根因是后者(INDEX 起点),不是游标解压。
+
+## 0.11.17 · 遗留小项(§8.4 三连)处理
+
+### #1 FST/VCD is-x 差 1 — 修复(双根因:初值 x 表示分裂 + 首采样归属)
+
+内测重测(t0 即 x、首个实值 2^36 在 t=33125000fs、clk 前 3 索引 FST(2 4 6) vs
+VCD(1 3 5)索引域整体偏移 1)给出的查点:"初值样本在 reader 的两条路径中是否
+共享同一个 x 表示"。本地同构(isx1.vcd:8-bit t0 无值、#10 显式 x、#20 实值)
+修复前 VCD isx=3 / FST isx=2 且 chg VCD 4 / FST 3。
+
+- **FST `find_indices`**: 首变化之前的初值 x 现在从 INDEX 0 起参与条件求值 —
+  电平类(is-x/Neq/…)把 x 段计入区间;边沿类把 x 作为 prev 值
+  (x→1 算 changed,x 不是 0/1 所以不算 rising/falling),与 VCD 逐拍路径一致。
+- **VCD `signal_value`**: 初值 x 统一为全宽带向量(8 位信号 → Vector(x×8),
+  与 "bxxxxxxxx" 同形),get/at/change_points/逐拍 (changes s) 与 find_indices
+  共享同一表示,消除 Bit(x) vs Vector 的伪变化计数;
+  find_indices 的 Changed 用语义相等比较(全 x/全 z 归一)。
+- **FST `find_indices` Changed**: 同样归一(x-run "x" vs "xxxx…" 不算变化)。
+
+回归: `trace::vcd::tests::test_initial_x_unified_across_paths`、
+`tests/fst_wellen_backend_test.rs::test_wellen_backend_initial_x_semantics`;
+isx1.vcd/isx1.fst 上 VCD=FST(isx 3=3、isz 1=1、chg 3=3、(changes) 列表一致)。
+差分门禁 ALL MATCH。
+
+### #2 SCOPES 帮助文案残留 — 帮助条目更新
+
+真实 API 为 `(all-scopes "")`(带参,返回作用域列表);`(help)` 的 Access 行
+原写 SIGNALS SCOPES。已改为 `SIGNALS all-scopes`,并让 `(SCOPES)` 零参调用
+等价于裸 `SCOPES`(与 SIGNALS 的调用形式约定一致,兼容旧脚本)。
+
+### #3 dump-trace 位宽没接线 — 修复(导出器按信号真实宽度)
+
+dump-trace 是"当前游标处虚拟信号快照"导出器;此前 `$var` 位宽按 Int 硬编码
+32 且高比特被截断(45 位值导出成 reg 32、只写首采样)。现改为:
+- 值本身定宽(Int 按实际比特长度,String 位串按长度);
+- 再按被引用底层信号的声明宽度扩宽(45 位 VCD → `$var reg 45 … [44:0]`),
+  写循环按声明宽度补零/截断,变化检测不再被截断破坏。
+- 说明: 非全轴导出(合成 #1 #2 #3 刻度 + 首值快照)属该工具既有定位,未改。
+
+(本地: al45c.vcd 上 dump-trace → $var reg 45 ×2,7400 条变化行。)

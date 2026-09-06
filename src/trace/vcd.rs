@@ -904,12 +904,28 @@ impl Trace for VcdTrace {
             ))?;
         let cache_key = (sig_idx, target_time);
 
+        // Initial-value representation shared by every read path: the value
+        // before the first change is 'x' — as a full-width vector for
+        // multi-bit signals (the same shape a change line "bxxx…x id" yields),
+        // so `(changes s)` / comparisons never see a Bit-vs-Vector mismatch.
+        let width = self.signal_widths.get(&sig_idx).copied().unwrap_or(1);
+        let normalize = |sv: ScalarValue| -> ScalarValue {
+            match sv {
+                ScalarValue::Bit(b) if (b == b'x' || b == b'z') && width > 1 => {
+                    ScalarValue::Vector(vec![b; width])
+                }
+                other => other,
+            }
+        };
+
         // Check decoded signal cache
         if let Some(ds) = self.signal_cache.lock().unwrap().get(&sig_idx) {
             if ds.full_scan || (idx as u32) <= ds.scanned_up_to {
                 let val_idx = match ds.change_indices.binary_search(&(idx as u32)) {
                     Ok(i) => i,           // exact match → value at this change
-                    Err(0) => return Ok(ScalarValue::Bit(b'x')), // before any change
+                    Err(0) => {
+                        return Ok(normalize(ScalarValue::Bit(b'x'))); // before any change
+                    }
                     Err(i) => i - 1,       // between changes → previous value
                 };
                 if val_idx < ds.values.len() {
@@ -922,13 +938,13 @@ impl Trace for VcdTrace {
 
         // Check LRU cache
         if let Some(cached) = self.lru_cache.borrow_mut().get(&cache_key).cloned() {
-            return Ok(value_to_scalar(&cached));
+            return Ok(normalize(value_to_scalar(&cached)));
         }
 
         // On-demand read from mmap
         let val = self.read_signal_value_at(sig_idx, target_time);
         self.lru_cache.borrow_mut().put(cache_key, val.clone());
-        Ok(value_to_scalar(&val))
+        Ok(normalize(value_to_scalar(&val)))
     }
 
     fn signal_width(&self, name: &str) -> Result<usize, String> {
@@ -1619,10 +1635,27 @@ fn find_cond_matches(val: &VcdValue, prev_val: Option<&VcdValue>, cond: &FindCon
         FindCondition::IsX => val.has_x(),
         FindCondition::IsZ => val.has_z(),
         FindCondition::Changed => match prev_val {
-            Some(p) => p != val,
+            Some(p) => !vcd_semantic_eq(p, val),
             None => false,
         },
     }
+}
+
+/// Semantic equality for "did the value change" comparisons: the initial value
+/// is represented as `Bit('x')` while a set value may be a same-state vector
+/// (e.g. 8-bit "xxxxxxxx"), and a fully-uniform vector is the same state as its
+/// single-bit form. Without normalization the initial x→x transition counted as
+/// a change, making VCD's `(changes s)` / changed-counts disagree with FST.
+fn vcd_semantic_eq(a: &VcdValue, b: &VcdValue) -> bool {
+    fn normalize(v: &VcdValue) -> VcdValue {
+        match v {
+            VcdValue::Vector(vec) if !vec.is_empty() && vec.iter().all(|&c| c == vec[0]) => {
+                VcdValue::Bit(vec[0])
+            }
+            other => other.clone(),
+        }
+    }
+    normalize(a) == normalize(b)
 }
 
 fn val_to_bit(val: &VcdValue) -> Option<u8> {
@@ -1776,10 +1809,60 @@ $end\n").unwrap();
         assert!(!idx.is_empty(), "no rising detected");
     }
 
-    /// Regression (P0-b round): a timestamp may carry several value lines for
-    /// the same id (delta cycles/glitches). The value AT the index is the LAST
-    /// one written; per-index reads (get), find_indices and change_points must
-    /// agree with each other and the FST backend.
+    /// Regression (152GB round §8.4 #1): the initial 'x' sample must be shared
+    /// by every read path (get/at, find_indices, change_points) with the same
+    /// representation — a full-width vector for multi-bit signals — so is-x
+    /// counts and `(changes s)` agree with the FST backend.
+    #[test]
+    fn test_initial_x_unified_across_paths() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let uniq = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let p = std::env::temp_dir().join(format!("wal_initx_{}_{}.vcd", std::process::id(), uniq));
+        std::fs::write(&p, "$timescale 1ns $end\n\
+$scope module t $end\n\
+$var wire 8 ! v [7:0] $end\n\
+$enddefinitions $end\n\
+$dumpvars\n\
+#0\n\
+$end\n\
+#10\n\
+bxxxxxxxx !\n\
+$end\n\
+#20\n\
+b00001111 !\n\
+$end\n\
+#30\n\
+b00000000 !\n\
+$end\n").unwrap();
+        let trace = load_vcd(p.to_str().unwrap());
+        let name = trace.signals().iter().find(|s| s.contains("v [")).unwrap().clone();
+
+        // Initial x is a full-width vector (same shape as "bxxxxxxxx"), not a Bit.
+        let sv0 = trace.signal_value(&name, 0).unwrap();
+        assert_eq!(sv0, crate::trace::ScalarValue::Vector(vec![b'x'; 8]));
+        let sv1 = trace.signal_value(&name, 1).unwrap();
+        assert_eq!(sv1, crate::trace::ScalarValue::Vector(vec![b'x'; 8]));
+
+        // is-x counts the initial x-run AND the explicit x at #10.
+        let isx = trace.find_indices(&name, FindCondition::IsX).unwrap();
+        assert_eq!(isx, vec![0, 1]);
+
+        // The x → x start is NOT a change; changes start at the real value.
+        let chg = trace.find_indices(&name, FindCondition::Changed).unwrap();
+        assert_eq!(chg, vec![2, 3]);
+
+        // change_points start at the first change record, value x.
+        let cp = trace.change_points(&name).unwrap();
+        let vals: Vec<(usize, crate::trace::ScalarValue)> =
+            cp.iter().map(|(i, sv)| (*i, sv.clone())).collect();
+        assert_eq!(vals, vec![
+            (1, crate::trace::ScalarValue::Vector(vec![b'x'; 8])),
+            (2, crate::trace::ScalarValue::Vector(b"00001111".to_vec())),
+            (3, crate::trace::ScalarValue::Vector(b"00000000".to_vec())),
+        ]);
+    }
+
     #[test]
     fn test_glitch_timestamp_last_value_wins() {
         use std::sync::atomic::{AtomicU64, Ordering};

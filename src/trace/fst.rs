@@ -96,7 +96,20 @@ fn find_cond_matches(
             Some(bs) => bs.contains('z') || bs.contains('Z'),
             None => false,
         },
-        FindCondition::Changed => prev_val.as_ref().map(|p| p != &sv.to_bit_string().unwrap_or_default().as_bytes()).unwrap_or(false),
+        FindCondition::Changed => prev_val.as_ref().map(|p| {
+            // Initial 'x' may be represented as "x" (bit form) while an
+            // explicit x-run is "xxxx…" — same state, not a change.
+            fn norm(bs: &[u8]) -> Vec<u8> {
+                if bs.iter().all(|&b| b == b'x' || b == b'X') {
+                    vec![b'x']
+                } else if bs.iter().all(|&b| b == b'z' || b == b'Z') {
+                    vec![b'z']
+                } else {
+                    bs.to_vec()
+                }
+            }
+            norm(p) != norm(&sv.to_bit_string().unwrap_or_default().into_bytes())
+        }).unwrap_or(false),
     };
     if let Some(bs) = sv.to_bit_string() {
         *prev_val = Some(bs.into_bytes());
@@ -265,6 +278,19 @@ impl Trace for FstTrace {
         let mut changes: Vec<(usize, bool)> = Vec::new();
         let mut prev_bit: Option<u8> = None;
         let mut prev_val: Option<Vec<u8>> = None;
+        // Initial value before the first change: 'x' (same as get_offset()→None).
+        // Level conditions (is-x/Neq/…) hold during the x-run from index 0 and
+        // edge conditions see the x as their previous value (x→1 IS a change;
+        // x is neither 0 nor 1 so x→1 is never a rising/falling edge), exactly
+        // like the VCD backend.
+        {
+            let xv = SignalValue::FourValue(&[2u8], 1);
+            let init_matched = find_cond_matches(&xv, prev_bit, &mut prev_val, &cond);
+            prev_bit = sv_as_bit(&xv);
+            if !is_edge && init_matched {
+                changes.push((0, true));
+            }
+        }
         for (idx, sv) in &collapsed {
             let matched = find_cond_matches(sv, prev_bit, &mut prev_val, &cond);
             prev_bit = sv_as_bit(sv);

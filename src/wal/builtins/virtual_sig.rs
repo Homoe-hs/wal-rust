@@ -4,6 +4,7 @@
 
 use crate::wal::ast::{Value, Operator};
 use crate::wal::eval::{Environment, Dispatcher, Evaluator};
+use crate::trace::Trace;
 use std::fs::File;
 use std::io::Write;
 use std::path::Path;
@@ -24,22 +25,69 @@ fn collect_virtual_signal_args(env: &Environment) -> Vec<(String, Value)> {
     sigs
 }
 
+fn int_bit_width(i: i64) -> u32 {
+    if i < 0 { 64 } else {
+        (64 - (i as u64).leading_zeros()).max(1)
+    }
+}
+
+/// Fit a bit-string to `width`: left-pad with '0' / keep the low `width` bits.
+fn fit_bits(bits: &str, width: u32) -> String {
+    let w = width as usize;
+    let chars: Vec<char> = bits.chars().collect();
+    if chars.len() < w {
+        let mut out = "0".repeat(w - chars.len());
+        out.extend(chars);
+        out
+    } else if chars.len() > w {
+        chars[chars.len() - w..].iter().collect()
+    } else {
+        bits.to_string()
+    }
+}
+
 fn value_to_vcd_bit(v: &Value) -> (String, u32) {
     match v {
         Value::Int(i) => {
-            let width = 32u32;
-            let unsigned = if *i < 0 {
-                ((*i as i64).wrapping_abs() as u64) & 0xFFFF_FFFF
-            } else {
-                *i as u64
-            };
-            (format!("{:032b}", unsigned), width)
+            // Dynamic width: the value's bit length (45-bit vectors must not be
+            // truncated to a hard-coded 32 bits).
+            let width = int_bit_width(*i);
+            (format!("{:0width$b}", *i as u64, width = width as usize), width)
         }
         Value::Bool(b) => (if *b { "1".to_string() } else { "0".to_string() }, 1),
         Value::Float(f) => (if *f == 0.0 { "0".to_string() } else { "1".to_string() }, 1),
+        // x/z-aware get returns bit-strings for vectors with unknown bits.
+        Value::String(s) => (s.clone(), s.len() as u32),
         Value::Nil => ("0".to_string(), 1),
         _ => ("0".to_string(), 1),
     }
+}
+
+/// Best-effort width of a referenced signal inside the loaded traces
+/// (exact name, then scoped candidates, then fuzzy fallback — like `get`).
+fn sig_width_in_traces(name: &str, env: &Environment) -> Option<u32> {
+    let traces = env.get_traces()?;
+    let traces = traces.read().ok()?;
+    for tr in traces.traces_iter() {
+        let sigs = tr.signals();
+        let candidates = [
+            name.to_string(),
+            format!("{}{}", env.get_scope(), name),
+            format!("{}{}", env.get_group(), name),
+        ];
+        let resolved = candidates.iter()
+            .find(|c| sigs.iter().any(|s| s == *c))
+            .cloned()
+            .or_else(|| {
+                crate::wal::builtins::signal::fuzzy_match_signal(name, &sigs).0.cloned()
+            });
+        if let Some(r) = resolved {
+            if let Ok(w) = tr.signal_width(&r) {
+                return Some(w as u32);
+            }
+        }
+    }
+    None
 }
 
 /// Extract all (get "signal_name") references from an expression tree.
@@ -123,7 +171,15 @@ fn op_dump_trace(args: &[Value], env: &mut Environment, eval: &mut Evaluator) ->
     for (i, (name, expr)) in sigs.iter().enumerate() {
         let id = format!("s{}", i + 1);
         if let Ok(val) = eval.eval_value_public(expr.clone()) {
-            let (bits_str, width) = value_to_vcd_bit(&val);
+            let (mut bits_str, mut width) = value_to_vcd_bit(&val);
+            // Widen by the underlying signal's declared width (a 45-bit value
+            // read as int at the first sample must not be declared as 32 bits).
+            for sig in extract_get_signals(expr) {
+                if let Some(w) = sig_width_in_traces(&sig, env) {
+                    width = width.max(w);
+                }
+            }
+            bits_str = fit_bits(&bits_str, width);
             let vtype = if width > 1 { "reg" } else { "wire" };
             let range = if width > 1 { format!(" [{}:0]", width - 1) } else { String::new() };
             writeln!(file, "$var {} {} {} {}{} $end", vtype, width, id, name, range).ok();
@@ -180,11 +236,10 @@ fn op_dump_trace(args: &[Value], env: &mut Environment, eval: &mut Evaluator) ->
                 let width = handles[i].1;
                 if let Ok(val) = eval.eval_value_public(expr.clone()) {
                     let (bits_str, _) = value_to_vcd_bit(&val);
-                    let bits = if width > 1 {
-                        bits_str.chars().take(width as usize).collect::<String>()
-                    } else {
-                        bits_str
-                    };
+                    // Fit to the declared width (left-pad / keep low bits), so
+                    // multi-bit virtual signals keep every bit and change
+                    // detection is not defeated by truncation.
+                    let bits = fit_bits(&bits_str, width);
                     if last_values.get(id).map_or(true, |last| *last != bits) {
                         if width > 1 {
                             writeln!(file, "b{}{}", bits, id).ok();
