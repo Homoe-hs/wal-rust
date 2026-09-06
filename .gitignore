@@ -23,3 +23,4 @@ wal-rust
 
 # local tooling (zig, caches)
 .tools/
+bench/data/
