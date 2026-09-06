@@ -3,11 +3,11 @@
 ## Quick commands
 
 ```bash
-cargo test                          # all Rust tests (112)
+cargo test                          # all Rust tests (210)
 cargo test --test wal_integration_test  # integration tests only
 cargo test test_vcd_pyvcd_verify_strobe -- --nocapture  # single test + stdout
 cargo build --release               # release build
-cargo zigbuild --release --target x86_64-unknown-linux-gnu.2.34  # glibc 2.34+ compatible
+cargo zigbuild --release --target x86_64-unknown-linux-gnu.2.17  # glibc 2.17+ compatible
 target/release/wal-rust '(expr)' -l trace.vcd   # eval expression
 target/release/wal-rust run script.wal -l file  # run script
 target/release/wal-rust repl        # interactive REPL
@@ -21,7 +21,8 @@ No subcommand needed for common cases:
 - existing file path → run as script
 - no input → REPL
 
-Subcommands: `run`, `repl`. Flags: `-l <waveform>` (repeatable), `-c <code>` (inline override).
+Subcommands: `run`, `repl`, `count <wave> <sig> [v]`, `sigs <wave> <pat> [n]`, `topsig <wave> [n]`.
+Flags: `-l <waveform>` (repeatable), `-c <code>` (inline override), `--halt-on-error` (stop at first script error).
 
 ## Source layout
 
@@ -71,8 +72,8 @@ Subcommands: `run`, `repl`. Flags: `-l <waveform>` (repeatable), `-c <code>` (in
 ## GitHub Release
 
 ```bash
-cargo zigbuild --release --target x86_64-unknown-linux-gnu.2.34
+cargo zigbuild --release --target x86_64-unknown-linux-gnu.2.17
 gh release create <tag> --title "v0.x.x" target/x86_64-unknown-linux-gnu/release/wal-rust
 ```
 
-Binary requires glibc ≥ 2.34 (compatible with RHEL 9, Ubuntu 22.04+).
+Binary requires glibc ≥ 2.17 (CentOS 7 / RHEL 7 / Ubuntu 16.04+ compatible).

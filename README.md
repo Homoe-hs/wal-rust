@@ -31,6 +31,17 @@ wal-rust repl
 # Explicit subcommands (still work)
 wal-rust run -l dump.vcd script.wal
 wal-rust run -c '(signals)'
+
+# One-shot queries (no WAL expression needed — shell/CI friendly)
+wal-rust count dump.vcd clk 1                        # count signal==VALUE timestamps
+wal-rust sigs dump.vcd "wdata" 20                    # signal names containing pattern
+wal-rust topsig dump.vcd                             # most-active signals (change count)
+
+# Stop at the first script error (CI-friendly; default continues)
+wal-rust run --halt-on-error script.wal -l dump.vcd
+
+# Or install with automatic PATH registration:
+bash scripts/install.sh
 ```
 
 **Auto-detection:** input starts with `(` → evaluated as WAL expression.
@@ -162,6 +173,7 @@ Input is a file path → executed as WAL script. No input → REPL.
 (second (list 10 20 30))  ;; => 20
 (last (list 10 20 30))    ;; => 30
 (rest (list 1 2 3))       ;; => (2 3)
+(take 2 (list 1 2 3))     ;; => (1 2)  — first N elements (works on SIGNALS too)
 (in 2 (list 1 2 3))       ;; => true
 (length (list 1 2 3 4))   ;; => 4
 
@@ -264,6 +276,10 @@ data_bus@-2          ;; value of data_bus 2 steps back
 ;; Count matching indices
 (count (> (get "counter") 100))
 
+;; Find signal names by substring — the first step of any debug session
+(find-sig "clk")                       ;; all names containing "clk"
+(take 5 (find-sig "wstrb"))            ;; first 5 matches
+
 ;; Global find (across all known scopes)
 (find/g (= (get "clk") 1))
 
@@ -277,6 +293,26 @@ data_bus@-2          ;; value of data_bus 2 steps back
 ;; Fold over time
 (fold signal expr init method)
 ```
+
+### Time-aware & Verification Queries
+
+These work with actual timestamps (in the waveform's native unit; use
+`(fmt-time T)` for human-readable time, `(fmt-time T "clk")` for beat numbers):
+
+```lisp
+(getwave "clk")                     ;; ((t v) ...) all change points
+(edges "clk" 0 1000000)             ;; change timestamps in a window
+(at "clk" 5000)                     ;; value at time t
+(wave "clk" t0 t1)                  ;; windowed change points (held value first)
+(assert-eq "sig" t0 t1 1)           ;; true if sig equals v throughout [t0,t1]
+(count (is-x "sig"))                ;; how much of the signal is unknown
+(search "sig" "101" t0 t1)          ;; bit-pattern occurrence timestamps
+(period "clk")                      ;; average clock period (seconds)
+(freq "clk")                        ;; clock frequency (Hz)
+```
+
+Big list results are rendered bounded (`(...(N items))`), so `(print SIGNALS)`
+on a 90k-signal wave stays terminal-friendly.
 
 ### Scopes & Groups
 
@@ -314,15 +350,17 @@ analyze TileLink bus protocols:
 
 ## FST Format Support
 
+**Read backend: [wellen](https://crates.io/crates/wellen)** (`wellen::simple::read` in
+`src/trace/fst.rs`) — the legacy hand-rolled reader is retired from the query path.
+**Write backend: hand-rolled `FstWriter`** (`src/fst/`) used by roundtrip tests and
+the VCD→FST converter.
+
 | Format | Encoding | Status |
 |:-------|:---------|:-------|
 | walconv (standard) | Little-endian | ✅ Full: signal names, hierarchy, VCDATA, ZWRAP |
 | Icarus Verilog | Big-endian | ✅ Full: gzip HIER after GEOM, signal names, scopes |
 | GTKWave examples | Big-endian | ✅ Verified: des.fst, transaction.fst, 10 test files |
-| vcd2fst (GTKWave) | Big-endian | ⚠️ HDR+GEOM read OK, HIER signal names not decoded ** |
-| ZWRAP (gzip) | Both | ✅ Auto-detect gzip vs zlib compression |
-
-** vcd2fst uses a compact/packed HIER encoding that differs from the Icarus gzip format. No crash — gracefully returns 0 signals.
+| vcd2fst (GTKWave) | Big-endian | ⚠️ Wellen-based decoding; re-verify against new backend |
 
 ---
 
@@ -345,8 +383,7 @@ wal-rust/
 │   │   ├── reader.rs        # MmapReader (madvise + memchr + zero-copy + compression detection)
 │   │   ├── parser.rs        # MmapVcdParser + VcdParser
 │   │   └── types.rs         # VcdEvent, VcdValue
-│   ├── fst/                 # FST read/write
-│   │   ├── reader.rs        # FstReader (LE/BE auto-detect, Icarus HIER)
+│   ├── fst/                 # FST writer (read happens via wellen in trace/fst.rs)
 │   │   ├── writer.rs        # FstWriter (blocks, varint, compress)
 │   │   ├── blocks.rs        # FST block types and parsing
 │   │   ├── compress.rs      # Compression/decompression (gzip, zlib, LZ4)
@@ -356,7 +393,7 @@ wal-rust/
 │       ├── trace.rs          # Trace trait, ScalarValue, FindCondition, TraceId
 │       ├── container.rs     # TraceContainer, SharedTraceContainer (Arc<RwLock<>>)
 │       ├── vcd.rs           # VcdTrace (parallel two-pass + sparse index + LRU)
-│       └── fst.rs           # FstTrace (on-demand block decompress + LRU)
+│       └── fst.rs           # FstTrace via wellen (on-demand data + LRU)
 ├── tree-sitter-wal/         # WAL grammar
 └── stress_tests/            # Generated stress test files
 ```
@@ -372,8 +409,8 @@ wal-rust/
 | **madvise(MADV_SEQUENTIAL)** | 2MB kernel readahead reduces page faults |
 | **Rc<RefCell\<Environment\>>** | Parent chain mutable for `set!` traversal |
 | **macro-as-special-form** | defun/defunm expanded inline in eval_list |
-| **FST endian auto-detect** | PI→LE, e→BE; no user configuration needed |
-| **Icarus gzip HIER** | Reverse-engineered from GTKWave fstapi.c source |
+| **FST read backend = wellen** | battle-tested parser; hand-rolled reader retired from query path |
+| **Icarus gzip HIER** | Reverse-engineered from GTKWave fstapi.c source (writer/roundtrip) |
 
 ---
 
@@ -428,6 +465,18 @@ Configure in `~/.config/opencode/opencode.json`:
 | Single-line args | 333,333 args | ✅ 0.89s |
 | Concurrent files | 100 files | ✅ 0.8s |
 | VCD loading | 100MB / 1GB / 10GB / 155GB | ✅ |
+
+---
+
+## Build & Releases
+
+```bash
+cargo build --release                                # host build
+cargo zigbuild --release --target x86_64-unknown-linux-gnu.2.17   # old-glibc (≥2.17) binary
+```
+
+GitHub releases ship a **glibc ≥ 2.17** binary (CentOS 7 / RHEL 7 / Ubuntu 16.04+
+compatible; `cargo zigbuild` cross-build). Local builds require the host toolchain.
 
 ---
 
