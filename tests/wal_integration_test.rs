@@ -482,6 +482,40 @@ fn test_count_step_and_find_step() {
     }
 }
 
+/// P0-b regression (152GB round): the variable-RHS count fallback used to start
+/// its per-step scan at the CURRENT cursor position (after `(step N)` it counted
+/// only the remaining window: 3×get → 184 instead of 301), while the literal
+/// fast path always scanned from INDEX 0. Queries are full-timeline: they must
+/// scan from 0 regardless of the cursor, and restore the cursor afterwards.
+#[test]
+fn test_count_fallback_scans_from_zero_after_step() {
+    use wal_rust::wal::eval::Evaluator;
+    use wal_rust::wal::ast::Value;
+    let mut eval = Evaluator::new();
+    eval.load_trace(&counter_vcd_path().to_string_lossy(), "test").unwrap();
+
+    // Value at index 0 (clk[0] = 0); variable-RHS path needs the fallback
+    // (the RHS is a variable, not an int literal).
+    eval.eval("(define v (get \"counter_tb.clk\"))").unwrap();
+    let lit = eval.eval("(count (= (get \"counter_tb.clk\") 0))").unwrap();
+    assert!(matches!(lit, Value::Int(n) if n > 0));
+
+    let base = eval.eval("(count (= (get \"counter_tb.clk\") v))").unwrap();
+    assert_eq!(base, lit, "variable RHS must count like the literal at cursor 0");
+
+    // Move the cursor; counts must NOT shrink (no remaining-window semantics).
+    eval.eval("(step 200)").unwrap();
+    let after_step = eval.eval("(count (= (get \"counter_tb.clk\") v))").unwrap();
+    assert_eq!(after_step, lit, "count must scan the full timeline from INDEX 0");
+    let again = eval.eval("(count (= (get \"counter_tb.clk\") v))").unwrap();
+    assert_eq!(again, lit, "repeated counts must be stable");
+    let skip = eval.eval("(count/step (= (get \"counter_tb.clk\") v))").unwrap();
+    assert_eq!(skip, lit, "count/step must also scan from INDEX 0");
+
+    // The cursor must be untouched by the scans.
+    assert_eq!(eval.eval("INDEX").unwrap(), Value::Int(200));
+}
+
 // ---------- x-aware get (IEEE 1364-1995 §14.1.1.4 convention) ----------
 
 #[test]

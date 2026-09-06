@@ -1407,11 +1407,18 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
                 )));
             }
 
-            // Fallback: evaluate condition at each step
+            // Fallback: evaluate condition at each step. Queries are full-timeline:
+            // always scan from INDEX 0 (never from the current cursor position) and
+            // restore the cursor afterwards (152GB round P0-b).
             let saved: Vec<(String, usize)> = {
                 let t = self.traces.read().unwrap_or_else(|e| e.into_inner());
                 traces.iter().filter_map(|tid| t.get(tid).map(|tr| (tid.clone(), tr.index()))).collect()
             };
+            if let Ok(mut t) = self.traces.write() {
+                for tid in &traces {
+                    let _ = t.set_index(tid, 0);
+                }
+            }
             let mut ended = false;
             while !ended && found.len() < max_results {
                 match self.eval_value(resolved_cond.clone())? {
@@ -1495,7 +1502,14 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
             return Ok(Value::List(WList::from_vec(found)));
         }
 
-        // Slow path: step-by-step iteration
+        // Slow path: step-by-step iteration. Queries are full-timeline: always
+        // scan from INDEX 0 (never from the current cursor position) and restore
+        // the cursor afterwards (152GB round P0-b).
+        if let Ok(mut t) = self.traces.write() {
+            for tid in &traces_ids {
+                let _ = t.set_index(tid, 0);
+            }
+        }
         let mut found = Vec::new();
         let mut ended = false;
         while !ended {
@@ -1660,7 +1674,15 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
             return Ok(Value::Int(result));
         }
 
-        // Fallback: evaluate condition at each step
+        // Fallback: evaluate condition at each step. Queries are full-timeline:
+        // always scan from INDEX 0 (never from the current cursor position) and
+        // restore the cursor afterwards. The literal fast paths above scan from 0
+        // too, so variable-RHS and literal-RHS stay consistent (152GB round P0-b).
+        if let Ok(mut t) = self.traces.write() {
+            for tid in &traces_ids {
+                let _ = t.set_index(tid, 0);
+            }
+        }
         let mut count: i64 = 0;
         let mut ended = false;
         while !ended {
@@ -1702,6 +1724,13 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
         };
         if ids.is_empty() {
             return Ok((Vec::new(), 0));
+        }
+        // Official "every waveform index" semantics: scan from INDEX 0 and
+        // restore the cursor afterwards (152GB round P0-b).
+        if let Ok(mut t) = self.traces.write() {
+            for tid in &ids {
+                let _ = t.set_index(tid, 0);
+            }
         }
         let mut found = Vec::new();
         let mut count = 0usize;
