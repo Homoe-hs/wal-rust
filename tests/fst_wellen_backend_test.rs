@@ -206,3 +206,57 @@ fn test_wellen_backend_step_and_index() {
 
     let _ = std::fs::remove_file(&path);
 }
+
+/// Regression (P0-b round): an FST may carry several changes at the SAME
+/// time-table index (delta cycles/glitches). The value AT the index is the
+/// LAST change; per-index reads, find_indices and change_points must agree
+/// with the VCD backend (which uses last-write-wins per timestamp).
+#[test]
+fn test_wellen_backend_glitch_same_index() {
+    let path = temp_fst_path("glitch");
+    let mut w = FstWriter::create(&path, FstOptions::default()).unwrap();
+    w.push_scope("top", ScopeType::VcdModule);
+    let clk = w.create_var("clk", 1, VarType::VcdWire);
+    w.pop_scope();
+    w.emit_time_change(0);
+    w.emit_value_change(clk, b"0");
+    w.emit_time_change(100);
+    w.emit_value_change(clk, b"1");
+    w.emit_value_change(clk, b"0"); // glitch at #100: final value 0
+    w.emit_time_change(200);
+    w.emit_value_change(clk, b"1");
+    w.close().unwrap();
+
+    let trace = FstTrace::load(&path, "t".to_string()).unwrap();
+    assert_eq!(trace.max_index(), 2);
+
+    // Last value wins at the glitch index.
+    assert_bit(&trace, "top.clk", 0, b'0');
+    assert_bit(&trace, "top.clk", 1, b'0');
+    assert_bit(&trace, "top.clk", 2, b'1');
+
+    // Per-index conditions (identity with the VCD backend's semantics):
+    // value 1 holds at idx 2 only; high/rising at idx 2 only.
+    assert_eq!(
+        trace.find_indices("top.clk", FindCondition::ValueI64(1)).unwrap(),
+        vec![2]
+    );
+    assert_eq!(
+        trace.find_indices("top.clk", FindCondition::High).unwrap(),
+        vec![2]
+    );
+    assert_eq!(
+        trace.find_indices("top.clk", FindCondition::Rising).unwrap(),
+        vec![2]
+    );
+
+    // change_points: per-index transitions — no spurious entry for the glitch.
+    let cp = trace.change_points("top.clk").unwrap();
+    let vals: Vec<(usize, ScalarValue)> = cp.iter().map(|(i, sv)| (*i, sv.clone())).collect();
+    assert_eq!(vals, vec![
+        (0, ScalarValue::Bit(b'0')),
+        (2, ScalarValue::Bit(b'1')),
+    ]);
+
+    let _ = std::fs::remove_file(&path);
+}

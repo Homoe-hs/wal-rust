@@ -1199,10 +1199,20 @@ impl Trace for VcdTrace {
         if std::env::var("WAL_DEBUG_FIND").is_ok() {
             eprintln!("  find_indices result ({}): {:?}", indices.len(), indices.iter().take(20).collect::<Vec<_>>());
         }
-        // Merge and sort changes (changes may overlap at chunk boundaries)
+        // Merge and sort changes (changes may overlap at chunk boundaries).
+        // Several value lines can carry the same timestamp index (delta cycles);
+        // the value AT the index is the LAST one — keep the last entry per idx
+        // so the decoded signal cache matches per-index get semantics.
         if all_changes.len() > 1 {
             all_changes.sort_by_key(|(i, _)| *i);
-            all_changes.dedup_by_key(|(i, _)| *i);
+            let mut deduped: Vec<(u32, VcdValue)> = Vec::with_capacity(all_changes.len());
+            for item in all_changes {
+                match deduped.last_mut() {
+                    Some(last) if last.0 == item.0 => *last = item,
+                    _ => deduped.push(item),
+                }
+            }
+            all_changes = deduped;
             self.try_cache_decoded_signal(sig_idx, &all_changes, CacheType::FullScan);
         }
         Ok(indices)
@@ -1634,6 +1644,10 @@ fn value_to_scalar(val: &VcdValue) -> ScalarValue {
 fn find_signal_in_block(block: &[u8], target_id: &[u8], id_len: usize) -> Option<VcdValue> {
     let nl = memchr::memchr(b'\n', block)?;
     let mut lp = nl + 1;
+    // A timestamp may contain several value lines for the same id (delta
+    // cycles/glitches). VCD semantics: the value at the timestamp is the LAST
+    // one written — keep scanning and return the last occurrence.
+    let mut last: Option<VcdValue> = None;
     while lp < block.len() {
         let line_end = match memchr::memchr(b'\n', &block[lp..]) {
             Some(n) => lp + n,
@@ -1656,12 +1670,12 @@ fn find_signal_in_block(block: &[u8], target_id: &[u8], id_len: usize) -> Option
                     }
                     other => VcdValue::Bit(other),
                 };
-                return Some(val);
+                last = Some(val);
             }
         }
         lp = line_end + 1;
     }
-    None
+    last
 }
 
 #[cfg(test)]
@@ -1760,5 +1774,63 @@ $end\n").unwrap();
         let idx = trace.find_indices(&name, FindCondition::Rising).unwrap();
         eprintln!("rising({}) = {:?}", name, idx);
         assert!(!idx.is_empty(), "no rising detected");
+    }
+
+    /// Regression (P0-b round): a timestamp may carry several value lines for
+    /// the same id (delta cycles/glitches). The value AT the index is the LAST
+    /// one written; per-index reads (get), find_indices and change_points must
+    /// agree with each other and the FST backend.
+    #[test]
+    fn test_glitch_timestamp_last_value_wins() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let uniq = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let p = std::env::temp_dir().join(format!("wal_glitch_{}_{}.vcd", std::process::id(), uniq));
+        std::fs::write(&p, "$timescale 1ns $end\n\
+$scope module top $end\n\
+$var wire 4 ! data $end\n\
+$upscope $end\n\
+$enddefinitions $end\n\
+$dumpvars\n\
+#0\n\
+b0000 !\n\
+$end\n\
+#10\n\
+b1100 !\n\
+b0011 !\n\
+$end\n\
+#20\n\
+b1010 !\n\
+$end\n\
+#30\n\
+b0000 !\n\
+$end\n").unwrap();
+        let trace = load_vcd(p.to_str().unwrap());
+        let name = trace.signals().iter().find(|s| s.ends_with("data")).unwrap().clone();
+
+        // Glitch at #10 (index 1): value line 1100 then 0011 → last wins.
+        let sv = trace.signal_value(&name, 1).unwrap();
+        assert_eq!(sv, crate::trace::ScalarValue::Vector(b"0011".to_vec()), "get at glitch ts must be last value");
+
+        // find_indices uses per-index last values: 0011 == 3 matches exactly idx 1.
+        let idx = trace.find_indices(&name, FindCondition::ValueI64(3)).unwrap();
+        assert_eq!(idx, vec![1usize], "value 3 must match only the glitch index");
+        // 1100 == 12 never holds (overwritten within #10).
+        let idx = trace.find_indices(&name, FindCondition::ValueI64(12)).unwrap();
+        assert!(idx.is_empty(), "overwritten 1100 must not match");
+        // Same read through the decoded-signal cache (built by find_indices):
+        // the cache must also keep the LAST value per index.
+        let sv = trace.signal_value(&name, 1).unwrap();
+        assert_eq!(sv, crate::trace::ScalarValue::Vector(b"0011".to_vec()), "cached get at glitch ts must be last value");
+        // Change points: per-index transitions (no spurious entry for the glitch).
+        let cp = trace.change_points(&name).unwrap();
+        let vals: Vec<(usize, crate::trace::ScalarValue)> = cp
+            .iter().map(|(i, sv)| (*i, sv.clone())).collect();
+        assert_eq!(vals, vec![
+            (0, crate::trace::ScalarValue::Vector(b"0000".to_vec())),
+            (1, crate::trace::ScalarValue::Vector(b"0011".to_vec())),
+            (2, crate::trace::ScalarValue::Vector(b"1010".to_vec())),
+            (3, crate::trace::ScalarValue::Vector(b"0000".to_vec())),
+        ], "change_points must be per-index last values");
     }
 }

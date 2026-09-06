@@ -185,7 +185,10 @@ impl Trace for FstTrace {
                 });
             }
         };
-        let sv = sig.get_value_at(&d_off, 0);
+        // Several changes can share the same time-table index (delta cycles).
+        // The value AT the index is the LAST change, same as the VCD backend.
+        let elem = d_off.elements.saturating_sub(1);
+        let sv = sig.get_value_at(&d_off, elem);
         Ok(value_to_scalar(&sv))
     }
 
@@ -246,15 +249,26 @@ impl Trace for FstTrace {
             FindCondition::Rising | FindCondition::Falling | FindCondition::Changed
         );
 
-        let mut changes: Vec<(usize, bool)> = Vec::new();
-        let mut prev_bit: Option<u8> = None;
-        let mut prev_val: Option<Vec<u8>> = None;
+        // Collapse multiple changes at the same time-table index (delta cycles)
+        // to their LAST value, so conditions use per-index semantics identical to
+        // the VCD backend (value at index = last change at that index).
+        let mut collapsed: Vec<(usize, SignalValue)> = Vec::new();
         for (time_idx, sv) in sig.iter_changes() {
             let idx = time_idx as usize;
             if idx > self.max_index() { break; }
-            let matched = find_cond_matches(&sv, prev_bit, &mut prev_val, &cond);
-            prev_bit = sv_as_bit(&sv);
-            changes.push((idx, matched));
+            match collapsed.last_mut() {
+                Some(last) if last.0 == idx => last.1 = sv,
+                _ => collapsed.push((idx, sv)),
+            }
+        }
+
+        let mut changes: Vec<(usize, bool)> = Vec::new();
+        let mut prev_bit: Option<u8> = None;
+        let mut prev_val: Option<Vec<u8>> = None;
+        for (idx, sv) in &collapsed {
+            let matched = find_cond_matches(sv, prev_bit, &mut prev_val, &cond);
+            prev_bit = sv_as_bit(sv);
+            changes.push((*idx, matched));
         }
 
         let mut indices = Vec::new();
@@ -329,11 +343,25 @@ impl Trace for FstTrace {
         let wf = self.wf.borrow();
         let sig = wf.get_signal(sig_ref)
             .ok_or_else(|| format!("Signal data not loaded: {}", name))?;
-        let mut out = Vec::new();
+        // Per-index change points, like the VCD backend: collapse multiple
+        // changes at the same time-table index (delta cycles) to their LAST
+        // value, then drop entries whose value did not change vs the previous
+        // index (glitches that return to the prior value are not change points).
+        let mut collapsed: Vec<(usize, ScalarValue)> = Vec::new();
         for (time_idx, sv) in sig.iter_changes() {
             let idx = time_idx as usize;
             if idx > self.max_index() { break; }
-            out.push((idx, value_to_scalar(&sv)));
+            let sv = value_to_scalar(&sv);
+            match collapsed.last_mut() {
+                Some((last_idx, last_sv)) if *last_idx == idx => *last_sv = sv,
+                _ => collapsed.push((idx, sv)),
+            }
+        }
+        let mut out: Vec<(usize, ScalarValue)> = Vec::new();
+        for (idx, sv) in collapsed {
+            if out.last().map(|(_, prev)| prev != &sv).unwrap_or(true) {
+                out.push((idx, sv));
+            }
         }
         Ok(out)
     }
