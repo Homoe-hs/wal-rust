@@ -197,14 +197,7 @@ fn op_trace_file(_args: &[Value], env: &mut Environment, _eval: &mut Evaluator) 
 }
 
 fn scalar_to_value(sv: ScalarValue) -> Value {
-    match sv {
-        ScalarValue::Bit(b) => Value::Int(if b == b'1' { 1 } else { 0 }),
-        ScalarValue::Vector(v) => {
-            let int_val = v.iter().fold(0i64, |acc, &b| (acc << 1) | if b == b'1' { 1 } else { 0 });
-            Value::Int(int_val)
-        }
-        ScalarValue::Real(r) => Value::Float(r),
-    }
+    crate::wal::builtins::wave::scalar_to_value_x_aware(&sv)
 }
 
 #[allow(dead_code)]
@@ -725,13 +718,13 @@ fn slice_value(sv: ScalarValue, hi: u32, lo: u32) -> Value {
                 return Value::Int(0);
             }
             let h = hi.min(width - 1);
-            let mut acc: i64 = 0;
+            let mut bits: Vec<u8> = Vec::with_capacity((h - lo + 1) as usize);
             for bit in (lo..=h).rev() {
                 let idx = (width - 1 - bit) as usize;
                 let b = *v.get(idx).unwrap_or(&b'0');
-                acc = (acc << 1) | if b == b'1' { 1 } else { 0 };
+                bits.push(b);
             }
-            Value::Int(acc)
+            crate::wal::builtins::wave::scalar_to_value_x_aware(&ScalarValue::Vector(bits))
         }
         ScalarValue::Real(r) => Value::Float(r),
     }
@@ -835,11 +828,12 @@ fn op_fold_signal(args: &[Value], env: &mut Environment, eval: &mut Evaluator) -
 
 fn op_signal_width(args: &[Value], env: &mut Environment, _eval: &mut Evaluator) -> Result<Value, String> {
     ensure_arity(args, 1)?;
-    let name = extract_symbol(&args[0])?;
+    let name = extract_name(&args[0])?;
     if let Some(traces) = env.get_traces() {
         let traces_lock = traces.read().unwrap_or_else(|e| e.into_inner());
         if let Some(trace) = traces_lock.first_trace() {
-            if let Ok(w) = trace.signal_width(&name) {
+            let resolved = resolve_signal_name(&name, &trace.signals()).unwrap_or(name.clone());
+            if let Ok(w) = trace.signal_width(&resolved) {
                 return Ok(Value::Int(w as i64));
             }
             // Try all traces
@@ -855,7 +849,9 @@ fn op_signal_width(args: &[Value], env: &mut Environment, _eval: &mut Evaluator)
 
 fn op_sample_at(args: &[Value], env: &mut Environment, _eval: &mut Evaluator) -> Result<Value, String> {
     ensure_arity(args, 2)?;
-    let signal_name = extract_symbol(&args[0])?;
+    let name = extract_name(&args[0])?;
+    let signal_name = resolve_signal_name(&name, &[]).unwrap_or(name);
+    let _ = &signal_name;
     let index = match &args[1] {
         Value::Int(i) => *i as usize,
         Value::Float(f) => *f as usize,
@@ -864,7 +860,8 @@ fn op_sample_at(args: &[Value], env: &mut Environment, _eval: &mut Evaluator) ->
     if let Some(traces) = env.get_traces() {
         let traces_lock = traces.read().unwrap_or_else(|e| e.into_inner());
         if let Some(trace) = traces_lock.first_trace() {
-            if let Ok(sv) = trace.signal_value(&signal_name, index) {
+            let resolved = resolve_signal_name(&signal_name, &trace.signals()).unwrap_or(signal_name.clone());
+            if let Ok(sv) = trace.signal_value(&resolved, index) {
                 return Ok(scalar_to_value(sv));
             }
             // Try all traces

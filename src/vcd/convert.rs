@@ -46,10 +46,18 @@ fn update_checkpoint(path: &Path, offset: u64) -> Result<(), String> {
 
 pub(crate) fn parse_timescale(line: &[u8]) -> Option<i8> {
     let s = std::str::from_utf8(line).ok()?;
-    let parts: Vec<&str> = s.split_whitespace().collect();
-    if parts.len() < 2 { return None; }
-    // Both "$timescale 1 ns $end" (iverilog) and "$timescale 1ns $end" (verilator)
-    let raw = parts[1].to_lowercase();
+    let mut parts: Vec<&str> = s.split_whitespace().collect();
+    // "$timescale 1ns $end" (single line), "1 ns $end" (iverilog spaced form),
+    // or the multi-line value line "1ns" / "1ns $end" — all land here.
+    if parts.first().map(|p| *p == "$timescale").unwrap_or(false) {
+        parts.remove(0);
+    }
+    if parts.last().map(|p| *p == "$end").unwrap_or(false) {
+        parts.pop();
+    }
+    if parts.is_empty() { return None; }
+    // both compact ("1ns") and spaced ("1 ns") forms normalize to "1 ns"
+    let raw = parts.join(" ").to_lowercase();
     let (num_str, unit_str): (String, String) = if raw.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false) {
         // split digits from unit suffix, e.g. "1ps", "10ns", "0.1us"
         match raw.find(|c: char| !c.is_ascii_digit() && c != '.') {

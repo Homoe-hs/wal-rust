@@ -65,15 +65,42 @@ fn resolve_signal(tr: &dyn Trace, name: &str) -> Result<String, String> {
     ))
 }
 
-fn scalar_to_wal(sv: &ScalarValue) -> Value {
+/// IEEE 1364-1995 §14.1.1.4 / 1800-2012 §21.2.1.4 value convention:
+/// a value WITHOUT x/z folds to an int; WITH x/z it is returned as a
+/// bit-string (single lowercase `x` when all bits are unknown, `z` when all
+/// are high-impedance, otherwise per-bit lowercase x/z — so a full-x vector
+/// is visibly `"x"` and a partial-x vector `"10x1"` instead of a silently
+/// folded integer).
+pub(crate) fn scalar_to_value_x_aware(sv: &ScalarValue) -> Value {
     match sv {
-        ScalarValue::Bit(b) => Value::Int(if *b == b'1' { 1 } else { 0 }),
+        ScalarValue::Bit(b) => match b {
+            b'x' | b'X' => Value::String("x".to_string()),
+            b'z' | b'Z' => Value::String("z".to_string()),
+            _ => Value::Int(if *b == b'1' { 1 } else { 0 }),
+        },
         ScalarValue::Vector(v) => {
-            let int_val = v.iter().fold(0i64, |acc, &b| (acc << 1) | if b == b'1' { 1 } else { 0 });
+            if v.iter().all(|b| matches!(b, b'x' | b'X')) {
+                return Value::String("x".to_string());
+            }
+            if v.iter().all(|b| matches!(b, b'z' | b'Z')) {
+                return Value::String("z".to_string());
+            }
+            if v.iter().any(|b| matches!(b, b'x' | b'X' | b'z' | b'Z')) {
+                return Value::String(
+                    v.iter().map(|&b| (b as char).to_ascii_lowercase()).collect(),
+                );
+            }
+            let int_val = v.iter().fold(0i64, |acc, &b| {
+                (acc << 1) | if b == b'1' { 1 } else { 0 }
+            });
             Value::Int(int_val)
         }
         ScalarValue::Real(r) => Value::Float(*r),
     }
+}
+
+fn scalar_to_wal(sv: &ScalarValue) -> Value {
+    scalar_to_value_x_aware(sv)
 }
 
 /// (t v) pair
@@ -488,6 +515,27 @@ const DOCS: &[(&str, &str)] = &[
     ("timescale", "Times are in the waveform's NATIVE unit: raw numbers from getwave/wave/at/edges are ps/ns/... per the file's $timescale (see the load summary). Only period/freq and fmt-time convert to seconds / human units."),
 ];
 
+/// (timescale) → print the loaded waveform's time unit (e.g. "1ns"/"?").
+fn op_timescale(args: &[Value], env: &mut Environment, _eval: &mut Evaluator) -> Result<Value, String> {
+    if !args.is_empty() {
+        return Err("(timescale) takes no arguments".to_string());
+    }
+    with_first_trace(env, |tr| {
+        let exp = tr.timescale_exp();
+        match exp {
+            Some(e) => {
+                let unit = match e {
+                    0 => "s", -3 => "ms", -6 => "us", -9 => "ns", -12 => "ps", -15 => "fs",
+                    _ => "?",
+                };
+                println!("timescale: 1{} (10^{} s)", unit, e);
+            }
+            None => println!("timescale: ?"),
+        }
+        Ok(Value::Nil)
+    })
+}
+
 fn op_doc(args: &[Value], _env: &mut Environment, _eval: &mut Evaluator) -> Result<Value, String> {
     if args.len() != 1 {
         return Err("(doc \"cmd\") expected".to_string());
@@ -570,4 +618,5 @@ pub fn register_wave(disp: &mut Dispatcher) {
     disp.register(Operator::Save, op_save);
     disp.register(Operator::Doc, op_doc);
     disp.register(Operator::FmtTime, op_fmt_time);
+    disp.register(Operator::Timescale, op_timescale);
 }

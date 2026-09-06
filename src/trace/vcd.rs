@@ -232,7 +232,15 @@ impl VcdTrace {
                         scopes.push(scope_stack.join("."));
                     }
                 } else if hl.starts_with(b"$timescale") {
+                    // 单行: "$timescale 1ns $end"; 多行: "$timescale\n 1ns\n $end".
+                    // 只有指令行本身无值(多行形态)才读下一行——单行解析失败时不得吞行。
                     timescale_exp = crate::vcd::convert::parse_timescale(hl);
+                    let inline_value = hl.iter().any(|c| *c == b' ') || hl.len() > b"$timescale".len();
+                    if !inline_value {
+                        if let Some(next) = reader.read_line_bytes() {
+                            timescale_exp = crate::vcd::convert::parse_timescale(next);
+                        }
+                    }
                 } else if hl.starts_with(b"$upscope") {
                     scope_stack.pop();
                 } else if hl.starts_with(b"$enddefinitions") {

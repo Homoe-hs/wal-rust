@@ -73,6 +73,14 @@ impl<R: Read> VcdParser<R> {
                         return Some(event);
                     }
                 }
+                ParserState::TimescaleValue => {
+                    let clean = trimmed.strip_suffix("$end").map(|t| t.trim()).unwrap_or(trimmed);
+                    if !clean.is_empty() {
+                        let exp = parse_timescale_exp(clean);
+                        self.state = ParserState::SkipToEnd; // skip the trailing $end
+                        return Some(Ok(VcdEvent::Timescale(exp)));
+                    }
+                }
                 ParserState::SkipToEnd => {
                     if trimmed == "$end" {
                         self.state = ParserState::Header;
@@ -124,8 +132,8 @@ impl<R: Read> VcdParser<R> {
                 let exp = parse_timescale_exp(&timescale_str);
                 return Some(Ok(VcdEvent::Timescale(exp)));
             } else {
-                // Multi-line: value is on next line
-                self.state = ParserState::SkipToEnd;
+                // Multi-line: value is on next line ($timescale \n 1ns \n $end)
+                self.state = ParserState::TimescaleValue;
                 return None;
             }
         } else if trimmed.starts_with("$date") {
@@ -499,6 +507,14 @@ impl MmapVcdParser {
                 ParserState::Dump => {
                     if let Some(event) = self.parse_dump_line_impl(line_num, &trimmed) {
                         return Some(event);
+                    }
+                }
+                ParserState::TimescaleValue => {
+                    let clean = trimmed.strip_suffix("$end").map(|t| t.trim()).unwrap_or(trimmed);
+                    if !clean.is_empty() {
+                        let exp = parse_timescale_exp(clean);
+                        self.state = ParserState::SkipToEnd;
+                        return Some(Ok(VcdEvent::Timescale(exp)));
                     }
                 }
                 ParserState::SkipToEnd => {

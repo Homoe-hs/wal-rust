@@ -153,6 +153,7 @@ pub enum Operator {
     Save,
     Doc,
     FmtTime,
+    Timescale,
 
     // Scope/group operations
     Allscopes,
@@ -467,6 +468,7 @@ impl Operator {
             "save" => Some(Operator::Save),
             "doc" => Some(Operator::Doc),
             "fmt-time" => Some(Operator::FmtTime),
+            "timescale" => Some(Operator::Timescale),
 
             // Scope/group
             "all-scopes" => Some(Operator::Allscopes),
@@ -631,6 +633,7 @@ impl Operator {
             Operator::Save => "save",
             Operator::Doc => "doc",
             Operator::FmtTime => "fmt-time",
+            Operator::Timescale => "timescale",
             Operator::Allscopes => "all-scopes",
             Operator::Scoped => "scoped",
             Operator::ResolveScope => "resolve-scope",

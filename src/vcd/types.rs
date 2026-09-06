@@ -241,6 +241,8 @@ pub(crate) enum ParserState {
     Dump,
     /// Skipping to $end keyword
     SkipToEnd,
+    /// $timescale on its own line: value (e.g. `1ns`) follows on the next line
+    TimescaleValue,
 }
 
 impl Default for ParserState {

@@ -481,3 +481,33 @@ fn test_count_step_and_find_step() {
         panic!("find/step must return a list, got {:?}", found);
     }
 }
+
+// ---------- x-aware get (IEEE 1364-1995 §14.1.1.4 convention) ----------
+
+#[test]
+fn test_get_x_aware_vector() {
+    use wal_rust::wal::eval::Evaluator;
+    use wal_rust::wal::ast::{Value, WList};
+    // small VCD with a partial-x vector and a full-z vector
+    let dir = std::env::temp_dir();
+    let p = dir.join("wal_x_aware.vcd");
+    std::fs::write(&p, "$timescale 1ns $end\n$scope module t $end\n$var wire 8 \" v $end\n$enddefinitions $end\n#0\nb1001x0x1 \"\n#5\nb00001111 \"\n#10\nbzzzzzzzz \"\n").unwrap();
+    let mut eval = Evaluator::new();
+    eval.load_trace(&p.to_string_lossy(), "test").unwrap();
+    // partial x → bit-string, not folded int
+    assert_eq!(eval.eval("(at \"t.v\" 0)").unwrap(), Value::List(WList::from_vec(vec![
+        Value::Int(0), Value::String("1001x0x1".to_string()),
+    ])));
+    // no x → folded int
+    assert_eq!(eval.eval("(at \"t.v\" 5)").unwrap(), Value::List(WList::from_vec(vec![
+        Value::Int(5), Value::Int(15),
+    ])));
+    // full z → single lowercase z
+    assert_eq!(eval.eval("(at \"t.v\" 10)").unwrap(), Value::List(WList::from_vec(vec![
+        Value::Int(10), Value::String("z".to_string()),
+    ])));
+    // x semantics: not 0, not 1 — count(fast) follows the same path
+    assert_eq!(eval.eval("(count (!= (get \"t.v\") 0))").unwrap(), Value::Int(3));
+    assert_eq!(eval.eval("(count (= (get \"t.v\") 0))").unwrap(), Value::Int(0));
+    let _ = std::fs::remove_file(&p);
+}
