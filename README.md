@@ -49,6 +49,55 @@ Input is a file path → executed as WAL script. No input → REPL.
 
 ---
 
+## Binary Quickstart
+
+The GitHub release ships one self-contained binary (`wal-rust`, x86_64,
+**glibc ≥ 2.17** — CentOS 7 / RHEL 7 / Ubuntu 16.04+). No Rust or waveform
+toolchain needed: copy it, chmod +x, done.
+
+```bash
+# download from https://github.com/Homoe-hs/wal-rust/releases
+chmod +x wal-rust && sudo mv wal-rust /usr/local/bin/   # or ~/.local/bin
+wal-rust --version        # → wal-rust 0.11.4 (from /path/to/wal-rust)
+```
+
+### Three ways to use it
+
+```bash
+# 1. One-shot queries (no WAL expression needed — shell/CI friendly)
+wal-rust count dump.vcd clk 1              # timestamps where clk == 1
+wal-rust sigs dump.vcd "wstrb" 10          # names containing "wstrb" (first 10)
+wal-rust topsig dump.vcd                   # most-active signals by change count
+
+# 2. WAL expressions (the workhorse; wave pre-loaded with -l)
+wal-rust -l sim.vcd '(take 5 (find-sig "clk"))'          # first 5 clk-named signals
+wal-rust -l sim.vcd '(count (is-x "sig"))'               # how much of sig is X
+wal-rust -l sim.vcd '(getwave "clk")'                    # all change points (t v)
+wal-rust -l sim.vcd '(edges "clk" 100000 200000)'        # change times in a window
+wal-rust -l sim.vcd '(at "sig" 1515000)'                 # value at time t
+wal-rust -l sim.vcd '(fmt-time 1515000)'                 # → "1.51us" human time
+wal-rust -l sim.vcd '(assert-eq "sig" t0 t1 1)'          # sig == 1 throughout?
+wal-rust -l sim.vcd '(count (&& (= (get "awvalid") 1) (= (get "awready") 1)))'  # handshakes
+
+# 3. Scripts / REPL
+wal-rust script.wal -l sim.vcd                # multi-line WAL scripts (define/map/fold…)
+wal-rust run --halt-on-error script.wal -l sim.vcd   # CI: stop at first error
+wal-rust repl                                 # interactive
+```
+
+### Gotchas
+
+- **Time units**: `getwave/at/edges` return raw values in the file's native
+  unit (VCD `$timescale`); use `(fmt-time T)` for human time,
+  `(fmt-time T "clk")` for beat numbers.
+- **Signal names**: `(find-sig "p")` or `sigs` for lookups; not-found errors
+  give nearest-name hints. `SIGNALS` prints bounded (`...(N items)`), so
+  90k-signal waves stay terminal-friendly.
+- **Full reference**: `(doc "edges")` one-liner for any command, `(help)` for
+  the operator list.
+
+---
+
 ## WAL Language Reference
 
 ### Math
