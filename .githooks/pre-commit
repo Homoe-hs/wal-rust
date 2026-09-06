@@ -12,6 +12,11 @@ set -euo pipefail
 
 TOML="$(git rev-parse --show-toplevel)/Cargo.toml"
 
+# Doc-only commits (README/AGENTS/docs/*.md/.gitignore) must not bump.
+if ! git diff --cached --name-only | grep -vE '\.md$|^docs/|^\.gitignore$' | grep -q .; then
+    exit 0
+fi
+
 # If Cargo.toml is already staged (version touched by the commit), do nothing.
 if ! git diff --cached --quiet -- Cargo.toml; then
     exit 0
