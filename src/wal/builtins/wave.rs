@@ -204,7 +204,17 @@ fn op_at(args: &[Value], env: &mut Environment, _eval: &mut Evaluator) -> Result
             Some((t, sv)) => Ok(Value::List(WList::from_vec(vec![
                 Value::Int(*t as i64), scalar_to_wal(sv),
             ]))),
-            None => Ok(Value::List(WList::from_vec(vec![Value::Int(0), Value::Int(0)]))),
+            None => {
+                // target precedes the first change: report the INITIAL held
+                // value instead of silently folding to (0 0) (feedback round:
+                // "at 恒 (0 0)" is misleading); no changes at all → error.
+                match timed.first() {
+                    Some((t0, sv0)) => Ok(Value::List(WList::from_vec(vec![
+                        Value::Int(*t0 as i64), scalar_to_wal(sv0),
+                    ]))),
+                    None => Err(format!("at: signal '{}' has no change points", sig)),
+                }
+            }
         }
     })
 }
