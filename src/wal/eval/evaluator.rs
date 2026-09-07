@@ -1057,6 +1057,48 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
         crate::wal::builtins::signal::resolve_cond_names(expr, &self.env)
     }
 
+    /// Substitute bound variables in the VALUE position of `(=/!= (get ...) VAR)`
+    /// (and `(not (= ...))`): a variable RHS becomes the literal it holds, so
+    /// count/find take the fast path instead of the O(N) per-step fallback.
+    /// The variable is sampled once at query time — exactly the existing
+    /// semantics of a bound RHS.
+    fn resolve_rhs_vars(&self, expr: Value) -> Value {
+        let lst = match &expr {
+            Value::List(l) => l.clone(),
+            _ => return expr,
+        };
+        let sym_op = |i: usize| -> Option<String> {
+            match &lst.get(i) {
+                Some(Value::Symbol(s)) => Some(s.name.clone()),
+                _ => None,
+            }
+        };
+        // (not (<simple>))
+        if lst.len() == 2 && matches!(lst.first(), Some(Value::Symbol(s)) if s.name == "not") {
+            let inner = self.resolve_rhs_vars(lst[1].clone());
+            return Value::List(WList::from_vec(vec![lst[0].clone(), inner]));
+        }
+        if lst.len() == 3 && matches!(sym_op(0).as_deref(), Some("=") | Some("!=")) {
+            let get_side: Option<usize> = [1usize, 2].iter().copied().find(|&i| {
+                matches!(&lst.get(i), Some(Value::List(inner))
+                    if inner.len() == 2 && matches!(inner.first(), Some(Value::Symbol(s)) if s.name == "get"))
+            });
+            if let Some(gi) = get_side {
+                let vi = 3 - gi;
+                if let Some(Value::Symbol(s)) = lst.get(vi) {
+                    if let Some(v) = self.env.lookup(&s.name) {
+                        if matches!(v, Value::Int(_) | Value::String(_) | Value::Bool(_)) {
+                            let mut nl = lst.0.clone();
+                            nl[vi] = v;
+                            return Value::List(WList::from_vec(nl));
+                        }
+                    }
+                }
+            }
+        }
+        expr
+    }
+
     /// Build a FindCondition from target value and negation flag.
     fn build_cond(target: i64, is_not: bool) -> FindCondition {
         if is_not {
@@ -1378,7 +1420,7 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
 
             // Resolve symbol names so (define s "sig") + (find (= (get s) 1))
             // takes the fast paths below instead of the per-step fallback.
-            let resolved_cond = self.resolve_get_symbols(&args[0]);
+            let resolved_cond = self.resolve_rhs_vars(self.resolve_get_symbols(&args[0]));
 
             // Fast path: try simple condition (= (get "sig") val), (!= ...), (not (= ...))
             // Uses trace.find_indices() for a parallel scan.
@@ -1579,7 +1621,7 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
             let mut batch_entries: Vec<BatchEntry> = Vec::new();
             for arg in args {
                 // Resolve variable references in (get <symbol>) → (get "resolved_string")
-                let resolved_arg = self.resolve_get_symbols(arg);
+                let resolved_arg = self.resolve_rhs_vars(self.resolve_get_symbols(arg));
                 if let Some((sig, target, is_not)) = self.parse_simple_condition(&resolved_arg) {
                     batch_entries.push(BatchEntry::Simple(sig, Self::build_cond(target, is_not)));
                 } else if let Some(subs) = self.decompose_and_condition(&resolved_arg) {
@@ -1639,7 +1681,7 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
 
         // Fast path 0: builtins simple-condition fast path (covers (= ...) plus
         // edge/X conditions: (rising/falling/changes/is-x/is-z "sig"))
-        let resolved_cond = self.resolve_get_symbols(&args[0]);
+        let resolved_cond = self.resolve_rhs_vars(self.resolve_get_symbols(&args[0]));
         if let Some(result) = crate::wal::builtins::signal::try_find_indices_simple(&resolved_cond, usize::MAX, &mut self.env) {
             match result {
                 Ok(Value::List(lst)) => {
