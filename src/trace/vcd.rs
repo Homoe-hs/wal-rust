@@ -435,6 +435,8 @@ impl VcdTrace {
         boundaries.push(data.len());
 
         // Shared read-only data for parallel threads
+        let col_enabled = col_cache_budget() > 0;
+        let col_enabled_arc = Arc::new(col_enabled);
         let signal_ids_arc = Arc::new(signal_ids);
         let widths_arc = Arc::new(signal_widths.clone());
         let has_events = !event_signals.is_empty();
@@ -475,6 +477,7 @@ impl VcdTrace {
                 let sid = signal_ids_arc.clone();
                 let evt = event_sigs_arc.clone();
                 let widths = widths_arc.clone();
+                let col_on = *col_enabled_arc;
 
                 let mut ts = Vec::new();
                 let mut ts_offsets = Vec::new();
@@ -522,28 +525,29 @@ impl VcdTrace {
                         _ => {
                             anchor_counter += 1;
                             let sampled = anchor_counter % sparse_interval == 0;
-                            // Every value line is parsed once: sparse anchors
-                            // (sampled) AND the columnar change list (full).
-                            if let Some((sig_hash, value)) = parse_value_change_fast(line) {
-                                if let Some(&sig_idx) = sid.get(&sig_hash) {
-                                    if sampled {
-                                        si.push((sig_idx, current_timestamp, base_offset + line_start as u64));
-                                    }
-                                    if has_events && evt.contains(&sig_idx) {
-                                        event_cp.push((sig_idx, current_timestamp));
-                                    }
-                                    // column: pack the PARSED value's own bit
-                                    // width (2 bits per bit; a line may carry
-                                    // more bits than the declared width — the
-                                    // anchored scan treats the line as truth).
-                                    let vw = match &value {
-                                        VcdValue::Vector(v) => v.len(),
-                                        VcdValue::Bit(_) => 1,
-                                        _ => 0,
-                                    };
-                                    if vw >= 1 && vw <= 64 {
-                                        if let Some(st) = col_states_from_vcd(&value, vw) {
-                                            cols.push((sig_idx, ts_seen - 1, st, base_offset + line_start as u64, vw as u8));
+                            // Column cache off → parse only the sampled fraction
+                            // (fast load, 0.12.2 speed); on → parse every line
+                            // once for anchors AND the columnar change list.
+                            if has_events || col_on || sampled {
+                                if let Some((sig_hash, value)) = parse_value_change_fast(line) {
+                                    if let Some(&sig_idx) = sid.get(&sig_hash) {
+                                        if sampled {
+                                            si.push((sig_idx, current_timestamp, base_offset + line_start as u64));
+                                        }
+                                        if has_events && evt.contains(&sig_idx) {
+                                            event_cp.push((sig_idx, current_timestamp));
+                                        }
+                                        if col_on {
+                                            let vw = match &value {
+                                                VcdValue::Vector(v) => v.len(),
+                                                VcdValue::Bit(_) => 1,
+                                                _ => 0,
+                                            };
+                                            if vw >= 1 && vw <= 64 {
+                                                if let Some(st) = col_states_from_vcd(&value, vw) {
+                                                    cols.push((sig_idx, ts_seen - 1, st, base_offset + line_start as u64, vw as u8));
+                                                }
+                                            }
                                         }
                                     }
                                 }
