@@ -1,6 +1,6 @@
 # wal-rust — WAL: Waveform Analysis Language
 
-High-performance Rust implementation of [WAL](https://wal-lang.org), supporting VCD/FST waveform analysis at scale. **155GB VCD loaded in 9 minutes on 16-core CPU.**
+High-performance Rust implementation of [WAL](https://wal-lang.org), supporting VCD/FST waveform analysis at scale. **v0.12.0: 58.7GB(3.5M 信号)加载 ~12s;同信号二次查询毫秒级;RSS 7.7GB** — 详见 [Performance](#performance)。
 
 ```bash
 $ wal-rust '(+ 1 2)'
@@ -58,7 +58,7 @@ toolchain needed: copy it, chmod +x, done.
 ```bash
 # download from https://github.com/Homoe-hs/wal-rust/releases
 chmod +x wal-rust && sudo mv wal-rust /usr/local/bin/   # or ~/.local/bin
-wal-rust --version        # → wal-rust 0.11.4 (from /path/to/wal-rust)
+wal-rust --version        # → wal-rust 0.12.0 (from /path/to/wal-rust)
 ```
 
 ### Three ways to use it
@@ -503,19 +503,29 @@ Configure in `~/.config/opencode/opencode.json`:
 
 ## Performance
 
-### 155GB VCD Benchmark
+### 大波形基准(2026-09-07,v0.12.0)
 
-| Metric | Value |
-|:-------|:------|
-| File size | 155 GB |
-| Signals | 103 |
-| Timestamps | 385,314,044 |
-| **Load time** | **9 min 05 sec** |
-| Parallelism | 16 cores (rayon), 562% CPU |
-| Memory | ~910 MB (PID RSS peak) |
-| I/O throughput | 284 MB/s (SSD bound) |
+合成 58.7GB(3.5M 信号 / 1.5M 时间戳 / ~1.65G 变更,与 152GB 同构):
 
-### Stress Tests
+| 指标 | v0.11.11 基线 | v0.12.0 | 变化 |
+|:-----|:-------------|:--------|:-----|
+| 纯加载(pass-1b 索引) | 360s | **~12s** | **30x** |
+| 冷查询(加载 + 首个 count) | 674s | ~282s | 2.4x |
+| 同信号第二次查询(同进程) | 208s | **毫秒级** | 消除 |
+| 峰值 RSS | 11.4GB | **7.7GB** | -32% |
+
+> 说明: 初值快照语义统一、per-index 最后写入、`$dumpvars` 初值、set! 词法穿透
+> 等均为 0.12.x 行为;快/慢路径分叉按 [查询引擎设计](docs/query-engine-design.md)
+> 在 0.12.x 内收敛为统一区间扫描引擎。
+
+### 早期基准(历史)
+
+| 指标 | 值 |
+|:-----|:---|
+| 155GB VCD 加载(旧实现) | 9 min 05 sec |
+| 152GB 内网实测(0.11.x) | count 数分钟-数十分钟(已由 0.12.x 改善) |
+
+### Stress Tests(保持)
 
 | Test | Scale | Result |
 |:-----|:------|:-------|
@@ -523,7 +533,7 @@ Configure in `~/.config/opencode/opencode.json`:
 | WAL lines | 10,000,000 lines | ✅ 85s |
 | Single-line args | 333,333 args | ✅ 0.89s |
 | Concurrent files | 100 files | ✅ 0.8s |
-| VCD loading | 100MB / 1GB / 10GB / 155GB | ✅ |
+| VCD loading | 100MB / 1GB / 10GB / 58.7GB(合成) | ✅ |
 
 ---
 

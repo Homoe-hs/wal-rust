@@ -3,7 +3,7 @@
 ## Quick commands
 
 ```bash
-cargo test                          # all Rust tests (210)
+cargo test                          # all Rust tests (~232)
 cargo test --test wal_integration_test  # integration tests only
 cargo test test_vcd_pyvcd_verify_strobe -- --nocapture  # single test + stdout
 cargo build --release               # release build
@@ -12,6 +12,7 @@ target/release/wal-rust '(expr)' -l trace.vcd   # eval expression
 target/release/wal-rust run script.wal -l file  # run script
 target/release/wal-rust repl        # interactive REPL
 test_samples/run_tests.sh           # WAL script test runner
+bash scripts/diff_find.sh .tools/wal-rust.old target/release/wal-rust   # find semantic diff gate
 ```
 
 ## CLI input auto-detect
@@ -28,46 +29,53 @@ Flags: `-l <waveform>` (repeatable), `-c <code>` (inline override), `--halt-on-e
 
 | Dir | Content | ~Lines |
 |-----|---------|--------|
-| `src/wal/` | AST, tree-sitter parser, Evaluator, builtins (11 modules) | 5,200 |
+| `src/wal/` | AST, tree-sitter parser, Evaluator, builtins (11 modules) | 5,300 |
 | `src/vcd/` | VCD parser (mmap + memchr + two-pass) | 2,100 |
 | `src/fst/` | FST writer (wellen reads via `src/trace/fst.rs`; legacy reader retired) | 2,700 |
-| `src/trace/` | `Trace` trait, `VcdTrace`, `FstTrace`, `TraceContainer` | 2,150 |
-| `tests/` | Rust integration & correctness tests (5 files, ~860 lines) | 860 |
+| `src/trace/` | `Trace` trait, `VcdTrace`, `FstTrace`, `TraceContainer` | 2,200 |
+| `tests/` | Rust integration & correctness tests (6 files, ~900 lines) | 900 |
 | `test_data/` | VCD/FST test files (counter.vcd 11K, pyvcd_100M 107MB, edge cases) | — |
 | `tree-sitter-wal/` | WAL grammar (`grammar.js`), compiled to `parser.c` via `build.rs` | — |
+| `docs/` | 设计/复盘: `query-engine-design.md`(统一引擎), `waveform-io-plan.md`(IO-1..6), `152gb-round.md`(P0 轮), `internal-feedback-review.md` | — |
 
 ## Architecture notes
 
 - **tree-sitter parser**: `build.rs` compiles `tree-sitter-wal/src/parser.c`. First build compiles C code.
-- **FST read backend**: wellen (`wellen::simple::read` in `src/trace/fst.rs`); the legacy hand-rolled reader was retired (only the writer stays: `src/fst/writer.rs` + vcd→fst convert tests).
-- **Dispatcher pattern** for builtins: (1) write handler in `src/wal/builtins/xxx.rs` (2) register in `builtins/mod.rs::register_all()` (3) optional `Operator` enum variant in `ast/operator.rs`.
-- **Global allocator**: `mimalloc` in `src/main.rs` (no `#[global_allocator]` elsewhere).
-- **VCD trace loading**: two-pass. Pass 1a scans header (sequential). Pass 1b scans dump in parallel chunks (Rayon). Builds sparse index per signal.
-- **Signal value reads**: `read_signal_value_at()` uses `timestamp_offsets` + memchr jump scan (not line-by-line `read_line_bytes()`).
+- **FST read backend**: wellen (`wellen::simple::read` in `src/trace/fst.rs`); legacy hand-rolled reader retired (writer stays: `src/fst/writer.rs`).
+- **Dispatcher pattern** for builtins: (1) handler in `src/wal/builtins/xxx.rs` (2) register in `builtins/mod.rs::register_all()` (3) optional `Operator` variant in `ast/operator.rs`.
+- **Global allocator**: `mimalloc` in `src/main.rs`.
+- **VCD trace loading** (v0.12.0): PASS-1a header (sequential, also captures `$dumpvars` initial snapshot). PASS-1b parallel chunks emit **flat triples `(sig, ts, off)`** (file order) which merge into lazy per-signal `Vec<(ts,off)>` sparse anchors (no more BTreeMap per signal). One `madvise(DONTNEED)` at load end.
+- **Signal value reads**: `read_signal_value_at()` uses sparse anchors (`partition_point` on the Vec) + memchr jump scan.
+- **Query semantics (0.12.x, single authoritative definition)**: value AT an index = LAST write in that timestamp (delta cycles collapse); initial value = `$dumpvars` snapshot else x; edges = per-index transitions (x→1 is Changed, never Rising/Falling); count/find always scan the full timeline from INDEX 0 and restore the cursor. See `docs/query-engine-design.md` §1.
 
 ## Performance-sensitive paths
 
 | Path | Mechanism |
 |------|-----------|
 | `VcdTrace::find_indices()` | Parallel chunk scan (Rayon), collects all changes for `signal_cache` |
-| `VcdTrace::find_indices_batch()` | Single pass over VCD dump for N signals (N× faster than N individual calls) |
+| **warm same-signal query** | `find_indices` answers from the cached full-scan change list (O(C), no file rescan) — 58.7GB warm-2nd query 208s → ms |
+| `VcdTrace::find_indices_batch()` | Single pass over VCD dump for N signals |
+| `signal_cache` | `find_indices` writes per-signal change history; both `signal_value` (O(log C)) and warm `find_indices` consume it; capped at `MAX_DECODED_SIGNALS` (256) |
 | `count` fast path | `(= (get "sig") 1)` uses `find_indices` directly |
 | `count &&` decomposition | `(count (&& a b) ...)` → `BatchEntry::And` → single pass |
-| `count` multi-arg batch | `(count cond1 cond2 ...)` → single `find_indices_batch` call |
-| `whenever` do decomposition | `(whenever (= 1 1) (do ...))` → independent `count` calls |
-| `signal_cache` | `find_indices` writes per-signal change history; `signal_value` uses it for O(log C) lookups |
+| `whenever` do decomposition | → independent `count` calls |
 
-## Builtin naming convention
+> 设计方向(0.12.x): 统一查询引擎(变更点并集区间扫描,消灭快/慢路径分叉)为最终形态;
+> 当前 count/find 的"字面量快路径 + 逐拍回退"是过渡期实现,新引擎落地后移除(docs/query-engine-design.md)。
 
-- **Uppercase special variables** (bare or function-call): `SIGNALS`, `MAX-INDEX`, `TS`, `INDEX`, `TRACE-NAME`, `TRACE-FILE`, `CG`, `CS`, `SCOPES`
-- **Lowercase operators** (always function-call): `count`, `find`, `whenever`, `get`, `step`, `define`, `set!`, `printf`, `+`, `-`, `&&`, `||`, `=`, `!=`, `first`, `rest`, `map`, `fold`, `length`
-- Both `(SIGNALS)` and bare `SIGNALS` work and return the same list.
+## Language notes (0.12.x)
+
+- **set! 词法穿透**: 绑定是共享 cell;`(set! x v)` 写 lookup 找到的那个绑定,闭包内修改对捕获方可见(累加器可用);fn 局部 `define` 每次调用独立。未知变量 set! 报错。
+- **四大写语义**: `(get/at)` 初值 = `$dumpvars` 快照;per-index 最后写入;`(at s T)` 首变化前返回 `(0 初值)`。
+- 大写特殊变量 `(SCOPES)`/`(CG)` 零参调用形式与裸符号等价。
 
 ## Test data notes
 
-- `test_data/test_pyvcd_150G.vcd` (155GB) may not exist on all clones (LFS-managed). Tests skip gracefully with `if !p.exists() { return; }`.
-- `test_data/test_pyvcd_100M.vcd` (107MB) is required for strobe/counter pyvcd tests.
-- `test_data/counter.vcd` (11KB) is the primary small test waveform (6 signals, 523 timestamps).
+- `test_data/test_pyvcd_150G.vcd` (155GB) may not exist on all clones (LFS-managed). Tests skip gracefully.
+- `test_data/test_pyvcd_100M.vcd` (107MB) required for strobe/counter pyvcd tests.
+- `test_data/counter.vcd` (11KB): primary small fixture (6 signals, 523 timestamps).
+- `.tools/` (gitignored): handwritten fixtures (x/z、glitch、dumpvars、alias、45-bit), vcd2fst binaries, old binaries for the diff gate.
+- `bench/data/` (gitignored): synthetic large waveforms (76MB / 11.5GB / 58.7GB), `bench/RESULTS.md` has the numbers.
 
 ## GitHub Release
 
@@ -77,3 +85,4 @@ gh release create <tag> --title "v0.x.x" target/x86_64-unknown-linux-gnu/release
 ```
 
 Binary requires glibc ≥ 2.17 (CentOS 7 / RHEL 7 / Ubuntu 16.04+ compatible).
+版本线: 0.12.x(0.12.0 已发布);pre-commit 钩子自动 bump 补丁号(**Cargo.toml 已暂存时不 bump**——版本变更与代码同 commit 提交)。
