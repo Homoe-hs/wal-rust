@@ -261,6 +261,11 @@ impl VcdTrace {
 
         // ====== PASS 1b: Parallel chunk scan of dump section ======
         let data = reader.data();
+        // Sequential access hint: the scan touches every page of the dump once
+        // — favors readahead over page-fault-by-page stalls (cold files).
+        unsafe {
+            libc::madvise(data.as_ptr() as *mut libc::c_void, data.len(), libc::MADV_SEQUENTIAL);
+        }
         let dump_start = header_end_offset as usize;
         let dump_len = data.len() - dump_start;
 
@@ -381,10 +386,15 @@ impl VcdTrace {
                 let mut ts = Vec::new();
                 let mut ts_offsets = Vec::new();
                 let mut si: Vec<(u32, u64, u64)> = Vec::new();
-                let mut change_counts: HashMap<u32, u64> = HashMap::new();
                 let mut event_cp: Vec<(u32, u64)> = Vec::new();
                 let mut current_timestamp: u64 = 0;
                 let base_offset = chunk_start as u64;
+                // Sparse anchors are sampled GLOBALLY (every sparse_interval-th
+                // value line) instead of per-signal counts — no per-signal
+                // counter map, and parsing/hashing happens on 1/100 of the
+                // lines (the per-line cost of 1.65G lines was the load
+                // bottleneck; expected anchor density per signal is unchanged).
+                let mut anchor_counter: u64 = 0;
 
                 let mut lp = 0usize;
                 while lp < chunk.len() {
@@ -415,16 +425,19 @@ impl VcdTrace {
                         }
                         b'$' => {}
                         _ => {
-                            if let Some((sig_hash, _value)) = parse_value_change_fast(line) {
-                                if let Some(&sig_idx) = sid.get(&sig_hash) {
-                                    let count = change_counts.entry(sig_idx).or_insert(0);
-                                    *count += 1;
-                                    // Always anchor the first record; then sample every sparse_interval
-                                    if *count == 1 || *count % sparse_interval == 0 {
-                                        si.push((sig_idx, current_timestamp, base_offset + line_start as u64));
-                                    }
-                                    if has_events && evt.contains(&sig_idx) {
-                                        event_cp.push((sig_idx, current_timestamp));
+                            anchor_counter += 1;
+                            let sampled = anchor_counter % sparse_interval == 0;
+                            // Event signals need EVERY change point; without
+                            // events, parse only the sampled fraction.
+                            if has_events || sampled {
+                                if let Some((sig_hash, _value)) = parse_value_change_fast(line) {
+                                    if let Some(&sig_idx) = sid.get(&sig_hash) {
+                                        if sampled {
+                                            si.push((sig_idx, current_timestamp, base_offset + line_start as u64));
+                                        }
+                                        if has_events && evt.contains(&sig_idx) {
+                                            event_cp.push((sig_idx, current_timestamp));
+                                        }
                                     }
                                 }
                             }
@@ -560,6 +573,152 @@ impl VcdTrace {
         let idx = v.partition_point(|(ts, _)| *ts <= target_ts);
         if idx == 0 { None } else { Some(v[idx - 1]) }
     }
+
+    /// Per-index change list for a signal — cached warm or id-anchored
+    /// cold scan. Single source for find_indices AND change_points.
+    fn anchored_changes(&self, sig_idx: u32) -> Result<Vec<(u32, VcdValue)>, String> {
+        // Two lightweight passes per chunk:
+        //   1. '#' timestamp line positions (→ per-chunk ts_idx table)
+        //   2. memmem over the chunk for `<id>\n` — value lines can never
+        //      contain "space id newline", so hits are exact by construction
+        //      (digit ids inside 32-bit bit-streams included). Each hit is
+        //      parsed lazily and collapsed per timestamp (last write wins).
+        let target_id = self.signal_id_bytes.get(&sig_idx).cloned()
+            .ok_or_else(|| "find_indices: signal ID bytes not found".to_string())?;
+        use rayon::prelude::*;
+        let shared_mmap = self.reader.borrow().data.clone();
+        let id_len = target_id.len();
+        let hdr_end = self.header_end_offset as usize;
+        let data_len = shared_mmap.len();
+        let n_threads = num_cpus::get().max(4);
+        let chunk_size = (data_len.saturating_sub(hdr_end) / n_threads.max(1)).max(64 * 1024);
+
+        // Newline-aligned boundaries (value lines stay with their data; the ts
+        // of a value line before the chunk's first '#' is resolved via the
+        // chunk's ts base — no rewind needed).
+        let mut boundaries = vec![hdr_end];
+        for i in 1..n_threads {
+            let mut p = hdr_end + i * chunk_size;
+            if p >= data_len { break; }
+            match memchr::memchr(b'\n', &shared_mmap[p..data_len]) {
+                Some(n) => p += n + 1,
+                None => break,
+            }
+            if p >= data_len { break; }
+            boundaries.push(p);
+        }
+        boundaries.push(data_len);
+
+        // (chunk '#'-counts, per-chunk hits: (ts_idx, pos, value))
+        let results: Vec<(usize, Vec<(u32, usize, VcdValue)>)> = boundaries[..boundaries.len() - 1]
+            .par_iter()
+            .enumerate()
+            .map(|(ci, &start)| {
+                let end = boundaries[ci + 1];
+                let chunk = &shared_mmap[start..end];
+                let mut ts_pos: Vec<usize> = Vec::new();
+                let mut p = 0usize;
+                while p < chunk.len() {
+                    match memchr::memchr(b'#', &chunk[p..]) {
+                        Some(n) => {
+                            let abs = p + n;
+                            if abs == 0 || chunk[abs - 1] == b'\n' {
+                                let line = match memchr::memchr(b'\n', &chunk[abs..]) {
+                                    Some(nl) => &chunk[abs..abs + nl],
+                                    None => &chunk[abs..],
+                                };
+                                if is_ts_line(line) {
+                                    ts_pos.push(abs);
+                                }
+                            }
+                            p = abs + 1;
+                        }
+                        None => break,
+                    }
+                }
+                let mut hits: Vec<(u32, usize, VcdValue)> = Vec::new();
+                // Search for `<id>\n` (id at line end). Values never contain
+                // the separator, so a mid-value id byte can NEVER be followed
+                // by '\n' at the right offset — exact by construction (digit
+                // ids like "1" in a 32-bit bit-stream included).
+                let mut needle = Vec::with_capacity(id_len + 1);
+                needle.extend_from_slice(&target_id);
+                needle.push(b'\n');
+                let mut p = 0usize;
+                while p < chunk.len() {
+                    let pos = match memchr::memmem::find(&chunk[p..], &needle) {
+                        Some(n) => p + n,
+                        None => break,
+                    };
+                    let line_start = match memchr::memrchr(b'\n', &chunk[..pos]) {
+                        Some(n) => n + 1,
+                        None => 0,
+                    };
+                    let line_end = pos + id_len;   // needle guarantees '\n' here
+                    let line = &chunk[line_start..line_end];
+                    let id_start = pos - line_start;
+                    // exact id position: preceded by ' ' or a single value char,
+                    // line doesn't start with '$'
+                    if !line.is_empty()
+                        && line[0] != b'$'
+                        && (line.len() == id_len + 1
+                            || (id_start > 0 && line[id_start - 1] == b' '))
+                    {
+                        let val = match line[0] {
+                            b'b' => {
+                                let ve = id_start.saturating_sub(1);
+                                let vs = if ve > 1 && line[ve] == b' ' { &line[1..ve] } else { &line[1..id_start] };
+                                VcdValue::Vector(vs.to_vec())
+                            }
+                            b'r' => match std::str::from_utf8(&line[1..id_start])
+                                .unwrap_or("0").trim().parse::<f64>() {
+                                Ok(r) => VcdValue::Real(r),
+                                Err(_) => VcdValue::Bit(b'x'),
+                            },
+                            other => VcdValue::Bit(other),
+                        };
+                        // value line belongs to the LAST '#' before it; a value
+                        // line before the file's FIRST '#' is the $dumpvars
+                        // block (already captured as the initial value) — skip.
+                        let after = ts_pos.partition_point(|&p0| p0 < line_start);
+                        if after > 0 {
+                            hits.push(((after - 1) as u32, pos, val));
+                        }
+                    }
+                    p = pos + 1;
+                }
+                (ts_pos.len(), hits)
+            })
+            .collect();
+
+        // Merge in chunk order (each chunk's hits are file order); per-chunk
+        // ts base = prefix of '#' counts; collapse same-ts (last write wins).
+        let mut all: Vec<(u32, VcdValue)> = Vec::new();
+        {
+            let mut base = 0usize;
+            for (ts_count, hits) in results {
+                for (local_idx, _pos, val) in hits {
+                    let ts_idx = base + local_idx as usize;
+                    match all.last_mut() {
+                        Some((i, v)) if *i as usize == ts_idx => *v = val,
+                        _ => all.push((ts_idx as u32, val)),
+                    }
+                }
+                base += ts_count;
+            }
+        }
+
+        if std::env::var("WAL_DEBUG_FIND").is_ok() {
+            eprintln!("anchored: sig={} id={:?} all={:?} init={:?}", sig_idx, target_id, all, self.initial_value_at(sig_idx));
+        }
+        // Cache the change list for warm queries / signal_value.
+        if all.len() > 1 {
+            self.try_cache_decoded_signal(sig_idx, &all, CacheType::FullScan);
+        }
+        Ok(all)
+    }
+
+
 
     fn read_signal_value_at(&self, sig_idx: u32, target_timestamp: u64) -> VcdValue {
         let target_id = match self.signal_id_bytes.get(&sig_idx) {
@@ -1083,165 +1242,10 @@ impl Trace for VcdTrace {
             return Ok(vec![]);
         }
 
-        use rayon::prelude::*;
-
-        let target_id = self.signal_id_bytes.get(&sig_idx).cloned()
-            .ok_or_else(|| "find_indices: signal ID bytes not found".to_string())?;
-
-        // Warm path: this signal was already fully scanned — answer from the
-        // cached per-index change list (single O(C) evaluation, no file scan).
-        if let Some(ds) = self.signal_cache.lock().unwrap().get(&sig_idx) {
-            if ds.full_scan && ds.change_indices.len() == ds.values.len() {
-                let changes: Vec<(u32, VcdValue)> = ds.change_indices.iter()
-                    .zip(ds.values.iter())
-                    .map(|(i, v)| (*i, v.clone()))
-                    .collect();
-                let init = self.initial_value_at(sig_idx);
-                return Ok(eval_change_list(self.max_index, &changes, &init, &cond));
-            }
-        }
-
-        // IO-1: id-anchored scan — two lightweight passes per chunk:
-        //   1. '#' timestamp line positions (→ per-chunk ts_idx table)
-        //   2. memmem over the chunk for target_id occurrences — value lines
-        //      use only 0/1/x/z chars, so the id's bytes occur nowhere inside
-        //      values; an exact line-end + separator check makes hits exact.
-        // Each hit is parsed lazily and collapsed per timestamp (last write
-        // wins), then evaluated with the semantics of eval_change_list.
-        use rayon::prelude::*;
-        let shared_mmap = self.reader.borrow().data.clone();
-        let id_len = target_id.len();
-        let hdr_end = self.header_end_offset as usize;
-        let data_len = shared_mmap.len();
-        let n_threads = num_cpus::get().max(4);
-        let chunk_size = (data_len.saturating_sub(hdr_end) / n_threads.max(1)).max(64 * 1024);
-
-        // Newline-aligned boundaries (value lines stay with their data; the ts
-        // of a value line before the chunk's first '#' is resolved via the
-        // chunk's ts base — no rewind needed).
-        let mut boundaries = vec![hdr_end];
-        for i in 1..n_threads {
-            let mut p = hdr_end + i * chunk_size;
-            if p >= data_len { break; }
-            match memchr::memchr(b'\n', &shared_mmap[p..data_len]) {
-                Some(n) => p += n + 1,
-                None => break,
-            }
-            if p >= data_len { break; }
-            boundaries.push(p);
-        }
-        boundaries.push(data_len);
-
-        // (chunk '#'-counts, per-chunk hits: (ts_idx, pos, value))
-        let results: Vec<(usize, Vec<(u32, usize, VcdValue)>)> = boundaries[..boundaries.len() - 1]
-            .par_iter()
-            .enumerate()
-            .map(|(ci, &start)| {
-                let end = boundaries[ci + 1];
-                let chunk = &shared_mmap[start..end];
-                let mut ts_pos: Vec<usize> = Vec::new();
-                let mut p = 0usize;
-                while p < chunk.len() {
-                    match memchr::memchr(b'#', &chunk[p..]) {
-                        Some(n) => {
-                            let abs = p + n;
-                            if abs == 0 || chunk[abs - 1] == b'\n' {
-                                let line = match memchr::memchr(b'\n', &chunk[abs..]) {
-                                    Some(nl) => &chunk[abs..abs + nl],
-                                    None => &chunk[abs..],
-                                };
-                                if is_ts_line(line) {
-                                    ts_pos.push(abs);
-                                }
-                            }
-                            p = abs + 1;
-                        }
-                        None => break,
-                    }
-                }
-                let mut hits: Vec<(u32, usize, VcdValue)> = Vec::new();
-                // Search for `<id>\n` (id at line end). Values never contain
-                // the separator, so a mid-value id byte can NEVER be followed
-                // by '\n' at the right offset — exact by construction (digit
-                // ids like "1" in a 32-bit bit-stream included).
-                let mut needle = Vec::with_capacity(id_len + 1);
-                needle.extend_from_slice(&target_id);
-                needle.push(b'\n');
-                let mut p = 0usize;
-                while p < chunk.len() {
-                    let pos = match memchr::memmem::find(&chunk[p..], &needle) {
-                        Some(n) => p + n,
-                        None => break,
-                    };
-                    let line_start = match memchr::memrchr(b'\n', &chunk[..pos]) {
-                        Some(n) => n + 1,
-                        None => 0,
-                    };
-                    let line_end = pos + id_len;   // needle guarantees '\n' here
-                    let line = &chunk[line_start..line_end];
-                    let id_start = pos - line_start;
-                    // exact id position: preceded by ' ' or a single value char,
-                    // line doesn't start with '$'
-                    if !line.is_empty()
-                        && line[0] != b'$'
-                        && (line.len() == id_len + 1
-                            || (id_start > 0 && line[id_start - 1] == b' '))
-                    {
-                        let val = match line[0] {
-                            b'b' => {
-                                let ve = id_start.saturating_sub(1);
-                                let vs = if ve > 1 && line[ve] == b' ' { &line[1..ve] } else { &line[1..id_start] };
-                                VcdValue::Vector(vs.to_vec())
-                            }
-                            b'r' => match std::str::from_utf8(&line[1..id_start])
-                                .unwrap_or("0").trim().parse::<f64>() {
-                                Ok(r) => VcdValue::Real(r),
-                                Err(_) => VcdValue::Bit(b'x'),
-                            },
-                            other => VcdValue::Bit(other),
-                        };
-                        // value line belongs to the LAST '#' before it; a value
-                        // line before the file's FIRST '#' is the $dumpvars
-                        // block (already captured as the initial value) — skip.
-                        let after = ts_pos.partition_point(|&p0| p0 < line_start);
-                        if after > 0 {
-                            hits.push(((after - 1) as u32, pos, val));
-                        }
-                    }
-                    p = pos + 1;
-                }
-                (ts_pos.len(), hits)
-            })
-            .collect();
-
-        // Merge in chunk order (each chunk's hits are file order); per-chunk
-        // ts base = prefix of '#' counts; collapse same-ts (last write wins).
-        let mut all: Vec<(u32, VcdValue)> = Vec::new();
-        {
-            let mut base = 0usize;
-            for (ts_count, hits) in results {
-                for (local_idx, _pos, val) in hits {
-                    let ts_idx = base + local_idx as usize;
-                    match all.last_mut() {
-                        Some((i, v)) if *i as usize == ts_idx => *v = val,
-                        _ => all.push((ts_idx as u32, val)),
-                    }
-                }
-                base += ts_count;
-            }
-        }
-
-        if std::env::var("WAL_DEBUG_FIND").is_ok() {
-            eprintln!("anchored: sig={} id={:?} all={:?} init={:?}", sig_idx, target_id, all, self.initial_value_at(sig_idx));
-        }
+        // Single authoritative per-index semantics over the change list.
+        let all = self.anchored_changes(sig_idx)?;
         let init = self.initial_value_at(sig_idx);
-        let mut indices = eval_change_list(self.max_index, &all, &init, &cond);
-
-        // Cache the change list for warm queries / signal_value.
-        if all.len() > 1 {
-            self.try_cache_decoded_signal(sig_idx, &all, CacheType::FullScan);
-        }
-        Ok(indices)
+        Ok(eval_change_list(self.max_index, &all, &init, &cond))
     }
 
     fn find_indices_batch(&self, entries: &[BatchEntry]) -> Result<Vec<(String, Vec<usize>)>, String> {
@@ -1569,15 +1573,16 @@ impl Trace for VcdTrace {
             }
             return Ok(out);
         }
-        // find_indices(Changed) skips the first record (no previous value);
-        // prepend it via the sparse index.
-        let mut changes = self.find_indices(name, FindCondition::Changed)?;
-        let first_ts = self.sparse_index.get(sig_idx)
-            .and_then(|v| v.first().map(|(ts, _)| *ts));
-        if let Some(ts) = first_ts {
-            let first_idx = self.find_timestamp_index(ts);
-            if changes.first() != Some(&first_idx) {
-                changes.insert(0, first_idx);
+        // find_indices(Changed) skips the first record (no previous value vs
+        // nothing); prepend the first WRITE from the change list itself — the
+        // sparse-index prepend is gone with the sampled anchors.
+        let all = self.anchored_changes(*sig_idx)?;
+        let init = self.initial_value_at(*sig_idx);
+        let mut changes = eval_change_list(self.max_index, &all, &init, &FindCondition::Changed);
+        if let Some(&(first_idx, _)) = all.first() {
+            let fi = first_idx as usize;
+            if changes.first() != Some(&fi) {
+                changes.insert(0, fi);
             }
         }
         let mut out = Vec::with_capacity(changes.len());
