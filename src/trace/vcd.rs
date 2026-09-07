@@ -24,6 +24,66 @@ struct DecodedSignal {
     scanned_up_to: u32,
 }
 
+/// In-memory columnar change list for one signal (budgeted; built during
+/// PASS-1b from the already-parsed lines — queries then never re-scan the
+/// file for covered signals). Values are packed 2 bits per bit
+/// (0=0, 1=1, x=2, z=3, MSB first) for widths <= 64.
+struct Col {
+    width: usize,
+    idxs: Vec<u32>,
+    states: Vec<u128>,
+}
+
+fn col_states_from_vcd(v: &VcdValue, width: usize) -> Option<u128> {
+    let bytes: Vec<u8> = match v {
+        VcdValue::Bit(b) => vec![*b],
+        VcdValue::Vector(vec) if vec.len() == width => vec.clone(),
+        _ => return None,
+    };
+    let mut st: u128 = 0;
+    for (p, &c) in bytes.iter().enumerate() {
+        let code = match c {
+            b'0' => 0u8, b'1' => 1u8,
+            b'x' | b'X' => 2u8,
+            b'z' | b'Z' => 3u8,
+            _ => return None,
+        };
+        st |= (code as u128) << (2 * (width - 1 - p));
+    }
+    Some(st)
+}
+
+fn vcd_from_states(st: u128, width: usize) -> VcdValue {
+    let mut out = Vec::with_capacity(width);
+    for p in 0..width {
+        let code = ((st >> (2 * (width - 1 - p))) & 0b11) as u8;
+        out.push(match code {
+            0 => b'0', 1 => b'1', 2 => b'x', _ => b'z',
+        });
+    }
+    if width == 1 { VcdValue::Bit(out[0]) } else { VcdValue::Vector(out) }
+}
+
+/// Column cache budget in bytes: WAL_COL_CACHE_MB env wins; default = half
+/// of available memory, capped at 64GiB (never OOM the machine).
+fn col_cache_budget() -> usize {
+    if let Ok(mb) = std::env::var("WAL_COL_CACHE_MB") {
+        if let Ok(v) = mb.trim().parse::<usize>() {
+            return v * 1024 * 1024;
+        }
+    }
+    let mut avail_mb = 0usize;
+    if let Ok(proc) = std::fs::read_to_string("/proc/meminfo") {
+        for line in proc.lines() {
+            if let Some(rest) = line.strip_prefix("MemAvailable:") {
+                avail_mb = rest.trim().trim_end_matches(" kB").trim().parse().unwrap_or(0) / 1024;
+                break;
+            }
+        }
+    }
+    (avail_mb * 512 * 1024).min(64 * 1024 * 1024 * 1024) // 50% RAM, cap 64GiB
+}
+
 /// LRU cache capacity (number of entries)
 fn adapt_lru_capacity(file_size: usize, signal_count: usize) -> usize {
     // Base: 5 timestamps per signal, capped at 200K signals
@@ -157,6 +217,9 @@ pub struct VcdTrace {
     // Pass 2: LRU cache
     lru_cache: RefCell<lru::LruCache<(u32, u64), VcdValue>>,
     signal_cache: Mutex<HashMap<u32, DecodedSignal>>,
+    /// Budgeted in-memory columnar change lists built during load; covered
+    /// signals answer queries with zero file re-scan (B/C 内存内核).
+    col_cache: HashMap<u32, Col>,
 
     // Persistent mmap
     reader: RefCell<crate::vcd::reader::MmapReader>,
@@ -367,6 +430,7 @@ impl VcdTrace {
 
         // Shared read-only data for parallel threads
         let signal_ids_arc = Arc::new(signal_ids);
+        let widths_arc = Arc::new(signal_widths.clone());
         let has_events = !event_signals.is_empty();
         let event_sigs_arc = Arc::new(event_signals.clone());
 
@@ -374,7 +438,7 @@ impl VcdTrace {
         let sparse_interval: u64 = 100;
         // Chunk-local flat triples (sig, ts, offset) — sorted by construction
         // (file order); merged per signal in chunk order, no per-signal trees.
-        let results: Vec<(Vec<u64>, Vec<u64>, Vec<(u32, u64, u64)>, Vec<(u32, u64)>)> = boundaries
+        let results: Vec<(Vec<u64>, Vec<u64>, Vec<(u32, u64, u64)>, Vec<(u32, u64)>, Vec<(u32, i64, u128)>)> = boundaries
             .par_windows(2)
             .map(|w| {
                 let chunk_start = w[0];
@@ -382,18 +446,20 @@ impl VcdTrace {
                 let chunk = &data[chunk_start..chunk_end];
                 let sid = signal_ids_arc.clone();
                 let evt = event_sigs_arc.clone();
+                let widths = widths_arc.clone();
 
                 let mut ts = Vec::new();
                 let mut ts_offsets = Vec::new();
                 let mut si: Vec<(u32, u64, u64)> = Vec::new();
+                let mut cols: Vec<(u32, i64, u128)> = Vec::new();
                 let mut event_cp: Vec<(u32, u64)> = Vec::new();
                 let mut current_timestamp: u64 = 0;
                 let base_offset = chunk_start as u64;
+                let mut ts_seen: i64 = 0;
                 // Sparse anchors are sampled GLOBALLY (every sparse_interval-th
-                // value line) instead of per-signal counts — no per-signal
-                // counter map, and parsing/hashing happens on 1/100 of the
-                // lines (the per-line cost of 1.65G lines was the load
-                // bottleneck; expected anchor density per signal is unchanged).
+                // value line) — anchor density per signal unchanged. Every
+                // value line is still parsed ONCE: it also feeds the budgeted
+                // in-memory columnar change lists (col cache).
                 let mut anchor_counter: u64 = 0;
 
                 let mut lp = 0usize;
@@ -419,6 +485,7 @@ impl VcdTrace {
                             // start with '#' but are NOT timestamps.
                             if line.len() > 1 && line[1..].iter().all(|c| c.is_ascii_digit()) {
                                 current_timestamp = parse_timestamp_fast(line);
+                                ts_seen += 1;
                                 ts.push(current_timestamp);
                                 ts_offsets.push(base_offset + line_start as u64);
                             }
@@ -427,16 +494,22 @@ impl VcdTrace {
                         _ => {
                             anchor_counter += 1;
                             let sampled = anchor_counter % sparse_interval == 0;
-                            // Event signals need EVERY change point; without
-                            // events, parse only the sampled fraction.
-                            if has_events || sampled {
-                                if let Some((sig_hash, _value)) = parse_value_change_fast(line) {
-                                    if let Some(&sig_idx) = sid.get(&sig_hash) {
-                                        if sampled {
-                                            si.push((sig_idx, current_timestamp, base_offset + line_start as u64));
-                                        }
-                                        if has_events && evt.contains(&sig_idx) {
-                                            event_cp.push((sig_idx, current_timestamp));
+                            // Every value line is parsed once: sparse anchors
+                            // (sampled) AND the columnar change list (full).
+                            if let Some((sig_hash, value)) = parse_value_change_fast(line) {
+                                if let Some(&sig_idx) = sid.get(&sig_hash) {
+                                    if sampled {
+                                        si.push((sig_idx, current_timestamp, base_offset + line_start as u64));
+                                    }
+                                    if has_events && evt.contains(&sig_idx) {
+                                        event_cp.push((sig_idx, current_timestamp));
+                                    }
+                                    // column: widths <= 64 keep 2-bits-per-bit
+                                    if let Some(&w) = widths.get(&sig_idx) {
+                                        if w <= 64 && w >= 1 {
+                                            if let Some(st) = col_states_from_vcd(&value, w) {
+                                                cols.push((sig_idx, ts_seen - 1, st));
+                                            }
                                         }
                                     }
                                 }
@@ -444,7 +517,7 @@ impl VcdTrace {
                         }
                     }
                 }
-                (ts, ts_offsets, si, event_cp)
+                (ts, ts_offsets, si, event_cp, cols)
             })
             .collect();
 
@@ -463,17 +536,46 @@ impl VcdTrace {
         // append-only in chunk order ⇒ per-signal Vec stays ascending.
         let mut sparse_index: HashMap<u32, Vec<(u64, u64)>> = HashMap::with_capacity(128);
         let mut event_change_ts: HashMap<u32, Vec<u64>> = HashMap::new();
+        // Budgeted columnar change lists: a signal either completes fully or
+        // is absent (fallback to the anchored scan) — never partial.
+        let col_budget = col_cache_budget();
+        let mut col_bytes: usize = 0;
+        let mut col_cache: HashMap<u32, Col> = HashMap::new();
+        let mut col_ts_base: usize = 0;
+        let mut col_ts_next: usize = 0;
 
-        for (chunk_ts, chunk_offsets, chunk_si, chunk_evt) in results {
+        for (chunk_ts, chunk_offsets, chunk_si, chunk_evt, chunk_cols) in results {
+            col_ts_next = col_ts_base + chunk_ts.len();
             timestamps.extend(chunk_ts);
             timestamp_offsets.extend(chunk_offsets);
             for (sig_idx, s_ts, s_off) in chunk_si {
                 sparse_index.entry(sig_idx).or_default().push((s_ts, s_off));
             }
-            // Group flat event tuples by sig_idx
             for (sig_idx, ts) in chunk_evt {
                 event_change_ts.entry(sig_idx).or_default().push(ts);
             }
+            for (sig_idx, local_ts, st) in chunk_cols {
+                // -1 before the chunk's first '#': the previous chunk's last
+                // timestamp (chunk 0's -1 = the $dumpvars block → skip).
+                let gts = col_ts_base as i64 + local_ts;
+                if gts < 0 { continue; }
+                let gts = gts as u32;
+                if let Some(col) = col_cache.get_mut(&sig_idx) {
+                    if col.idxs.last() == Some(&gts) {
+                        *col.states.last_mut().unwrap() = st; // last write wins
+                    } else {
+                        col.idxs.push(gts);
+                        col.states.push(st);
+                        col_bytes += 20;
+                    }
+                } else if col_bytes < col_budget {
+                    let w = signal_widths.get(&sig_idx).copied().unwrap_or(1) as usize;
+                    col_cache.insert(sig_idx, Col { width: w, idxs: vec![gts], states: vec![st] });
+                    col_bytes += 20;
+                }
+                // else: budget exhausted — leave this signal to the scan path
+            }
+            col_ts_base = col_ts_next;
         }
 
         // Convert event timestamps to sequential INDEX using sorted timestamps
@@ -518,6 +620,7 @@ impl VcdTrace {
             timestamps: build_ts_store(timestamps), timestamp_offsets, sparse_index,
             lru_cache: RefCell::new(lru::LruCache::new(lru_cap)),
             signal_cache: Mutex::new(HashMap::new()),
+            col_cache,
             reader: RefCell::new(reader),
             header_end_offset,
             scopes,
@@ -577,6 +680,18 @@ impl VcdTrace {
     /// Per-index change list for a signal — cached warm or id-anchored
     /// cold scan. Single source for find_indices AND change_points.
     fn anchored_changes(&self, sig_idx: u32) -> Result<Vec<(u32, VcdValue)>, String> {
+        // In-memory column (built during load) — zero file re-scan.
+        if let Some(col) = self.col_cache.get(&sig_idx) {
+            let mut out = Vec::with_capacity(col.idxs.len());
+            for (i, st) in col.states.iter().enumerate() {
+                out.push((col.idxs[i], vcd_from_states(*st, col.width)));
+            }
+            if out.len() > 1 {
+                self.try_cache_decoded_signal(sig_idx, &out, CacheType::FullScan);
+            }
+            return Ok(out);
+        }
+        // Cold anchored scan (signals outside the column budget).
         // Two lightweight passes per chunk:
         //   1. '#' timestamp line positions (→ per-chunk ts_idx table)
         //   2. memmem over the chunk for `<id>\n` — value lines can never
