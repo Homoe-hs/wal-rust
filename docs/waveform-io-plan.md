@@ -1,0 +1,89 @@
+# 波形加载/解析效率优化专项(数据库领域方案调研 + 落地计划)
+
+> 关联: `docs/query-engine-design.md`(查询侧统一引擎)。
+> 目标: 150GB VCD 加载 ≤ 2-3 分钟(现 58.7GB 加载 360s,线性外推 150GB ≈ 900s),
+> 单信号查询 ≤ 60s,解析吞吐 ≥ 2GB/s(现 0.5-0.6GB/s 有效),RSS ≤ 3GB。
+
+## 0. 参考(数据库/文本解析领域先进做法)
+
+- **SIMD 结构化索引**(simdjson stage1 / hyper-scan CSV):先用向量化分类字节
+  (引号/分隔符/换行)建立"行/字段边界表",再批量做逐字段语义解析;比逐行
+  字节判定快 5-15x — 对应我们 PASS-1b 的"边扫边解"。
+  - [simdjson core concepts](https://deepwiki.com/abab2025/simdjson_simdjson_master_d140bc2/3-core-concepts)
+- **批量列装配 + 分区归并**(Arrow/DuckDB ingest 的"chunk-local tables + 按分区键
+  排序/radix 分区,再 stream-merge"):把 PASS-1b 的 per-signal `BTreeMap`
+  (每信号 O(log) 散插、3.5M 信号 × 数十条变更)换成 **分块局部表
+  (id, ts_idx, value) → 按 id 桶化排序 → 跨块归并**,单遍、有界内存、可并行。
+- **Row-group / zone-map 统计下推**:每 64MB 块记录 per-signal (min_ts, max_ts,
+  状态集);查询按列裁剪块(Predicate pushdown)。我们现有 per-signal sparse
+  index 已近此——改为**块级 zone map + 列级按需重建**,免去 3.5M 个 BTreeMap。
+- **列式紧凑编码**:45 位值打包 7B、x/z 按 2bit/state、事件型只存索引
+  (wellen FST 已是此形态)。VCD 文本解析后立即打包,内存 ×10+ 下降;
+  change_indices 用 delta 编码(offset: 变长 int)。
+- **xevdb**(相邻项目):VCD → 单文件 SQLite,值变更存表,查询走 SQL;验证了
+  "波形物化 + 关系查询"路线,但逐行 INSERT 路线吞吐有限,SQLite 不适配 150GB
+  级稀疏列 — 我们保留内存列 + 单遍扫描,不做 SQL 物化。
+  - [xevdb README](https://github.com/aionhw/xevdb)
+- **FastWaveBackend**(UCR Yehowshua,波形数据库后端研究)为同类"后端查询引擎"
+  项目,站点被 Cloudflare 屏蔽,未能取到细节;若后续需要可邮件索取
+  (git.icanbuildit.io/Yehowshua/FastWaveBackend)。
+
+## 1. 现状瓶颈(实测基线)
+
+| 环节 | 现状 | 瓶颈 |
+|---|---|---|
+| PASS-1b 解析 | 并行分块逐行 memchr+\# 定位,每行做 id 尾匹配 | 每字节 ~0.5 次分支;行数 = 变更点行数(百万级) |
+| 稀疏索引 | per-signal `BTreeMap<ts, offset>` 1/100 采样 | 3.5M 信号 → 3.5M 个小 map,堆分配/指针跟随 |
+| 时间戳 | `Timestamps`(Uniform 压缩检测) + strided offsets | 已压缩,OK |
+| 值读取 | 按块 memchr 跳扫 + find_signal_in_block(找 id 行) | 每次 get 重访 mmap 页 |
+| 内存 | mmap 页驻留(load 后 madvise DONTNEED;查询再触摸) | RSS 11GB @58.7GB |
+| 加载 | 360s @58.7GB | 解析 + 每信号 BTreeMap 构建 |
+
+## 2. 方案:分块列装配 + 分区归并(核心改造)
+
+PASS-1b 重写为 **5 段管线**(仍单遍文件、并行分块):
+
+```
+[块扫描] 每 64MB 块(rayon):
+  a. SIMD 找 '\n' → 行边界表(结构索引,hyper-scan 式)
+  b. 每行: '#' 时间戳累进;值行 → (id_hash, ts_idx, value) 三元组
+  c. 块局部表: 按 id_hash 桶化(预分配 Vec,哈希分桶) + 每桶排序(ts 增量)
+  d. 块统计: per-id (min_ts, max_ts, states_mask) → zone map
+[归并] 各块局部表按 (id, ts) 流式归并(多路 k-way,同块内已有序)
+  → per-signal Column { change_indices(delta 编码), values(紧凑打包) }
+[构建] sparse_index: 不再 per-signal BTreeMap——
+  · 块级 zone map: Vec<(block_id, min_ts, max_ts, sig_mask bitvec)> 查询先剪块
+  · 列级 change_indices 本身即索引(binary search 定位拍)
+[内存] madvise: 每块扫完立即 DONTNEED(分块而非文件尾一次),RSS ≤ 堆大小
+```
+
+对应收益:
+- 解析: 行边界表把"逐行判定"变 bulk;数值解码(45 位字符串→u64)用查表/SWAR,
+  预计 1.5-3x;
+- 索引: 3.5M 小 BTreeMap → 数百个块局部表,归并 O(N log K),加载显著下降;
+- 查询: zone map 剪块 + 列 binary search;get 不再重扫文件(列缓存);
+- RSS: 分块 madvise + 紧凑打包,目标 1-3GB。
+
+## 3. 分阶段落地
+
+| 阶段 | 内容 | 验收 |
+|---|---|---|
+| IO-1 | PASS-1b 行边界 SIMD 化(只改行分裂,不解值);值行 id 尾匹配查表 | 解析吞吐 ≥1GB/s;门禁 ALL MATCH |
+| IO-2 | 稀疏索引 BTreeMap → 块局部表 + 归并(M 保留现有读取逻辑,只换构建) | 加载时间 -40~60%;行为不变 |
+| IO-3 | 值紧凑打包(delta 索引 + 2bit x/z) + 列缓存替换 LRU 重扫 | get 同信号二次查询 <0.1s;RSS 下降 |
+| IO-4 | 分块 madvise 细粒度化 | RSS ≤3GB @150GB |
+| IO-5 | zone map 剪块 + predicate 早退(is-x 列状态集) | 稀疏信号查询再 3-10x |
+| IO-6 | 与查询引擎(P1-P6)合流:Column 直喂 IntervalSweep | 单套 IO 路径 |
+
+每阶段独立发布(0.11.x 补丁线),diff gate + 一致性矩阵兜底;IO-1/IO-2 先行
+(纯性能、零语义变化)。
+
+## 4. 风险
+
+- **行为等价**:IO-1/IO-2 只影响性能路径,必须与旧稀疏索引逐查询对拍
+  (WAL_DEBUG_FIND + diff gate 全 fixture)。
+- **内存峰值**:块局部表 = O(块内变更行数 × 16B),64MB 块约 50 万行 → ~10MB/块,
+  并行 64 块 ≈ 640MB,可控;可调 block_size。
+- **id 哈希碰撞**:块局部表按 hash 桶化,桶内做字节比对(与现 find_indices 一致)。
+- **VCD 方言**:Icarus 1-bit `#%` 行、$dumpvars、`r` 实数行 — 行分类表需覆盖,
+  用现有语料(测试集 + 152GB dump 采样)回归。
