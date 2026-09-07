@@ -9,7 +9,10 @@ use crate::trace::SharedTraceContainer;
 #[derive(Debug)]
 pub struct Environment {
     parent: Option<Rc<RefCell<Environment>>>,
-    bindings: HashMap<String, Value>,
+    /// Bindings are shared cells: every scope that captures a name shares the
+    /// SAME cell, so `set!` writes visible everywhere the binding is seen
+    /// (lexical mutation semantics; the fn-call snapshot no longer loses it).
+    bindings: HashMap<String, Rc<RefCell<Value>>>,
     aliases: HashMap<String, String>,   // alias_name → target_name
     virtual_signals: std::collections::HashSet<String>,
     scope: String,
@@ -65,22 +68,32 @@ impl Environment {
     }
 
     pub fn define(&mut self, name: impl Into<String>, value: Value) {
-        self.bindings.insert(name.into(), value);
+        let name = name.into();
+        // Re-defining in the same scope updates the existing cell, so closures
+        // that captured the binding see the new value (single-binding scope).
+        match self.bindings.get(&name) {
+            Some(cell) => *cell.borrow_mut() = value,
+            None => {
+                self.bindings.insert(name, Rc::new(RefCell::new(value)));
+            }
+        }
     }
 
     pub fn lookup(&self, name: &str) -> Option<Value> {
-        self.bindings.get(name).cloned().or_else(|| {
-            self.parent.as_ref().and_then(|p| p.borrow().lookup(name))
-        })
+        self.bindings.get(name)
+            .map(|cell| cell.borrow().clone())
+            .or_else(|| {
+                self.parent.as_ref().and_then(|p| p.borrow().lookup(name))
+            })
     }
 
     pub fn lookup_global(&self, name: &str) -> Option<Value> {
-        self.bindings.get(name).cloned()
+        self.bindings.get(name).map(|cell| cell.borrow().clone())
     }
 
     pub fn set(&mut self, name: &str, value: Value) -> Result<(), String> {
-        if self.bindings.contains_key(name) {
-            self.bindings.insert(name.to_string(), value);
+        if let Some(cell) = self.bindings.get(name) {
+            *cell.borrow_mut() = value;
             Ok(())
         } else if let Some(ref parent) = self.parent {
             parent.borrow_mut().set(name, value)

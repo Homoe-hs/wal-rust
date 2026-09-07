@@ -94,6 +94,39 @@ fn test_while_special_form() {
     assert_eq!(eval_str(&mut eval, "i"), "5");
 }
 
+/// B9 regression: set! inside fn closures must penetrate — shared binding
+/// cells + lexical capture. Accumulators over multiple calls work; fn-local
+/// define stays per-call.
+#[test]
+fn test_set_penetrates_closures() {
+    let mut eval = new_eval(&fst_fixture_path());
+    // write to a binding captured by a closure
+    eval_str(&mut eval, "(define b 0)");
+    eval_str(&mut eval, "(define f (fn [] (set! b 9)))");
+    eval_str(&mut eval, "(f)");
+    assert_eq!(eval_str(&mut eval, "b"), "9");
+    // accumulator across calls
+    eval_str(&mut eval, "(define acc 0)");
+    eval_str(&mut eval, "(define tick (fn [] (set! acc (+ acc 1))))");
+    eval_str(&mut eval, "(tick)");
+    eval_str(&mut eval, "(tick)");
+    assert_eq!(eval_str(&mut eval, "acc"), "2");
+    // lexical capture: the fn sees the defining scope, not the caller's shadow
+    eval_str(&mut eval, "(define x 10)");
+    eval_str(&mut eval, "(define getx (fn [] x))");
+    eval_str(&mut eval, "(define r (fn [] (define x 99) (getx)))");
+    assert_eq!(eval_str(&mut eval, "(r)"), "10");
+    // fn-local define stays per-call (fresh binding each invocation)
+    eval_str(&mut eval, "(define counter (fn [] (define n 0) (set! n (+ n 1)) n))");
+    eval_str(&mut eval, "(counter)");
+    assert_eq!(eval_str(&mut eval, "(counter)"), "1");
+    // free variable NOT defined in the captured scope must error, not fall
+    // through to the caller's env (no dynamic scoping)
+    eval_str(&mut eval, "(define g (fn [] zzzz))");
+    let err = eval_str(&mut eval, "(g)");
+    assert!(err.contains("Undefined") || err.contains("undefined"), "got {}", err);
+}
+
 #[test]
 fn test_save_csv() {
     let mut eval = new_eval(&fst_fixture_path());

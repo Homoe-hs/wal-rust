@@ -540,14 +540,14 @@ pub fn eval_value(&mut self, value: Value) -> Result<Value, String> {
     }
 
 pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value, String> {
-        let closure_env = closure.env.clone();
         let closure_name = closure.name().map(|s| s.to_string());
 
-        let mut closure_env_mut = closure_env.borrow().clone();
-        closure_env_mut.set_parent(Some(Rc::new(RefCell::new(self.env.clone()))));
-        let closure_rc = Rc::new(RefCell::new(closure_env_mut));
-
-        let mut local_env = Environment::with_parent(closure_rc);
+        // Lexical scoping with shared binding cells: the body runs in the
+        // closure's DEFINITION environment (its captured chain), with call
+        // arguments on top. `set!` writes the cell of the binding it resolves
+        // to, so mutations are visible everywhere the binding is captured
+        // (penetration; fixes B9 — mutations used to land in a per-call copy).
+        let mut local_env = Environment::with_parent(closure.env.clone());
 
         if closure.variadic {
             if let Some(first_arg) = closure.args.first() {
@@ -671,7 +671,12 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
                                     Value::Symbol(s) => (vec![s.clone()], true),
                                     _ => return Err("fn expects argument list".to_string()),
                                 };
-                                let body = if fn_list.len() > 1 {
+                                let body = if fn_list.len() > 2 {
+                                    // Multiple body expressions → wrap in (do ...)
+                                    let mut do_args = vec![Value::Symbol(Symbol::new("do"))];
+                                    do_args.extend_from_slice(&fn_list[1..]);
+                                    Value::List(WList::from_vec(do_args))
+                                } else if fn_list.len() == 2 {
                                     fn_list[1].clone()
                                 } else {
                                     Value::Nil
