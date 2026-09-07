@@ -656,28 +656,34 @@ fn op_get(args: &[Value], env: &mut Environment, eval: &mut Evaluator) -> Result
 
     if let Some(traces) = env.get_traces() {
         let traces = traces.read().unwrap_or_else(|e| e.into_inner());
-        if let Some(trace) = traces.first_trace() {
+        // Search every loaded trace (not just the first): the same short name
+        // may live in a second -l file (multi-trace get, feedback round B12).
+        let mut all_sigs: Vec<String> = Vec::new();
+        for trace in traces.traces_iter() {
             for candidate in &candidates {
                 match trace.signal_value(candidate, trace.index()) {
                     Ok(sv) => return Ok(slice_value(sv, hi, lo)),
                     Err(_) => continue,
                 }
             }
-            // Fuzzy fallback: try suffix / substring matching
             let sigs = trace.signals();
-            let (matched, candidates) = fuzzy_match_signal(&name, &sigs);
-            if candidates.len() > 1 {
+            all_sigs.extend(sigs.iter().cloned());
+            // Fuzzy fallback: try suffix / substring matching
+            let (matched, cands) = fuzzy_match_signal(&name, &sigs);
+            if cands.len() > 1 {
                 log::warn!("signal '{}' is ambiguous: matches {:?}, using '{}'",
-                    name, &candidates[..candidates.len().min(5)], matched.as_ref().map(|s| s.as_str()).unwrap_or("?"));
+                    name, &cands[..cands.len().min(5)], matched.as_ref().map(|s| s.as_str()).unwrap_or("?"));
             }
             if let Some(matched) = matched {
                 if let Ok(sv) = trace.signal_value(matched, trace.index()) {
                     return Ok(slice_value(sv, hi, lo));
                 }
             }
-            // 最近似候选: 编辑距离/包含关系排序(与 FST 侧提示一致)
+        }
+        // 最近似候选: 编辑距离/包含关系排序(跨全部 trace;与 FST 侧提示一致)
+        if !all_sigs.is_empty() {
             let preview: Vec<String> = {
-                let mut scored: Vec<(usize, &String)> = sigs.iter()
+                let mut scored: Vec<(usize, &String)> = all_sigs.iter()
                     .map(|s| {
                         // score against the full name and its last component:
                         // the common "tb_x.dut." prefix dominates full-name

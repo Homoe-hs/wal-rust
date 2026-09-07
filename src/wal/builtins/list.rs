@@ -212,6 +212,10 @@ fn op_fold(args: &[Value], _env: &mut Environment, eval: &mut Evaluator) -> Resu
     let mut acc = acc_init;
     for item in &list {
         match &args[0] {
+            // dispatcher already evaluated (fn ...) → closure: apply directly
+            Value::Closure(c) => {
+                acc = eval.eval_closure(c.clone(), &[acc.clone(), item.clone()])?;
+            }
             Value::Symbol(s) => {
                 if let Some(op) = Operator::from_str(&s.name) {
                     let quoted_acc = Value::List(WList::from_vec(vec![

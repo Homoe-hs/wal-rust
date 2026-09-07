@@ -5,7 +5,7 @@
 use crate::trace::{Trace, TraceId, ScalarValue, FindCondition, BatchEntry};
 use crate::vcd::types::VcdValue;
 use std::cell::RefCell;
-use std::collections::{HashMap, BTreeMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::path::Path;
 
@@ -148,10 +148,11 @@ pub struct VcdTrace {
     // Pre-recorded change point INDICES for event signals (built during PASS 1b)
     event_change_points: HashMap<u32, Vec<usize>>,
 
-    // Pass 1: sparse index
+    // Pass 1: sparse index — per-signal (ts, offset) anchors, built chunk-local
+    // and appended in ascending order (no BTreeMap: one contiguous Vec each).
     timestamps: TsStore,
     timestamp_offsets: Vec<u64>,
-    sparse_index: HashMap<u32, BTreeMap<u64, u64>>,
+    sparse_index: HashMap<u32, Vec<(u64, u64)>>,
 
     // Pass 2: LRU cache
     lru_cache: RefCell<lru::LruCache<(u32, u64), VcdValue>>,
@@ -366,7 +367,9 @@ impl VcdTrace {
 
         // Parallel processing
         let sparse_interval: u64 = 100;
-        let results: Vec<(Vec<u64>, Vec<u64>, HashMap<u32, BTreeMap<u64, u64>>, Vec<(u32, u64)>)> = boundaries
+        // Chunk-local flat triples (sig, ts, offset) — sorted by construction
+        // (file order); merged per signal in chunk order, no per-signal trees.
+        let results: Vec<(Vec<u64>, Vec<u64>, Vec<(u32, u64, u64)>, Vec<(u32, u64)>)> = boundaries
             .par_windows(2)
             .map(|w| {
                 let chunk_start = w[0];
@@ -377,7 +380,7 @@ impl VcdTrace {
 
                 let mut ts = Vec::new();
                 let mut ts_offsets = Vec::new();
-                let mut si: HashMap<u32, BTreeMap<u64, u64>> = HashMap::new();
+                let mut si: Vec<(u32, u64, u64)> = Vec::new();
                 let mut change_counts: HashMap<u32, u64> = HashMap::new();
                 let mut event_cp: Vec<(u32, u64)> = Vec::new();
                 let mut current_timestamp: u64 = 0;
@@ -418,9 +421,7 @@ impl VcdTrace {
                                     *count += 1;
                                     // Always anchor the first record; then sample every sparse_interval
                                     if *count == 1 || *count % sparse_interval == 0 {
-                                        si.entry(sig_idx)
-                                            .or_default()
-                                            .insert(current_timestamp, base_offset + line_start as u64);
+                                        si.push((sig_idx, current_timestamp, base_offset + line_start as u64));
                                     }
                                     if has_events && evt.contains(&sig_idx) {
                                         event_cp.push((sig_idx, current_timestamp));
@@ -445,18 +446,16 @@ impl VcdTrace {
         // ====== MERGE RESULTS ======
         let mut timestamps: Vec<u64> = Vec::with_capacity(est_ts);
         let mut timestamp_offsets: Vec<u64> = Vec::with_capacity(est_ts);
-        let mut sparse_index: HashMap<u32, BTreeMap<u64, u64>> = HashMap::with_capacity(128);
+        // Lazy per-signal sparse anchors (only signals that actually changed);
+        // append-only in chunk order ⇒ per-signal Vec stays ascending.
+        let mut sparse_index: HashMap<u32, Vec<(u64, u64)>> = HashMap::with_capacity(128);
         let mut event_change_ts: HashMap<u32, Vec<u64>> = HashMap::new();
-        // Init empty btreemaps for each signal
-        for idx in 0..signals.len() {
-            sparse_index.insert(idx as u32, BTreeMap::new());
-        }
 
         for (chunk_ts, chunk_offsets, chunk_si, chunk_evt) in results {
             timestamps.extend(chunk_ts);
             timestamp_offsets.extend(chunk_offsets);
-            for (sig_idx, entries) in chunk_si {
-                sparse_index.entry(sig_idx).or_default().extend(entries);
+            for (sig_idx, s_ts, s_off) in chunk_si {
+                sparse_index.entry(sig_idx).or_default().push((s_ts, s_off));
             }
             // Group flat event tuples by sig_idx
             for (sig_idx, ts) in chunk_evt {
@@ -554,6 +553,14 @@ impl VcdTrace {
         self.initial_values.get(&sig_idx).cloned().unwrap_or(VcdValue::Bit(b'x'))
     }
 
+    /// Last sparse anchor with ts ≤ target (entries are appended in ascending
+    /// ts order — binary search instead of BTreeMap range probes).
+    fn sparse_anchor(&self, sig_idx: u32, target_ts: u64) -> Option<(u64, u64)> {
+        let v = self.sparse_index.get(&sig_idx)?;
+        let idx = v.partition_point(|(ts, _)| *ts <= target_ts);
+        if idx == 0 { None } else { Some(v[idx - 1]) }
+    }
+
     fn read_signal_value_at(&self, sig_idx: u32, target_timestamp: u64) -> VcdValue {
         let target_id = match self.signal_id_bytes.get(&sig_idx) {
             Some(id) => id,
@@ -574,15 +581,14 @@ impl VcdTrace {
         if std::env::var("WAL_DEBUG_FIND").is_ok() {
             eprintln!("read_signal_value_at: sig={} target_ts={} target_idx={}", sig_idx, target_timestamp, target_idx);
         }
-        let sparse_anchor = self.sparse_index.get(&sig_idx)
-            .and_then(|idx_map| idx_map.range(..=target_timestamp).last());
+        let sparse_anchor = self.sparse_anchor(sig_idx, target_timestamp);
         let scan_start = sparse_anchor
-            .and_then(|(&ts, _)| self.timestamps.search(ts).ok())
+            .and_then(|(ts, _)| self.timestamps.search(ts).ok())
             .map(|i| self.ts_line_anchor(i))
             .unwrap_or(self.header_end_offset) as usize;
         if std::env::var("WAL_DEBUG_FIND").is_ok() {
             eprintln!("  sparse_anchor={:?} scan_start={} scan_end={}",
-                sparse_anchor.map(|(&ts, &off)| (ts, off)), scan_start,
+                sparse_anchor, scan_start,
                 self.ts_end_anchor(target_idx + 1));
         }
         if std::env::var("WAL_DEBUG_FIND").is_ok() && sparse_anchor.is_none() {
@@ -679,10 +685,8 @@ impl VcdTrace {
         let mut reader = self.reader.borrow_mut();
 
         let start_offset = self
-            .sparse_index
-            .get(&sig_idx)
-            .and_then(|idx_map| idx_map.range(..=target_timestamp).last())
-            .map(|(_, &off)| off)
+            .sparse_anchor(sig_idx, target_timestamp)
+            .map(|(_, off)| off)
             .unwrap_or(self.header_end_offset);
 
         let _ = reader.seek_to(start_offset);
@@ -730,10 +734,8 @@ impl VcdTrace {
         let mut reader = self.reader.borrow_mut();
 
         let start_offset = self
-            .sparse_index
-            .get(&sig_idx)
-            .and_then(|idx_map| idx_map.range(..=target_timestamp).last())
-            .map(|(_, &off)| off)
+            .sparse_anchor(sig_idx, target_timestamp)
+            .map(|(_, off)| off)
             .unwrap_or(self.header_end_offset);
 
         let _ = reader.seek_to(start_offset);
@@ -1085,6 +1087,47 @@ impl Trace for VcdTrace {
 
         let target_id = self.signal_id_bytes.get(&sig_idx).cloned()
             .ok_or_else(|| "find_indices: signal ID bytes not found".to_string())?;
+
+        // Warm path: if this signal was already fully scanned (a previous query
+        // cached its complete change list), evaluate the condition against the
+        // cached columns — O(C) interval math, no file rescan. This is what
+        // makes repeated queries on huge files fast (152GB round: warm-2nd
+        // query on the same signal used to re-scan the whole file).
+        if let Some(ds) = self.signal_cache.lock().unwrap().get(&sig_idx) {
+            if ds.full_scan && ds.change_indices.len() == ds.values.len() {
+                let mut indices: Vec<usize> = Vec::new();
+                let is_edge = matches!(
+                    &cond,
+                    FindCondition::Rising | FindCondition::Falling | FindCondition::Changed
+                );
+                let mut prev_val: Option<VcdValue> = None;
+                // initial x-run / $dumpvars snapshot before the first change:
+                // mirror the cold scan (chunk-0 seed semantics)
+                if !is_edge {
+                    let init = self.initial_value_at(sig_idx);
+                    if find_cond_matches(&init, None, &cond) {
+                        let first_idx = ds.change_indices.first().copied().unwrap_or(self.max_index as u32 + 1) as usize;
+                        indices.extend(0..first_idx.min(self.max_index + 1));
+                    }
+                }
+                for (i, (ci, v)) in ds.change_indices.iter().zip(ds.values.iter()).enumerate() {
+                    let idx = *ci as usize;
+                    if idx > self.max_index { break; }
+                    let matched = find_cond_matches(v, prev_val.as_ref(), &cond);
+                    prev_val = Some(v.clone());
+                    if !matched { continue; }
+                    if is_edge {
+                        indices.push(idx);
+                    } else {
+                        let end = ds.change_indices.get(i + 1)
+                            .map(|&n| n as usize)
+                            .unwrap_or(self.max_index + 1);
+                        indices.extend(idx..end.min(self.max_index + 1));
+                    }
+                }
+                return Ok(indices);
+            }
+        }
 
         // Get shared mmap via Arc — drop RefCell borrow before rayon parallel section
         let shared_mmap = self.reader.borrow().data.clone();
@@ -1630,7 +1673,7 @@ impl Trace for VcdTrace {
         // prepend it via the sparse index.
         let mut changes = self.find_indices(name, FindCondition::Changed)?;
         let first_ts = self.sparse_index.get(sig_idx)
-            .and_then(|m| m.keys().next().copied());
+            .and_then(|v| v.first().map(|(ts, _)| *ts));
         if let Some(ts) = first_ts {
             let first_idx = self.find_timestamp_index(ts);
             if changes.first() != Some(&first_idx) {

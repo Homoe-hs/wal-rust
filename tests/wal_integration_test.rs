@@ -620,3 +620,54 @@ $end\n").unwrap();
     // first change at #10 → x before it only when NO snapshot: here it is 15.
     let _ = std::fs::remove_file(&p);
 }
+
+/// Bug-sweep batch (0.12.x): B2 fold-with-closure, B3 search duplicate
+/// results, B12 multi-trace get, B13 import fn arg binding.
+#[test]
+fn test_bug_sweep_fold_search_multitrace_import() {
+    use wal_rust::wal::eval::Evaluator;
+    use wal_rust::wal::ast::{Value, WList};
+
+    // B2: (fold (fn ...) init lst) — lambda form must work, not just symbol ops
+    let mut eval = Evaluator::new();
+    eval.load_trace(&counter_vcd_path().to_string_lossy(), "t").unwrap();
+    let v = eval.eval("(fold (fn [a b] (+ a b)) 0 (list 1 2 3))").unwrap();
+    assert_eq!(v, Value::Int(6), "fold with closure must fold");
+
+    // B3: search reports one result per change point (not per bit offset)
+    let dir = std::env::temp_dir();
+    let p = dir.join(format!("wal_v8_{}.vcd", std::process::id()));
+    std::fs::write(&p, "$timescale 1ns $end\n$scope module t $end\n\
+$var wire 8 ! v [7:0] $end\n$enddefinitions $end\n\
+#0\nb01010101 !\n#10\nb01011010 !\n").unwrap();
+    let mut eval2 = Evaluator::new();
+    eval2.load_trace(&p.to_string_lossy(), "t").unwrap();
+    let v = eval2.eval("(search \"t.v\" \"0101\")").unwrap();
+    assert_eq!(v, Value::List(WList::from_vec(vec![
+        Value::Int(0), Value::Int(10),
+    ])), "search must dedupe per change point");
+    let _ = std::fs::remove_file(&p);
+
+    // B12: a signal living only in the SECOND loaded trace must be queryable
+    let p2 = dir.join(format!("wal_v8b_{}.vcd", std::process::id()));
+    std::fs::write(&p2, "$timescale 1ns $end\n$scope module t $end\n\
+$var wire 8 ! v [7:0] $end\n$enddefinitions $end\n\
+#0\nb01010101 !\n#10\nb01011010 !\n").unwrap();
+    let mut eval3 = Evaluator::new();
+    eval3.load_trace(&counter_vcd_path().to_string_lossy(), "t1").unwrap();
+    eval3.load_trace(&p2.to_string_lossy(), "t2").unwrap();
+    // first trace has 6 signals named counter_tb.*; the second has t.v — the
+    // name "v" must resolve via the second trace (previously first_trace only)
+    let v = eval3.eval("(at \"v\" 0)").unwrap();
+    assert!(matches!(v, Value::List(_)), "multi-trace get must search all traces: {:?}", v);
+    let _ = std::fs::remove_file(&p2);
+
+    // B13: import keeps fn argument bindings
+    let lib = dir.join(format!("wal_inc_{}.wal", std::process::id()));
+    std::fs::write(&lib, "(define inc (fn [x] (+ x 1)))").unwrap();
+    let mut eval4 = Evaluator::new();
+    eval4.load_trace(&counter_vcd_path().to_string_lossy(), "t").unwrap();
+    eval4.eval(&format!("(import \"{}\")", lib.display())).unwrap();
+    assert_eq!(eval4.eval("(inc 41)").unwrap(), Value::Int(42));
+    let _ = std::fs::remove_file(&lib);
+}

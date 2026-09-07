@@ -342,14 +342,18 @@ fn op_search(args: &[Value], env: &mut Environment, _eval: &mut Evaluator) -> Re
             (None, None) => true,
         };
         if in_window {
-            // Search pattern within the signal bit string since last check
+            // Search pattern within the signal bit string since last check.
+            // One result per change point: a pattern may match at several bit
+            // offsets of the same value — report the timestamp once (B3).
             for (i, &b) in bits.iter().enumerate() {
                 window.push(b);
                 if window.len() > pattern.len() {
                     window.remove(0);
                 }
                 if window.len() == pattern.len() && window.iter().zip(&pattern).all(|(a, b)| a == b) {
-                    out.push(Value::Int(t as i64));
+                    if out.last() != Some(&Value::Int(t as i64)) {
+                        out.push(Value::Int(t as i64));
+                    }
                 }
                 let _ = i;
             }
