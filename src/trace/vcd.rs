@@ -85,16 +85,6 @@ fn col_cache_budget() -> usize {
         }
     }
     0
-    let mut avail_mb = 0usize;
-    if let Ok(proc) = std::fs::read_to_string("/proc/meminfo") {
-        for line in proc.lines() {
-            if let Some(rest) = line.strip_prefix("MemAvailable:") {
-                avail_mb = rest.trim().trim_end_matches(" kB").trim().parse().unwrap_or(0) / 1024;
-                break;
-            }
-        }
-    }
-    (avail_mb * 512 * 1024).min(64 * 1024 * 1024 * 1024) // 50% RAM, cap 64GiB
 }
 
 /// LRU cache capacity (number of entries)
