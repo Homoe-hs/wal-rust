@@ -1088,258 +1088,158 @@ impl Trace for VcdTrace {
         let target_id = self.signal_id_bytes.get(&sig_idx).cloned()
             .ok_or_else(|| "find_indices: signal ID bytes not found".to_string())?;
 
-        // Warm path: if this signal was already fully scanned (a previous query
-        // cached its complete change list), evaluate the condition against the
-        // cached columns — O(C) interval math, no file rescan. This is what
-        // makes repeated queries on huge files fast (152GB round: warm-2nd
-        // query on the same signal used to re-scan the whole file).
+        // Warm path: this signal was already fully scanned — answer from the
+        // cached per-index change list (single O(C) evaluation, no file scan).
         if let Some(ds) = self.signal_cache.lock().unwrap().get(&sig_idx) {
             if ds.full_scan && ds.change_indices.len() == ds.values.len() {
-                let mut indices: Vec<usize> = Vec::new();
-                let is_edge = matches!(
-                    &cond,
-                    FindCondition::Rising | FindCondition::Falling | FindCondition::Changed
-                );
-                let mut prev_val: Option<VcdValue> = None;
-                // initial x-run / $dumpvars snapshot before the first change:
-                // mirror the cold scan (chunk-0 seed semantics)
-                if !is_edge {
-                    let init = self.initial_value_at(sig_idx);
-                    if find_cond_matches(&init, None, &cond) {
-                        let first_idx = ds.change_indices.first().copied().unwrap_or(self.max_index as u32 + 1) as usize;
-                        indices.extend(0..first_idx.min(self.max_index + 1));
-                    }
-                }
-                for (i, (ci, v)) in ds.change_indices.iter().zip(ds.values.iter()).enumerate() {
-                    let idx = *ci as usize;
-                    if idx > self.max_index { break; }
-                    let matched = find_cond_matches(v, prev_val.as_ref(), &cond);
-                    prev_val = Some(v.clone());
-                    if !matched { continue; }
-                    if is_edge {
-                        indices.push(idx);
-                    } else {
-                        let end = ds.change_indices.get(i + 1)
-                            .map(|&n| n as usize)
-                            .unwrap_or(self.max_index + 1);
-                        indices.extend(idx..end.min(self.max_index + 1));
-                    }
-                }
-                return Ok(indices);
+                let changes: Vec<(u32, VcdValue)> = ds.change_indices.iter()
+                    .zip(ds.values.iter())
+                    .map(|(i, v)| (*i, v.clone()))
+                    .collect();
+                let init = self.initial_value_at(sig_idx);
+                return Ok(eval_change_list(self.max_index, &changes, &init, &cond));
             }
         }
 
-        // Get shared mmap via Arc — drop RefCell borrow before rayon parallel section
+        // IO-1: id-anchored scan — two lightweight passes per chunk:
+        //   1. '#' timestamp line positions (→ per-chunk ts_idx table)
+        //   2. memmem over the chunk for target_id occurrences — value lines
+        //      use only 0/1/x/z chars, so the id's bytes occur nowhere inside
+        //      values; an exact line-end + separator check makes hits exact.
+        // Each hit is parsed lazily and collapsed per timestamp (last write
+        // wins), then evaluated with the semantics of eval_change_list.
+        use rayon::prelude::*;
         let shared_mmap = self.reader.borrow().data.clone();
         let id_len = target_id.len();
         let hdr_end = self.header_end_offset as usize;
         let data_len = shared_mmap.len();
-
         let n_threads = num_cpus::get().max(4);
-        let dump_len = data_len.saturating_sub(hdr_end);
-        // Minimum chunk size: tiny chunks fragment the scan and lose cross-chunk
-        // previous-value state (Rising/Falling/Changed conditions).
-        let chunk_size = (dump_len / n_threads.max(1)).max(64 * 1024);
+        let chunk_size = (data_len.saturating_sub(hdr_end) / n_threads.max(1)).max(64 * 1024);
 
-        // Build newline-aligned chunk boundaries starting from hdr_end (includes $dumpvars).
-        // IMPORTANT: a boundary must fall right BEFORE a '#' timestamp line, so that a
-        // value line always stays in the same chunk as its '#' line. Otherwise the
-        // orphan value line at the start of a chunk corrupts the timestamp index
-        // accounting of find_indices.
+        // Newline-aligned boundaries (value lines stay with their data; the ts
+        // of a value line before the chunk's first '#' is resolved via the
+        // chunk's ts base — no rewind needed).
         let mut boundaries = vec![hdr_end];
-        let mut rewound: Vec<usize> = vec![0];
         for i in 1..n_threads {
             let mut p = hdr_end + i * chunk_size;
             if p >= data_len { break; }
-            loop {
-                // skip to the start of the next line
-                match memchr::memchr(b'\n', &shared_mmap[p..data_len]) {
-                    Some(n) => p += n + 1,
-                    None => { p = data_len; break; }
-                }
-                if p >= data_len { break; }
-                if shared_mmap[p] == b'#' { break; }
+            match memchr::memchr(b'\n', &shared_mmap[p..data_len]) {
+                Some(n) => p += n + 1,
+                None => break,
             }
-            let mut rewound_ts = 0usize;
-            if p < data_len {
-                // Rewind to the previous '#' line start so this chunk carries the
-                // previous timestamp's value lines. The scan then seeds prev_val
-                // from them, making edge conditions (Rising/Falling/Changed)
-                // correct across chunk boundaries.
-                let mut q = p;
-                while q > hdr_end {
-                    let mut nl = q - 1;
-                    while nl > hdr_end && shared_mmap[nl] != b'\n' { nl -= 1; }
-                    if shared_mmap[nl] != b'\n' { break; }
-                    let line_start = nl + 1;
-                    if shared_mmap[line_start] == b'#' {
-                        q = line_start;
-                        break;
-                    }
-                    q = line_start;
-                }
-                rewound_ts = shared_mmap[q..p].iter().filter(|&&b| b == b'#').count();
-                p = q;
-            }
-
-
-
+            if p >= data_len { break; }
             boundaries.push(p);
-            rewound.push(rewound_ts);
         }
         boundaries.push(data_len);
 
-        // Pre-compute ts_idx at each boundary: number of '#' timestamp lines
-        // strictly before the boundary position. With rewind, a boundary sits at
-        // a '#' line start, so start_ts = count of '#' lines before it, and the
-        // chunk's scan index starts at start_ts - (rewound '#' count) ... the
-        // scan below derives its own index from the chunk's first '#' instead:
-        // boundary_ts[i] = ts index of the chunk's FIRST timestamp.
-        let boundary_ts: Vec<usize> = {
-            let mut ts = vec![0usize; boundaries.len()];
-            let mut count = 0usize;
-            let mut bi = 1usize;
-            let start = hdr_end;
-            for (i, &b) in shared_mmap[start..].iter().enumerate() {
-                while bi < boundaries.len() && start + i >= boundaries[bi] {
-                    ts[bi] = count;
-                    bi += 1;
-                }
-                let line_start = i == 0 || shared_mmap[start + i - 1] == b'\n';
-                if line_start && b == b'#' && is_ts_line_at(&shared_mmap, start + i) {
-                    count += 1;
-                }
-            }
-            while bi < boundaries.len() {
-                ts[bi] = count;
-                bi += 1;
-            }
-            ts
-        };
-
-        // Build chunk descriptors for parallel processing
-        let chunks: Vec<(usize, usize, usize, usize, Option<VcdValue>)> = (0..boundaries.len() - 1)
-            .map(|i| {
-                // seed: value of the target signal at the timestamp just before
-                // the chunk start (sparse signals keep their last value across
-                // timestamps with no records)
-                let seed = if boundary_ts[i] > 0 {
-                    if std::env::var("WAL_DEBUG_FIND").is_ok() {
-                        eprintln!("seed[{}] ts={}", i, self.timestamps.get(boundary_ts[i] - 1));
-                    }
-                    self.read_signal_value_at(sig_idx, self.timestamps.get(boundary_ts[i] - 1))
-                } else {
-                    self.initial_value_at(sig_idx)
-                };
-                (boundaries[i], boundaries[i+1], boundary_ts[i], boundary_ts[i] + rewound[i], Some(seed))
-            })
-            .collect();
-
-        // Parallel chunk scan using rayon — Arc<Mmap> is Sync so threads can share
-        if std::env::var("WAL_DEBUG_FIND").is_ok() {
-            eprintln!("find_indices({}, {:?}): chunks={:?}", name, cond, chunks.iter().map(|c| (c.0, c.1, c.2)).collect::<Vec<_>>());
-        }
-        let results: Vec<(Vec<usize>, Vec<(u32, VcdValue)>)> = chunks.par_iter().map(|&(start, end, start_ts, valid_from, ref seed)| {
-            let chunk = &shared_mmap[start..end];
-            let mut local_indices = Vec::new();
-            let mut all_changes: Vec<(u32, VcdValue)> = Vec::new();
-            let mut current_val: Option<VcdValue> = seed.clone();
-            let mut prev_val: Option<VcdValue> = None;
-            let mut ts_idx = start_ts;
-            let mut seen_first_ts = false;
-
-            let mut lp = 0usize;
-            while lp < chunk.len() {
-                let line_start = lp;
-                let line_end = match memchr::memchr(b'\n', &chunk[lp..]) {
-                    Some(nl) => { lp += nl; let end = lp; lp += 1; end }
-                    None => break,
-                };
-                let line = &chunk[line_start..line_end];
-                if line.is_empty() { continue; }
-
-                let first = line[0];
-                if first == b'#' && is_ts_line(line) {
-                    if seen_first_ts {
-                        if let Some(ref val) = current_val {
-                            if find_cond_matches(val, prev_val.as_ref(), &cond) {
-                                if ts_idx >= valid_from {
-                                    local_indices.push(ts_idx);
+        // (chunk '#'-counts, per-chunk hits: (ts_idx, pos, value))
+        let results: Vec<(usize, Vec<(u32, usize, VcdValue)>)> = boundaries[..boundaries.len() - 1]
+            .par_iter()
+            .enumerate()
+            .map(|(ci, &start)| {
+                let end = boundaries[ci + 1];
+                let chunk = &shared_mmap[start..end];
+                let mut ts_pos: Vec<usize> = Vec::new();
+                let mut p = 0usize;
+                while p < chunk.len() {
+                    match memchr::memchr(b'#', &chunk[p..]) {
+                        Some(n) => {
+                            let abs = p + n;
+                            if abs == 0 || chunk[abs - 1] == b'\n' {
+                                let line = match memchr::memchr(b'\n', &chunk[abs..]) {
+                                    Some(nl) => &chunk[abs..abs + nl],
+                                    None => &chunk[abs..],
+                                };
+                                if is_ts_line(line) {
+                                    ts_pos.push(abs);
                                 }
                             }
-                            prev_val = current_val.clone();
+                            p = abs + 1;
                         }
-                        ts_idx += 1;
+                        None => break,
                     }
-                    seen_first_ts = true;
-                } else if first != b'$' && line.len() > id_len {
-                    let id_start = line.len() - id_len;
-                    if (line.len() == id_len + 1 || (id_start > 0 && line[id_start - 1] == b' ')) && &line[id_start..] == target_id.as_slice() {
-                        let val = match first {
+                }
+                let mut hits: Vec<(u32, usize, VcdValue)> = Vec::new();
+                // Search for `<id>\n` (id at line end). Values never contain
+                // the separator, so a mid-value id byte can NEVER be followed
+                // by '\n' at the right offset — exact by construction (digit
+                // ids like "1" in a 32-bit bit-stream included).
+                let mut needle = Vec::with_capacity(id_len + 1);
+                needle.extend_from_slice(&target_id);
+                needle.push(b'\n');
+                let mut p = 0usize;
+                while p < chunk.len() {
+                    let pos = match memchr::memmem::find(&chunk[p..], &needle) {
+                        Some(n) => p + n,
+                        None => break,
+                    };
+                    let line_start = match memchr::memrchr(b'\n', &chunk[..pos]) {
+                        Some(n) => n + 1,
+                        None => 0,
+                    };
+                    let line_end = pos + id_len;   // needle guarantees '\n' here
+                    let line = &chunk[line_start..line_end];
+                    let id_start = pos - line_start;
+                    // exact id position: preceded by ' ' or a single value char,
+                    // line doesn't start with '$'
+                    if !line.is_empty()
+                        && line[0] != b'$'
+                        && (line.len() == id_len + 1
+                            || (id_start > 0 && line[id_start - 1] == b' '))
+                    {
+                        let val = match line[0] {
                             b'b' => {
                                 let ve = id_start.saturating_sub(1);
                                 let vs = if ve > 1 && line[ve] == b' ' { &line[1..ve] } else { &line[1..id_start] };
                                 VcdValue::Vector(vs.to_vec())
                             }
-                            b'r' => {
-                                let vs = std::str::from_utf8(&line[1..id_start]).unwrap_or("0");
-                                if let Ok(r) = vs.trim().parse::<f64>() { VcdValue::Real(r) } else { continue; }
-                            }
-                            _ => VcdValue::Bit(first),
+                            b'r' => match std::str::from_utf8(&line[1..id_start])
+                                .unwrap_or("0").trim().parse::<f64>() {
+                                Ok(r) => VcdValue::Real(r),
+                                Err(_) => VcdValue::Bit(b'x'),
+                            },
+                            other => VcdValue::Bit(other),
                         };
-                        if !seen_first_ts {
-                            // Value line before the first '#' of this chunk: it
-                            // belongs to the previous timestamp (handled by the
-                            // previous chunk) — seed prev_val so edge conditions
-                            // (Rising/Falling/Changed) work across boundaries.
-                            prev_val = Some(val);
-                        } else {
-                            all_changes.push((ts_idx as u32, val.clone()));
-                            current_val = Some(val);
+                        // value line belongs to the LAST '#' before it; a value
+                        // line before the file's FIRST '#' is the $dumpvars
+                        // block (already captured as the initial value) — skip.
+                        let after = ts_pos.partition_point(|&p0| p0 < line_start);
+                        if after > 0 {
+                            hits.push(((after - 1) as u32, pos, val));
                         }
                     }
+                    p = pos + 1;
                 }
-            }
+                (ts_pos.len(), hits)
+            })
+            .collect();
 
-            if seen_first_ts {
-                if let Some(ref val) = current_val {
-                    if find_cond_matches(val, prev_val.as_ref(), &cond) {
-                                if ts_idx >= valid_from {
-                                    local_indices.push(ts_idx);
-                                }
+        // Merge in chunk order (each chunk's hits are file order); per-chunk
+        // ts base = prefix of '#' counts; collapse same-ts (last write wins).
+        let mut all: Vec<(u32, VcdValue)> = Vec::new();
+        {
+            let mut base = 0usize;
+            for (ts_count, hits) in results {
+                for (local_idx, _pos, val) in hits {
+                    let ts_idx = base + local_idx as usize;
+                    match all.last_mut() {
+                        Some((i, v)) if *i as usize == ts_idx => *v = val,
+                        _ => all.push((ts_idx as u32, val)),
                     }
                 }
+                base += ts_count;
             }
-
-            (local_indices, all_changes)
-        }).collect();
-
-        let mut indices: Vec<usize> = Vec::new();
-        let mut all_changes: Vec<(u32, VcdValue)> = Vec::new();
-        for (idxs, changes) in results {
-            indices.extend(idxs);
-            all_changes.extend(changes);
         }
-        indices.sort();
-        indices.dedup();
+
         if std::env::var("WAL_DEBUG_FIND").is_ok() {
-            eprintln!("  find_indices result ({}): {:?}", indices.len(), indices.iter().take(20).collect::<Vec<_>>());
+            eprintln!("anchored: sig={} id={:?} all={:?} init={:?}", sig_idx, target_id, all, self.initial_value_at(sig_idx));
         }
-        // Merge and sort changes (changes may overlap at chunk boundaries).
-        // Several value lines can carry the same timestamp index (delta cycles);
-        // the value AT the index is the LAST one — keep the last entry per idx
-        // so the decoded signal cache matches per-index get semantics.
-        if all_changes.len() > 1 {
-            all_changes.sort_by_key(|(i, _)| *i);
-            let mut deduped: Vec<(u32, VcdValue)> = Vec::with_capacity(all_changes.len());
-            for item in all_changes {
-                match deduped.last_mut() {
-                    Some(last) if last.0 == item.0 => *last = item,
-                    _ => deduped.push(item),
-                }
-            }
-            all_changes = deduped;
-            self.try_cache_decoded_signal(sig_idx, &all_changes, CacheType::FullScan);
+        let init = self.initial_value_at(sig_idx);
+        let mut indices = eval_change_list(self.max_index, &all, &init, &cond);
+
+        // Cache the change list for warm queries / signal_value.
+        if all.len() > 1 {
+            self.try_cache_decoded_signal(sig_idx, &all, CacheType::FullScan);
         }
         Ok(indices)
     }
@@ -1701,6 +1601,45 @@ fn vcd_is_zero(val: &VcdValue) -> Option<bool> {
         }
         _ => None,
     }
+}
+
+/// Evaluate a condition over a per-index change list (ascending ts_idx, the
+/// LAST write per index — the list is already delta-collapsed) with the
+/// initial value as predecessor. Single authoritative per-index semantics used
+/// by BOTH the warm cached-column path and the id-anchored cold scan.
+fn eval_change_list(
+    max_index: usize,
+    changes: &[(u32, VcdValue)],
+    initial: &VcdValue,
+    cond: &FindCondition,
+) -> Vec<usize> {
+    let is_edge = matches!(
+        cond,
+        FindCondition::Rising | FindCondition::Falling | FindCondition::Changed
+    );
+    let mut indices = Vec::new();
+    let mut prev_val: Option<VcdValue> = Some(initial.clone());
+    // Initial held segment [0, first change): level conditions see it; edges
+    // use the initial value as their previous value (x→x not a change, x→0/1
+    // never a rise/fall).
+    if !is_edge && find_cond_matches(initial, None, cond) {
+        let first_idx = changes.first().map(|(i, _)| *i as usize).unwrap_or(max_index + 1);
+        indices.extend(0..first_idx.min(max_index + 1));
+    }
+    for (k, (ci, v)) in changes.iter().enumerate() {
+        let idx = *ci as usize;
+        if idx > max_index { break; }
+        let matched = find_cond_matches(v, prev_val.as_ref(), cond);
+        prev_val = Some(v.clone());
+        if !matched { continue; }
+        if is_edge {
+            indices.push(idx);
+        } else {
+            let end = changes.get(k + 1).map(|(n, _)| *n as usize).unwrap_or(max_index + 1);
+            indices.extend(idx..end.min(max_index + 1));
+        }
+    }
+    indices
 }
 
 fn find_cond_matches(val: &VcdValue, prev_val: Option<&VcdValue>, cond: &FindCondition) -> bool {

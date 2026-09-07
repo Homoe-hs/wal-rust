@@ -658,8 +658,8 @@ $var wire 8 ! v [7:0] $end\n$enddefinitions $end\n\
     eval3.load_trace(&p2.to_string_lossy(), "t2").unwrap();
     // first trace has 6 signals named counter_tb.*; the second has t.v — the
     // name "v" must resolve via the second trace (previously first_trace only)
-    let v = eval3.eval("(at \"v\" 0)").unwrap();
-    assert!(matches!(v, Value::List(_)), "multi-trace get must search all traces: {:?}", v);
+    let v = eval3.eval("(get \"v\")").unwrap();
+    assert_eq!(v, Value::Int(0b01010101), "multi-trace get must search all traces: {:?}", v);
     let _ = std::fs::remove_file(&p2);
 
     // B13: import keeps fn argument bindings
