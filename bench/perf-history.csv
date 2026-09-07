@@ -1,1 +1,8 @@
 version,date,op,fixture,wall_s,rss_mb,note
+0.11.11,2026-09-06,load,bench_10g.vcd,360,9797,历史基线(每信号 BTreeMap)
+0.12.0,2026-09-06,load,bench_10g.vcd,12,-,页缓存暖;冷 ~62s
+0.12.0,2026-09-07,count-lit,bench_10g.vcd,282,-,锚定扫描前(逐行)
+0.12.1,2026-09-07,count-lit,bench_10g.vcd,151,-,IO-1 锚定扫描
+0.12.2,2026-09-07,load,bench_10g.vcd,42,-,全局行采样加载
+0.12.3,2026-09-07,count-var,bench_10g.vcd,138,-,变量 RHS 快路径
+0.12.4,2026-09-08,count-lit(column),bench_2g.vcd,NA,NA,列缓存路径;计数与锚定一致 77629;加载成本提升(待干净复测)
