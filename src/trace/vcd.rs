@@ -138,6 +138,9 @@ pub struct VcdTrace {
     signal_ids: HashMap<u64, u32>,       // hash → index
     signal_id_bytes: HashMap<u32, Vec<u8>>, // index → VCD signal ID bytes (for fast matching)
     signal_widths: HashMap<u32, usize>,
+    /// $dumpvars snapshot: signal index → initial value before the first '#'
+    /// timestamp line (missing entry ⇒ 'x', the VCD default).
+    initial_values: HashMap<u32, VcdValue>,
     name_to_idx: HashMap<String, u32>,
 
     // Event signals (VCD event type — auto-reset to 0 at each timestamp boundary)
@@ -260,11 +263,67 @@ impl VcdTrace {
         let dump_start = header_end_offset as usize;
         let dump_len = data.len() - dump_start;
 
-        // Skip $dumpvars section to first timestamp
+        // Capture the $dumpvars snapshot (lines between header end and the
+        // first '#' timestamp). These are the values held at t0 — used as the
+        // initial value before any change; previously dropped, which let the
+        // FST/VCD is-x (and get/at) initial semantics diverge (152GB §8.4 #1).
+        let mut initial_values: HashMap<u32, VcdValue> = HashMap::new();
         let mut pos = dump_start;
-        while pos < data.len() && data[pos] != b'#' {
-            pos += 1;
+        {
+            let mut line_start = dump_start;
+            while line_start < data.len() && data[line_start] != b'#' {
+                let line_end = match memchr::memchr(b'\n', &data[line_start..]) {
+                    Some(n) => line_start + n,
+                    None => break,
+                };
+                let line = &data[line_start..line_end];
+                if !line.is_empty() && line[0] != b'$' {
+                    // value line: <value><id> or b<bits...><id>; resolve the id
+                    // by hash (ids are 1..~5 chars; VCD ids are identifiers).
+                    let max_id_len = line.len().min(6);
+                    for id_len in (1..max_id_len).rev() {
+                        let id_start = line.len() - id_len;
+                        // separator before the id: start, space, or a single
+                        // leading value char ("0!" / "1!").
+                        if id_start > 0
+                            && line[id_start - 1] != b' '
+                            && line[id_start - 1] != b'\t'
+                            && line.len() != id_len + 1
+                        {
+                            continue;
+                        }
+                        let hash = hash_sig_id(&line[id_start..]);
+                        if let Some(&sidx) = signal_ids.get(&hash) {
+                            // byte-verify (hash ambiguity)
+                            if signal_id_bytes.get(&sidx)
+                                .map(|idb| idb.as_slice() == &line[id_start..])
+                                .unwrap_or(false)
+                            {
+                                let val = match line[0] {
+                                    b'b' => {
+                                        let ve = id_start.saturating_sub(1);
+                                        let vs = if ve > 1 && line[ve] == b' ' { &line[1..ve] } else { &line[1..id_start] };
+                                        VcdValue::Vector(vs.to_vec())
+                                    }
+                                    b'r' => match std::str::from_utf8(&line[1..id_start])
+                                        .unwrap_or("0").trim().parse::<f64>() {
+                                        Ok(r) => VcdValue::Real(r),
+                                        Err(_) => VcdValue::Bit(b'x'),
+                                    },
+                                    other => VcdValue::Bit(other),
+                                };
+                                initial_values.insert(sidx, val);
+                                break;
+                            }
+                        }
+                    }
+                }
+                line_start = line_end + 1;
+            }
+            pos = line_start;
         }
+
+        // Skip $dumpvars section to first timestamp
         let actual_start = pos;
 
         let n_threads = num_cpus::get();
@@ -443,7 +502,7 @@ impl VcdTrace {
         }
         Ok(VcdTrace {
             id, filename,
-            signals, signal_ids, signal_id_bytes, signal_widths, name_to_idx, event_signals, event_change_points,
+            signals, signal_ids, signal_id_bytes, signal_widths, initial_values, name_to_idx, event_signals, event_change_points,
             timestamps: build_ts_store(timestamps), timestamp_offsets, sparse_index,
             lru_cache: RefCell::new(lru::LruCache::new(lru_cap)),
             signal_cache: Mutex::new(HashMap::new()),
@@ -488,6 +547,13 @@ impl VcdTrace {
     }
 
     /// On-demand: read signal value at a specific timestamp (memchr jump scan + sampled offsets)
+    /// Initial value of a signal: $dumpvars snapshot if present, else 'x'
+    /// (the VCD default for values that never got an explicit write).
+    #[inline]
+    fn initial_value_at(&self, sig_idx: u32) -> VcdValue {
+        self.initial_values.get(&sig_idx).cloned().unwrap_or(VcdValue::Bit(b'x'))
+    }
+
     fn read_signal_value_at(&self, sig_idx: u32, target_timestamp: u64) -> VcdValue {
         let target_id = match self.signal_id_bytes.get(&sig_idx) {
             Some(id) => id,
@@ -601,7 +667,7 @@ impl VcdTrace {
             pos = next_ts;
         }
 
-        last_value.unwrap_or(VcdValue::Bit(b'x'))
+        last_value.unwrap_or_else(|| self.initial_value_at(sig_idx))
     }
 
     fn read_signal_value_at_legacy(&self, sig_idx: u32, target_timestamp: u64) -> VcdValue {
@@ -655,7 +721,7 @@ impl VcdTrace {
                 }
             }
         }
-        last_value.unwrap_or(VcdValue::Bit(b'x'))
+        last_value.unwrap_or_else(|| self.initial_value_at(sig_idx))
     }
 
     /// On-demand find bit value at timestamp
@@ -924,7 +990,8 @@ impl Trace for VcdTrace {
                 let val_idx = match ds.change_indices.binary_search(&(idx as u32)) {
                     Ok(i) => i,           // exact match → value at this change
                     Err(0) => {
-                        return Ok(normalize(ScalarValue::Bit(b'x'))); // before any change
+                        // before any change: $dumpvars initial snapshot, else x
+                        return Ok(normalize(value_to_scalar(&self.initial_value_at(sig_idx))));
                     }
                     Err(i) => i - 1,       // between changes → previous value
                 };
@@ -1119,7 +1186,7 @@ impl Trace for VcdTrace {
                     }
                     self.read_signal_value_at(sig_idx, self.timestamps.get(boundary_ts[i] - 1))
                 } else {
-                    VcdValue::Bit(b'x')
+                    self.initial_value_at(sig_idx)
                 };
                 (boundaries[i], boundaries[i+1], boundary_ts[i], boundary_ts[i] + rewound[i], Some(seed))
             })

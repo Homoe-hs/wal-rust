@@ -206,14 +206,13 @@ fn op_at(args: &[Value], env: &mut Environment, _eval: &mut Evaluator) -> Result
             ]))),
             None => {
                 // target precedes the first change: report the INITIAL held
-                // value instead of silently folding to (0 0) (feedback round:
-                // "at 恒 (0 0)" is misleading); no changes at all → error.
-                match timed.first() {
-                    Some((t0, sv0)) => Ok(Value::List(WList::from_vec(vec![
-                        Value::Int(*t0 as i64), scalar_to_wal(sv0),
-                    ]))),
-                    None => Err(format!("at: signal '{}' has no change points", sig)),
-                }
+                // value at time 0 (the $dumpvars snapshot, else x) — the value
+                // held from the start of the timeline (feedback round B5:
+                // "at 恒 (0 0)"/first-change answers were both misleading).
+                let init_sv = tr.signal_value(&sig, 0).unwrap_or_else(|_| ScalarValue::Bit(b'x'));
+                Ok(Value::List(WList::from_vec(vec![
+                    Value::Int(0), scalar_to_wal(&init_sv),
+                ])))
             }
         }
     })

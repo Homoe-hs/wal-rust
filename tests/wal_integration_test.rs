@@ -568,3 +568,55 @@ fn test_compound_is_x_preserved() {
     assert_eq!(eval.eval("(count (&& (rising \"t.en\") (is-x \"t.v\")))").unwrap(), Value::Int(1));
     let _ = std::fs::remove_file(&p);
 }
+
+/// $dumpvars initial snapshot (T0 = 第 4 轮 152GB round §8.4 #1 / B5 / B11):
+/// the values written in the $dumpvars block are the values held at t0 —
+/// get@0 reads them, (at sig 0) returns (0 snapshot), and is-x does NOT treat
+/// the snapshot region as x.
+#[test]
+fn test_dumpvars_initial_snapshot() {
+    use wal_rust::wal::eval::Evaluator;
+    use wal_rust::wal::ast::{Value, WList};
+    let dir = std::env::temp_dir();
+    let p = dir.join(format!("wal_dumpvars_{}.vcd", std::process::id()));
+    std::fs::write(&p, "$timescale 1ns $end\n\
+$scope module t $end\n\
+$var wire 8 ! v [7:0] $end\n\
+$var wire 1 \" rst $end\n\
+$enddefinitions $end\n\
+$dumpvars\n\
+b00001111 !\n\
+1\"\n\
+$end\n\
+#0\n\
+#10\n\
+b10101010 !\n\
+#20\n\
+b00000000 !\n\
+0\"\n\
+#30\n\
+b11110000 !\n\
+$end\n").unwrap();
+    let mut eval = Evaluator::new();
+    eval.load_trace(&p.to_string_lossy(), "test").unwrap();
+
+    // get@0 = snapshot value (was 'x' before the fix)
+    assert_eq!(eval.eval("(at \"t.v\" 0)").unwrap(), Value::List(WList::from_vec(vec![
+        Value::Int(0), Value::Int(15),
+    ])));
+    assert_eq!(eval.eval("(at \"t.rst\" 0)").unwrap(), Value::List(WList::from_vec(vec![
+        Value::Int(0), Value::Int(1),
+    ])));
+    // t before the first change: still the initial held value
+    assert_eq!(eval.eval("(at \"t.v\" 5)").unwrap(), Value::List(WList::from_vec(vec![
+        Value::Int(0), Value::Int(15),
+    ])));
+    // after the first change
+    assert_eq!(eval.eval("(at \"t.v\" 15)").unwrap(), Value::List(WList::from_vec(vec![
+        Value::Int(10), Value::Int(170),
+    ])));
+    // snapshot region is NOT x
+    assert_eq!(eval.eval("(count/step (is-x \"t.v\"))").unwrap(), Value::Int(0));
+    // first change at #10 → x before it only when NO snapshot: here it is 15.
+    let _ = std::fs::remove_file(&p);
+}
