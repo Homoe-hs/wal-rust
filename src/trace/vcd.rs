@@ -73,14 +73,18 @@ fn vcd_from_states(st: u128, width: usize) -> VcdValue {
     if width == 1 { VcdValue::Bit(out[0]) } else { VcdValue::Vector(out) }
 }
 
-/// Column cache budget in bytes: WAL_COL_CACHE_MB env wins; default = half
-/// of available memory, capped at 64GiB (never OOM the machine).
+/// Column cache budget in bytes — OPT-IN via WAL_COL_CACHE_MB (MB). Default
+/// 0 keeps the load at the fast sampled-parse speed (no regression); with
+/// the env set the load pays the full-parse cost once and every covered
+/// query answers from memory (zero file re-scan).
 fn col_cache_budget() -> usize {
     if let Ok(mb) = std::env::var("WAL_COL_CACHE_MB") {
         if let Ok(v) = mb.trim().parse::<usize>() {
+            if v == 0 { return 0; }
             return v * 1024 * 1024;
         }
     }
+    0
     let mut avail_mb = 0usize;
     if let Ok(proc) = std::fs::read_to_string("/proc/meminfo") {
         for line in proc.lines() {
