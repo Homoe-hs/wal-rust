@@ -87,3 +87,23 @@ PASS-1b 重写为 **5 段管线**(仍单遍文件、并行分块):
 - **id 哈希碰撞**:块局部表按 hash 桶化,桶内做字节比对(与现 find_indices 一致)。
 - **VCD 方言**:Icarus 1-bit `#%` 行、$dumpvars、`r` 实数行 — 行分类表需覆盖,
   用现有语料(测试集 + 152GB dump 采样)回归。
+
+## 7. 追加调研:冷查询(磁盘重读)的治本方案(2026-09-07)
+
+现状量化: 58.7GB 每新信号首次扫描 ≈ 225s(冷盘)/ 82s(缓存热);CPU <5s,
+墙钟 = 磁盘重读 ×2(锚定扫描的 '#' 位置遍 + id 遍各扫一遍文件)。
+数据库侧对应方案(已核):
+
+| 方案 | 机制 | 代价 | 期望 |
+|---|---|---|---|
+| A. 双遍合一 | 单次遍历同时产出 '#' 位置与 id 命中(段内 memmem),磁盘读 ×1 | 小改;现有锚定扫描重排 | 冷查询 225s→~110s |
+| B. 预算化内存列缓存(推荐) | PASS-1b 反正全量解析,顺手打包 per-signal 变更列(delta 索引 + 打包值);按预算(如 min(24GB, 20%RAM))截停;缓存命中信号 O(C) 零文件读 | 加载期打包 CPU 少(已解析);预算内 RSS | 脚本内多数查询 ms;未缓存信号维持现状扫描 |
+| C. 列式 sidecar 文件 | 加载期写 `<wave>.walcol`(Arrow 风格: per-signal RLE + zone map + mmap 惰性读);查询只 mmap 目标列二分 | 一次写盘(≈加载时间);磁盘 +10-15%;新文件格式 | 任意查询毫秒级;150GB ≤60s 可达(但接近"转换",与"不做 convert"原则有张力) |
+| D. FST 优先工作流 | vcd2fst(外部)已零扫描;FST 查询本已毫秒级 | 无代码;依赖外部转换 | 内网 152GB 已走此路 |
+
+参考: DuckDB [Sorting on Insert / Row-Group 统计下推](https://duckdb.org.cn/2025/05/14/sorting-for-fast-selective-queries)、
+[Row-Group 存储](https://github.com/duckdb/duckdb/pull/1808) — 稀疏列 + 块级 min/max 裁剪;
+simdjson [stage1 结构索引/指针](https://deepwiki.com/abab2025/simdjson_simdjson_master_74bb7b2/3.1-two-stage-parsing-architecture)(A 的参照);
+Arrow/Parquet RLE+delta + [Lance 关于 Arrow 多 buffer 编码的批评](https://arxiv.org/pdf/2504.15247)(C 的设计注意点)。
+
+建议顺序: A(1-2h,收益 1.5x)→ B(半天,脚本场景体验质变)→ C(如需 150GB≤60s 硬指标)。
