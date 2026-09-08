@@ -143,6 +143,7 @@ pub enum Node {
 | P1 | 语义冻结 + 一致性矩阵(小/大×标量/向量/xz/glitch/alias × VCD/FST × 表达式集) | 矩阵跑通,旧行为全部对拍 |
 | P2 | `Column` 抽象 + `Trace::columns()`(VCD 单遍收集、FST 打包) | 同信号列 == 旧 change_points 语义(含 delta 折叠/初值快照) |
 | P3 | Expr 编译 + IntervalSweep;`count`/`find` 切换到引擎 | diff gate(scripts/diff_find.sh)ALL MATCH + 矩阵全绿 |
+| **P3 ✅ 已落地(0.12.x)** | **实现变体**: 不另写表达式编译器,而是"同一解释器 + 信号值覆盖"——`interval_scan` 收集引用信号,取变更点并集为边界,在边界处给 `op_get`/边沿谓词安装值覆盖后调用**现有解释器**求值;无边缘谓词按区间长度计入,含边缘谓词只计边界。`count`/`find` 回退前先试引擎。矩阵用例 `matrix_interval_engine_equals_oracle` 全绿 |
 | P4 | whenever/step 系列/at/change_points/edge 计数收敛到引擎 | 矩阵全绿;B4/B5/B6/B15 类病例如期望归零 |
 | P5 | 批量向量化 + SIMD 行解析 + 并行 | 150GB 任意表达式 ≤60s;RSS ≤3GB |
 | P6 | 删除旧 FindCondition 匹配路径(仅保留 CLI/导出视图) | 无死代码;矩阵绿 |
