@@ -192,6 +192,10 @@ fn queries(sigs: &[Sig], times: &[u64]) -> Vec<String> {
         qs.push(format!("(count (|| (rising \"{}\") (falling \"{}\")))", a, b));
         qs.push(format!("(count (&& (not (rising \"{}\")) (= (get \"{}\") 1)))", a, b));
         qs.push(format!("(find (&& (rising \"{}\") (= (get \"{}\") 1)))", a, b));
+        // 两侧都是信号的比较(只有引擎/逐拍能算, 无分解快路径)
+        qs.push(format!("(count (= (get \"{}\") (get \"{}\")))", a, b));
+        qs.push(format!("(count (!= (get \"{}\") (get \"{}\")))", a, b));
+        qs.push(format!("(find (= (get \"{}\") (get \"{}\")))", a, b));
     }
     qs
 }
