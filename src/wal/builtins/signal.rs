@@ -992,6 +992,7 @@ fn edge_falling(prev: Option<&ScalarValue>, cur: Option<&ScalarValue>) -> bool {
 
 fn op_rising(args: &[Value], env: &mut Environment, _eval: &mut Evaluator) -> Result<Value, String> {
     ensure_arity(args, 1)?;
+    if env.edge_off() { return Ok(Value::Bool(false)); }
     let name = extract_name(&args[0])?;
     // 区间扫描覆盖(统一引擎): 直接用边界处的 (prev, cur) 求值
     if let Some((prev, cur)) = env.sig_override_pair(&name) {
@@ -1020,6 +1021,7 @@ fn op_rising(args: &[Value], env: &mut Environment, _eval: &mut Evaluator) -> Re
 
 fn op_falling(args: &[Value], env: &mut Environment, _eval: &mut Evaluator) -> Result<Value, String> {
     ensure_arity(args, 1)?;
+    if env.edge_off() { return Ok(Value::Bool(false)); }
     let name = extract_name(&args[0])?;
     if let Some((prev, cur)) = env.sig_override_pair(&name) {
         return Ok(Value::Bool(edge_falling(prev.as_ref(), Some(&cur))));
@@ -1091,6 +1093,7 @@ fn op_is_z(args: &[Value], env: &mut Environment, _eval: &mut Evaluator) -> Resu
 
 fn op_changes(args: &[Value], env: &mut Environment, _eval: &mut Evaluator) -> Result<Value, String> {
     ensure_arity(args, 1)?;
+    if env.edge_off() { return Ok(Value::Bool(false)); }
     let name = extract_name(&args[0])?;
     if let Some((prev, cur)) = env.sig_override_pair(&name) {
         return Ok(Value::Bool(match prev {

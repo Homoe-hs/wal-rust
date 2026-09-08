@@ -21,6 +21,9 @@ pub struct Environment {
     /// 区间扫描引擎的信号值覆盖: name → (prev, cur)。op_get/边沿谓词优先读它,
     /// 从而在"变更点并集"边界上用同一解释器求值(统一引擎)。
     sig_override: Option<Rc<RefCell<std::collections::HashMap<String, (Option<crate::trace::ScalarValue>, crate::trace::ScalarValue)>>>>,
+    /// 区间扫描"区间内部"求值: 边沿谓词(rising/falling/changes)强制 false
+    /// (边界之间值恒定, 边沿不可能发生)。
+    edge_off: Option<Rc<std::cell::Cell<bool>>>,
 }
 
 impl Environment {
@@ -34,6 +37,7 @@ impl Environment {
             group: String::new(),
             traces: None,
             sig_override: None,
+            edge_off: None,
         }
     }
 
@@ -47,6 +51,7 @@ impl Environment {
             group: String::new(),
             traces: None,
             sig_override: None,
+            edge_off: None,
         }
     }
 
@@ -74,6 +79,38 @@ impl Environment {
         map: Rc<RefCell<std::collections::HashMap<String, (Option<crate::trace::ScalarValue>, crate::trace::ScalarValue)>>>,
     ) {
         self.sig_override = Some(map);
+    }
+
+    pub fn set_edge_off(&mut self, flag: Rc<std::cell::Cell<bool>>) {
+        self.edge_off = Some(flag);
+    }
+
+    /// 保存/恢复覆盖表与边沿开关(引擎可重入: 条件内部再触发 count/find 时,
+    /// 内层扫描不得永久清掉外层的覆盖状态)。
+    pub fn take_override_state(
+        &mut self,
+    ) -> (
+        Option<Rc<RefCell<std::collections::HashMap<String, (Option<crate::trace::ScalarValue>, crate::trace::ScalarValue)>>>>,
+        Option<Rc<std::cell::Cell<bool>>>,
+    ) {
+        (self.sig_override.take(), self.edge_off.take())
+    }
+
+    pub fn restore_override_state(
+        &mut self,
+        state: (
+            Option<Rc<RefCell<std::collections::HashMap<String, (Option<crate::trace::ScalarValue>, crate::trace::ScalarValue)>>>>,
+            Option<Rc<std::cell::Cell<bool>>>,
+        ),
+    ) {
+        self.sig_override = state.0;
+        self.edge_off = state.1;
+    }
+
+    /// 区间内部: 边沿谓词是否应强制 false(默认 false=正常求值)
+    pub fn edge_off(&self) -> bool {
+        if let Some(f) = &self.edge_off { return f.get(); }
+        self.parent.as_ref().map(|p| p.borrow().edge_off()).unwrap_or(false)
     }
 
     pub fn sig_override_pair(&self, name: &str) -> Option<(Option<crate::trace::ScalarValue>, crate::trace::ScalarValue)> {
@@ -197,6 +234,7 @@ impl Clone for Environment {
             group: self.group.clone(),
             traces: self.traces.clone(),
             sig_override: self.sig_override.clone(),
+            edge_off: self.edge_off.clone(),
         }
     }
 }

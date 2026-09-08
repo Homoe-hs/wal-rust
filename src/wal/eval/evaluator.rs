@@ -1233,9 +1233,11 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
         let sub1 = &lst[1];
         let sub2 = &lst[2];
         let mut idx_sets: Vec<Vec<usize>> = Vec::new();
+        let mut parsed_subs = 0usize;
 
         for sub in [sub1, sub2] {
             if let Some((sig, target, is_not)) = self.parse_simple_condition(sub) {
+                parsed_subs += 1;
                 let cond: FindCondition = if is_not {
                     if target <= 1 && target >= 0 { FindCondition::Neq(target as u8) }
                     else { FindCondition::NeqI64(target) }
@@ -1258,7 +1260,9 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
             }
         }
 
-        if idx_sets.is_empty() {
+        // 只要有任一侧无法解析(rising/falling/changes/嵌套表达式等),
+        // 就不能用"可解析部分的交集/并集"代替整条件——那会静默丢掉谓词。
+        if idx_sets.is_empty() || parsed_subs < 2 {
             return Ok(None);
         }
 
@@ -1792,6 +1796,10 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
     /// - 含边沿谓词: 边沿只可能在边界处为真 → 只计边界点。
     /// 返回 None 表示表达式未引用任何信号(交给逐拍回退或常量折叠)。
     fn interval_scan(&mut self, cond: &Value) -> Result<Option<(Vec<usize>, usize)>, String> {
+        // 调试/回归用逃生口: 禁用统一引擎 → 全部走逐拍路径(测试的独立 oracle)
+        if std::env::var_os("WAL_NO_ENGINE").is_some() {
+            return Ok(None);
+        }
         let mut names: Vec<String> = Vec::new();
         let mut has_edge = false;
         collect_cond_signals(cond, &mut names, &mut has_edge);
@@ -1844,7 +1852,10 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
                 }
             }
         }
+        let prev_state = self.env.take_override_state();
         self.env.set_sig_override(map.clone());
+        let edge_off = std::rc::Rc::new(std::cell::Cell::new(false));
+        self.env.set_edge_off(edge_off.clone());
 
         // 边界 = 0 ∪ 各信号变更点(idx>0)
         let mut bounds: Vec<usize> = vec![0];
@@ -1871,15 +1882,17 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
                     let mut m = map.borrow_mut();
                     for (si, (keys, cps, _)) in per_sig.iter().enumerate() {
                         while ptr[si] < cps.len() && cps[ptr[si]].0 < b { ptr[si] += 1; }
-                        if ptr[si] < cps.len() && cps[ptr[si]].0 == b {
-                            let newv = cps[ptr[si]].1.clone();
-                            for k in keys {
-                                let e = m.get_mut(k).unwrap();
-                                e.0 = Some(e.1.clone());
-                                e.1 = newv.clone();
-                            }
-                            ptr[si] += 1;
+                        let changed = ptr[si] < cps.len() && cps[ptr[si]].0 == b;
+                        let newv = if changed { Some(cps[ptr[si]].1.clone()) } else { None };
+                        for k in keys {
+                            let e = m.get_mut(k).unwrap();
+                            // 每个边界都要把 prev 推进到"上一索引的值": 信号在 b 处
+                            // 不变时 prev 必须等于 cur,否则边沿谓词会在"别的信号引发的
+                            // 边界"上误报(prev 停在上一次自身变化处)。
+                            e.0 = Some(e.1.clone());
+                            if let Some(nv) = &newv { e.1 = nv.clone(); }
                         }
+                        if changed { ptr[si] += 1; }
                     }
                 }
                 if let Ok(mut t) = self.traces.write() {
@@ -1888,23 +1901,38 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
                     }
                 }
                 let truthy = self.eval_value(cond.clone())?.is_truthy();
-                if truthy {
-                    if has_edge {
+                let next = bounds.get(bi + 1).copied().unwrap_or(max_index + 1);
+                if has_edge {
+                    // 边沿谓词只在边界那一刻可能为真;区间内部值恒定,边沿必为 false。
+                    // 混合条件(如 (|| (rising clk) (= (get d) 3)))的"电平部分"
+                    // 在整段区间内保持为真,必须按区间长度累加,否则漏计区间内部索引。
+                    let interior = if next > b + 1 {
+                        edge_off.set(true);
+                        let v = self.eval_value(cond.clone()).map(|v| v.is_truthy());
+                        edge_off.set(false);
+                        v?
+                    } else {
+                        false
+                    };
+                    if truthy {
                         count += 1;
                         indices.push(b);
-                    } else {
-                        let next = bounds.get(bi + 1).copied().unwrap_or(max_index + 1);
-                        count += next - b;
-                        indices.extend(b..next);
                     }
+                    if interior {
+                        count += next - b - 1;
+                        indices.extend((b + 1)..next);
+                    }
+                } else if truthy {
+                    count += next - b;
+                    indices.extend(b..next);
                 }
             }
             Ok(())
         })();
 
-        // 清理: 卸载覆盖表 + 恢复进入时的游标(查询不污染 INDEX 的约定)
-        self.env.set_sig_override(std::rc::Rc::new(std::cell::RefCell::new(
-            std::collections::HashMap::new())));
+        // 清理: 恢复进入时的覆盖状态 + 游标(查询不污染 INDEX/外层扫描的约定)
+        edge_off.set(false);
+        self.env.restore_override_state(prev_state);
         if let Ok(mut t) = self.traces.write() {
             for (tid, idx) in &saved {
                 let _ = t.set_index(tid, *idx);

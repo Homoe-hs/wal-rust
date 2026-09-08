@@ -108,6 +108,29 @@ pub enum Node {
 成本 **O(变更点并集 × E)** ——稀疏信号 C ≪ T;稠密(clk 级)退化为 O(T×E)
 但每拍只做常数级节点求值,无解释器/环境开销。**快路径 = 单列特例**,自然消失。
 
+#### 边界处求值的三条硬约束(0.12.x 实测踩坑记录)
+
+1. **每个边界都要推进 `prev`**。覆盖表存 `(prev, cur)`;`cur` 只在信号自身
+   变更处更新,但 `prev` 必须在**每个**边界先写成"上一索引的 `cur`"。
+   否则 `(rising a)` 会在"由 b 的变化引入的边界"上拿陈旧 `prev` 误报
+   (经典查询 `(count (&& (rising clk) (= (get state) 3)))` 过计数)。
+2. **区间内部边沿恒为假**。边界之间各信号值恒定 ⇒ 边沿谓词只可能在边界为真。
+   混合条件(`(|| (rising c) (= (get d) 3))`)的**电平部分**在整段区间内保持为真,
+   必须按区间长度累加;只计边界会漏计区间内部索引。
+   实现:区间内部用 `edge_off` 标志把 rising/falling/changes 强制 false 再求值一次,
+   命中则 `count += next - b - 1` / `find` 展开 `(b+1)..next`。
+3. **分解优化不得丢谓词**。`(&& ...)`/`(|| ...)` 的"只取可解析子条件"优化
+   (count 的 `decompose_and_count`、find 的 `decompose_and_find_indices`)
+   必须对**无法解析的子条件直接放弃分解**;否则 `(find (&& (rising c) (= (get d) 3)))`
+   会静默返回电平段。count 侧靠 `parse_edge_condition` 覆盖边沿谓词,
+   find 侧不再分解含边沿谓词的条件(交给引擎)。
+
+#### 独立 oracle:`WAL_NO_ENGINE=1`
+
+引擎与"逐拍路径"若共享同一套实现,对拍就是自证。`WAL_NO_ENGINE=1` 让
+`interval_scan` 直接返回 `None`(全部走纯逐拍),回归矩阵在**子进程**里用它做
+独立 oracle(`matrix_engine_matches_step_oracle_subprocess`,22 个条件 × count/find)。
+
 ### 向量化(P5,后续深入)
 
 - 边界批量:一次取 V=4096 个边界,Cur 变为 V 宽小列,节点求值 SIMD
@@ -144,7 +167,7 @@ pub enum Node {
 | P2 | `Column` 抽象 + `Trace::columns()`(VCD 单遍收集、FST 打包) | 同信号列 == 旧 change_points 语义(含 delta 折叠/初值快照) |
 | P3 | Expr 编译 + IntervalSweep;`count`/`find` 切换到引擎 | diff gate(scripts/diff_find.sh)ALL MATCH + 矩阵全绿 |
 | **P3 ✅ 已落地(0.12.x)** | **实现变体**: 不另写表达式编译器,而是"同一解释器 + 信号值覆盖"——`interval_scan` 收集引用信号,取变更点并集为边界,在边界处给 `op_get`/边沿谓词安装值覆盖后调用**现有解释器**求值;无边缘谓词按区间长度计入,含边缘谓词只计边界。`count`/`find` 回退前先试引擎。矩阵用例 `matrix_interval_engine_equals_oracle` 全绿 |
-| P4 | whenever/step 系列/at/change_points/edge 计数收敛到引擎 | 矩阵全绿;B4/B5/B6/B15 类病例如期望归零 |
+| **P4 ✅ 已落地(0.12.x)** | whenever/`count/step`/`find/step`/`at` 收敛到引擎(count/find/whenever/step 四个入口同一实现) | 矩阵 20/20 全绿(含子进程独立 oracle) |
 | P5 | 批量向量化 + SIMD 行解析 + 并行 | 150GB 任意表达式 ≤60s;RSS ≤3GB |
 | P6 | 删除旧 FindCondition 匹配路径(仅保留 CLI/导出视图) | 无死代码;矩阵绿 |
 

@@ -24,3 +24,12 @@ wal-rust
 # local tooling (zig, caches)
 .tools/
 bench/data/
+
+# 跨进程列缓存(WAL_CACHE=auto 时在 CWD 生成)
+.wal-rust-cache/
+# 本地调试/实验产物
+_dbg/
+_logs/
+exp/
+scratch_mt/
+_*_sim.log

@@ -13,6 +13,7 @@ target/release/wal-rust run script.wal -l file  # run script
 target/release/wal-rust repl        # interactive REPL
 test_samples/run_tests.sh           # WAL script test runner
 bash scripts/diff_find.sh .tools/wal-rust.old target/release/wal-rust   # find semantic diff gate
+WAL_NO_ENGINE=1 target/release/wal-rust '(count (&& (rising "c") (= (get "d") 3)))' -l x.vcd  # 禁用统一引擎(纯逐拍)= 独立 oracle
 ```
 
 ## CLI input auto-detect
@@ -59,9 +60,12 @@ Flags: `-l <waveform>` (repeatable), `-c <code>` (inline override), `--halt-on-e
 | `count` fast path | `(= (get "sig") 1)` uses `find_indices` directly |
 | `count &&` decomposition | `(count (&& a b) ...)` → `BatchEntry::And` → single pass |
 | `whenever` do decomposition | → independent `count` calls |
+| **统一区间扫描引擎** | `interval_scan`(变更点并集边界 + 解释器值覆盖): count/find/whenever/count/step 同一实现;含边沿谓词时"边界真值 + 区间内部真值(边沿强制 false)"两段计入 |
+| **纯逐拍 oracle** | `WAL_NO_ENGINE=1` 让引擎直接返回 None → 全部走逐拍;矩阵在子进程里用它做独立对拍 |
 
-> 设计方向(0.12.x): 统一查询引擎(变更点并集区间扫描,消灭快/慢路径分叉)为最终形态;
-> 当前 count/find 的"字面量快路径 + 逐拍回退"是过渡期实现,新引擎落地后移除(docs/query-engine-design.md)。
+> 统一查询引擎(变更点并集区间扫描)已落地(docs/query-engine-design.md §IntervalSweep):
+> 三个硬约束——①每个边界都要推进 prev ②区间内部边沿恒假、电平按区间长累加
+> ③&&/|| 分解不得丢无法解析的谓词。矩阵 `tests/regression_matrix.rs` 是语义冻结闸。
 
 ## Language notes (0.12.x)
 

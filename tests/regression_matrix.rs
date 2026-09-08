@@ -230,7 +230,7 @@ fn matrix_vcd_fst_consistency() {
     use wal_rust::fst::{FstOptions, FstWriter, ScopeType, VarType};
     // 同一波形: d = 2,3,15,255,2 (8bit); clk 0/1 交替; vec 含 x
     let vcd = tmp("both", "$timescale 1ns $end\n$scope module t $end\n$var wire 8 ! d $end\n$var wire 1 \" clk $end\n$var wire 4 # vec $end\n$enddefinitions $end\n\
-#0\nb00000010 !\n0\"\nb00x1 #\n#10\nb00000011 !\n1\"\nb0101 #\n#20\nb00001111 !\n0\"\nb0000 #\n#30\nb11111111 !\n1\"\nb0011 #\n#40\nb00000010 !\n0\"\nb0101 #\n");
+#0\nb00000010 !\n0\"\nb00x1 #\n#10\nb00000011 !\n1\"\nb0101 #\n#20\nb00001111 !\n0\"\nb0000 #\n#30\nb11111111 !\n1\"\nb0011 #\n#40\nb00000010 !\n0\"\nb0101 #\n#50\n1\"\n");
     let fst = std::env::temp_dir().join(format!("wal_reg_both_{}.fst", std::process::id()));
     {
         let mut w = FstWriter::create(&fst, FstOptions::default()).unwrap();
@@ -239,10 +239,10 @@ fn matrix_vcd_fst_consistency() {
         let clk = w.create_var("clk", 1, VarType::VcdWire);
         let vec = w.create_var("vec", 4, VarType::VcdWire);
         w.pop_scope();
-        let dv: [&[u8]; 5] = [b"00000010", b"00000011", b"00001111", b"11111111", b"00000010"];
-        let cv: [&[u8]; 5] = [b"0", b"1", b"0", b"1", b"0"];
-        let vv: [&[u8]; 5] = [b"00x1", b"0101", b"0000", b"0011", b"0101"];
-        for i in 0..5u64 {
+        let dv: [&[u8]; 6] = [b"00000010", b"00000011", b"00001111", b"11111111", b"00000010", b"00000010"];
+        let cv: [&[u8]; 6] = [b"0", b"1", b"0", b"1", b"0", b"1"];
+        let vv: [&[u8]; 6] = [b"00x1", b"0101", b"0000", b"0011", b"0101", b"0101"];
+        for i in 0..6u64 {
             w.emit_time_change(i * 10);
             w.emit_value_change(d, dv[i as usize]);
             w.emit_value_change(clk, cv[i as usize]);
@@ -270,6 +270,13 @@ fn matrix_vcd_fst_consistency() {
         "(at \"vec\" 5)",
         "(length (find (&& (> (get \"d\") 2) (< (get \"d\") 200))))",
         "(count/step (= (get \"d\") 15))",
+        // 混合条件 + "别的信号引入的边界"(idx5 只有 clk 变化)
+        "(count (&& (rising \"clk\") (= (get \"d\") 2)))",
+        "(count (&& (rising \"clk\") (= (get \"vec\") 5)))",
+        "(count (&& (falling \"clk\") (= (get \"d\") 2)))",
+        "(count (&& (not (rising \"clk\")) (= (get \"d\") 2)))",
+        "(count (|| (rising \"clk\") (= (get \"d\") 15)))",
+        "(find (&& (rising \"clk\") (= (get \"vec\") 5)))",
     ];
     for q in queries {
         let a = ev(&vcd, q);
@@ -376,4 +383,95 @@ fn matrix_vcd_fst_glitch_and_wide() {
         assert_eq!(ev(&vcd, q), ev(&fst, q), "VCD/FST divergence on {}", q);
     }
     let _ = std::fs::remove_file(&fst);
+}
+
+/// 20) 统一引擎: 边沿谓词必须在"任何边界"上比较相邻索引值。
+///     回归点: prev 只在信号自身变化处推进 → 别的信号引发的边界上
+///     (rising s) 会用陈旧 prev 误报(&& (rising clk) (= (get state) 3) 类查询过计数)。
+///     同时验证混合条件(边沿∨电平)在区间内部按长度累加。
+#[test]
+fn matrix_engine_edge_prev_advances_every_boundary() {
+    let p = tmp("prevb", "$timescale 1ns $end\n$scope module t $end\n$var wire 8 ! d $end\n$var wire 1 \" c $end\n$enddefinitions $end\n\
+$dumpvars\nb00000011 !\n0\"\n$end\n#0\n#10\n1\"\n#20\n#30\nb00001111 !\n#40\n");
+    let e = |c: &str| eval_with(&p, c);
+    let ints = |v: Vec<i64>| Value::List(WList::from_vec(v.into_iter().map(Value::Int).collect()));
+    // d: idx0..4 = 3,3,3,15,15   c: 0,1,1,1,1 → rising 仅在 idx1
+    // 边界 = {0,1,3}; idx3 由 d 的变化引入, 此时 c 未变化 → 不得报 rising
+    assert_eq!(e("(count (&& (rising \"t.c\") (= (get \"t.d\") 15)))"), Value::Int(0),
+        "idx3 边界由 d 引入, c 未变化 → 不得用陈旧 prev 报 rising");
+    assert_eq!(e("(find (&& (rising \"t.c\") (= (get \"t.d\") 15)))"), ints(vec![]));
+    assert_eq!(e("(count (&& (rising \"t.c\") (= (get \"t.d\") 3)))"), Value::Int(1));
+    assert_eq!(e("(find (&& (rising \"t.c\") (= (get \"t.d\") 3)))"), ints(vec![1]));
+    // 混合条件: (|| (rising c) (= (get d) 3)) 的真值集 = {0,1,2}
+    assert_eq!(e("(count (|| (rising \"t.c\") (= (get \"t.d\") 3)))"), Value::Int(3));
+    assert_eq!(e("(find (|| (rising \"t.c\") (= (get \"t.d\") 3)))"), ints(vec![0, 1, 2]),
+        "区间内部电平为真时, find 必须展开区间内全部索引");
+    assert_eq!(e("(count (&& (not (rising \"t.c\")) (= (get \"t.d\") 3)))"), Value::Int(2));
+    assert_eq!(e("(find (&& (not (rising \"t.c\")) (= (get \"t.d\") 3)))"), ints(vec![0, 2]));
+}
+
+/// 21) find 的 (&& ...)/(|| ...) 分解不得丢弃无法解析的子条件。
+///     回归点: 只取"可解析部分"的交集 → (find (&& (rising c) (= (get d) 3)))
+///     曾返回电平段 (0 1 2) 而非 (1)。
+#[test]
+fn matrix_find_decomposition_no_predicate_drop() {
+    let p = tmp("fdrop", "$timescale 1ns $end\n$scope module t $end\n$var wire 8 ! d $end\n$var wire 1 \" c $end\n$enddefinitions $end\n\
+$dumpvars\nb00000011 !\n0\"\n$end\n#0\n#10\n1\"\n#20\n#30\nb00001111 !\n#40\n");
+    let e = |c: &str| eval_with(&p, c);
+    let ints = |v: Vec<i64>| Value::List(WList::from_vec(v.into_iter().map(Value::Int).collect()));
+    assert_eq!(e("(find (&& (rising \"t.c\") (= (get \"t.d\") 3)))"), ints(vec![1]));
+    assert_eq!(e("(find (|| (rising \"t.c\") (= (get \"t.d\") 3)))"), ints(vec![0, 1, 2]));
+    // 两个可解析子条件仍走分解(结果必须与语义一致)
+    assert_eq!(e("(find (&& (= (get \"t.d\") 3) (= (get \"t.c\") 1)))"), ints(vec![1, 2]));
+}
+
+fn run_cli(bin: &str, query: &str, vcd: &std::path::Path, no_engine: bool) -> String {
+    let mut cmd = std::process::Command::new(bin);
+    cmd.arg(query).arg("-l").arg(vcd);
+    if no_engine { cmd.env("WAL_NO_ENGINE", "1"); }
+    let out = cmd.output().expect("spawn wal-rust");
+    assert!(out.status.success(), "cli failed for {}: {}", query, String::from_utf8_lossy(&out.stderr));
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// 22) 独立 oracle: 子进程里用 WAL_NO_ENGINE 禁用统一引擎(纯逐拍路径),
+///     逐条件比对 count/find 输出。这条闸不依赖"引擎与逐拍共享的实现"。
+#[test]
+fn matrix_engine_matches_step_oracle_subprocess() {
+    let src = "$timescale 1ns $end\n$scope module t $end\n$var wire 8 ! d $end\n$var wire 1 \" c $end\n$var wire 1 # e $end\n$var wire 4 $ q $end\n$enddefinitions $end\n\
+$dumpvars\nb00000011 !\n0\"\n0#\nbxxxx $\n$end\n#0\n#10\n1\"\n#20\nb00001111 !\nb0011 $\n#30\n1#\n#40\n0\"\n#50\nb00000011 !\nbxx00 $\n#60\n0#\n";
+    let vcd = tmp("oracle", src);
+    let bin = env!("CARGO_BIN_EXE_wal-rust");
+    let conds = [
+        "(= (get \"t.d\") 3)",
+        "(!= (get \"t.d\") 3)",
+        "(not (= (get \"t.d\") 15))",
+        "(rising \"t.c\")",
+        "(falling \"t.c\")",
+        "(changes \"t.c\")",
+        "(rising \"t.e\")",
+        "(falling \"t.e\")",
+        "(is-x \"t.q\")",
+        "(changes \"t.q\")",
+        "(&& (rising \"t.c\") (= (get \"t.e\") 1))",
+        "(&& (rising \"t.c\") (= (get \"t.d\") 3))",
+        "(&& (rising \"t.e\") (= (get \"t.d\") 15))",
+        "(&& (rising \"t.e\") (falling \"t.c\"))",
+        "(&& (rising \"t.c\") (changes \"t.e\"))",
+        "(|| (rising \"t.c\") (= (get \"t.d\") 15))",
+        "(|| (rising \"t.c\") (= (get \"t.d\") 3))",
+        "(|| (changes \"t.e\") (falling \"t.c\"))",
+        "(|| (is-x \"t.q\") (= (get \"t.d\") 3))",
+        "(&& (is-x \"t.q\") (rising \"t.c\"))",
+        "(&& (not (rising \"t.c\")) (= (get \"t.d\") 3))",
+        "(&& (not (falling \"t.c\")) (is-z \"t.q\"))",
+    ];
+    for cond in conds {
+        for form in ["count", "find"] {
+            let q = format!("({} {})", form, cond);
+            let engine = run_cli(bin, &q, &vcd, false);
+            let step = run_cli(bin, &q, &vcd, true);
+            assert_eq!(engine, step, "engine 与纯逐拍 oracle 不一致: {}", q);
+        }
+    }
 }
