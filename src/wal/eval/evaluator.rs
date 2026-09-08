@@ -1793,8 +1793,10 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
     /// 边界之间所有被引用信号的值恒定,因此用**同一个解释器** + 信号值覆盖
     /// (op_get / 边沿谓词读覆盖表)在边界处求值即可。
     /// - 不含边沿谓词(rising/falling/changes): 条件在区间内恒定 → 按区间长度计入;
-    /// - 含边沿谓词: 边沿只可能在边界处为真 → 只计边界点。
-    /// 返回 None 表示表达式未引用任何信号(交给逐拍回退或常量折叠)。
+    /// - 含边沿谓词: 边界处按正常语义求值(计 1);区间内部把边沿谓词强制为 false
+    ///   再求值一次——电平部分若仍为真,按区间长度 -1 累加(否则漏计区间内部索引)。
+    /// 返回 None 表示表达式未引用任何信号,或引用了随索引变化的 INDEX/TS
+    /// (区间内部不恒定,交给逐拍回退)。
     fn interval_scan(&mut self, cond: &Value) -> Result<Option<(Vec<usize>, usize)>, String> {
         // 调试/回归用逃生口: 禁用统一引擎 → 全部走逐拍路径(测试的独立 oracle)
         if std::env::var_os("WAL_NO_ENGINE").is_some() {
