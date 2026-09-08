@@ -1802,8 +1802,11 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
         }
         let mut names: Vec<String> = Vec::new();
         let mut has_edge = false;
-        collect_cond_signals(cond, &mut names, &mut has_edge);
-        if names.is_empty() {
+        let mut idx_dep = false;
+        collect_cond_signals(cond, &mut names, &mut has_edge, &mut idx_dep);
+        // INDEX/TS 在区间内部会变化 → 引擎的"边界求值 + 区间常量"假设不成立,
+        // 交给逐拍路径(此类条件本身就必须 O(索引数))。
+        if names.is_empty() || idx_dep {
             return Ok(None);
         }
 
@@ -2496,7 +2499,15 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
 /// 收集条件表达式中引用的信号名 + 是否含边沿谓词。
 /// 识别形式: (get "name") / (get sym) / (rising|falling|changes|is-x|is-z "name"|sym)。
 /// 其余符号若绑定为字符串也按信号名处理(resolve_cond_names 之前调用)。
-fn collect_cond_signals(expr: &Value, out: &mut Vec<String>, has_edge: &mut bool) {
+/// 收集条件表达式引用的信号名。
+/// `idx_dep`: 表达式引用了随"索引"变化的伪信号(INDEX/TS)——此类条件
+/// 在区间内部并非恒定,区间扫描不适用(必须逐索引求值)。
+fn collect_cond_signals(expr: &Value, out: &mut Vec<String>, has_edge: &mut bool, idx_dep: &mut bool) {
+    if let Value::Symbol(sym) = expr {
+        if matches!(sym.name.as_str(), "INDEX" | "TS") {
+            *idx_dep = true;
+        }
+    }
     if let Value::List(lst) = expr {
         if lst.len() >= 2 {
             if let Value::Symbol(op) = &lst[0] {
@@ -2524,7 +2535,7 @@ fn collect_cond_signals(expr: &Value, out: &mut Vec<String>, has_edge: &mut bool
             }
         }
         for item in lst.iter() {
-            collect_cond_signals(item, out, has_edge);
+            collect_cond_signals(item, out, has_edge, idx_dep);
         }
     }
 }

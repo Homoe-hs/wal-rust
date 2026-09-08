@@ -64,8 +64,8 @@ Flags: `-l <waveform>` (repeatable), `-c <code>` (inline override), `--halt-on-e
 | **纯逐拍 oracle** | `WAL_NO_ENGINE=1` 让引擎直接返回 None → 全部走逐拍;矩阵在子进程里用它做独立对拍 |
 
 > 统一查询引擎(变更点并集区间扫描)已落地(docs/query-engine-design.md §IntervalSweep):
-> 三个硬约束——①每个边界都要推进 prev ②区间内部边沿恒假、电平按区间长累加
-> ③&&/|| 分解不得丢无法解析的谓词。矩阵 `tests/regression_matrix.rs` 是语义冻结闸。
+> 四条硬约束——①每个边界都要推进 prev ②区间内部边沿恒假、电平按区间长累加
+> ③&&/|| 分解不得丢无法解析的谓词 ④引用 INDEX/TS 的条件必须放弃引擎(走逐拍)。矩阵 `tests/regression_matrix.rs` 是语义冻结闸。
 
 ## Language notes (0.12.x)
 

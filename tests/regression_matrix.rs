@@ -408,6 +408,9 @@ $dumpvars\nb00000011 !\n0\"\n$end\n#0\n#10\n1\"\n#20\n#30\nb00001111 !\n#40\n");
         "区间内部电平为真时, find 必须展开区间内全部索引");
     assert_eq!(e("(count (&& (not (rising \"t.c\")) (= (get \"t.d\") 3)))"), Value::Int(2));
     assert_eq!(e("(find (&& (not (rising \"t.c\")) (= (get \"t.d\") 3)))"), ints(vec![0, 2]));
+    // INDEX 依赖: 区间扫描不适用(区间内部 INDEX 会变), 结果必须与逐拍一致
+    assert_eq!(e("(count (&& (= (get \"t.d\") 3) (= INDEX 2)))"), Value::Int(1));
+    assert_eq!(e("(find (&& (= (get \"t.c\") 1) (= INDEX 3)))"), ints(vec![3]));
 }
 
 /// 21) find 的 (&& ...)/(|| ...) 分解不得丢弃无法解析的子条件。
@@ -465,6 +468,11 @@ $dumpvars\nb00000011 !\n0\"\n0#\nbxxxx $\n$end\n#0\n#10\n1\"\n#20\nb00001111 !\n
         "(&& (is-x \"t.q\") (rising \"t.c\"))",
         "(&& (not (rising \"t.c\")) (= (get \"t.d\") 3))",
         "(&& (not (falling \"t.c\")) (is-z \"t.q\"))",
+        // INDEX/TS 在区间内部会变化 → 引擎必须放弃(逐拍)
+        "(&& (= (get \"t.d\") 3) (= INDEX 2))",
+        "(|| (= (get \"t.d\") 3) (= INDEX 5))",
+        "(&& (rising \"t.c\") (= INDEX 1))",
+        "(&& (= (get \"t.d\") 15) (= TS 30))",
     ];
     for cond in conds {
         for form in ["count", "find"] {
