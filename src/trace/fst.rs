@@ -16,6 +16,32 @@ pub struct FstTrace {
     timestamps: Vec<u64>,
     name_to_ref: HashMap<String, SignalRef>,
     current_index: usize,
+    /// 首次解码失败的说明(文件损坏/编码不支持);查询路径可能吞掉局部 Err,
+    /// 顶层用 fatal_error() 兜底上报,避免"看似正常的错误结果"。
+    fatal: RefCell<Option<String>>,
+}
+
+/// 运行 wellen 的解码调用:捕获 panic 并**抑制其默认打印**
+/// (默认 hook 会把 Rust panic 文本直接吐到 stderr,对内网用户像崩溃)。
+fn quiet_guard<R>(what: &str, f: impl FnOnce() -> R) -> Result<R, String> {
+    let prev_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+    std::panic::set_hook(prev_hook);
+    result.map_err(|payload| {
+        let msg = if let Some(s) = payload.downcast_ref::<&str>() {
+            (*s).to_string()
+        } else if let Some(s) = payload.downcast_ref::<String>() {
+            s.clone()
+        } else {
+            "unknown decoder panic".to_string()
+        };
+        format!(
+            "{}: {}。该 FST 值无法解码(文件可能已损坏:常见于 vcd2fst 处理含\
+'向量单字符值'(如 0!/1!)的 VCD 时写出坏文件;请把向量值写成 b<bits> 形式后重新生成)",
+            what, msg
+        )
+    })
 }
 
 
@@ -144,9 +170,8 @@ impl FstTrace {
         let filename = path.to_string_lossy().to_string();
         // wellen panics on some foreign formats (e.g. FSDB with a "similar
         // magic"); turn the abort into a clean error instead of crashing.
-        let wf = std::panic::catch_unwind(|| wellen::simple::read(path))
-            .map_err(|_| format!(
-                "Failed to read FST file {}: unsupported or corrupt waveform (parser panic)", filename))?
+        let wf = quiet_guard(&format!("读取 FST 文件 {}", filename), || wellen::simple::read(path))
+            .map_err(|e| format!("Failed to read FST file {}: {}", filename, e))?
             .map_err(|e| format!("Failed to read FST file {}: {}", filename, e))?;
 
         let timestamps: Vec<u64> = wf.time_table().to_vec();
@@ -165,6 +190,7 @@ impl FstTrace {
             timestamps,
             name_to_ref,
             current_index: 0,
+            fatal: RefCell::new(None),
         })
     }
 
@@ -185,11 +211,19 @@ impl FstTrace {
         let mut wf = self.wf.borrow_mut();
         if wf.get_signal(sig_ref).is_none() {
             // wellen may panic on foreign/odd value encodings (FST write
-            // variants); turn that into a clean query-time error.
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                wf.load_signals(&[sig_ref]);
-            }))
-            .map_err(|_| format!("FST signal data decode failed (unsupported encoding): {}", name))?;
+            // variants); turn that into a clean query-time error and remember it
+            // (查询路径可能吞掉局部 Err,顶层用 fatal_error() 兜底)。
+            let r = quiet_guard(
+                &format!("FST 信号 {} 的数据", name),
+                || wf.load_signals(&[sig_ref]),
+            );
+            if let Err(e) = r {
+                let mut slot = self.fatal.borrow_mut();
+                if slot.is_none() {
+                    *slot = Some(e.clone());
+                }
+                return Err(e);
+            }
         }
         Ok(sig_ref)
     }
@@ -197,6 +231,10 @@ impl FstTrace {
 
 impl Trace for FstTrace {
     fn id(&self) -> &TraceId { &self.id }
+
+    fn fatal_error(&self) -> Option<String> {
+        self.fatal.borrow().clone()
+    }
     fn filename(&self) -> &str { &self.filename }
 
     fn step(&mut self, steps: usize) -> Result<(), String> {

@@ -39,7 +39,21 @@ impl Evaluator {
     pub fn eval(&mut self, source: &str) -> Result<Value, String> {
         let mut parser = crate::wal::WalParser::new()?;
         let value = parser.parse_expr(source)?;
-        self.eval_value(value)
+        let result = self.eval_value(value);
+        // 顶层兜底: 解码失败可能被查询快路径的 .ok() 吞掉,给出"看似正常"的 0;
+        // 这里统一上报(并把误导性的"signal not found"替换成真实原因)。
+        self.report_fatal_trace_error()?;
+        result
+    }
+
+    /// 若任一 trace 记录了致命解码错误(文件损坏/编码不支持)→ 返回该错误。
+    pub fn report_fatal_trace_error(&self) -> Result<(), String> {
+        if let Ok(t) = self.traces.read() {
+            if let Some(e) = t.fatal_error() {
+                return Err(e);
+            }
+        }
+        Ok(())
     }
 }
 

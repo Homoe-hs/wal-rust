@@ -10,6 +10,16 @@ pub struct TraceContainer {
 }
 
 impl TraceContainer {
+    /// 任一条 trace 报告致命解码错误 → 上报(见 Trace::fatal_error)
+    pub fn fatal_error(&self) -> Option<String> {
+        for tr in self.traces.values() {
+            if let Some(e) = tr.fatal_error() {
+                return Some(e);
+            }
+        }
+        None
+    }
+
     pub fn new() -> Self {
         Self {
             traces: HashMap::new(),

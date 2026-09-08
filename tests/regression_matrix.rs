@@ -483,3 +483,37 @@ $dumpvars\nb00000011 !\n0\"\n0#\nbxxxx $\n$end\n#0\n#10\n1\"\n#20\nb00001111 !\n
         }
     }
 }
+
+/// 23) 损坏 FST(值含非法字符,如 vcd2fst 处理"向量单字符值"写出的坏文件):
+///     必须给出可读错误(含修复提示),不得 panic、不得静默返回 0。
+#[test]
+fn matrix_fst_corrupt_value_clean_error() {
+    use wal_rust::fst::{FstOptions, FstWriter, ScopeType, VarType};
+    let fst = std::env::temp_dir().join(format!("wal_reg_corrupt_{}.fst", std::process::id()));
+    {
+        let mut w = FstWriter::create(&fst, FstOptions::default()).unwrap();
+        w.push_scope("t", ScopeType::VcdModule);
+        let d = w.create_var("d", 8, VarType::VcdWire);
+        let ok = w.create_var("c", 1, VarType::VcdWire);
+        w.pop_scope();
+        w.emit_time_change(0);
+        w.emit_value_change(d, b"0000zz!!"); // 非法字符 → wellen 解码 panic
+        w.emit_value_change(ok, b"0");
+        w.emit_time_change(10);
+        w.emit_value_change(d, b"00000001");
+        w.emit_value_change(ok, b"1");
+        w.close().unwrap();
+    }
+    let mut e = Evaluator::new();
+    e.load_trace(&fst.to_string_lossy(), "t").unwrap();
+    // 健康信号仍可查(不因别的信号损坏而误报)
+    assert_eq!(e.eval("(count (= (get \"t.c\") 1))").unwrap(), Value::Int(1));
+    for q in ["(get \"t.d\")", "(count (= (get \"t.d\") 1))", "(count/step (is-x \"t.d\"))", "(at \"t.d\" 1)"] {
+        let r = e.eval(q);
+        assert!(r.is_err(), "损坏 FST 必须报错, {} 得到 {:?}", q, r);
+        let msg = r.unwrap_err();
+        assert!(msg.contains("无法解码") || msg.contains("decode"),
+            "错误信息应说明解码失败: {}", msg);
+    }
+    let _ = std::fs::remove_file(&fst);
+}

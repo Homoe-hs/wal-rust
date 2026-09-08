@@ -89,3 +89,44 @@ dump-trace 是"当前游标处虚拟信号快照"导出器;此前 `$var` 位宽�
 - 说明: 非全轴导出(合成 #1 #2 #3 刻度 + 首值快照)属该工具既有定位,未改。
 
 (本地: al45c.vcd 上 dump-trace → $var reg 45 ×2,7400 条变化行。)
+
+## 内网 #1 续 · FST 向量 panic —— 已定位为**上游 vcd2fst 写出坏 FST**(v0.12.25)
+
+**复现(本机已完整复现)**
+
+```bash
+cat > tiny.vcd <<'V'
+$timescale 1ns $end
+$scope module t $end
+$var wire 8 ! d $end
+$upscope $end
+$enddefinitions $end
+#0
+0!          # ← 向量用单字符值(VCD 允许的简写)
+#10
+1!
+V
+vcd2fst -v tiny.vcd -f tiny.fst
+fst2vcd tiny.fst | grep b     # → b0!   defi !   (值里混进 VCD 文本/垃圾)
+```
+
+`fst2vcd` 自己也还原出垃圾,说明**文件已损坏**(vcd2fst 对"向量单字符值"
+的长度处理错误),不是 wal-rust 读错。wellen 在解码时 `panic!("Unexpected
+signal value: 0!   defi")`。
+
+**0.12.25 的产品行为**(此前:原始 panic 文本 + 误导性 "signal not found" +
+`count` 静默返回 0):
+
+```
+error: FST 信号 t.d 的数据: Unexpected signal value: 0!defi。该 FST 值无法解码
+(文件可能已损坏:常见于 vcd2fst 处理含'向量单字符值'(如 0!/1!)的 VCD 时写出坏文件;
+请把向量值写成 b<bits> 形式后重新生成)
+```
+
+- wellen 调用统一走 `quiet_guard`:捕获 panic 并**抑制默认 panic 打印**;
+- 失败记入 `FstTrace::fatal`,顶层 `Evaluator::eval` 统一上报
+  (查询快路径里的 `.ok()` 吞错不再能造成"看似正常的 0");
+- 健康信号不受影响(`(get "t.c")` 正常)。
+
+**给内网的绕过方法**:生成 VCD 时把向量写成 `b<bits>` 形式
+(`b00000001 !` 而不是 `1!`),或改用 VCD 直接喂给 wal-rust(我们只读波形)。

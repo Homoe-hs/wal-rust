@@ -53,6 +53,12 @@ pub trait Trace {
     /// Timescale exponent: the time unit is 10^n seconds (None if unknown).
     fn timescale_exp(&self) -> Option<i8>;
 
+    /// 致命解码错误(文件损坏/编码不支持)。一旦发生,任何"静默吞错"的查询路径
+    /// 都可能给出看似正常的错误结果(如 count=0);顶层求值结束前必须上报。
+    fn fatal_error(&self) -> Option<String> {
+        None
+    }
+
     /// Top-`k` signals by number of value changes. Default: per-signal
     /// change_points (fine for small signal sets); VCD overrides this with a
     /// single-pass counter so 90k-signal waves stay fast.
