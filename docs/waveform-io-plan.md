@@ -117,7 +117,9 @@ Arrow/Parquet RLE+delta + [Lance 关于 Arrow 多 buffer 编码的批评](https:
 不改变"VCD 是唯一真值来源"的原则,也不引入第二种波形格式。
 
 **方案**:
-- 位置: 默认 `./.wal-rust-cache/`(执行目录;可用 `WAL_CACHE_DIR` 覆盖;波形目录可写时也可选 `WAL_CACHE=beside`)。
+- 位置: 默认 **执行命令的当前目录** `./.wal-rust-cache/`(相对 CWD,可用 `WAL_CACHE_DIR` 覆盖)。
+  **绝不写在波形所在目录**——波形可能来自只读挂载/共享盘;缓存目录不可写时静默跳过,
+  查询结果不受影响。
 - 命名: `<wave_basename>.<size>.<mtime>.<format_version>.wcol`。
 - 内容(顺序读一次即得,无需解析):
   1. 头部: magic + 版本 + 波形 (size, mtime, 首尾 1MB 指纹);

@@ -1411,6 +1411,8 @@ fn cache_mode() -> CacheMode {
     }
 }
 
+/// 缓存目录: 默认 **CWD 相对** `./.wal-rust-cache`(执行命令的目录一定可写;
+/// 波形目录可能是只读挂载/共享盘, 因此绝不写在波形旁边)。`WAL_CACHE_DIR` 可覆盖。
 fn cache_dir() -> std::path::PathBuf {
     std::env::var_os("WAL_CACHE_DIR").map(std::path::PathBuf::from)
         .unwrap_or_else(|| std::path::PathBuf::from(".wal-rust-cache"))
@@ -2517,5 +2519,36 @@ $end\n").unwrap();
             (2, crate::trace::ScalarValue::Vector(b"1010".to_vec())),
             (3, crate::trace::ScalarValue::Vector(b"0000".to_vec())),
         ], "change_points must be per-index last values");
+    }
+}
+
+#[cfg(test)]
+mod cache_path_tests {
+    use super::*;
+
+    /// 缓存位置必须是"执行目录"(CWD 相对), 绝不落在波形目录里
+    /// (波形可能来自只读挂载; 用户明确要求写 CWD)。
+    #[test]
+    fn cache_dir_is_cwd_relative_and_keyed_by_basename_only() {
+        if std::env::var_os("WAL_CACHE_DIR").is_some() {
+            return; // 并发用例可能设置该变量, 跳过避免误判
+        }
+        let d = cache_dir();
+        assert!(!d.is_absolute(), "默认缓存目录必须是 CWD 相对路径: {:?}", d);
+        assert_eq!(d.file_name().and_then(|f| f.to_str()), Some(".wal-rust-cache"));
+
+        // 缓存文件名只含波形 basename(不含任何目录成分)
+        let dir = std::env::temp_dir().join(format!("wal_cache_path_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let wave = dir.join("wave.vcd");
+        std::fs::write(&wave, "x").unwrap();
+        if let Some(p) = cache_file_for(&wave) {
+            let name = p.file_name().unwrap().to_string_lossy().to_string();
+            assert!(name.starts_with("wave.vcd-"), "缓存名应只取 basename: {}", name);
+            assert!(!name.contains('/') && !name.contains('\\'));
+            assert!(p.parent().map(|q| q == cache_dir()).unwrap_or(false),
+                "缓存必须位于 cache_dir(): {:?}", p);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
