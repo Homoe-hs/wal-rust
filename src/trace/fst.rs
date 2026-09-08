@@ -120,7 +120,11 @@ fn find_cond_matches(
 impl FstTrace {
     pub fn load(path: &Path, id: TraceId) -> Result<Self, String> {
         let filename = path.to_string_lossy().to_string();
-        let wf = wellen::simple::read(path)
+        // wellen panics on some foreign formats (e.g. FSDB with a "similar
+        // magic"); turn the abort into a clean error instead of crashing.
+        let wf = std::panic::catch_unwind(|| wellen::simple::read(path))
+            .map_err(|_| format!(
+                "Failed to read FST file {}: unsupported or corrupt waveform (parser panic)", filename))?
             .map_err(|e| format!("Failed to read FST file {}: {}", filename, e))?;
 
         let timestamps: Vec<u64> = wf.time_table().to_vec();

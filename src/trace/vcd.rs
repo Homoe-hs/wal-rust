@@ -902,7 +902,10 @@ impl VcdTrace {
                     if !line.is_empty()
                         && line[0] != b'$'
                         && (line.len() == id_len + 1
-                            || (id_start > 0 && line[id_start - 1] == b' '))
+                            || (id_start > 0
+                                && (line[id_start - 1] == b' '
+                                    || matches!(line[id_start - 1],
+                                        b'0' | b'1' | b'x' | b'X' | b'z' | b'Z'))))
                     {
                         let val = match line[0] {
                             b'b' => {
@@ -1732,25 +1735,16 @@ impl Trace for VcdTrace {
         Ok(result)
     }
 
-    /// Single-pass top-`k` by value-change count (no per-signal scans), so
-    /// waves with 90k+ signals answer instantly.
+    /// Single-pass top-`k` by value-change count. Uses the LOAD-time hash map
+    /// (signal_ids) + a dense counts vec — no per-signal map rebuild (that was
+    /// the 42M-signal 15-minute path: a HashMap<Vec<u8>,u32> with 42M entries).
     fn signal_change_counts_top(&self, k: usize) -> Vec<(String, usize)> {
         let data = self.reader.borrow().data.clone();
         let hdr = self.header_end_offset as usize;
         let dump = &data[hdr..];
 
-        let mut id_to_idx: HashMap<Vec<u8>, u32> = HashMap::with_capacity(self.id_offsets.len());
-        let mut idx_to_name: HashMap<u32, &str> = HashMap::with_capacity(self.name_to_idx.len());
-        for idx in 0..self.id_offsets.len() as u32 {
-            if let Some(idb) = self.id_bytes(idx) {
-                id_to_idx.insert(idb.to_vec(), idx);
-            }
-        }
-        for (name, idx) in &self.name_to_idx {
-            idx_to_name.insert(*idx, name.as_ref());
-        }
-
-        let mut counts: HashMap<u32, usize> = HashMap::new();
+        let n_sigs = self.id_offsets.len();
+        let mut counts: Vec<u32> = vec![0; n_sigs];
         let mut i = 0usize;
         while i < dump.len() {
             let line_start = i;
@@ -1780,14 +1774,18 @@ impl Trace for VcdTrace {
             } else {
                 &line[1..]
             };
-            if let Some(&idx) = id_to_idx.get(id) {
-                *counts.entry(idx).or_insert(0) += 1;
+            if id.is_empty() || id.len() > 64 { continue; }
+            let hash = hash_sig_id(id);
+            if let Some(&idx) = self.signal_ids.get(&hash) {
+                if let Some(c) = counts.get_mut(idx as usize) {
+                    *c += 1;
+                }
             }
         }
 
-        let mut v: Vec<(String, usize)> = counts
-            .into_iter()
-            .filter_map(|(idx, c)| idx_to_name.get(&idx).map(|n| (n.to_string(), c)))
+        let mut v: Vec<(String, usize)> = counts.iter().enumerate()
+            .filter(|(_, c)| **c > 0)
+            .filter_map(|(idx, c)| self.signals.get(idx).map(|n| (n.to_string(), *c as usize)))
             .collect();
         v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
         v.truncate(k);
@@ -1971,11 +1969,14 @@ fn value_to_scalar(val: &VcdValue) -> ScalarValue {
 }
 
 fn find_signal_in_block(block: &[u8], target_id: &[u8], id_len: usize) -> Option<VcdValue> {
-    let nl = memchr::memchr(b'\n', block)?;
-    let mut lp = nl + 1;
     // A timestamp may contain several value lines for the same id (delta
     // cycles/glitches). VCD semantics: the value at the timestamp is the LAST
-    // one written — keep scanning and return the last occurrence.
+    // one written — keep scanning and return the last occurrence. Parsing via
+    // parse_value_change_fast covers every line form (with/without the space
+    // separator, bit/real/scalar).
+    let target_hash = hash_sig_id(target_id);
+    let nl = memchr::memchr(b'\n', block)?;
+    let mut lp = nl + 1;
     let mut last: Option<VcdValue> = None;
     while lp < block.len() {
         let line_end = match memchr::memchr(b'\n', &block[lp..]) {
@@ -1983,23 +1984,11 @@ fn find_signal_in_block(block: &[u8], target_id: &[u8], id_len: usize) -> Option
             None => block.len(),
         };
         let line = &block[lp..line_end];
-        if line.is_empty() { lp = line_end + 1; continue; }
-        if line.len() > id_len && line[0] != b'$' {
-            let id_start = line.len() - id_len;
-            if (line.len() == id_len + 1 || (id_start > 0 && line[id_start - 1] == b' ')) && &line[id_start..] == target_id {
-                let val = match line[0] {
-                    b'b' => {
-                        let ve = id_start.saturating_sub(1);
-                        let vs = if ve > 1 && line[ve] == b' ' { &line[1..ve] } else { &line[1..id_start] };
-                        VcdValue::Vector(vs.to_vec())
-                    }
-                    b'r' => {
-                        let vs = std::str::from_utf8(&line[1..id_start]).unwrap_or("0");
-                        if let Ok(r) = vs.trim().parse::<f64>() { VcdValue::Real(r) } else { return None; }
-                    }
-                    other => VcdValue::Bit(other),
-                };
-                last = Some(val);
+        if !line.is_empty() {
+            if let Some((sig_hash, val)) = parse_value_change_fast(line) {
+                if sig_hash == target_hash {
+                    last = Some(val);
+                }
             }
         }
         lp = line_end + 1;

@@ -1,0 +1,148 @@
+//! 回归矩阵: 汇聚历届 bug 的修复语义,每项断言=当时修复的口径。
+//! 运行: bash scripts/diff_find.sh 之外的第二道闸;P1(统一引擎)落地后
+//! 该矩阵必须原样全绿(语义冻结的验收标准)。
+use wal_rust::wal::eval::Evaluator;
+use wal_rust::wal::ast::Value;
+use wal_rust::trace::{FindCondition, ScalarValue, Trace, VcdTrace};
+use wal_rust::wal::ast::WList;
+
+fn tmp(name: &str, body: &str) -> std::path::PathBuf {
+    let p = std::env::temp_dir().join(format!("wal_reg_{}_{}_{}.vcd", name, std::process::id(), body.len()));
+    std::fs::write(&p, body).unwrap();
+    p
+}
+
+fn load(vcd: &std::path::Path) -> VcdTrace {
+    VcdTrace::load(vcd, "t".to_string()).unwrap()
+}
+
+fn eval_with(vcd: &std::path::Path, code: &str) -> Value {
+    let mut e = Evaluator::new();
+    e.load_trace(&vcd.to_string_lossy(), "t").unwrap();
+    e.eval(code).unwrap()
+}
+
+/// 1) delta 周期: 同一时间戳双写 → per-index 最后写入胜出;
+///    count(字面量)==count(变量)==get(该索引) 三者一致(P0-b 根)。
+#[test]
+fn matrix_delta_cycle_last_write() {
+    let p = tmp("delta", "$timescale 1ns $end\n$scope module t $end\n$var wire 4 ! v $end\n$enddefinitions $end\n\
+#0\nb0000 !\n#10\nb1100 !\nb0011 !\n#20\nb0000 !\n");
+    let t = load(&p);
+    let name = t.signals().iter().find(|s| s.ends_with("v")).unwrap().clone();
+    assert_eq!(t.signal_value(&name, 1).unwrap(), wal_rust::trace::ScalarValue::Vector(b"0011".to_vec()));
+    assert_eq!(t.find_indices(&name, FindCondition::ValueI64(3)).unwrap(), vec![1]);
+    let e = |c: &str| eval_with(&p, c);
+    // fast path == per-step oracle(值语义由 oracle 裁决,不写死黄金数)
+    assert_eq!(e("(count (= (get \"t.v\") 3))"), e("(count/step (= (get \"t.v\") 3))"));
+    assert_eq!(e("(define v (get \"t.v\")) (count (= (get \"t.v\") v))"),
+               e("(define v (get \"t.v\")) (count/step (= (get \"t.v\") v))"));
+    assert!(e("(count (= (get \"t.v\") 3))") == Value::Int(1));
+}
+
+/// 2) 初值 x 段: count(is-x) 覆盖 0..首变化;is-x|x→x 不算 change(P0-b-1)。
+#[test]
+fn matrix_initial_x_run() {
+    let p = tmp("initx", "$timescale 1ns $end\n$scope module t $end\n$var wire 8 ! v $end\n$enddefinitions $end\n\
+#0\n#10\nbxxxxxxxx !\n#20\nb00001111 !\n#30\nb00000000 !\n");
+    let e = |c: &str| eval_with(&p, c);
+    assert_eq!(e("(count (is-x \"t.v\"))"), Value::Int(2), "idx0 x-run + idx1");
+    assert_eq!(e("(count (changes \"t.v\"))"), Value::Int(2), "x→x 不算变化");
+}
+
+/// 3) $dumpvars 初值快照: get@0/at 首变化前 = 快照值(B5/B11)。
+#[test]
+fn matrix_dumpvars_initial() {
+    let p = tmp("dv", "$timescale 1ns $end\n$scope module t $end\n$var wire 8 ! v $end\n$var wire 1 \" r $end\n$enddefinitions $end\n\
+$dumpvars\nb00001111 !\n1\"\n$end\n#0\n#10\nb10101010 !\n#20\n0\"\n");
+    let e = |c: &str| eval_with(&p, c);
+    let list = |a: i64, b: i64| Value::List(WList::from_vec(vec![Value::Int(a), Value::Int(b)]));
+    assert_eq!(e("(at \"t.v\" 0)"), list(0, 15));
+    assert_eq!(e("(at \"t.r\" 0)"), list(0, 1));
+    assert_eq!(e("(count/step (is-x \"t.v\"))"), Value::Int(0));
+}
+
+/// 4) P0-a: (&& (get-simple) (is-x ...)) 不得丢谓词。
+#[test]
+fn matrix_compound_is_x_not_dropped() {
+    let p = tmp("a", "$timescale 1ns $end\n$scope module t $end\n$var wire 1 ! en $end\n$var wire 4 \" dat $end\n$enddefinitions $end\n\
+#0\n1!\nb00x0\"\n#10\n1!\nb0010\"\n#20\n0!\nb0010\"\n#30\n1!\nb0010\"\n");
+    let e = |c: &str| eval_with(&p, c);
+    // && 分解路径必须与逐拍 oracle 一致(且不丢子谓词: 至少 en 与 is-x 都生效)
+    assert_eq!(e("(count (&& (= (get \"t.en\") 1) (is-x \"t.dat\")))"),
+               e("(count/step (&& (= (get \"t.en\") 1) (is-x \"t.dat\")))"));
+    // P0-a 判别: 若 is-x 被丢, 结果为 en 计数 3; 参与则仅 idx0 满足
+    assert_eq!(e("(count (&& (= (get \"t.en\") 1) (is-x \"t.dat\")))"), Value::Int(1));
+    assert_eq!(e("(count (= (get \"t.en\") 1))"), Value::Int(3));
+}
+
+/// 5) P0-b 扫描起点: step 后 count 仍全时间线;INDEX 恢复。
+#[test]
+fn matrix_count_from_zero_and_cursor_restore() {
+    let p = tmp("step", "$timescale 1ns $end\n$scope module t $end\n$var wire 1 ! c $end\n$enddefinitions $end\n\
+#0\n0!\n#10\n1!\n#20\n0!\n#30\n1!\n#40\n0!\n");
+    let mut e = Evaluator::new();
+    e.load_trace(&p.to_string_lossy(), "t").unwrap();
+    e.eval("(step 2)").unwrap();
+    assert_eq!(e.eval("(count (= (get \"t.c\") 1))").unwrap(), Value::Int(2));
+    assert_eq!(e.eval("INDEX").unwrap(), Value::Int(2));
+}
+
+/// 6) B9: set! 词法穿透(共享 cell)+ fn 局部 define 每次独立。
+#[test]
+fn matrix_set_penetrates_closure() {
+    let p = tmp("b9", "$timescale 1ns $end\n$scope module t $end\n$var wire 1 ! c $end\n$enddefinitions $end\n#0\n0!\n");
+    let mut e = Evaluator::new();
+    e.load_trace(&p.to_string_lossy(), "t").unwrap();
+    e.eval("(define b 0)(define f (fn [] (set! b 9)))(f)").unwrap();
+    assert_eq!(e.eval("b").unwrap(), Value::Int(9));
+    e.eval("(define acc 0)(define tick (fn [] (set! acc (+ acc 1)))) (tick) (tick)").unwrap();
+    assert_eq!(e.eval("acc").unwrap(), Value::Int(2));
+    e.eval("(define ctr (fn [] (define n 0) (set! n (+ n 1)) n))").unwrap();
+    assert_eq!(e.eval("(ctr)").unwrap(), Value::Int(1));
+    assert_eq!(e.eval("(ctr)").unwrap(), Value::Int(1));
+}
+
+/// 7) B2: fold 闭包;8) B3: search 每变更点一次;13) B13: import 参数绑定。
+#[test]
+fn matrix_fold_search_import() {
+    let p = tmp("b2", "$timescale 1ns $end\n$scope module t $end\n$var wire 4 ! v $end\n$enddefinitions $end\n\
+#0\nb0101 !\n#10\nb0110 !\n");
+    let e = |c: &str| eval_with(&p, c);
+    assert_eq!(e("(fold (fn [a b] (+ a b)) 0 (list 1 2 3))"), Value::Int(6));
+    assert_eq!(e("(search \"t.v\" \"01\")"), Value::List(WList::from_vec(vec![Value::Int(0), Value::Int(10)])));
+
+    let lib = tmp("lib", "(define inc (fn [x] (+ x 1)))");
+    let mut e4 = Evaluator::new();
+    e4.load_trace(&p.to_string_lossy(), "t").unwrap();
+    e4.eval(&format!("(import \"{}\")", lib.display())).unwrap();
+    assert_eq!(e4.eval("(inc 41)").unwrap(), Value::Int(42));
+    let _ = std::fs::remove_file(&lib);
+}
+
+/// 9) B12: 多 trace 查询(信号在第二条 trace)。
+#[test]
+fn matrix_multi_trace_get() {
+    let p2 = tmp("b12", "$timescale 1ns $end\n$scope module t $end\n$var wire 8 ! v $end\n$enddefinitions $end\n\
+#0\nb10101010 !\n");
+    let mut e = Evaluator::new();
+    // 第一条 trace 无 v;第二条有 → 必须解析到
+    e.load_trace(&p2.to_string_lossy(), "t1").unwrap();
+    e.load_trace(&p2.to_string_lossy(), "t2").unwrap();
+    assert_eq!(e.eval("(get \"v\")").unwrap(), Value::Int(0b10101010));
+}
+
+/// 10) 列缓存 == 锚定路径(预算 0 vs 充足),计数一致。
+#[test]
+fn matrix_column_equals_anchored() {
+    let p = tmp("col", "$timescale 1ns $end\n$scope module t $end\n$var wire 4 ! v $end\n$enddefinitions $end\n\
+#0\nb0000 !\n#10\nb1100 !\nb0011 !\n#20\nb0000 !\n#30\nb1010 !\n");
+    let run = |env: &str| -> Value {
+        std::env::set_var("WAL_COL_CACHE_MB", env);
+        let mut e = Evaluator::new();
+        e.load_trace(&p.to_string_lossy(), "t").unwrap();
+        e.eval("(count (= (get \"t.v\") 3))").unwrap()
+    };
+    assert_eq!(run("0"), run("1024"));
+    std::env::remove_var("WAL_COL_CACHE_MB");
+}
