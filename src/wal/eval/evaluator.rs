@@ -1808,7 +1808,7 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
                 .collect();
             let tr = match t.first_trace() { Some(tr) => tr, None => return Ok(None) };
             let sigs = tr.signals();
-            let mut per_sig: Vec<(String, Vec<(usize, ScalarValue)>, ScalarValue)> = Vec::new();
+            let mut per_sig: Vec<(Vec<String>, Vec<(usize, ScalarValue)>, ScalarValue)> = Vec::new();
             for n in &names {
                 let resolved = resolve_signal_name(n, &sigs).unwrap_or_else(|| n.clone());
                 // 数据不可用(如 FST 解码失败)→ 传播错误而不是伪造 x 值
@@ -1816,7 +1816,13 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
                     .map_err(|e| format!("interval_scan: {}: {}", resolved, e))?;
                 let cps = tr.change_points(&resolved)
                     .map_err(|e| format!("interval_scan: {}: {}", resolved, e))?;
-                per_sig.push((resolved, cps, base));
+                // 原始名与解析名都要建键: 解释器里 op_get/边沿谓词可能用任一形式,
+                // 更新时必须同时写所有别名(否则读到的永远是初值快照)。
+                let mut keys = vec![resolved];
+                if !keys.contains(n) {
+                    keys.push(n.clone());
+                }
+                per_sig.push((keys, cps, base));
             }
             (ids, saved, tr.max_index(), per_sig)
         };
@@ -1827,9 +1833,10 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
             std::rc::Rc::new(std::cell::RefCell::new(std::collections::HashMap::new()));
         {
             let mut m = map.borrow_mut();
-            for (raw, (resolved, _, base)) in names.iter().zip(per_sig.iter()) {
-                m.insert(resolved.clone(), (None, base.clone()));
-                m.insert(raw.clone(), (None, base.clone()));
+            for (keys, _, base) in per_sig.iter() {
+                for k in keys {
+                    m.insert(k.clone(), (None, base.clone()));
+                }
             }
         }
         self.env.set_sig_override(map.clone());
@@ -1844,6 +1851,10 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
         bounds.sort_unstable();
         bounds.dedup();
 
+        if std::env::var("WAL_DEBUG_FIND").is_ok() {
+            eprintln!("interval_scan: names={:?} has_edge={} cps={:?} bounds={:?}",
+                names, has_edge, per_sig.iter().map(|(k, c, _)| (k.join("|"), c.len())).collect::<Vec<_>>(), bounds);
+        }
         let mut ptr: Vec<usize> = vec![0; per_sig.len()];
         let mut indices: Vec<usize> = Vec::new();
         let mut count: usize = 0;
@@ -1853,12 +1864,15 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
                 let b = bounds[bi];
                 if b > 0 {
                     let mut m = map.borrow_mut();
-                    for (si, (name, cps, _)) in per_sig.iter().enumerate() {
+                    for (si, (keys, cps, _)) in per_sig.iter().enumerate() {
                         while ptr[si] < cps.len() && cps[ptr[si]].0 < b { ptr[si] += 1; }
                         if ptr[si] < cps.len() && cps[ptr[si]].0 == b {
-                            let e = m.get_mut(name).unwrap();
-                            e.0 = Some(e.1.clone());
-                            e.1 = cps[ptr[si]].1.clone();
+                            let newv = cps[ptr[si]].1.clone();
+                            for k in keys {
+                                let e = m.get_mut(k).unwrap();
+                                e.0 = Some(e.1.clone());
+                                e.1 = newv.clone();
+                            }
                             ptr[si] += 1;
                         }
                     }

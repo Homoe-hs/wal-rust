@@ -222,3 +222,59 @@ fn matrix_engine_whenever_and_steps() {
     ev.eval("(whenever (changes \"t.d\") (define zz 1))").unwrap();
     assert_eq!(ev.eval("INDEX").unwrap(), Value::Int(3));
 }
+
+/// VCD 与 FST 后端语义一致性: 同一波形的等价查询必须给出相同结果
+/// (内网历轮 VCD/FST 分叉的回归防线)。
+#[test]
+fn matrix_vcd_fst_consistency() {
+    use wal_rust::fst::{FstOptions, FstWriter, ScopeType, VarType};
+    // 同一波形: d = 2,3,15,255,2 (8bit); clk 0/1 交替; vec 含 x
+    let vcd = tmp("both", "$timescale 1ns $end\n$scope module t $end\n$var wire 8 ! d $end\n$var wire 1 \" clk $end\n$var wire 4 # vec $end\n$enddefinitions $end\n\
+#0\nb00000010 !\n0\"\nb00x1 #\n#10\nb00000011 !\n1\"\nb0101 #\n#20\nb00001111 !\n0\"\nb0000 #\n#30\nb11111111 !\n1\"\nb0011 #\n#40\nb00000010 !\n0\"\nb0101 #\n");
+    let fst = std::env::temp_dir().join(format!("wal_reg_both_{}.fst", std::process::id()));
+    {
+        let mut w = FstWriter::create(&fst, FstOptions::default()).unwrap();
+        w.push_scope("t", ScopeType::VcdModule);
+        let d = w.create_var("d", 8, VarType::VcdWire);
+        let clk = w.create_var("clk", 1, VarType::VcdWire);
+        let vec = w.create_var("vec", 4, VarType::VcdWire);
+        w.pop_scope();
+        let dv: [&[u8]; 5] = [b"00000010", b"00000011", b"00001111", b"11111111", b"00000010"];
+        let cv: [&[u8]; 5] = [b"0", b"1", b"0", b"1", b"0"];
+        let vv: [&[u8]; 5] = [b"00x1", b"0101", b"0000", b"0011", b"0101"];
+        for i in 0..5u64 {
+            w.emit_time_change(i * 10);
+            w.emit_value_change(d, dv[i as usize]);
+            w.emit_value_change(clk, cv[i as usize]);
+            w.emit_value_change(vec, vv[i as usize]);
+        }
+        w.close().unwrap();
+    }
+
+    let ev = |path: &std::path::Path, code: &str| -> Value {
+        let mut e = Evaluator::new();
+        e.load_trace(&path.to_string_lossy(), "t").unwrap();
+        e.eval(code).unwrap()
+    };
+    let queries = [
+        "(count (= (get \"d\") 2))",
+        "(count (!= (get \"d\") 3))",
+        "(count (> (get \"d\") 2))",
+        "(count (&& (> (get \"d\") 2) (< (get \"d\") 200)))",
+        "(count (rising \"clk\"))",
+        "(count (falling \"clk\"))",
+        "(count (changes \"clk\"))",
+        "(count (is-x \"vec\"))",
+        "(count/step (is-x \"vec\"))",
+        "(at \"d\" 25)",
+        "(at \"vec\" 5)",
+        "(length (find (&& (> (get \"d\") 2) (< (get \"d\") 200))))",
+        "(count/step (= (get \"d\") 15))",
+    ];
+    for q in queries {
+        let a = ev(&vcd, q);
+        let b = ev(&fst, q);
+        assert_eq!(a, b, "VCD/FST divergence on {}", q);
+    }
+    let _ = std::fs::remove_file(&fst);
+}

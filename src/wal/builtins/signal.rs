@@ -939,7 +939,11 @@ fn edge_value(name: &str, env: &mut Environment) -> Result<Option<(Option<u8>, O
 fn scalar_is_zero(sv: Option<&ScalarValue>) -> Option<bool> {
     let sv = sv?;
     match sv {
-        ScalarValue::Bit(b) => Some(*b == b'0'),
+        ScalarValue::Bit(b) => match *b {
+            b'0' => Some(true),
+            b'1' => Some(false),
+            _ => None,
+        },
         ScalarValue::Vector(v) => {
             if v.iter().all(|b| *b == b'0' || *b == b'1') {
                 Some(v.iter().all(|b| *b == b'0'))

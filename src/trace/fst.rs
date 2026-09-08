@@ -314,7 +314,10 @@ impl Trace for FstTrace {
         // edge conditions see the x as their previous value (x→1 IS a change;
         // x is neither 0 nor 1 so x→1 is never a rising/falling edge), exactly
         // like the VCD backend.
-        {
+        // 索引 0 没有前驱: 首个变更点就在 0 时不把初值当 prev
+        // (与 VCD 的 eval_change_list / 逐拍 op_changes 一致)
+        let first_at_zero = collapsed.first().map(|(i, _)| *i) == Some(0);
+        if !first_at_zero {
             let xv = SignalValue::FourValue(&[2u8], 1);
             let init_matched = find_cond_matches(&xv, prev_bit, &mut prev_val, &cond);
             prev_bit = sv_as_bit(&xv);

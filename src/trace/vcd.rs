@@ -1836,7 +1836,12 @@ impl Trace for VcdTrace {
 /// Check if current value matches the condition
 fn vcd_is_zero(val: &VcdValue) -> Option<bool> {
     match val {
-        VcdValue::Bit(b) => Some(*b == b'0'),
+        // x/z 不是"确定的非零"——返回 None 让调用方回退到位比较
+        VcdValue::Bit(b) => match *b {
+            b'0' => Some(true),
+            b'1' => Some(false),
+            _ => None,
+        },
         VcdValue::Vector(v) => {
             if v.iter().all(|b| *b == b'0' || *b == b'1') {
                 Some(v.iter().all(|b| *b == b'0'))
@@ -1863,7 +1868,10 @@ fn eval_change_list(
         FindCondition::Rising | FindCondition::Falling | FindCondition::Changed
     );
     let mut indices = Vec::new();
-    let mut prev_val: Option<VcdValue> = Some(initial.clone());
+    // 索引 0 没有前驱: 若首个变更点就在 0, prev 必须为 None(否则 x→v 会被
+    // 误判为"变化", 与逐拍 op_changes / 区间扫描引擎不一致)。
+    let first_is_zero = changes.first().map(|(i, _)| *i as usize) == Some(0);
+    let mut prev_val: Option<VcdValue> = if first_is_zero { None } else { Some(initial.clone()) };
     // Initial held segment [0, first change): level conditions see it; edges
     // use the initial value as their previous value (x→x not a change, x→0/1
     // never a rise/fall).
