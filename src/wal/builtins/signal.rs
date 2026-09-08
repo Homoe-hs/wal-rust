@@ -308,8 +308,7 @@ fn try_find_indices_enum(sig_name: &str, cond_enum: FindCondition, max_results: 
     let first_trace_info = {
         let t = traces.read().ok()?;
         let tr = t.first_trace()?;
-        let sigs = tr.signals();
-        let resolved = resolve_signal_name(sig_name, &sigs)
+        let resolved = tr.resolve_name(sig_name)
             .unwrap_or_else(|| sig_name.to_string());
         (tr.id().clone(), resolved)
     };
@@ -848,7 +847,7 @@ fn op_signal_width(args: &[Value], env: &mut Environment, _eval: &mut Evaluator)
     if let Some(traces) = env.get_traces() {
         let traces_lock = traces.read().unwrap_or_else(|e| e.into_inner());
         if let Some(trace) = traces_lock.first_trace() {
-            let resolved = resolve_signal_name(&name, &trace.signals()).unwrap_or(name.clone());
+            let resolved = trace.resolve_name(&name).unwrap_or(name.clone());
             if let Ok(w) = trace.signal_width(&resolved) {
                 return Ok(Value::Int(w as i64));
             }
@@ -876,7 +875,7 @@ fn op_sample_at(args: &[Value], env: &mut Environment, _eval: &mut Evaluator) ->
     if let Some(traces) = env.get_traces() {
         let traces_lock = traces.read().unwrap_or_else(|e| e.into_inner());
         if let Some(trace) = traces_lock.first_trace() {
-            let resolved = resolve_signal_name(&signal_name, &trace.signals()).unwrap_or(signal_name.clone());
+            let resolved = trace.resolve_name(&signal_name).unwrap_or(signal_name.clone());
             if let Ok(sv) = trace.signal_value(&resolved, index) {
                 return Ok(scalar_to_value(sv));
             }

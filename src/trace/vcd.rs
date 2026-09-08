@@ -1735,6 +1735,10 @@ impl Trace for VcdTrace {
         Ok(self.signal_widths.get(sig_idx as usize).copied().unwrap_or(1) as usize)
     }
 
+    fn resolve_name(&self, name: &str) -> Option<String> {
+        self.resolve_idx(name).map(|i| self.signals[i as usize].to_string())
+    }
+
     fn signals(&self) -> Vec<String> {
         self.signals.iter().map(|s| s.to_string()).collect()
     }

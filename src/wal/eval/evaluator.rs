@@ -1200,8 +1200,7 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
             if let Ok(t) = self.traces.read() {
                 for tid in trace_ids {
                     if let Some(tr) = t.get(tid) {
-                        let sigs = tr.signals();
-                        let resolved = match resolve_signal_name(&sig, &sigs) {
+                        let resolved = match tr.resolve_name(&sig) {
                             Some(r) => r,
                             None => continue,
                         };
@@ -1286,8 +1285,7 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
                 if let Ok(t) = self.traces.read() {
                     for tid in trace_ids {
                         if let Some(tr) = t.get(tid) {
-                            let sigs = tr.signals();
-                            let resolved = match resolve_signal_name(&sig, &sigs) {
+                            let resolved = match tr.resolve_name(&sig) {
                                 Some(r) => r,
                                 None => continue,
                             };
@@ -1403,8 +1401,7 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
             if let Ok(t) = self.traces.read() {
                 for tid in trace_ids {
                     if let Some(tr) = t.get(tid) {
-                        let sigs = tr.signals();
-                        let resolved = resolve_signal_name(&sig, &sigs)
+                        let resolved = tr.resolve_name(&sig)
                             .unwrap_or_else(|| sig.clone());
                         if let Ok(idxs) = tr.find_indices(&resolved, cond.clone()) {
                             total += idxs.len();
@@ -1486,8 +1483,7 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
                 if let Ok(t) = self.traces.read() {
                     for tid in &traces {
                         if let Some(tr) = t.get(tid) {
-                            // Resolve signal name via fuzzy matching (handles short names)
-                            let resolved = resolve_signal_name(&sig_name, &tr.signals())
+                            let resolved = tr.resolve_name(&sig_name)
                                 .unwrap_or_else(|| sig_name.clone());
                             if let Ok(idxs) = tr.find_indices(&resolved, cond.clone()) {
                                 found.extend(idxs.into_iter().map(|i| i as i64));
@@ -1609,7 +1605,8 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
             if let Ok(t) = self.traces.read() {
                 for tid in &traces_ids {
                     if let Some(tr) = t.get(tid) {
-                        if let Ok(idxs) = tr.find_indices(&resolve_signal_name(&sig_name, &tr.signals()).unwrap_or_else(|| sig_name.clone()), cond.clone()) {
+                        let resolved = tr.resolve_name(&sig_name).unwrap_or_else(|| sig_name.clone());
+                        if let Ok(idxs) = tr.find_indices(&resolved, cond.clone()) {
                             for &idx in &idxs {
                                 found.push(Value::Int(idx as i64));
                             }
@@ -1712,13 +1709,13 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
                             let resolved_entries: Vec<BatchEntry> = batch_entries.iter()
                                 .map(|entry| match entry {
                                     BatchEntry::Simple(name, cond) => {
-                                        let r = resolve_signal_name(name, &sigs).unwrap_or_else(|| name.clone());
+                                        let r = tr.resolve_name(name).unwrap_or_else(|| name.clone());
                                         BatchEntry::Simple(r, cond.clone())
                                     }
                                     BatchEntry::And(subs) => {
                                         let resolved: Vec<(String, FindCondition)> = subs.iter()
                                             .map(|(name, cond)| {
-                                                let r = resolve_signal_name(name, &sigs).unwrap_or_else(|| name.clone());
+                                                let r = tr.resolve_name(name).unwrap_or_else(|| name.clone());
                                                 (r, cond.clone())
                                             })
                                             .collect();
@@ -1781,8 +1778,7 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
                 let mut sum = 0usize;
                 for tid in &traces_ids {
                     if let Some(tr) = t.get(tid) {
-                        let sigs = tr.signals();
-                        let resolved = resolve_signal_name(&sig_name, &sigs)
+                        let resolved = tr.resolve_name(&sig_name)
                             .unwrap_or_else(|| sig_name.clone());
                         if let Ok(idxs) = tr.find_indices(&resolved, cond.clone()) {
                             sum += idxs.len();
@@ -1916,8 +1912,7 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
                 let mut found: Option<(String, Vec<(usize, ScalarValue)>, ScalarValue)> = None;
                 for tid in &ids {
                     let tr = match t.get(tid) { Some(tr) => tr, None => continue };
-                    let sigs = tr.signals();
-                    let resolved = match resolve_signal_name(n, &sigs) {
+                    let resolved = match tr.resolve_name(n) {
                         Some(r) => r,
                         None => continue,
                     };
@@ -2216,7 +2211,7 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
                 let t = self.traces.read().unwrap_or_else(|e| e.into_inner());
                 traces_ids.iter().filter_map(|tid| {
                     t.get(tid).and_then(|tr| {
-                        let resolved = resolve_signal_name(&sig_name, &tr.signals())
+                        let resolved = tr.resolve_name(&sig_name)
                             .unwrap_or_else(|| sig_name.clone());
                         tr.find_indices(&resolved, FindCondition::Changed).ok()
                     })
@@ -2257,7 +2252,7 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
                 let t = self.traces.read().unwrap_or_else(|e| e.into_inner());
                 traces_ids.iter().filter_map(|tid| {
                     t.get(tid).and_then(|tr| {
-                        let resolved = resolve_signal_name(&sig_name, &tr.signals())
+                        let resolved = tr.resolve_name(&sig_name)
                             .unwrap_or_else(|| sig_name.clone());
                         tr.find_indices(&resolved, cond.clone()).ok()
                     })

@@ -20,7 +20,7 @@ pub struct FstTrace {
     /// 顶层用 fatal_error() 兜底上报,避免"看似正常的错误结果"。
     fatal: RefCell<Option<String>>,
     /// 短名/叶子名/子串解析缓存(与 VcdTrace::resolve_idx 同口径)。
-    name_cache: RefCell<HashMap<String, Option<SignalRef>>>,
+    name_cache: RefCell<HashMap<String, Option<(SignalRef, String)>>>,
 }
 
 /// 运行 wellen 的解码调用:捕获 panic 并**抑制其默认打印**
@@ -224,39 +224,39 @@ impl FstTrace {
         })
     }
 
-    /// 解析信号名: 精确 → 叶子名(短名/无点) → 子串;结果缓存。
-    fn resolve_cached(&self, name: &str) -> Option<SignalRef> {
+    /// 解析信号名: 精确 → 叶子名(短名/无点) → 子串;结果缓存(ref + 全名)。
+    fn resolve_cached(&self, name: &str) -> Option<(SignalRef, String)> {
         if let Some(r) = self.name_to_ref.get(name) {
-            return Some(*r);
+            return Some((*r, name.to_string()));
         }
         if let Some(c) = self.name_cache.borrow().get(name) {
-            return *c;
+            return c.clone();
         }
         fn leaf(s: &str) -> &str { s.rsplitn(2, '.').next().unwrap_or("") }
-        let mut hit: Option<SignalRef> = None;
-        let mut sub: Option<SignalRef> = None;
+        let mut hit: Option<(SignalRef, String)> = None;
+        let mut sub: Option<(SignalRef, String)> = None;
         {
             let wf = self.wf.borrow();
             let h = wf.hierarchy();
             for var in h.iter_vars() {
                 let full = var.full_name(h);
                 if (name.len() <= 8 || !name.contains('.')) && leaf(&full) == name {
-                    hit = Some(var.signal_ref());
+                    hit = Some((var.signal_ref(), full));
                     break;
                 }
                 if sub.is_none() && full.contains(name) {
-                    sub = Some(var.signal_ref());
+                    sub = Some((var.signal_ref(), full));
                 }
             }
         }
         let found = hit.or(sub);
-        self.name_cache.borrow_mut().insert(name.to_string(), found);
+        self.name_cache.borrow_mut().insert(name.to_string(), found.clone());
         found
     }
 
     /// Resolve a signal ref and load its data on demand (wellen loads lazily)
     fn resolve_ref(&self, name: &str) -> Result<SignalRef, String> {
-        self.resolve_cached(name)
+        self.resolve_cached(name).map(|(r, _)| r)
             .ok_or_else(|| format!("Unknown signal: {}", name))
     }
 
@@ -342,6 +342,10 @@ impl Trace for FstTrace {
             }
         }
         Err(format!("Unknown signal: {}", name))
+    }
+
+    fn resolve_name(&self, name: &str) -> Option<String> {
+        self.resolve_cached(name).map(|(_, n)| n)
     }
 
     fn signals(&self) -> Vec<String> {

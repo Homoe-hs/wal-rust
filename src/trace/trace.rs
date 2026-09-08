@@ -53,6 +53,21 @@ pub trait Trace {
     /// Timescale exponent: the time unit is 10^n seconds (None if unknown).
     fn timescale_exp(&self) -> Option<i8>;
 
+    /// 解析信号名(精确 → 叶子名(短名/无点) → 子串)。
+    /// 默认实现基于 `signals()`(整表分配);后端应覆盖为带缓存的版本。
+    fn resolve_name(&self, name: &str) -> Option<String> {
+        let sigs = self.signals();
+        if let Some(s) = sigs.iter().find(|s| s.as_str() == name) {
+            return Some(s.clone());
+        }
+        if name.len() <= 8 || !name.contains('.') {
+            if let Some(s) = sigs.iter().find(|s| s.rsplitn(2, '.').next().unwrap_or("") == name) {
+                return Some(s.clone());
+            }
+        }
+        sigs.iter().find(|s| s.contains(name)).cloned()
+    }
+
     /// 致命解码错误(文件损坏/编码不支持)。一旦发生,任何"静默吞错"的查询路径
     /// 都可能给出看似正常的错误结果(如 count=0);顶层求值结束前必须上报。
     fn fatal_error(&self) -> Option<String> {

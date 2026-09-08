@@ -156,6 +156,8 @@ pub enum Node {
      → `&&` 恒 0),并把含它的各 trace 结果取并集;
    - `getwave`/`wave`/`at` 改为跨 trace 查找(`with_signal_trace`),错误信息列出全部
      trace 的候选。
+   - 名字解析统一走 `Trace::resolve_name`(后端带缓存实现),避免每次查询都
+     `signals()` 分配整张信号表(3.5M 信号 ≈ 数十 MB/次)。
 
 #### 独立 oracle:`WAL_NO_ENGINE=1`
 
