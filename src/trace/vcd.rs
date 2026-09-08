@@ -820,6 +820,16 @@ impl VcdTrace {
     /// Per-index change list for a signal — cached warm or id-anchored
     /// cold scan. Single source for find_indices AND change_points.
     fn anchored_changes(&self, sig_idx: u32) -> Result<Vec<(u32, VcdValue)>, String> {
+        // 同进程重复查询(以及 signal_value 已解码过的信号): 直接复用已解码变更列。
+        // 此前只有 signal_value 读 signal_cache, find_indices/change_points 每次
+        // 都重新做锚定扫描(58.7GB 上第二次同信号查询仍要 ~85s)。
+        if let Some(ds) = self.signal_cache.lock().unwrap().get(&sig_idx) {
+            if ds.full_scan {
+                return Ok(ds.change_indices.iter().copied()
+                    .zip(ds.values.iter().cloned())
+                    .collect());
+            }
+        }
         // In-memory column (built during load) — zero file re-scan.
         if let Some(col) = self.col_cache.get(&sig_idx) {
             let mut out = Vec::with_capacity(col.idxs.len());

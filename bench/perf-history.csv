@@ -11,3 +11,11 @@ version,date,op,fixture,wall_s,rss_mb,note
 0.12.24,2026-09-08,count-lit,bench_2g.vcd,29.08,3945,语义修复轮无回归(==77629 oracle)
 0.12.24,2026-09-08,count-edge-level,bench_2g.vcd,58.69,3949,(&& (rising s0) (= (get s1) 1)) 引擎==逐拍==0
 0.12.24,2026-09-08,count-mixed,bench_2g.vcd,57.85,3901,(|| (rising s0) (= (get s0) 1)) == 77757(电平+边沿并集)
+0.12.34,2026-09-08,load,bench_10g.vcd,82.37,3008,冷读(页缓存冷;0.12.2 的 42s 是暖页缓存)
+0.12.34,2026-09-08,count-lit-cold,bench_10g.vcd,216.28,6975,==92871
+0.12.34,2026-09-08,count-lit-2nd-same-proc,bench_10g.vcd,85,-,修复前:同进程第二次同信号仍重扫(~85s)
+0.12.35,2026-09-08,count-lit-3x-same-proc,bench_10g.vcd,227.28,5453,修复后第2/3次≈0s(变更列复用);==92871
+0.12.34,2026-09-08,count-engine-only,bench_2g.vcd,78.93,3194,(= (get s0) (get s1)) 引擎 O(变更点)
+0.12.34,2026-09-08,count-edge-level,bench_2g.vcd,72.81,3292,(&& (rising s0) (= (get s0) 1)) == 54
+0.12.34,2026-09-08,count-const,bench_2g.vcd,15.45,3013,(count (= 1 1)) == 300000(常量折叠)
+0.12.34,2026-09-08,cache-hit,bench_10g.vcd,150.34,6527,跨进程缓存命中(391MB .wcol)

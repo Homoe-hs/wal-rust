@@ -626,3 +626,22 @@ fn matrix_multitrace_engine_and_builtins() {
     let err = e.eval("(getwave \"nosuchsig\")").unwrap_err();
     assert!(err.contains("not found in any loaded trace"), "unexpected error: {}", err);
 }
+
+/// 28) 同进程重复查询: 第二次起必须复用已解码变更列(性能),但语义不得变化
+///     (缓存的是变更列而非查询结果 → 不同条件仍需正确)。
+#[test]
+fn matrix_warm_repeat_query_matches_cold() {
+    let p = tmp("warm", "$timescale 1ns $end\n$scope module t $end\n$var wire 8 ! d $end\n$var wire 1 \" c $end\n$enddefinitions $end\n\
+#0\nb00000010 !\n0\"\n#10\nb00000011 !\n1\"\n#20\nb00001111 !\n0\"\n#30\nb00000011 !\n1\"\n");
+    let e = |c: &str| eval_with(&p, c);
+    let q = "(count (= (get \"t.d\") 3))";
+    let cold = e(q);
+    assert_eq!(cold, Value::Int(2));
+    assert_eq!(e(q), cold, "第二次同查询必须一致");
+    assert_eq!(e(q), cold, "第三次同查询必须一致");
+    // 缓存的是变更列: 换条件/换信号仍要正确
+    assert_eq!(e("(count (rising \"t.c\"))"), Value::Int(2));
+    assert_eq!(e("(find (= (get \"t.d\") 3))"), Value::List(WList::from_vec(vec![Value::Int(1), Value::Int(3)])));
+    assert_eq!(e("(count (changes \"t.d\"))"), Value::Int(3));
+    assert_eq!(e(q), cold, "交叉查询后原查询仍一致");
+}

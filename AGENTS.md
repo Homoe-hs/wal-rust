@@ -55,7 +55,7 @@ Flags: `-l <waveform>` (repeatable), `-c <code>` (inline override), `--halt-on-e
 | Path | Mechanism |
 |------|-----------|
 | `VcdTrace::find_indices()` | Parallel chunk scan (Rayon), collects all changes for `signal_cache` |
-| **warm same-signal query** | `find_indices` answers from the cached full-scan change list (O(C), no file rescan) — 58.7GB warm-2nd query 208s → ms |
+| **warm same-signal query** | `anchored_changes` 先查 `signal_cache`(已解码变更列, full_scan)→ 同进程第 2 次起 O(1) 复用;58.7GB: 第二次同信号查询 ~85s → ≈0s(3 次 count 合计 227s ≈ 加载+首次扫描) |
 | `VcdTrace::find_indices_batch()` | Single pass over VCD dump for N signals |
 | `signal_cache` | `find_indices` writes per-signal change history; both `signal_value` (O(log C)) and warm `find_indices` consume it; capped at `MAX_DECODED_SIGNALS` (256) |
 | `count` fast path | `(= (get "sig") 1)` uses `find_indices` directly |
