@@ -196,15 +196,16 @@ impl TsStore {
 pub struct VcdTrace {
     id: TraceId,
     filename: String,
-    signals: Vec<String>,
+    signals: Vec<std::sync::Arc<str>>,   // interned once, shared with name_to_idx
     #[allow(dead_code)]
     signal_ids: HashMap<u64, u32>,       // hash → index
-    signal_id_bytes: HashMap<u32, Vec<u8>>, // index → VCD signal ID bytes (for fast matching)
-    signal_widths: HashMap<u32, usize>,
+    id_blob: Vec<u8>,          // concatenated signal ids (allocated once)
+    id_offsets: Vec<u32>,      // per-signal start offset into id_blob
+    signal_widths: Vec<u32>,               // dense by signal index (declared width)
     /// $dumpvars snapshot: signal index → initial value before the first '#'
     /// timestamp line (missing entry ⇒ 'x', the VCD default).
     initial_values: HashMap<u32, VcdValue>,
-    name_to_idx: HashMap<String, u32>,
+    name_to_idx: HashMap<std::sync::Arc<str>, u32>,
 
     // Event signals (VCD event type — auto-reset to 0 at each timestamp boundary)
     event_signals: HashSet<u32>,
@@ -257,9 +258,10 @@ impl VcdTrace {
         // ====== PASS 1a: Scan header (single-thread) ======
         let mut signals = Vec::with_capacity(256);
         let mut signal_ids: HashMap<u64, u32> = HashMap::with_capacity(256);
-        let mut signal_id_bytes: HashMap<u32, Vec<u8>> = HashMap::with_capacity(256);
-        let mut signal_widths: HashMap<u32, usize> = HashMap::with_capacity(256);
-        let mut name_to_idx: HashMap<String, u32> = HashMap::with_capacity(256);
+        let mut id_blob: Vec<u8> = Vec::new();
+        let mut id_offsets: Vec<u32> = Vec::new();
+        let mut signal_widths: Vec<u32> = Vec::new();
+        let mut name_to_idx: HashMap<std::sync::Arc<str>, u32> = HashMap::with_capacity(256);
         let mut event_signals: HashSet<u32> = HashSet::new();
         let mut header_end_offset: u64 = 0;
 
@@ -291,11 +293,16 @@ impl VcdTrace {
                         } else {
                             format!("{}.{}", scope_stack.join("."), short_name)
                         };
-                        signals.push(full_name.clone());
+                        let interned: std::sync::Arc<str> = std::sync::Arc::from(full_name);
+                        signals.push(interned.clone());
                         signal_ids.insert(sig_hash, idx);
-                        signal_id_bytes.insert(idx, id_bytes);
-                        name_to_idx.insert(full_name, idx);
-                        signal_widths.insert(idx, width);
+                        id_offsets.push(id_blob.len() as u32);
+                        id_blob.extend_from_slice(&id_bytes);
+                        name_to_idx.insert(interned, idx);
+                        if signal_widths.len() <= idx as usize {
+                            signal_widths.resize(idx as usize + 1, 1);
+                        }
+                        signal_widths[idx as usize] = width as u32;
                         if is_event { event_signals.insert(idx); }
                     }
                 } else if hl.starts_with(b"$scope") {
@@ -370,9 +377,12 @@ impl VcdTrace {
                         let hash = hash_sig_id(&line[id_start..]);
                         if let Some(&sidx) = signal_ids.get(&hash) {
                             // byte-verify (hash ambiguity)
-                            if signal_id_bytes.get(&sidx)
-                                .map(|idb| idb.as_slice() == &line[id_start..])
-                                .unwrap_or(false)
+                            let idb = id_offsets.get(sidx as usize).map(|&st| {
+                                let en = id_offsets.get(sidx as usize + 1)
+                                    .map(|&v| v as usize).unwrap_or(id_blob.len());
+                                &id_blob[st as usize..en.min(id_blob.len())]
+                            });
+                            if idb.map(|b| b == &line[id_start..]).unwrap_or(false)
                             {
                                 let val = match line[0] {
                                     b'b' => {
@@ -690,7 +700,7 @@ impl VcdTrace {
         }
         Ok(VcdTrace {
             id, filename,
-            signals, signal_ids, signal_id_bytes, signal_widths, initial_values, name_to_idx, event_signals, event_change_points,
+            signals, signal_ids, id_blob, id_offsets, signal_widths, initial_values, name_to_idx, event_signals, event_change_points,
             timestamps: build_ts_store(timestamps), timestamp_offsets, sparse_index,
             lru_cache: RefCell::new(lru::LruCache::new(lru_cap)),
             signal_cache: Mutex::new(HashMap::new()),
@@ -737,6 +747,15 @@ impl VcdTrace {
     }
 
     /// On-demand: read signal value at a specific timestamp (memchr jump scan + sampled offsets)
+    /// Signal id bytes for a signal index (blob + offsets: one allocation).
+    #[inline]
+    fn id_bytes(&self, sig_idx: u32) -> Option<&[u8]> {
+        let start = *self.id_offsets.get(sig_idx as usize)? as usize;
+        let end = self.id_offsets.get(sig_idx as usize + 1).map(|v| *v as usize).unwrap_or(self.id_blob.len());
+        if start > self.id_blob.len() { return None; }
+        Some(&self.id_blob[start..end.min(self.id_blob.len())])
+    }
+
     /// Initial value of a signal: $dumpvars snapshot if present, else 'x'
     /// (the VCD default for values that never got an explicit write).
     #[inline]
@@ -803,8 +822,9 @@ impl VcdTrace {
         //      contain "space id newline", so hits are exact by construction
         //      (digit ids inside 32-bit bit-streams included). Each hit is
         //      parsed lazily and collapsed per timestamp (last write wins).
-        let target_id = self.signal_id_bytes.get(&sig_idx).cloned()
-            .ok_or_else(|| "find_indices: signal ID bytes not found".to_string())?;
+        let target_id = self.id_bytes(sig_idx)
+            .ok_or_else(|| "find_indices: signal ID bytes not found".to_string())?
+            .to_vec();
         use rayon::prelude::*;
         let shared_mmap = self.reader.borrow().data.clone();
         let id_len = target_id.len();
@@ -941,7 +961,7 @@ impl VcdTrace {
 
 
     fn read_signal_value_at(&self, sig_idx: u32, target_timestamp: u64) -> VcdValue {
-        let target_id = match self.signal_id_bytes.get(&sig_idx) {
+        let target_id = match self.id_bytes(sig_idx) {
             Some(id) => id,
             None => return VcdValue::Bit(b'x'),
         };
@@ -1056,7 +1076,7 @@ impl VcdTrace {
     }
 
     fn read_signal_value_at_legacy(&self, sig_idx: u32, target_timestamp: u64) -> VcdValue {
-        let target_id = match self.signal_id_bytes.get(&sig_idx) {
+        let target_id = match self.id_bytes(sig_idx) {
             Some(id) => id,
             None => return VcdValue::Bit(b'x'),
         };
@@ -1087,7 +1107,7 @@ impl VcdTrace {
                 }
             } else if first != b'$' && line.len() > id_len {
                 let id_start = line.len() - id_len;
-                if (line.len() == id_len + 1 || (id_start > 0 && line[id_start - 1] == b' ')) && &line[id_start..] == target_id.as_slice() {
+                if (line.len() == id_len + 1 || (id_start > 0 && line[id_start - 1] == b' ')) && &line[id_start..] == target_id {
                     let val = match first {
                         b'b' => {
                             let ve = id_start.saturating_sub(1);
@@ -1355,7 +1375,7 @@ impl Trace for VcdTrace {
         // before the first change is 'x' — as a full-width vector for
         // multi-bit signals (the same shape a change line "bxxx…x id" yields),
         // so `(changes s)` / comparisons never see a Bit-vs-Vector mismatch.
-        let width = self.signal_widths.get(&sig_idx).copied().unwrap_or(1);
+        let width = self.signal_widths.get(sig_idx as usize).copied().unwrap_or(1) as usize;
         let normalize = |sv: ScalarValue| -> ScalarValue {
             match sv {
                 ScalarValue::Bit(b) if (b == b'x' || b == b'z') && width > 1 => {
@@ -1398,11 +1418,11 @@ impl Trace for VcdTrace {
     fn signal_width(&self, name: &str) -> Result<usize, String> {
         let sig_idx = self.name_to_idx.get(name).copied()
             .ok_or_else(|| format!("Unknown signal: {}", name))?;
-        Ok(self.signal_widths.get(&sig_idx).copied().unwrap_or(1))
+        Ok(self.signal_widths.get(sig_idx as usize).copied().unwrap_or(1) as usize)
     }
 
     fn signals(&self) -> Vec<String> {
-        self.signals.clone()
+        self.signals.iter().map(|s| s.to_string()).collect()
     }
 
     fn scopes(&self) -> Vec<String> {
@@ -1434,9 +1454,9 @@ impl Trace for VcdTrace {
         if std::env::var("WAL_DEBUG_FIND").is_ok() {
             eprintln!("  sig_idx={} id={:?} anchors={}",
                       sig_idx,
-                      self.signal_id_bytes.get(&sig_idx),
+                      self.id_bytes(sig_idx),
                       self.sparse_index.get(&sig_idx).map(|m| m.len()).unwrap_or(0));
-            let idb = self.signal_id_bytes.get(&sig_idx).cloned().unwrap_or_default();
+            let idb = self.id_bytes(sig_idx).unwrap_or_default().to_vec();
             let h = crate::trace::vcd::hash_sig_id(&idb);
             eprintln!("  hash={:#x} sid has it: {}", h,
                       self.signal_ids.get(&h).copied() == Some(sig_idx));
@@ -1494,16 +1514,16 @@ impl Trace for VcdTrace {
         let mut id_to_batch: HashMap<Vec<u8>, Vec<usize>> = HashMap::new();
 
         for (name, cond) in signals {
-            let sig_idx = match self.name_to_idx.get(&name) {
+            let sig_idx = match self.name_to_idx.get(name.as_str()) {
                 Some(i) => *i,
                 None => continue,
             };
-            let id_bytes = match self.signal_id_bytes.get(&sig_idx) {
+            let id_bytes = match self.id_bytes(sig_idx) {
                 Some(b) => b,
                 None => continue,
             };
             let batch_idx = batch_sigs.len();
-            id_to_batch.entry(id_bytes.clone()).or_default().push(batch_idx);
+            id_to_batch.entry(id_bytes.to_vec()).or_default().push(batch_idx);
             batch_sigs.push(BatchSig {
                 name: name.clone(),
                 cond: cond.clone(),
@@ -1719,13 +1739,15 @@ impl Trace for VcdTrace {
         let hdr = self.header_end_offset as usize;
         let dump = &data[hdr..];
 
-        let mut id_to_idx: HashMap<Vec<u8>, u32> = HashMap::with_capacity(self.signal_id_bytes.len());
+        let mut id_to_idx: HashMap<Vec<u8>, u32> = HashMap::with_capacity(self.id_offsets.len());
         let mut idx_to_name: HashMap<u32, &str> = HashMap::with_capacity(self.name_to_idx.len());
-        for (idx, idb) in &self.signal_id_bytes {
-            id_to_idx.insert(idb.clone(), *idx);
+        for idx in 0..self.id_offsets.len() as u32 {
+            if let Some(idb) = self.id_bytes(idx) {
+                id_to_idx.insert(idb.to_vec(), idx);
+            }
         }
         for (name, idx) in &self.name_to_idx {
-            idx_to_name.insert(*idx, name.as_str());
+            idx_to_name.insert(*idx, name.as_ref());
         }
 
         let mut counts: HashMap<u32, usize> = HashMap::new();
