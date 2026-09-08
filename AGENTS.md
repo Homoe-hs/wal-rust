@@ -62,6 +62,7 @@ Flags: `-l <waveform>` (repeatable), `-c <code>` (inline override), `--halt-on-e
 | `count &&` decomposition | `(count (&& a b) ...)` → `BatchEntry::And` → single pass |
 | `whenever` do decomposition | → independent `count` calls |
 | **统一区间扫描引擎** | `interval_scan`(变更点并集边界 + 解释器值覆盖): count/find/whenever/count/step 同一实现;含边沿谓词时"边界真值 + 区间内部真值(边沿强制 false)"两段计入 |
+| **旁挂列缓存(跨进程)** | 冷扫描后按信号落盘 `<cache>/<wave>-<len>-<mtime>-v1.cols/<fnv(name)>.col`;下一个进程 `anchored_changes` 直接命中(58.7GB 同查询 113.8s → 3.35s) |
 | **纯逐拍 oracle** | `WAL_NO_ENGINE=1` 让引擎直接返回 None → 全部走逐拍;矩阵在子进程里用它做独立对拍 |
 
 > 统一查询引擎(变更点并集区间扫描)已落地(docs/query-engine-design.md §IntervalSweep):

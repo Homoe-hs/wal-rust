@@ -749,7 +749,7 @@ impl VcdTrace {
         // build 是显式要求写回, 始终写。
         let should_write_cache = match cmode {
             CacheMode::Build => true,
-            CacheMode::Auto => file_len >= 8 * 1024 * 1024,
+            CacheMode::Auto => (file_len as u64) >= cache_min_bytes(),
             _ => false,
         };
         if should_write_cache {
@@ -830,6 +830,13 @@ impl VcdTrace {
                     .collect());
             }
         }
+        // 跨进程旁挂列缓存(首次冷扫描已落盘)→ 直接命中, 不碰文件
+        if let Some(all) = self.try_load_col_sidecar(sig_idx) {
+            if all.len() > 1 {
+                self.try_cache_decoded_signal(sig_idx, &all, CacheType::FullScan);
+            }
+            return Ok(all);
+        }
         // In-memory column (built during load) — zero file re-scan.
         if let Some(col) = self.col_cache.get(&sig_idx) {
             let mut out = Vec::with_capacity(col.idxs.len());
@@ -842,6 +849,7 @@ impl VcdTrace {
             }
             if out.len() > 1 {
                 self.try_cache_decoded_signal(sig_idx, &out, CacheType::FullScan);
+                self.save_col_sidecar(sig_idx, &out);
             }
             return Ok(out);
         }
@@ -868,6 +876,7 @@ impl VcdTrace {
             }
             if out.len() > 1 {
                 self.try_cache_decoded_signal(sig_idx, &out, CacheType::FullScan);
+                self.save_col_sidecar(sig_idx, &out);
             }
             return Ok(out);
         }
@@ -1023,6 +1032,7 @@ impl VcdTrace {
         // Cache the change list for warm queries / signal_value.
         if all.len() > 1 {
             self.try_cache_decoded_signal(sig_idx, &all, CacheType::FullScan);
+            self.save_col_sidecar(sig_idx, &all);
         }
         Ok(all)
     }
@@ -1235,6 +1245,58 @@ impl VcdTrace {
             }
         }
         last_value
+    }
+
+    /// 读取旁挂列缓存(跨进程): 命中即返回已解码变更列。
+    fn try_load_col_sidecar(&self, sig_idx: u32) -> Option<Vec<(u32, VcdValue)>> {
+        if cache_mode() == CacheMode::Off {
+            return None;
+        }
+        let name = self.signals.get(sig_idx as usize)?.to_string();
+        let path = col_sidecar_file(std::path::Path::new(&self.filename), &name)?;
+        let data = std::fs::read(&path).ok()?;
+        let mut r = BufR::new(&data);
+        if r.bytes()? != b"WALCOL01".to_vec() {
+            return None;
+        }
+        let n = r.u32()? as usize;
+        let mut out = Vec::with_capacity(n);
+        for _ in 0..n {
+            let idx = r.u32()?;
+            let val = r.val()?;
+            out.push((idx, val));
+        }
+        if std::env::var("WAL_DEBUG_FIND").is_ok() {
+            eprintln!("col-sidecar hit: sig={} n={}", name, out.len());
+        }
+        Some(out)
+    }
+
+    /// 冷扫描/列构建之后把该信号的变更列落盘(下一个进程直接命中)。
+    fn save_col_sidecar(&self, sig_idx: u32, changes: &[(u32, VcdValue)]) {
+        if changes.len() < 2 {
+            return;
+        }
+        let Ok(meta) = std::fs::metadata(&self.filename) else { return };
+        if !col_sidecar_write_enabled(meta.len()) {
+            return;
+        }
+        let Some(name) = self.signals.get(sig_idx as usize).map(|s| s.to_string()) else { return };
+        let Some(path) = col_sidecar_file(std::path::Path::new(&self.filename), &name) else { return };
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let mut w = BufW::new();
+        w.bytes(b"WALCOL01");
+        w.u32(changes.len() as u32);
+        for (i, v) in changes {
+            w.u32(*i);
+            w.val(v);
+        }
+        let tmp = path.with_extension("tmp");
+        if std::fs::write(&tmp, &w.b).is_ok() {
+            let _ = std::fs::rename(&tmp, &path);
+        }
     }
 
     fn try_cache_decoded_signal(&self, sig_idx: u32, changes: &[(u32, VcdValue)], scan_type: CacheType) {
@@ -1455,6 +1517,40 @@ fn cache_file_for(vcd: &std::path::Path) -> Option<std::path::PathBuf> {
         .map(|d| d.as_secs())?;
     let base = vcd.file_name()?.to_string_lossy().replace('/', "_");
     Some(cache_dir().join(format!("{}-{}-{}-v1.wcol", base, meta.len(), mtime)))
+}
+
+/// 列缓存旁挂目录: 与 .wcol 同 key(波形 basename+size+mtime), 后缀换 .cols。
+/// 每个信号一个文件, 首次冷扫描后落盘 → 下一个进程直接命中, 不再扫全文件。
+fn col_sidecar_dir(vcd: &std::path::Path) -> Option<std::path::PathBuf> {
+    let f = cache_file_for(vcd)?;
+    let name = f.file_name()?.to_string_lossy().replace(".wcol", ".cols");
+    let mut d = f;
+    d.set_file_name(name);
+    Some(d)
+}
+
+fn col_sidecar_file(vcd: &std::path::Path, sig_name: &str) -> Option<std::path::PathBuf> {
+    let dir = col_sidecar_dir(vcd)?;
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in sig_name.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x100_0000_01b3);
+    }
+    Some(dir.join(format!("{:016x}.col", h)))
+}
+
+/// 缓存写回的最小波形大小(默认 8MB; `WAL_CACHE_MIN_MB` 可调, 测试用 0)。
+fn cache_min_bytes() -> u64 {
+    std::env::var("WAL_CACHE_MIN_MB").ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map(|mb| mb.saturating_mul(1024 * 1024))
+        .unwrap_or(8 * 1024 * 1024)
+}
+
+/// 旁挂列缓存与 .wcol 同一套开关与阈值(auto/build 写, read/off 不写; ≥ 阈值)。
+fn col_sidecar_write_enabled(wave_len: u64) -> bool {
+    wave_len >= cache_min_bytes()
+        && matches!(cache_mode(), CacheMode::Auto | CacheMode::Build)
 }
 
 struct BufW { b: Vec<u8> }

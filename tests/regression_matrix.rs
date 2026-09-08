@@ -645,3 +645,50 @@ fn matrix_warm_repeat_query_matches_cold() {
     assert_eq!(e("(count (changes \"t.d\"))"), Value::Int(3));
     assert_eq!(e(q), cold, "交叉查询后原查询仍一致");
 }
+
+/// 29) 跨进程列缓存旁挂文件: 首次冷扫描后按信号落盘, 下一个进程直接命中
+///     (不再扫全文件)。用子进程验证, 避免进程内环境变量竞态。
+#[test]
+fn matrix_col_sidecar_cross_process_hit() {
+    let bin = env!("CARGO_BIN_EXE_wal-rust");
+    let dir = std::env::temp_dir().join(format!("wal_reg_sidecar_{}", std::process::id()));
+    let cdir = dir.join("cache");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&cdir).unwrap();
+    let vcd = dir.join("w.vcd");
+    let mut src = String::from("$timescale 1ns $end\n$scope module t $end\n$var wire 8 ! d $end\n$enddefinitions $end\n");
+    for i in 0..64 {
+        src.push_str(&format!("#{}\nb{:08b} !\n", i * 10, i % 4));
+    }
+    std::fs::write(&vcd, src).unwrap();
+
+    let run = |q: &str| -> (String, String) {
+        let out = std::process::Command::new(bin)
+            .arg(q).arg("-l").arg(&vcd)
+            .env("WAL_CACHE", "auto")
+            .env("WAL_CACHE_DIR", &cdir)
+            .env("WAL_CACHE_MIN_MB", "0")   // 小夹具也允许落盘
+            .env("WAL_DEBUG_FIND", "1")
+            .output().expect("spawn wal-rust");
+        assert!(out.status.success(), "cli 失败: {}", String::from_utf8_lossy(&out.stderr));
+        (String::from_utf8_lossy(&out.stdout).trim().to_string(),
+         String::from_utf8_lossy(&out.stderr).to_string())
+    };
+
+    let (out1, err1) = run("(count (= (get \"t.d\") 1))");
+    assert!(!err1.contains("col-sidecar hit"), "首次不应命中: {}", err1);
+    let cols_dir = std::fs::read_dir(&cdir).unwrap()
+        .filter_map(|e| e.ok())
+        .find(|e| e.file_name().to_string_lossy().ends_with(".cols"))
+        .expect("应生成 .cols 目录");
+    assert!(std::fs::read_dir(cols_dir.path()).unwrap().count() > 0, "应写出信号列文件");
+
+    let (out2, err2) = run("(count (= (get \"t.d\") 1))");
+    assert!(err2.contains("col-sidecar hit"), "第二次应命中旁挂列缓存: {}", err2);
+    assert_eq!(out1, out2, "命中结果必须与冷扫描一致");
+    // 换条件仍命中同一列(缓存的是变更列, 不是查询结果)
+    let (out3, err3) = run("(find (= (get \"t.d\") 2))");
+    assert!(err3.contains("col-sidecar hit"), "不同条件也应命中变更列: {}", err3);
+    assert_eq!(out3, "=> (2 6 10 14 18 22 26 30 34 38 42 46 50 54 58 62)");
+    let _ = std::fs::remove_dir_all(&dir);
+}
