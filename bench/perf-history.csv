@@ -6,3 +6,5 @@ version,date,op,fixture,wall_s,rss_mb,note
 0.12.2,2026-09-07,load,bench_10g.vcd,42,-,全局行采样加载
 0.12.3,2026-09-07,count-var,bench_10g.vcd,138,-,变量 RHS 快路径
 0.12.4,2026-09-08,count-lit(column),bench_2g.vcd,NA,NA,列缓存路径;计数与锚定一致 77629;加载成本提升(待干净复测)
+0.12.8,2026-09-08,count-any-expr,bench_2g.vcd,31,4547,区间扫描引擎(load+变更列扫描主导;逐拍回退原>90s超时)
+0.12.9,2026-09-08,whenever-any-expr,bench_2g.vcd,NA,NA,引擎命中索引+body逐拍执行(矩阵12项==oracle)
