@@ -214,6 +214,29 @@ impl Args {
                 if trimmed.starts_with('(') || trimmed.starts_with('\'') {
                     // Looks like a WAL expression
                     ExecMode::EvalExpr { code: trimmed, load }
+                } else if !PathBuf::from(&trimmed).exists()
+                    && !trimmed.starts_with('(')
+                    && !trimmed.starts_with(';')
+                    && !trimmed.contains('\n')
+                {
+                    // Not an expression and not an existing file: the most
+                    // common misuse is passing a waveform (or a stray argument)
+                    // where a script path is expected. Say so explicitly
+                    // (feedback round: "No such file" was mistaken for a
+                    // broken -l).
+                    eprintln!(
+                        "error: '{}' is neither a WAL expression (must start with '(') nor an existing script file.",
+                        trimmed
+                    );
+                    eprintln!("hint:  expression:  wal-rust '(count (rising \"clk\"))' -l wave.vcd");
+                    eprintln!("       script:      wal-rust run script.wal -l wave.vcd");
+                    eprintln!("       waveform:    pass it with -l (not as the input argument)");
+                    ExecMode::RunScript {
+                        path: PathBuf::from(&trimmed),
+                        load,
+                        code: None,
+                        halt_on_error: self.halt_on_error,
+                    }
                 } else {
                     // Treat as file path
                     ExecMode::RunScript {
