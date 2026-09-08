@@ -108,7 +108,7 @@ pub enum Node {
 成本 **O(变更点并集 × E)** ——稀疏信号 C ≪ T;稠密(clk 级)退化为 O(T×E)
 但每拍只做常数级节点求值,无解释器/环境开销。**快路径 = 单列特例**,自然消失。
 
-#### 边界处求值的四条硬约束(0.12.x 实测踩坑记录)
+#### 边界处求值的五条硬约束(0.12.x 实测踩坑记录)
 
 1. **每个边界都要推进 `prev`**。覆盖表存 `(prev, cur)`;`cur` 只在信号自身
    变更处更新,但 `prev` 必须在**每个**边界先写成"上一索引的 `cur`"。
@@ -130,7 +130,12 @@ pub enum Node {
 > 因此 `scripts/diff_find.sh` 的"与旧版对拍"**不是**这类条件的 oracle;
 > 权威 oracle 是纯逐拍路径(下节)与手算黄金值。
 
-4. **INDEX/TS 依赖的条件必须放弃引擎**。区间内部"值恒定"的前提只对信号成立;
+4. **名字解析必须所有读取路径一致**。`op_get` 走 `resolve_signal_name`(短名/叶子名/
+   子串),而 `op_rising`/`op_falling`/`op_changes`/`is-x`/`is-z` 曾直接按字面名读 →
+   短名场景下边沿/X 谓词静默给 false(`count/step`、`find` 回退、`whenever` 回退全中招)。
+   现在解析下沉到 `VcdTrace::resolve_idx` / `FstTrace::resolve_cached`(带缓存,
+   一次 O(N) 扫描后 O(1)),所有路径共用。
+5. **INDEX/TS 依赖的条件必须放弃引擎**。区间内部"值恒定"的前提只对信号成立;
    `INDEX`/`TS` 随索引变化,`(&& (= (get c) 1) (= INDEX 3))` 在引擎里会被
    按边界游标求值 → 漏计。`collect_cond_signals` 检测到 INDEX/TS 直接返回
    `Ok(None)` 走逐拍(此类条件本身就必须 O(索引数),无性能损失)。

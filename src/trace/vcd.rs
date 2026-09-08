@@ -206,6 +206,9 @@ pub struct VcdTrace {
     /// timestamp line (missing entry ⇒ 'x', the VCD default).
     initial_values: HashMap<u32, VcdValue>,
     name_to_idx: HashMap<std::sync::Arc<str>, u32>,
+    /// 短名/叶子名/子串解析缓存(一次 O(N) 扫描,之后 O(1));
+    /// 所有读取路径共用,避免"op_get 能解析、边沿谓词不能"的不一致。
+    name_cache: std::cell::RefCell<HashMap<String, Option<u32>>>,
 
     // Event signals (VCD event type — auto-reset to 0 at each timestamp boundary)
     event_signals: HashSet<u32>,
@@ -244,6 +247,26 @@ pub struct VcdTrace {
 }
 
 impl VcdTrace {
+    /// 解析信号名: 精确 → 叶子名(短名/无点) → 子串;结果缓存。
+    /// 与 evaluator::resolve_signal_name 同口径,但作用在 Arc<str> 上且带缓存。
+    fn resolve_idx(&self, name: &str) -> Option<u32> {
+        if let Some(i) = self.name_to_idx.get(name) {
+            return Some(*i);
+        }
+        if let Some(c) = self.name_cache.borrow().get(name) {
+            return *c;
+        }
+        fn leaf(s: &str) -> &str { s.rsplitn(2, '.').next().unwrap_or("") }
+        let mut hit = None;
+        if name.len() <= 8 || !name.contains('.') {
+            hit = self.signals.iter().position(|s| leaf(s) == name).map(|i| i as u32);
+        }
+        if hit.is_none() {
+            hit = self.signals.iter().position(|s| s.contains(name)).map(|i| i as u32);
+        }
+        self.name_cache.borrow_mut().insert(name.to_string(), hit);
+        hit
+    }
     pub fn load(path: &Path, id: TraceId) -> Result<Self, String> {
         use rayon::prelude::*;
         use std::sync::Arc;
@@ -709,7 +732,8 @@ impl VcdTrace {
         }
         let trace = VcdTrace {
             id, filename,
-            signals, signal_ids, id_blob, id_offsets, signal_widths, initial_values, name_to_idx, event_signals, event_change_points,
+            signals, signal_ids, id_blob, id_offsets, signal_widths, initial_values, name_to_idx,
+            name_cache: std::cell::RefCell::new(HashMap::new()), event_signals, event_change_points,
             timestamps: build_ts_store(timestamps), timestamp_offsets, sparse_index,
             lru_cache: RefCell::new(lru::LruCache::new(lru_cap)),
             signal_cache: Mutex::new(HashMap::new()),
@@ -1597,6 +1621,7 @@ impl VcdTrace {
         Some(VcdTrace {
             id, filename,
             signals, signal_ids, id_blob, id_offsets, signal_widths, initial_values, name_to_idx,
+            name_cache: std::cell::RefCell::new(HashMap::new()),
             event_signals, event_change_points,
             timestamps, timestamp_offsets, sparse_index,
             lru_cache: RefCell::new(lru::LruCache::new(lru_cap)),
@@ -1643,7 +1668,7 @@ impl Trace for VcdTrace {
         };
 
         let target_time = self.timestamps.get(idx);
-        let sig_idx = self.name_to_idx.get(name).copied()
+        let sig_idx = self.resolve_idx(name)
             .ok_or_else(|| format!(
                 "signal '{}' not found. Available signals (first 5): {:?}",
                 name,
@@ -1696,7 +1721,7 @@ impl Trace for VcdTrace {
     }
 
     fn signal_width(&self, name: &str) -> Result<usize, String> {
-        let sig_idx = self.name_to_idx.get(name).copied()
+        let sig_idx = self.resolve_idx(name)
             .ok_or_else(|| format!("Unknown signal: {}", name))?;
         Ok(self.signal_widths.get(sig_idx as usize).copied().unwrap_or(1) as usize)
     }
@@ -1729,7 +1754,7 @@ impl Trace for VcdTrace {
         if std::env::var("WAL_DEBUG_FIND").is_ok() {
             eprintln!("find_indices enter: {}", name);
         }
-        let sig_idx = self.name_to_idx.get(name).copied()
+        let sig_idx = self.resolve_idx(name)
             .ok_or_else(|| format!("Unknown signal: {}", name))?;
         if std::env::var("WAL_DEBUG_FIND").is_ok() {
             eprintln!("  sig_idx={} id={:?} anchors={}",
@@ -2078,10 +2103,10 @@ impl Trace for VcdTrace {
     }
 
     fn change_points(&self, name: &str) -> Result<Vec<(usize, ScalarValue)>, String> {
-        let sig_idx = self.name_to_idx.get(name)
+        let sig_idx = self.resolve_idx(name)
             .ok_or_else(|| format!("Unknown signal: {}", name))?;
         // Event signals: change points already recorded during load
-        if let Some(points) = self.event_change_points.get(sig_idx) {
+        if let Some(points) = self.event_change_points.get(&sig_idx) {
             let mut out = Vec::with_capacity(points.len());
             for &i in points {
                 let idx = i as usize;
@@ -2093,8 +2118,8 @@ impl Trace for VcdTrace {
         // find_indices(Changed) skips the first record (no previous value vs
         // nothing); prepend the first WRITE from the change list itself — the
         // sparse-index prepend is gone with the sampled anchors.
-        let all = self.anchored_changes(*sig_idx)?;
-        let init = self.initial_value_at(*sig_idx);
+        let all = self.anchored_changes(sig_idx)?;
+        let init = self.initial_value_at(sig_idx);
         let mut changes = eval_change_list(self.max_index, &all, &init, &FindCondition::Changed);
         if let Some(&(first_idx, _)) = all.first() {
             let fi = first_idx as usize;

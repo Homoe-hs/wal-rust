@@ -272,8 +272,19 @@ impl<W: Write> FstWriter<W> {
         let mut zlib = ZlibEncoder::new(Vec::new(), ZlComp::best());
         zlib.write_all(&time_raw).unwrap();
         let time_comp = zlib.finish().unwrap();
-        let tsec_uclen = time_raw.len() as u64;
-        let tsec_clen = time_comp.len() as u64;
+        // fstapi 约定: 压缩没有收益时直接存原始字节, 此时 clen == uclen,
+        // 读端(allow_uncompressed=true)会把它当作未压缩数据读取。
+        // 若我们在此仍写 zlib 数据而 clen 恰好等于 uclen(例如 11 个时间点、
+        // 每步 10 → raw=11 字节、压缩后也 11 字节), 读端会把 zlib 头当成时间
+        // 表, 整块数据报废(wellen 报 I/O error / fst2vcd 输出乱序时间)。
+        let (time_payload, tsec_uclen, tsec_clen) = if time_comp.len() < time_raw.len() {
+            let ul = time_raw.len() as u64;
+            let cl = time_comp.len() as u64;
+            (time_comp, ul, cl)
+        } else {
+            let n = time_raw.len() as u64;
+            (time_raw, n, n)
+        };
         let tsec_nitems = timestamps.len() as u64;
         drop(timestamps);
 
@@ -440,7 +451,7 @@ impl<W: Write> FstWriter<W> {
         // -- 6. Assemble --
         let mut body = Vec::with_capacity(
             24 + cp_buf.len() + vc_buf.len() + chain_data_area.len() + 8 + idx_buf.len() + 8
-            + time_comp.len() + 24,
+            + time_payload.len() + 24,
         );
 
         // HDR24: begin_time, end_time, mem_required (big-endian per FST format)
@@ -462,7 +473,7 @@ impl<W: Write> FstWriter<W> {
         body.extend_from_slice(&chain_clen.to_be_bytes());
 
         // Time section
-        body.extend_from_slice(&time_comp);
+        body.extend_from_slice(&time_payload);
         // Trailer (big-endian per FST format)
         body.extend_from_slice(&tsec_uclen.to_be_bytes());
         body.extend_from_slice(&tsec_clen.to_be_bytes());

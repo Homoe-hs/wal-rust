@@ -14,6 +14,7 @@ target/release/wal-rust repl        # interactive REPL
 test_samples/run_tests.sh           # WAL script test runner
 bash scripts/diff_find.sh .tools/wal-rust.old target/release/wal-rust   # find semantic diff gate
 WAL_NO_ENGINE=1 target/release/wal-rust '(count (&& (rising "c") (= (get "d") 3)))' -l x.vcd  # 禁用统一引擎(纯逐拍)= 独立 oracle
+cargo test --test fuzz_vcd_fst_diff   # 随机波形差分: VCD↔FST 等价 + 引擎↔逐拍(可调 WAL_FUZZ_N/WAL_FUZZ_SEED)
 ```
 
 ## CLI input auto-detect
@@ -64,8 +65,8 @@ Flags: `-l <waveform>` (repeatable), `-c <code>` (inline override), `--halt-on-e
 | **纯逐拍 oracle** | `WAL_NO_ENGINE=1` 让引擎直接返回 None → 全部走逐拍;矩阵在子进程里用它做独立对拍 |
 
 > 统一查询引擎(变更点并集区间扫描)已落地(docs/query-engine-design.md §IntervalSweep):
-> 四条硬约束——①每个边界都要推进 prev ②区间内部边沿恒假、电平按区间长累加
-> ③&&/|| 分解不得丢无法解析的谓词 ④引用 INDEX/TS 的条件必须放弃引擎(走逐拍)。矩阵 `tests/regression_matrix.rs` 是语义冻结闸。
+> 五条硬约束——①每个边界都要推进 prev ②区间内部边沿恒假、电平按区间长累加
+> ③&&/|| 分解不得丢无法解析的谓词 ④名字解析所有读取路径一致(短名/叶子名) ⑤引用 INDEX/TS 的条件必须放弃引擎(走逐拍)。矩阵 `tests/regression_matrix.rs` 是语义冻结闸。
 
 ## Language notes (0.12.x)
 

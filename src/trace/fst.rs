@@ -19,6 +19,8 @@ pub struct FstTrace {
     /// 首次解码失败的说明(文件损坏/编码不支持);查询路径可能吞掉局部 Err,
     /// 顶层用 fatal_error() 兜底上报,避免"看似正常的错误结果"。
     fatal: RefCell<Option<String>>,
+    /// 短名/叶子名/子串解析缓存(与 VcdTrace::resolve_idx 同口径)。
+    name_cache: RefCell<HashMap<String, Option<SignalRef>>>,
 }
 
 /// 运行 wellen 的解码调用:捕获 panic 并**抑制其默认打印**
@@ -75,6 +77,20 @@ fn value_to_scalar(sv: &SignalValue) -> ScalarValue {
     }
 }
 
+/// 位串是否"确定的全 0/全 1"(含 x/z → None)。与 VCD 侧 `vcd_is_zero` 同口径:
+/// 向量 rising = prev 全 0 且 cur 为**确定的非零**(不必全 1)。
+fn bytes_is_zero(bs: &[u8]) -> Option<bool> {
+    if bs.iter().all(|&b| b == b'0' || b == b'1') {
+        Some(bs.iter().all(|&b| b == b'0'))
+    } else {
+        None
+    }
+}
+
+fn sv_is_zero(sv: &SignalValue) -> Option<bool> {
+    bytes_is_zero(sv_bit_string(sv)?.as_bytes())
+}
+
 fn sv_as_bit(sv: &SignalValue) -> Option<u8> {
     let bs = sv_bit_string(sv)?;
     if bs.len() == 1 { Some(bs.as_bytes()[0]) } else { None }
@@ -113,8 +129,21 @@ fn find_cond_matches(
 ) -> bool {
     let curr_bit = sv_as_bit(sv);
     let matched = match cond {
-        FindCondition::Rising => prev_bit == Some(b'0') && curr_bit == Some(b'1'),
-        FindCondition::Falling => prev_bit == Some(b'1') && curr_bit == Some(b'0'),
+        // 向量语义与 VCD 侧一致: rising = prev 为 0 且 cur 为确定的非零;
+        // falling = 反之。只按单个 bit 比较会让**向量信号永远没有边沿**
+        // (sv_as_bit 对多位返回 None)——内网 "NE/changes 漂移" 的根因之一。
+        FindCondition::Rising => {
+            match (prev_val.as_ref().and_then(|p| bytes_is_zero(p)), sv_is_zero(sv)) {
+                (Some(true), Some(false)) => true,
+                _ => prev_bit == Some(b'0') && curr_bit == Some(b'1'),
+            }
+        }
+        FindCondition::Falling => {
+            match (prev_val.as_ref().and_then(|p| bytes_is_zero(p)), sv_is_zero(sv)) {
+                (Some(false), Some(true)) => true,
+                _ => prev_bit == Some(b'1') && curr_bit == Some(b'0'),
+            }
+        }
         FindCondition::High => curr_bit == Some(b'1'),
         FindCondition::Low => curr_bit == Some(b'0'),
         FindCondition::Value(v) => {
@@ -191,13 +220,43 @@ impl FstTrace {
             name_to_ref,
             current_index: 0,
             fatal: RefCell::new(None),
+            name_cache: RefCell::new(HashMap::new()),
         })
+    }
+
+    /// 解析信号名: 精确 → 叶子名(短名/无点) → 子串;结果缓存。
+    fn resolve_cached(&self, name: &str) -> Option<SignalRef> {
+        if let Some(r) = self.name_to_ref.get(name) {
+            return Some(*r);
+        }
+        if let Some(c) = self.name_cache.borrow().get(name) {
+            return *c;
+        }
+        fn leaf(s: &str) -> &str { s.rsplitn(2, '.').next().unwrap_or("") }
+        let mut hit: Option<SignalRef> = None;
+        let mut sub: Option<SignalRef> = None;
+        {
+            let wf = self.wf.borrow();
+            let h = wf.hierarchy();
+            for var in h.iter_vars() {
+                let full = var.full_name(h);
+                if (name.len() <= 8 || !name.contains('.')) && leaf(&full) == name {
+                    hit = Some(var.signal_ref());
+                    break;
+                }
+                if sub.is_none() && full.contains(name) {
+                    sub = Some(var.signal_ref());
+                }
+            }
+        }
+        let found = hit.or(sub);
+        self.name_cache.borrow_mut().insert(name.to_string(), found);
+        found
     }
 
     /// Resolve a signal ref and load its data on demand (wellen loads lazily)
     fn resolve_ref(&self, name: &str) -> Result<SignalRef, String> {
-        self.name_to_ref.get(name)
-            .copied()
+        self.resolve_cached(name)
             .ok_or_else(|| format!("Unknown signal: {}", name))
     }
 
@@ -275,9 +334,10 @@ impl Trace for FstTrace {
     }
 
     fn signal_width(&self, name: &str) -> Result<usize, String> {
+        let want = self.resolve_ref(name)?;
         let wf = self.wf.borrow();
         for var in wf.hierarchy().iter_vars() {
-            if var.full_name(wf.hierarchy()) == name {
+            if var.signal_ref() == want {
                 return Ok(var.length().unwrap_or(1) as usize);
             }
         }

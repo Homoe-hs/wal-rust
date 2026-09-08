@@ -1199,10 +1199,19 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
                         let sigs = tr.signals();
                         let resolved = resolve_signal_name(&sig, &sigs)
                             .unwrap_or_else(|| sig.clone());
-                        if let Ok(idxs) = tr.find_indices(&resolved, cond.clone()) {
-                            idx_sets.push(idxs);
-                        } else {
-                            idx_sets.push(Vec::new());
+                        match tr.find_indices(&resolved, cond.clone()) {
+                            Ok(idxs) => {
+                                if std::env::var("WAL_DEBUG_FIND").is_ok() {
+                                    eprintln!("decompose: sig={} cond={:?} n={}", resolved, cond, idxs.len());
+                                }
+                                idx_sets.push(idxs);
+                            }
+                            Err(e) => {
+                                if std::env::var("WAL_DEBUG_FIND").is_ok() {
+                                    eprintln!("decompose ERR: sig={} cond={:?} err={}", resolved, cond, e);
+                                }
+                                idx_sets.push(Vec::new());
+                            }
                         }
                     }
                 }

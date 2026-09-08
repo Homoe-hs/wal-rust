@@ -130,3 +130,26 @@ error: FST 信号 t.d 的数据: Unexpected signal value: 0!defi。该 FST 值�
 
 **给内网的绕过方法**:生成 VCD 时把向量写成 `b<bits>` 形式
 (`b00000001 !` 而不是 `1!`),或改用 VCD 直接喂给 wal-rust(我们只读波形)。
+
+## 内网 "NE/changes 漂移" —— 已用随机差分复现并修复三处(v0.12.26)
+
+内网报的 NE/changes 计数漂移本地不可复现,于是新增
+`tests/fuzz_vcd_fst_diff.rs`:**确定性伪随机波形**(含 x/z、delta 周期、毛刺、
+45/128 位向量)× 同一波形写 VCD 与 FST × 一批表达式逐值对拍。立刻复现出三类缺陷:
+
+1. **FST 向量信号没有边沿**(`src/trace/fst.rs`)
+   `find_indices` 用 `sv_as_bit`(多位返回 None)比较 prev/cur → `(count (rising s))`
+   对向量信号恒为 0;VCD 侧正常。已改为与 VCD 同口径:prev 全 0 且 cur 为
+   "确定的非零" 即 rising。
+2. **短名/叶子名解析只在部分路径生效**(`src/trace/{vcd,fst}.rs`)
+   `op_get` 会解析短名,`rising/falling/changes/is-x/is-z` 直接按字面名读 →
+   短名场景下这些谓词静默 false(`count/step`、`find`/`whenever` 回退路径全中招)。
+   解析已下沉到 trace 层并带缓存,所有路径共用。
+3. **FST writer 时间段压缩约定**(`src/fst/writer.rs`)
+   fstapi 约定:压缩无收益时存原始字节(clen==uclen)。旧实现总是写 zlib 数据,
+   当压缩后长度恰好等于原始长度(例如 11 个时间点、每步 10 → 11 字节)时,
+   读端按"未压缩"解析 → 整块报废(wellen `I/O operation failed`、fst2vcd 输出乱序时间)。
+   已按约定加回退。
+
+**复现/回归**:`cargo test --test fuzz_vcd_fst_diff`(默认 40 波形,可用
+`WAL_FUZZ_N=300 WAL_FUZZ_SEED=...` 加码;失败时自动把波形写到 `.tools/fuzz_fail.*`)。

@@ -517,3 +517,46 @@ fn matrix_fst_corrupt_value_clean_error() {
     }
     let _ = std::fs::remove_file(&fst);
 }
+
+/// 24) 短名/叶子名解析必须对所有读取路径一致(op_get 能解析,边沿/X 谓词也曾不能):
+///     内网现象为 count/step、find、whenever 回退路径对短名静默给 0。
+#[test]
+fn matrix_short_name_resolution_all_paths() {
+    let p = tmp("shortname", "$timescale 1ns $end\n$scope module t $end\n$var wire 8 ! d $end\n$var wire 1 \" c $end\n$enddefinitions $end\n\
+$dumpvars\nb00000000 !\n0\"\n$end\n#0\n#10\n1\"\nb00001111 !\n#20\n0\"\n#30\nb11110000 !\n");
+    let e = |c: &str| eval_with(&p, c);
+    // 短名与全名结果必须一致(四条路径)
+    assert_eq!(e("(count (rising \"c\"))"), e("(count (rising \"t.c\"))"));
+    assert_eq!(e("(count/step (rising \"c\"))"), Value::Int(1));
+    assert_eq!(e("(find (rising \"c\"))"), e("(find (rising \"t.c\"))"));
+    assert_eq!(e("(count/step (is-x \"d\"))"), e("(count/step (is-x \"t.d\"))"));
+    assert_eq!(e("(find (changes \"d\"))"), e("(find (changes \"t.d\"))"));
+    assert_eq!(e("(count/step (falling \"c\"))"), Value::Int(1));
+    assert_eq!(e("(count/step (changes \"c\"))"), Value::Int(2));
+}
+
+/// 25) FST writer: 压缩无收益时必须按 fstapi 约定写原始字节(clen==uclen)。
+///     回归点: 11 个时间点、每步 10 → raw=11 字节、zlib 后也 11 字节,
+///     旧实现写 zlib 数据但 clen==uclen,读端按未压缩解析 → 整块报废。
+#[test]
+fn matrix_fst_writer_time_section_uncompressed_fallback() {
+    use wal_rust::fst::{FstOptions, FstWriter, ScopeType, VarType};
+    let fst = std::env::temp_dir().join(format!("wal_reg_ts11_{}.fst", std::process::id()));
+    {
+        let mut w = FstWriter::create(&fst, FstOptions::default()).unwrap();
+        w.push_scope("t", ScopeType::VcdModule);
+        let d = w.create_var("d", 8, VarType::VcdWire);
+        w.pop_scope();
+        for i in 0..11u64 {
+            w.emit_time_change(i * 10);
+            w.emit_value_change(d, if i % 2 == 0 { b"00000000" } else { b"00001111" });
+        }
+        w.close().unwrap();
+    }
+    let t = wal_rust::trace::FstTrace::load(&fst, "t".to_string()).expect("11 时间点 FST 必须可读");
+    assert_eq!(t.max_index() + 1, 11, "时间轴必须完整");
+    let name = t.signals().iter().find(|s| s.ends_with('d')).unwrap().clone();
+    assert_eq!(t.signal_value(&name, 1).unwrap(), ScalarValue::Vector(b"00001111".to_vec()));
+    assert_eq!(t.signal_value(&name, 10).unwrap(), ScalarValue::Vector(b"00000000".to_vec()));
+    let _ = std::fs::remove_file(&fst);
+}
