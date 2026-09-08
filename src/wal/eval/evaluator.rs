@@ -1800,9 +1800,12 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
         }
 
         // 取第一条 trace 的信号表(与 op_get / 逐拍路径一致)
-        let (ids, max_index, per_sig) = {
+        let (ids, saved, max_index, per_sig) = {
             let t = self.traces.read().unwrap_or_else(|e| e.into_inner());
             let ids = t.trace_ids();
+            let saved: Vec<(String, usize)> = ids.iter()
+                .filter_map(|tid| t.get(tid).map(|tr| (tid.clone(), tr.index())))
+                .collect();
             let tr = match t.first_trace() { Some(tr) => tr, None => return Ok(None) };
             let sigs = tr.signals();
             let mut per_sig: Vec<(String, Vec<(usize, ScalarValue)>, ScalarValue)> = Vec::new();
@@ -1813,7 +1816,7 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
                 let cps = tr.change_points(&resolved).unwrap_or_default();
                 per_sig.push((resolved, cps, base));
             }
-            (ids, tr.max_index(), per_sig)
+            (ids, saved, tr.max_index(), per_sig)
         };
 
         // 覆盖表: 原始名与解析后全名都建键(op_get 可能用任一形式)
@@ -1878,12 +1881,12 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
             Ok(())
         })();
 
-        // 清理: 卸载覆盖表 + 游标归零(与逐拍路径的"不污染"约定一致)
+        // 清理: 卸载覆盖表 + 恢复进入时的游标(查询不污染 INDEX 的约定)
         self.env.set_sig_override(std::rc::Rc::new(std::cell::RefCell::new(
             std::collections::HashMap::new())));
         if let Ok(mut t) = self.traces.write() {
-            for tid in &ids {
-                let _ = t.set_index(tid, 0);
+            for (tid, idx) in &saved {
+                let _ = t.set_index(tid, *idx);
             }
         }
         result?;
@@ -1906,6 +1909,11 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
         };
         if ids.is_empty() {
             return Ok((Vec::new(), 0));
+        }
+        // P1 统一引擎: 变更点并集区间扫描等价于"逐索引求值"
+        // (边界之间值恒定, 边沿只可能在边界为真), 先试引擎。
+        if let Some((idxs, n)) = self.interval_scan(cond)? {
+            return Ok((idxs, n));
         }
         // Official "every waveform index" semantics: scan from INDEX 0 and
         // restore the cursor afterwards (152GB round P0-b).
@@ -2122,6 +2130,29 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
                 }
             }
             return Ok(Value::Nil);
+        }
+
+        // P1 统一引擎: 区间扫描给出命中索引集合, 再在命中索引处执行 body
+        // (body 语义=逐拍执行, 命中索引升序, 与逐拍回退等价; 条件求值由
+        //  O(时间戳) 降为 O(变更点))。
+        if let Some((idxs, _n)) = self.interval_scan(&args[0])? {
+            let mut result = Value::Nil;
+            for idx in idxs {
+                if let Ok(mut t) = self.traces.write() {
+                    for tid in &traces_ids {
+                        let _ = t.set_index(tid, idx);
+                    }
+                }
+                for b in &body_args {
+                    result = self.eval_value(b.clone())?;
+                }
+            }
+            if let Ok(mut t) = self.traces.write() {
+                for (tid, idx) in &saved {
+                    let _ = t.set_index(tid, *idx);
+                }
+            }
+            return Ok(result);
         }
 
         // Reset all traces to start (fallback path)

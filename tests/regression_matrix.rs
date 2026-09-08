@@ -187,3 +187,38 @@ fn matrix_interval_engine_equals_oracle() {
     ev.eval("(count (&& (> (get \"t.d\") 2) (< (get \"t.d\") 200)))").unwrap();
     assert_eq!(ev.eval("INDEX").unwrap(), Value::Int(3));
 }
+
+/// P1: whenever / count-step / find-step 走同一引擎,且不污染游标。
+#[test]
+fn matrix_engine_whenever_and_steps() {
+    let p = tmp("eng2", "$timescale 1ns $end\n$scope module t $end\n$var wire 8 ! d $end\n$enddefinitions $end\n\
+#0\nb00000010 !\n#10\nb00000011 !\n#20\nb00001111 !\n#30\nb11111111 !\n#40\nb00000010 !\n");
+    let e = |c: &str| eval_with(&p, c);
+    let cond = "(&& (> (get \"t.d\") 2) (< (get \"t.d\") 200))";
+    // whenever 引擎路径的执行次数 == 逐拍命中数
+    assert_eq!(
+        e(&format!("(do (define c 0) (whenever {} (set! c (+ c 1))) c)", cond)),
+        e(&format!("(count/step {})", cond))
+    );
+    // 边沿条件 whenever 同理
+    assert_eq!(
+        e("(do (define c 0) (whenever (changes \"t.d\") (set! c (+ c 1))) c)"),
+        e("(count/step (changes \"t.d\"))")
+    );
+    // count/step 与 find/step 均走引擎, 结果 == 区间语义
+    assert_eq!(e(&format!("(count/step {})", cond)), e(&format!("(count {})", cond)));
+    assert_eq!(e(&format!("(length (find/step {}))", cond)),
+               e(&format!("(length (find {}))", cond)));
+    // 引擎路径不污染游标(count / count-step / find / whenever)
+    let mut ev = Evaluator::new();
+    ev.load_trace(&p.to_string_lossy(), "t").unwrap();
+    ev.eval("(step 3)").unwrap();
+    ev.eval(&format!("(count {})", cond)).unwrap();
+    assert_eq!(ev.eval("INDEX").unwrap(), Value::Int(3));
+    ev.eval(&format!("(count/step {})", cond)).unwrap();
+    assert_eq!(ev.eval("INDEX").unwrap(), Value::Int(3));
+    ev.eval(&format!("(find {})", cond)).unwrap();
+    assert_eq!(ev.eval("INDEX").unwrap(), Value::Int(3));
+    ev.eval("(whenever (changes \"t.d\") (define zz 1))").unwrap();
+    assert_eq!(ev.eval("INDEX").unwrap(), Value::Int(3));
+}
