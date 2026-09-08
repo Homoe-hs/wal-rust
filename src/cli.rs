@@ -85,7 +85,10 @@ pub enum Command {
     Repl,
 
     /// Count timestamps where a signal equals a value (default 1)
-    #[command(about = "Count signal==VALUE timestamps:\nwal-rust count <wave> <signal> [value]")]
+    #[command(about = "Count timestamps where signal == VALUE (default 1).\n\
+NOTE: this is NOT the change count — for that use the expression\n\
+  wal-rust '(count (changes \"sig\"))' -l <wave>\n\
+wal-rust count <wave> <signal> [value]")]
     Count(CountArgs),
 
     /// List signal names containing a pattern
