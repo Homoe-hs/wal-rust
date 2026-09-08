@@ -1811,9 +1811,11 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
             let mut per_sig: Vec<(String, Vec<(usize, ScalarValue)>, ScalarValue)> = Vec::new();
             for n in &names {
                 let resolved = resolve_signal_name(n, &sigs).unwrap_or_else(|| n.clone());
+                // 数据不可用(如 FST 解码失败)→ 传播错误而不是伪造 x 值
                 let base = tr.signal_value(&resolved, 0)
-                    .unwrap_or(ScalarValue::Bit(b'x'));
-                let cps = tr.change_points(&resolved).unwrap_or_default();
+                    .map_err(|e| format!("interval_scan: {}: {}", resolved, e))?;
+                let cps = tr.change_points(&resolved)
+                    .map_err(|e| format!("interval_scan: {}: {}", resolved, e))?;
                 per_sig.push((resolved, cps, base));
             }
             (ids, saved, tr.max_index(), per_sig)

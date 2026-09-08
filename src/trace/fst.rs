@@ -18,6 +18,19 @@ pub struct FstTrace {
     current_index: usize,
 }
 
+
+/// wellen's `SignalValue::to_bit_string()` PANICS for Real/String/Event values
+/// (`panic!("Cannot convert ...")`). Guard every call: only the bit-vector
+/// variants convert; everything else yields None (handled by the caller).
+fn sv_bit_string(sv: &SignalValue) -> Option<String> {
+    match sv {
+        SignalValue::Binary(..) | SignalValue::FourValue(..) | SignalValue::NineValue(..) => {
+            sv.to_bit_string()
+        }
+        _ => None,
+    }
+}
+
 fn value_to_scalar(sv: &SignalValue) -> ScalarValue {
     match sv {
         SignalValue::Event => ScalarValue::Bit(b'1'),
@@ -27,7 +40,7 @@ fn value_to_scalar(sv: &SignalValue) -> ScalarValue {
             // Binary/FourValue/NineValue: wellen packs state codes (0..3 / 0..8),
             // not ASCII chars, and partial bytes are LSB-aligned. Decode through
             // wellen's own to_bit_string() to get canonical VCD chars ('0','1','x','z',...).
-            match sv.to_bit_string() {
+            match sv_bit_string(sv) {
                 Some(bs) if bs.len() == 1 => ScalarValue::Bit(bs.as_bytes()[0]),
                 Some(bs) => ScalarValue::Vector(bs.as_bytes().to_vec()),
                 None => ScalarValue::Bit(b'x'),
@@ -37,12 +50,12 @@ fn value_to_scalar(sv: &SignalValue) -> ScalarValue {
 }
 
 fn sv_as_bit(sv: &SignalValue) -> Option<u8> {
-    let bs = sv.to_bit_string()?;
+    let bs = sv_bit_string(sv)?;
     if bs.len() == 1 { Some(bs.as_bytes()[0]) } else { None }
 }
 
 fn sv_to_i64(sv: &SignalValue) -> Option<i64> {
-    let bs = sv.to_bit_string()?;
+    let bs = sv_bit_string(sv)?;
     if bs.is_empty() { return None; }
     let bytes = bs.as_bytes();
     // Match hand-rolled reader semantics: 1-bit x/z treated as 0
@@ -97,11 +110,11 @@ fn find_cond_matches(
             }
         }
         FindCondition::NeqI64(target) => sv_to_i64(sv) != Some(*target),
-        FindCondition::IsX => match sv.to_bit_string() {
+        FindCondition::IsX => match sv_bit_string(sv) {
             Some(bs) => bs.contains('x') || bs.contains('X'),
             None => false,
         },
-        FindCondition::IsZ => match sv.to_bit_string() {
+        FindCondition::IsZ => match sv_bit_string(sv) {
             Some(bs) => bs.contains('z') || bs.contains('Z'),
             None => false,
         },
@@ -117,10 +130,10 @@ fn find_cond_matches(
                     bs.to_vec()
                 }
             }
-            norm(p) != norm(&sv.to_bit_string().unwrap_or_default().into_bytes())
+            norm(p) != norm(&sv_bit_string(sv).unwrap_or_default().into_bytes())
         }).unwrap_or(false),
     };
-    if let Some(bs) = sv.to_bit_string() {
+    if let Some(bs) = sv_bit_string(sv) {
         *prev_val = Some(bs.into_bytes());
     }
     matched
@@ -408,5 +421,26 @@ impl Trace for FstTrace {
             }
         }
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// wellen 的 to_bit_string 对 Real/String/Event 会 panic;sv_bit_string 必须
+    /// 返回 None 而不是崩溃(内网 #1 FST 向量 panic 的兜底)。
+    #[test]
+    fn test_sv_bit_string_no_panic_on_non_bitvector() {
+        let real = SignalValue::Real(1.5);
+        assert!(sv_bit_string(&real).is_none());
+        let s = SignalValue::String("abc");
+        assert!(sv_bit_string(&s).is_none());
+        assert!(sv_bit_string(&SignalValue::Event).is_none());
+        // 位向量正常转换(LSB 对齐: 0b0101 的低 4 位 = "0101")
+        let bin = SignalValue::Binary(&[0b0000_0101u8], 4);
+        assert_eq!(sv_bit_string(&bin).as_deref(), Some("0101"));
+        // 标量解码路径也不 panic
+        assert!(matches!(value_to_scalar(&real), ScalarValue::Real(_)));
     }
 }
