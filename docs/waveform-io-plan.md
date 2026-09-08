@@ -128,7 +128,9 @@ Arrow/Parquet RLE+delta + [Lance 关于 Arrow 多 buffer 编码的批评](https:
 - 加载: 命中且校验通过 → 直接 mmap/顺序读缓存(约为 VCD 的 10-15% 字节)→ 查询毫秒级;
   未命中/失效 → 按现状构建,若 `WAL_CACHE=build`(或 auto 且命中失败)则写回。
 - 失效: (size, mtime, 指纹) 任一变化或格式版本不符 → 视为未命中并重建。
-- 开关: `WAL_CACHE=off|auto|build|read`(默认 auto: 命中读、未命中不写;`build` 显式构建)。
+- 开关: `WAL_CACHE=off|auto|build|read`(默认 auto: 命中读;**未命中且波形 ≥8MB 时写回**,
+  小文件不写以免污染目录;`build` 显式构建,始终写;`read` 只读不建)。
+- 目录污染防护(0.12.28): auto 模式设 8MB 阈值;缓存目录不可写时静默跳过(查询结果不受影响)。
 - 风险: 磁盘占用(~10-15%);CWD 污染(隐藏目录 + 文档说明);mtime 粒度;多进程并发写(临时文件 + 原子 rename)。
 
 **收益预估**: 首次构建仍 ~2-3 分钟(17.5GB 级);之后 `sigs/count/topsig` 从 2m40s-3min/次

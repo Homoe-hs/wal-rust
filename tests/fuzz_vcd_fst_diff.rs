@@ -196,6 +196,15 @@ fn queries(sigs: &[Sig], times: &[u64]) -> Vec<String> {
     qs
 }
 
+fn run_cli_env(bin: &str, query: &str, vcd: &std::path::Path, envs: &[(&str, &str)]) -> String {
+    let mut cmd = std::process::Command::new(bin);
+    cmd.arg(query).arg("-l").arg(vcd);
+    for (k, v) in envs { cmd.env(k, v); }
+    let out = cmd.output().expect("spawn wal-rust");
+    assert!(out.status.success(), "cli 失败 {}: {}", query, String::from_utf8_lossy(&out.stderr));
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
 fn eval_file(path: &std::path::Path, q: &str) -> Result<Value, String> {
     let mut e = Evaluator::new();
     e.load_trace(&path.to_string_lossy(), "t")?;
@@ -271,17 +280,8 @@ fn fuzz_engine_matches_step_oracle() {
 
         for q in queries(&sigs, &times) {
             if !q.starts_with("(count") && !q.starts_with("(find") { continue; }
-            let run = |no_engine: bool| -> String {
-                let mut c = std::process::Command::new(bin);
-                c.arg(&q).arg("-l").arg(&vcd_path);
-                if no_engine { c.env("WAL_NO_ENGINE", "1"); }
-                let out = c.output().expect("spawn wal-rust");
-                assert!(out.status.success(), "seed={:#x} cli 失败 {}: {}", seed, q,
-                    String::from_utf8_lossy(&out.stderr));
-                String::from_utf8_lossy(&out.stdout).trim().to_string()
-            };
-            let eng = run(false);
-            let step = run(true);
+            let eng = run_cli_env(bin, &q, &vcd_path, &[]);
+            let step = run_cli_env(bin, &q, &vcd_path, &[("WAL_NO_ENGINE", "1")]);
             if eng != step && std::env::var_os("WAL_FUZZ_KEEP").is_some() {
                 let _ = std::fs::copy(&vcd_path, ".tools/fuzz_step_fail.vcd");
             }
@@ -291,4 +291,50 @@ fn fuzz_engine_matches_step_oracle() {
         let _ = std::fs::remove_file(&vcd_path);
     }
     let _ = std::fs::remove_dir(&dir);
+}
+
+/// 可选路径必须与基线逐值一致: 列缓存(WAL_COL_CACHE_MB)、跨进程缓存
+/// (WAL_CACHE=build 写回 → auto/read 命中)。这些路径默认关闭,固定夹具覆盖
+/// 有限,这里用随机波形加闸。
+#[test]
+fn fuzz_optin_paths_match_baseline() {
+    let n: u64 = std::env::var("WAL_FUZZ_N").ok().and_then(|v| v.parse().ok()).unwrap_or(12);
+    let seed0: u64 = std::env::var("WAL_FUZZ_SEED").ok().and_then(|v| v.parse().ok())
+        .unwrap_or(0x51ED_270B_1111_2222);
+    let dir = std::env::temp_dir().join(format!("wal_fuzz_opt_{}", std::process::id()));
+    let cdir = dir.join("cache");
+    std::fs::create_dir_all(&cdir).unwrap();
+    let bin = env!("CARGO_BIN_EXE_wal-rust");
+    let cdir_s = cdir.to_string_lossy().to_string();
+
+    for it in 0..n {
+        let seed = seed0.wrapping_add(it.wrapping_mul(0x9E37_79B9_7F4A_7C15));
+        let mut rng = Rng(seed | 1);
+        let (sigs, times) = gen_wave(&mut rng);
+        let vcd_path = dir.join(format!("o{}.vcd", it));
+        std::fs::write(&vcd_path, to_vcd(&sigs, &times)).unwrap();
+        let qs = queries(&sigs, &times);
+
+        // 1) 先用 build 构建跨进程缓存(任意查询都会触发加载+写回)
+        let _ = run_cli_env(bin, &qs[0], &vcd_path, &[("WAL_CACHE", "build"), ("WAL_CACHE_DIR", &cdir_s)]);
+        assert!(std::fs::read_dir(&cdir).unwrap().count() > 0,
+            "build 模式未写出缓存文件 seed={:#x}", seed);
+
+        for q in &qs {
+            let base = run_cli_env(bin, q, &vcd_path, &[]);
+            let col = run_cli_env(bin, q, &vcd_path, &[("WAL_COL_CACHE_MB", "8")]);
+            assert_eq!(base, col, "列缓存路径不一致 seed={:#x} q={}", seed, q);
+            let auto = run_cli_env(bin, q, &vcd_path, &[("WAL_CACHE", "auto"), ("WAL_CACHE_DIR", &cdir_s)]);
+            let read = run_cli_env(bin, q, &vcd_path, &[("WAL_CACHE", "read"), ("WAL_CACHE_DIR", &cdir_s)]);
+            assert_eq!(base, auto, "跨进程缓存(auto 命中)不一致 seed={:#x} q={}", seed, q);
+            assert_eq!(base, read, "跨进程缓存(read 命中)不一致 seed={:#x} q={}", seed, q);
+            let both = run_cli_env(bin, q, &vcd_path,
+                &[("WAL_CACHE", "read"), ("WAL_COL_CACHE_MB", "8"), ("WAL_CACHE_DIR", &cdir_s)]);
+            assert_eq!(base, both, "缓存组合路径不一致 seed={:#x} q={}", seed, q);
+        }
+        let _ = std::fs::remove_file(&vcd_path);
+        let _ = std::fs::remove_dir_all(&cdir);
+        std::fs::create_dir_all(&cdir).unwrap();
+    }
+    let _ = std::fs::remove_dir_all(&dir);
 }

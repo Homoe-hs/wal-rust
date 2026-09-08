@@ -745,7 +745,14 @@ impl VcdTrace {
             timescale_exp,
             current_index: 0, max_index,
         };
-        if cmode == CacheMode::Auto || cmode == CacheMode::Build {
+        // auto 模式只对较大波形写回: 小文件解析本来就毫秒级,写缓存只会污染目录。
+        // build 是显式要求写回, 始终写。
+        let should_write_cache = match cmode {
+            CacheMode::Build => true,
+            CacheMode::Auto => file_len >= 8 * 1024 * 1024,
+            _ => false,
+        };
+        if should_write_cache {
             if let Some(cp) = cache_file_for(path) {
                 trace.save_cache(&cp);
             }

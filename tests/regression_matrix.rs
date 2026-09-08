@@ -308,16 +308,27 @@ fn matrix_cache_roundtrip_and_invalidation() {
     let p = tmp("cache", "$timescale 1ns $end\n$scope module t $end\n$var wire 8 ! d $end\n$enddefinitions $end\n\
 #0\nb00000010 !\n#10\nb00000011 !\n#20\nb00001111 !\n");
     let q = "(count (&& (> (get \"t.d\") 2) (< (get \"t.d\") 200)))";
-    let first = eval_with(&p, q);          // 未命中 → 加载 + 写缓存
-    let second = eval_with(&p, q);         // 命中 → 读缓存
-    assert_eq!(first, second, "cache hit must match the cold result");
+    // auto 模式对小于阈值的波形**不写**缓存(小文件解析本来就快,避免污染目录)
+    let _ = eval_with(&p, q);
+    assert!(std::fs::read_dir(&dir).map(|d| d.count() == 0).unwrap_or(true),
+        "auto 模式不应为小文件写缓存文件");
+    // build 显式写回 → read/auto 命中必须与冷加载一致
+    std::env::set_var("WAL_CACHE", "build");
+    let first = eval_with(&p, q);
+    std::env::remove_var("WAL_CACHE");
     assert!(std::fs::read_dir(&dir).map(|d| d.count() > 0).unwrap_or(false),
-        "cache file should exist after a load");
+        "build 模式应写出缓存文件");
+    std::env::set_var("WAL_CACHE", "read");
+    let second = eval_with(&p, q);
+    std::env::remove_var("WAL_CACHE");
+    assert_eq!(first, second, "cache hit must match the cold result");
     // 波形内容变化 → mtime/指纹变化 → 失效重建, 结果更新
     std::thread::sleep(std::time::Duration::from_millis(1100));
     std::fs::write(&p, "$timescale 1ns $end\n$scope module t $end\n$var wire 8 ! d $end\n$enddefinitions $end\n\
 #0\nb00000100 !\n#10\nb00000101 !\n#20\nb00000110 !\n").unwrap();
+    std::env::set_var("WAL_CACHE", "build");
     let third = eval_with(&p, q);
+    std::env::remove_var("WAL_CACHE");
     assert_eq!(third, Value::Int(3), "after invalidation the new waveform must be read");
     std::env::remove_var("WAL_CACHE_DIR");
     let _ = std::fs::remove_dir_all(&dir);
