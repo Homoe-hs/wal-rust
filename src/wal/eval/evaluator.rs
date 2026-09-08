@@ -1810,7 +1810,12 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
             let sigs = tr.signals();
             let mut per_sig: Vec<(Vec<String>, Vec<(usize, ScalarValue)>, ScalarValue)> = Vec::new();
             for n in &names {
-                let resolved = resolve_signal_name(n, &sigs).unwrap_or_else(|| n.clone());
+                // 信号不在第一条 trace(如多 trace 场景的第二个文件)→ 引擎不适用,
+                // 交给逐拍回退(op_get 会跨 trace 查找)。
+                let resolved = match resolve_signal_name(n, &sigs) {
+                    Some(r) => r,
+                    None => return Ok(None),
+                };
                 // 数据不可用(如 FST 解码失败)→ 传播错误而不是伪造 x 值
                 let base = tr.signal_value(&resolved, 0)
                     .map_err(|e| format!("interval_scan: {}: {}", resolved, e))?;

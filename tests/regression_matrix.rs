@@ -315,3 +315,65 @@ fn matrix_cache_roundtrip_and_invalidation() {
     std::env::remove_var("WAL_CACHE_DIR");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// 引擎在多 trace 场景下必须安全回退(信号不在第一条 trace)。
+#[test]
+fn matrix_engine_multitrace_fallback() {
+    let a = tmp("mta", "$timescale 1ns $end\n$scope module a $end\n$var wire 1 ! c $end\n$enddefinitions $end\n#0\n0!\n#10\n1!\n");
+    let b = tmp("mtb", "$timescale 1ns $end\n$scope module b $end\n$var wire 8 \" v $end\n$enddefinitions $end\n#0\nb00000010 \"\n#10\nb00000011 \"\n");
+    let mut e = Evaluator::new();
+    e.load_trace(&a.to_string_lossy(), "t1").unwrap();
+    e.load_trace(&b.to_string_lossy(), "t2").unwrap();
+    // 引擎可处理的表达式, 但信号在第二条 trace → 必须回退逐拍而不是报错
+    let fast = e.eval("(count (= (+ (get \"v\") 1) 3))").unwrap();
+    let slow = e.eval("(count/step (= (+ (get \"v\") 1) 3))").unwrap();
+    assert_eq!(fast, slow, "multi-trace engine fallback must match the per-step oracle");
+    assert_eq!(fast, Value::Int(1));
+}
+
+/// FST 同索引毛刺 + 宽向量 与 VCD 的语义一致性(扩展现有一致性矩阵)。
+#[test]
+fn matrix_vcd_fst_glitch_and_wide() {
+    use wal_rust::fst::{FstOptions, FstWriter, ScopeType, VarType};
+    // VCD: #10 同拍双写 (1100 → 0011, 最后写入胜出); 128 位向量
+    let zero120 = "0".repeat(120);
+    let vcd_src = format!("$timescale 1ns $end\n$scope module t $end\n$var wire 4 ! d $end\n$var wire 128 \" w $end\n$enddefinitions $end\n\
+#0\nb0000 !\nb{}11111111 \"\n#10\nb1100 !\nb0011 !\nb{}10000000 \"\n#20\nb0000 !\nb{}00000000 \"\n", zero120, zero120, zero120);
+    let vcd = tmp("gwide", &vcd_src);
+    let fst = std::env::temp_dir().join(format!("wal_reg_gwide_{}.fst", std::process::id()));
+    {
+        let mut w = FstWriter::create(&fst, FstOptions::default()).unwrap();
+        w.push_scope("t", ScopeType::VcdModule);
+        let d = w.create_var("d", 4, VarType::VcdWire);
+        let wv = w.create_var("w", 128, VarType::VcdWire);
+        w.pop_scope();
+        w.emit_time_change(0);
+        w.emit_value_change(d, b"0000");
+        w.emit_value_change(wv, format!("{}11111111", zero120).as_bytes());
+        w.emit_time_change(10);
+        w.emit_value_change(d, b"1100");
+        w.emit_value_change(d, b"0011"); // 同索引毛刺: 最后写入胜出
+        w.emit_value_change(wv, format!("{}10000000", zero120).as_bytes());
+        w.emit_time_change(20);
+        w.emit_value_change(d, b"0000");
+        w.emit_value_change(wv, format!("{}00000000", zero120).as_bytes());
+        w.close().unwrap();
+    }
+    let ev = |path: &std::path::Path, code: &str| -> Value {
+        let mut e = Evaluator::new();
+        e.load_trace(&path.to_string_lossy(), "t").unwrap();
+        e.eval(code).unwrap()
+    };
+    for q in [
+        "(count (= (get \"t.d\") 3))",
+        "(count (changes \"t.d\"))",
+        "(count (= (get \"t.w\") 255))",
+        "(count (= (get \"t.w\") 128))",
+        "(count (!= (get \"t.w\") 0))",
+        "(at \"t.w\" 5)",
+        "(count (&& (> (get \"t.w\") 100) (< (get \"t.w\") 300)))",
+    ] {
+        assert_eq!(ev(&vcd, q), ev(&fst, q), "VCD/FST divergence on {}", q);
+    }
+    let _ = std::fs::remove_file(&fst);
+}
