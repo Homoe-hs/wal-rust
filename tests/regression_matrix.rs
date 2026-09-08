@@ -278,3 +278,40 @@ fn matrix_vcd_fst_consistency() {
     }
     let _ = std::fs::remove_file(&fst);
 }
+
+/// id 后缀歧义: 目标 id "1" 不得命中更长的 id "11" 的行(锚定扫描误配回归)。
+#[test]
+fn matrix_id_suffix_ambiguity() {
+    let p = tmp("suf", "$timescale 1ns $end\n$scope module t $end\n$var wire 8 1 a $end\n$var wire 8 11 b $end\n$enddefinitions $end\n\
+#0\nb00000001 1\nb00000010 11\n#10\nb00000011 1\nb00000100 11\n");
+    let e = |c: &str| eval_with(&p, c);
+    assert_eq!(e("(length (getwave \"t.a\"))"), Value::Int(2));
+    assert_eq!(e("(length (getwave \"t.b\"))"), Value::Int(2));
+    assert_eq!(e("(count (= (get \"t.a\") 1))"), Value::Int(1));
+    assert_eq!(e("(count (= (get \"t.b\") 2))"), Value::Int(1));
+    assert_eq!(e("(count (= (get \"t.a\") 2))"), Value::Int(0));
+}
+
+/// 跨进程缓存(§8): 命中与未命中结果一致; 波形改动后失效。
+#[test]
+fn matrix_cache_roundtrip_and_invalidation() {
+    let dir = std::env::temp_dir().join(format!("wal_reg_cache_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::env::set_var("WAL_CACHE_DIR", &dir);
+    let p = tmp("cache", "$timescale 1ns $end\n$scope module t $end\n$var wire 8 ! d $end\n$enddefinitions $end\n\
+#0\nb00000010 !\n#10\nb00000011 !\n#20\nb00001111 !\n");
+    let q = "(count (&& (> (get \"t.d\") 2) (< (get \"t.d\") 200)))";
+    let first = eval_with(&p, q);          // 未命中 → 加载 + 写缓存
+    let second = eval_with(&p, q);         // 命中 → 读缓存
+    assert_eq!(first, second, "cache hit must match the cold result");
+    assert!(std::fs::read_dir(&dir).map(|d| d.count() > 0).unwrap_or(false),
+        "cache file should exist after a load");
+    // 波形内容变化 → mtime/指纹变化 → 失效重建, 结果更新
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    std::fs::write(&p, "$timescale 1ns $end\n$scope module t $end\n$var wire 8 ! d $end\n$enddefinitions $end\n\
+#0\nb00000100 !\n#10\nb00000101 !\n#20\nb00000110 !\n").unwrap();
+    let third = eval_with(&p, q);
+    assert_eq!(third, Value::Int(3), "after invalidation the new waveform must be read");
+    std::env::remove_var("WAL_CACHE_DIR");
+    let _ = std::fs::remove_dir_all(&dir);
+}

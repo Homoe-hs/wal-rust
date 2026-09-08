@@ -253,6 +253,15 @@ impl VcdTrace {
             .map_err(|e| format!("Failed to mmap {}: {}", filename, e))?;
 
         let file_len = reader.data_len();
+        // 跨进程缓存(§8): 命中即跳过 PASS 1a/1b
+        let cmode = cache_mode();
+        if cmode != CacheMode::Off {
+            if let Some(cp) = cache_file_for(path) {
+                if let Some(t) = Self::try_load_cache(&cp, path, id.clone()) {
+                    return Ok(t);
+                }
+            }
+        }
         let est_ts = (file_len / 200).max(1024) as usize;
 
         // ====== PASS 1a: Scan header (single-thread) ======
@@ -698,7 +707,7 @@ impl VcdTrace {
             eprintln!("load: ts={} offsets={} sparse_entries={} event_entries={} signals={}",
                       timestamps.len(), timestamp_offsets.len(), sparse_entries, event_entries, signals.len());
         }
-        Ok(VcdTrace {
+        let trace = VcdTrace {
             id, filename,
             signals, signal_ids, id_blob, id_offsets, signal_widths, initial_values, name_to_idx, event_signals, event_change_points,
             timestamps: build_ts_store(timestamps), timestamp_offsets, sparse_index,
@@ -711,7 +720,13 @@ impl VcdTrace {
             scopes,
             timescale_exp,
             current_index: 0, max_index,
-        })
+        };
+        if cmode == CacheMode::Auto || cmode == CacheMode::Build {
+            if let Some(cp) = cache_file_for(path) {
+                trace.save_cache(&cp);
+            }
+        }
+        Ok(trace)
     }
 
     /// Find the index of a given timestamp (returns nearest <= target)
@@ -825,6 +840,7 @@ impl VcdTrace {
         let target_id = self.id_bytes(sig_idx)
             .ok_or_else(|| "find_indices: signal ID bytes not found".to_string())?
             .to_vec();
+        let target_hash = hash_sig_id(&target_id);
         use rayon::prelude::*;
         let shared_mmap = self.reader.borrow().data.clone();
         let id_len = target_id.len();
@@ -899,14 +915,23 @@ impl VcdTrace {
                     let id_start = pos - line_start;
                     // exact id position: preceded by ' ' or a single value char,
                     // line doesn't start with '$'
-                    if !line.is_empty()
+                    // 精确校验(避免"更长 id 以目标 id 结尾"的误配, 例如目标 "1"
+                    // 命中 `b0101 11` 的尾字符):
+                    //  1) 命中处到行尾恰为目标 id(needle 保证);
+                    //  2) 前一字符是空格/行首 → 合法;
+                    //     是值字符(无空格速写 `b00x0"`) → 要求整行解析出的 id 一致。
+                    let exact = !line.is_empty()
                         && line[0] != b'$'
-                        && (line.len() == id_len + 1
-                            || (id_start > 0
-                                && (line[id_start - 1] == b' '
-                                    || matches!(line[id_start - 1],
-                                        b'0' | b'1' | b'x' | b'X' | b'z' | b'Z'))))
-                    {
+                        && (id_start == 0 || line[id_start - 1] == b' ')
+                        || (!line.is_empty()
+                            && line[0] != b'$'
+                            && id_start > 0
+                            && matches!(line[id_start - 1],
+                                b'0' | b'1' | b'x' | b'X' | b'z' | b'Z')
+                            && parse_value_change_fast(line)
+                                .map(|(h, _)| h == target_hash)
+                                .unwrap_or(false));
+                    if exact {
                         let val = match line[0] {
                             b'b' => {
                                 let ve = id_start.saturating_sub(1);
@@ -1332,6 +1357,256 @@ fn parse_value_change_fast(line: &[u8]) -> Option<(u64, VcdValue)> {
     };
 
     Some((sig_hash, value))
+}
+
+
+// ================= 跨进程缓存(§8): 可再生中间文件, 非格式转换 =================
+//
+// WAL_CACHE=off|auto|build|read (默认 auto: 命中即读, 未命中按常加载并在 auto
+// 下写回)。文件位于 WAL_CACHE_DIR 或 ./.wal-rust-cache/, 名字含波形
+// 长度/修改时间/格式版本; 头部另有首尾 64KB 指纹。任一不符即视为未命中。
+
+#[derive(PartialEq, Clone, Copy)]
+enum CacheMode { Off, Auto, Build, Read }
+
+fn cache_mode() -> CacheMode {
+    match std::env::var("WAL_CACHE").unwrap_or_default().to_ascii_lowercase().as_str() {
+        "off" | "0" | "none" => CacheMode::Off,
+        "build" => CacheMode::Build,
+        "read" => CacheMode::Read,
+        _ => CacheMode::Auto,
+    }
+}
+
+fn cache_dir() -> std::path::PathBuf {
+    std::env::var_os("WAL_CACHE_DIR").map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from(".wal-rust-cache"))
+}
+
+fn wave_fingerprint(path: &std::path::Path) -> u64 {
+    use std::io::Read;
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut buf = vec![0u8; 64 * 1024];
+    if let Ok(mut f) = std::fs::File::open(path) {
+        if let Ok(n) = f.read(&mut buf) {
+            for &b in &buf[..n] { h ^= b as u64; h = h.wrapping_mul(0x100_0000_01b3); }
+        }
+        let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+        if len > 64 * 1024 {
+            use std::io::Seek;
+            let _ = f.seek(std::io::SeekFrom::End(-(64 * 1024)));
+            if let Ok(n) = f.read(&mut buf) {
+                for &b in &buf[..n] { h ^= b as u64; h = h.wrapping_mul(0x100_0000_01b3); }
+            }
+        }
+    }
+    h
+}
+
+fn cache_file_for(vcd: &std::path::Path) -> Option<std::path::PathBuf> {
+    let meta = std::fs::metadata(vcd).ok()?;
+    let mtime = meta.modified().ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())?;
+    let base = vcd.file_name()?.to_string_lossy().replace('/', "_");
+    Some(cache_dir().join(format!("{}-{}-{}-v1.wcol", base, meta.len(), mtime)))
+}
+
+struct BufW { b: Vec<u8> }
+impl BufW {
+    fn new() -> Self { BufW { b: Vec::with_capacity(1 << 16) } }
+    fn u8(&mut self, v: u8) { self.b.push(v); }
+    fn u32(&mut self, v: u32) { self.b.extend_from_slice(&v.to_le_bytes()); }
+    fn u64(&mut self, v: u64) { self.b.extend_from_slice(&v.to_le_bytes()); }
+    fn bytes(&mut self, v: &[u8]) { self.u32(v.len() as u32); self.b.extend_from_slice(v); }
+    fn val(&mut self, v: &VcdValue) {
+        match v {
+            VcdValue::Bit(b) => { self.u8(0); self.u8(*b); }
+            VcdValue::Vector(vec) => { self.u8(1); self.bytes(vec); }
+            VcdValue::Real(r) => { self.u8(2); self.u64(r.to_bits()); }
+        }
+    }
+}
+
+struct BufR<'a> { b: &'a [u8], p: usize }
+impl<'a> BufR<'a> {
+    fn new(b: &'a [u8]) -> Self { BufR { b, p: 0 } }
+    fn u8(&mut self) -> Option<u8> { let v = *self.b.get(self.p)?; self.p += 1; Some(v) }
+    fn u32(&mut self) -> Option<u32> {
+        let e = self.p.checked_add(4)?;
+        let v = u32::from_le_bytes(self.b.get(self.p..e)?.try_into().ok()?);
+        self.p = e; Some(v)
+    }
+    fn u64(&mut self) -> Option<u64> {
+        let e = self.p.checked_add(8)?;
+        let v = u64::from_le_bytes(self.b.get(self.p..e)?.try_into().ok()?);
+        self.p = e; Some(v)
+    }
+    fn bytes(&mut self) -> Option<Vec<u8>> {
+        let n = self.u32()? as usize;
+        let e = self.p.checked_add(n)?;
+        let v = self.b.get(self.p..e)?.to_vec();
+        self.p = e; Some(v)
+    }
+    fn val(&mut self) -> Option<VcdValue> {
+        match self.u8()? {
+            0 => Some(VcdValue::Bit(self.u8()?)),
+            1 => Some(VcdValue::Vector(self.bytes()?)),
+            2 => Some(VcdValue::Real(f64::from_bits(self.u64()?))),
+            _ => None,
+        }
+    }
+}
+
+impl VcdTrace {
+    /// 写出可再生缓存(失败静默, 缓存不影响正确性)。
+    fn save_cache(&self, path: &std::path::Path) {
+        let mut w = BufW::new();
+        w.b.extend_from_slice(b"WALVC001");
+        w.u32(1);
+        let meta = match std::fs::metadata(std::path::Path::new(&self.filename)) { Ok(m) => m, Err(_) => return };
+        w.u64(meta.len());
+        w.u64(meta.modified().ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs()).unwrap_or(0));
+        w.u64(wave_fingerprint(std::path::Path::new(&self.filename)));
+        w.u64(self.header_end_offset);
+        // scopes
+        w.u32(self.scopes.len() as u32);
+        for sc in &self.scopes { w.bytes(sc.as_bytes()); }
+        // timescale
+        match self.timescale_exp { Some(e) => { w.u8(1); w.u8(e as u8); } None => { w.u8(0); } }
+        // signals: name/id/width/initial
+        w.u32(self.signals.len() as u32);
+        for (i, name) in self.signals.iter().enumerate() {
+            w.bytes(name.as_bytes());
+            let idb = self.id_bytes(i as u32).unwrap_or_default();
+            w.bytes(idb);
+            w.u32(self.signal_widths.get(i).copied().unwrap_or(1));
+            match self.initial_values.get(&(i as u32)) {
+                Some(v) => { w.u8(1); w.val(v); }
+                None => { w.u8(0); }
+            }
+        }
+        // timestamps
+        match &self.timestamps {
+            TsStore::Uniform { start, step, count } => { w.u8(0); w.u64(*start); w.u64(*step); w.u64(*count); }
+            TsStore::Dense(v) => { w.u8(1); w.u32(v.len() as u32); for &t in v { w.u64(t); } }
+        }
+        // timestamp_offsets
+        w.u32(self.timestamp_offsets.len() as u32);
+        for &o in &self.timestamp_offsets { w.u64(o); }
+        // sparse_index
+        w.u32(self.sparse_index.len() as u32);
+        for (sig, v) in &self.sparse_index {
+            w.u32(*sig); w.u32(v.len() as u32);
+            for &(ts, off) in v { w.u64(ts); w.u64(off); }
+        }
+        // event signals + change points
+        w.u32(self.event_signals.len() as u32);
+        for s in &self.event_signals { w.u32(*s); }
+        w.u32(self.event_change_points.len() as u32);
+        for (sig, pts) in &self.event_change_points {
+            w.u32(*sig); w.u32(pts.len() as u32);
+            for &p in pts { w.u64(p as u64); }
+        }
+        let _ = std::fs::create_dir_all(cache_dir());
+        let tmp = path.with_extension("tmp");
+        if std::fs::write(&tmp, &w.b).is_ok() {
+            let _ = std::fs::rename(&tmp, path);
+        }
+    }
+
+    /// 尝试从缓存构造(命中返回 Some)。
+    fn try_load_cache(cache: &std::path::Path, vcd: &std::path::Path, id: TraceId) -> Option<VcdTrace> {
+        let data = std::fs::read(cache).ok()?;
+        let mut r = BufR::new(&data);
+        if data.len() < 8 || &data[..8] != b"WALVC001" { return None; }
+        r.p = 8;
+        if r.u32()? != 1 { return None; }
+        let meta = std::fs::metadata(vcd).ok()?;
+        if r.u64()? != meta.len() { return None; }
+        let mtime = meta.modified().ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs()).unwrap_or(0);
+        if r.u64()? != mtime { return None; }
+        if r.u64()? != wave_fingerprint(vcd) { return None; }
+        // mmap 仍然需要(值按需从 VCD 读取)
+        let reader = crate::vcd::reader::MmapReader::new(vcd).ok()?;
+        let header_end_offset = r.u64()?;
+        let mut scopes = Vec::new();
+        for _ in 0..r.u32()? { scopes.push(String::from_utf8(r.bytes()?).ok()?); }
+        let timescale_exp = match r.u8()? { 1 => Some(r.u8()? as i8), _ => None };
+        let n_sigs = r.u32()? as usize;
+        let mut signals: Vec<std::sync::Arc<str>> = Vec::with_capacity(n_sigs);
+        let mut id_blob: Vec<u8> = Vec::new();
+        let mut id_offsets: Vec<u32> = Vec::new();
+        let mut signal_widths: Vec<u32> = Vec::with_capacity(n_sigs);
+        let mut initial_values: HashMap<u32, VcdValue> = HashMap::new();
+        let mut signal_ids: HashMap<u64, u32> = HashMap::with_capacity(n_sigs);
+        let mut name_to_idx: HashMap<std::sync::Arc<str>, u32> = HashMap::with_capacity(n_sigs);
+        for i in 0..n_sigs {
+            let name = String::from_utf8(r.bytes()?).ok()?;
+            let idb = r.bytes()?;
+            let width = r.u32()?;
+            if r.u8()? == 1 { initial_values.insert(i as u32, r.val()?); }
+            id_offsets.push(id_blob.len() as u32);
+            signal_ids.insert(hash_sig_id(&idb), i as u32);
+            id_blob.extend_from_slice(&idb);
+            signal_widths.push(width);
+            let arc: std::sync::Arc<str> = std::sync::Arc::from(name);
+            name_to_idx.insert(arc.clone(), i as u32);
+            signals.push(arc);
+        }
+        let timestamps = match r.u8()? {
+            0 => TsStore::Uniform { start: r.u64()?, step: r.u64()?, count: r.u64()? },
+            _ => {
+                let n = r.u32()? as usize;
+                let mut v = Vec::with_capacity(n);
+                for _ in 0..n { v.push(r.u64()?); }
+                TsStore::Dense(v)
+            }
+        };
+        let n_off = r.u32()? as usize;
+        let mut timestamp_offsets = Vec::with_capacity(n_off);
+        for _ in 0..n_off { timestamp_offsets.push(r.u64()?); }
+        let n_sp = r.u32()? as usize;
+        let mut sparse_index: HashMap<u32, Vec<(u64, u64)>> = HashMap::with_capacity(n_sp);
+        for _ in 0..n_sp {
+            let sig = r.u32()?; let n = r.u32()? as usize;
+            let mut v = Vec::with_capacity(n);
+            for _ in 0..n { let ts = r.u64()?; let off = r.u64()?; v.push((ts, off)); }
+            sparse_index.insert(sig, v);
+        }
+        let n_ev = r.u32()? as usize;
+        let mut event_signals: HashSet<u32> = HashSet::with_capacity(n_ev);
+        for _ in 0..n_ev { event_signals.insert(r.u32()?); }
+        let n_ecp = r.u32()? as usize;
+        let mut event_change_points: HashMap<u32, Vec<usize>> = HashMap::with_capacity(n_ecp);
+        for _ in 0..n_ecp {
+            let sig = r.u32()?; let n = r.u32()? as usize;
+            let mut v = Vec::with_capacity(n);
+            for _ in 0..n { v.push(r.u64()? as usize); }
+            event_change_points.insert(sig, v);
+        }
+        let max_index = if timestamps.len() == 0 { 0 } else { timestamps.len() - 1 };
+        let lru_cap = std::num::NonZeroUsize::new(64 * 1024).unwrap();
+        let filename = vcd.to_string_lossy().to_string();
+        Some(VcdTrace {
+            id, filename,
+            signals, signal_ids, id_blob, id_offsets, signal_widths, initial_values, name_to_idx,
+            event_signals, event_change_points,
+            timestamps, timestamp_offsets, sparse_index,
+            lru_cache: RefCell::new(lru::LruCache::new(lru_cap)),
+            signal_cache: Mutex::new(HashMap::new()),
+            col_cache: HashMap::new(),
+            off_cache: HashMap::new(),
+            reader: RefCell::new(reader),
+            header_end_offset,
+            scopes, timescale_exp,
+            current_index: 0, max_index,
+        })
+    }
 }
 
 impl Trace for VcdTrace {
