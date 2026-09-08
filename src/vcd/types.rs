@@ -84,6 +84,16 @@ impl VcdValue {
                 if v.is_empty() { return None; }
                 // Check for unknowns
                 if v.iter().any(|&b| b != b'0' && b != b'1') { return None; }
+                if v.len() > 64 {
+                    // Width beyond 64: compare as "high bits zero, low 64 bits"
+                    let hi = &v[..v.len() - 64];
+                    if hi.iter().any(|&b| b == b'1') { return None; }
+                    // high bits must be zero: fall through on the low 64 bits
+                    let lo: u64 = v[v.len() - 64..].iter().fold(0u64, |acc, &b|
+                        acc.overflowing_shl(1).0 | if b == b'1' { 1 } else { 0 }
+                    );
+                    return Some(lo as i64);
+                }
                 Some(v.iter().fold(0i64, |acc, &b|
                     acc.overflowing_shl(1).0 | if b == b'1' { 1 } else { 0 }
                 ))

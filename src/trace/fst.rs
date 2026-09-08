@@ -43,13 +43,22 @@ fn sv_as_bit(sv: &SignalValue) -> Option<u8> {
 
 fn sv_to_i64(sv: &SignalValue) -> Option<i64> {
     let bs = sv.to_bit_string()?;
-    if bs.is_empty() || bs.len() > 64 { return None; }
+    if bs.is_empty() { return None; }
     let bytes = bs.as_bytes();
     // Match hand-rolled reader semantics: 1-bit x/z treated as 0
     if bytes.len() == 1 {
         return Some(if bytes[0] == b'1' { 1 } else { 0 });
     }
     if !bytes.iter().all(|&b| b == b'0' || b == b'1') { return None; }
+    if bytes.len() > 64 {
+        // Width beyond 64: value = low 64 bits with the high bits zero
+        let hi = &bytes[..bytes.len() - 64];
+        if hi.iter().any(|&b| b == b'1') { return None; }
+        let lo: u64 = bytes[bytes.len() - 64..].iter().fold(0u64, |acc, &b|
+            acc.overflowing_shl(1).0 | if b == b'1' { 1 } else { 0 }
+        );
+        return Some(lo as i64);
+    }
     let mut val: i64 = 0;
     for &b in bytes {
         val = val.overflowing_shl(1).0 | (if b == b'1' { 1 } else { 0 });
@@ -162,7 +171,12 @@ impl FstTrace {
         let sig_ref = self.resolve_ref(name)?;
         let mut wf = self.wf.borrow_mut();
         if wf.get_signal(sig_ref).is_none() {
-            wf.load_signals(&[sig_ref]);
+            // wellen may panic on foreign/odd value encodings (FST write
+            // variants); turn that into a clean query-time error.
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                wf.load_signals(&[sig_ref]);
+            }))
+            .map_err(|_| format!("FST signal data decode failed (unsupported encoding): {}", name))?;
         }
         Ok(sig_ref)
     }

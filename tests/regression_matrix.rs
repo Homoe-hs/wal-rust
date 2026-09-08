@@ -146,3 +146,17 @@ fn matrix_column_equals_anchored() {
     assert_eq!(run("0"), run("1024"));
     std::env::remove_var("WAL_COL_CACHE_MB");
 }
+
+/// 内网轮(0.12.10)新增: >64 位向量与整数值比较 — 高位全 0 且低 64 位等于目标
+/// 才算匹配(旧的 to_i64 对 >64 位直接 None → 静默给 0)。
+#[test]
+fn matrix_wide_vector_int_compare() {
+    // 128-bit 信号: idx0 = 000…011111111(=255), idx1 = 000…010000000(=128)
+    let zero120 = "0".repeat(120);
+    let p = tmp("wide", &format!("$timescale 1ns $end\n$scope module t $end\n$var wire 128 ! d $end\n$enddefinitions $end\n\
+#0\nb{}{}!\n#10\nb{}{}!\n", zero120, "11111111", zero120, "10000000"));
+    let e = |c: &str| eval_with(&p, c);
+    assert_eq!(e("(count (= (get \"t.d\") 255))"), Value::Int(1));
+    assert_eq!(e("(count (= (get \"t.d\") 128))"), Value::Int(1));
+    assert_eq!(e("(count/step (= (get \"t.d\") 255))"), Value::Int(1));
+}
