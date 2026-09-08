@@ -1339,7 +1339,9 @@ fn parse_value_change_fast(line: &[u8]) -> Option<(u64, VcdValue)> {
         }
     };
 
-    if sig_id_bytes.is_empty() || sig_id_bytes[0] == b'$' { return None; }
+    // 只排除空 id;`$` 开头的 id 是合法 VCD 标识符(如 counter 夹具的 rst `$`),
+    // 指令行由调用方按"行首 $`"过滤, 不能在这里按 id 首字符误杀。
+    if sig_id_bytes.is_empty() { return None; }
 
     let sig_hash = hash_sig_id(sig_id_bytes);
     let vfirst = value_part[0];
