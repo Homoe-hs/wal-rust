@@ -107,3 +107,29 @@ simdjson [stage1 结构索引/指针](https://deepwiki.com/abab2025/simdjson_sim
 Arrow/Parquet RLE+delta + [Lance 关于 Arrow 多 buffer 编码的批评](https://arxiv.org/pdf/2504.15247)(C 的设计注意点)。
 
 建议顺序: A(1-2h,收益 1.5x)→ B(半天,脚本场景体验质变)→ C(如需 150GB≤60s 硬指标)。
+
+## 8. 跨进程索引复用: CWD 缓存文件方案(待讨论)
+
+内测诉求: `sigs/count/topsig` 每次调用全量重扫(17.5GB/42M 信号 ≈ 2m40s-3min/次)。
+现有列缓存是**进程内**的;跨进程复用需要落盘一份**可再生的缓存**(不是格式转换)。
+
+**定位**: 缓存 ≠ 转换。缓存是可丢弃、可重建、带版本与身份校验的中间产物;
+不改变"VCD 是唯一真值来源"的原则,也不引入第二种波形格式。
+
+**方案**:
+- 位置: 默认 `./.wal-rust-cache/`(执行目录;可用 `WAL_CACHE_DIR` 覆盖;波形目录可写时也可选 `WAL_CACHE=beside`)。
+- 命名: `<wave_basename>.<size>.<mtime>.<format_version>.wcol`。
+- 内容(顺序读一次即得,无需解析):
+  1. 头部: magic + 版本 + 波形 (size, mtime, 首尾 1MB 指纹);
+  2. 信号元数据: 名池(长度前缀)+ id + 宽度 + 初值;
+  3. 稀疏锚点(每信号 (ts,offset) 序列);
+  4. 变更列: 每信号 (ts_idx 增量编码 + 2bit/位状态,宽度≤64) —— 即现有内存列缓存序列化;
+     超预算信号写"偏移索引"(ts_idx + 文件偏移),值仍从 VCD 按需读。
+- 加载: 命中且校验通过 → 直接 mmap/顺序读缓存(约为 VCD 的 10-15% 字节)→ 查询毫秒级;
+  未命中/失效 → 按现状构建,若 `WAL_CACHE=build`(或 auto 且命中失败)则写回。
+- 失效: (size, mtime, 指纹) 任一变化或格式版本不符 → 视为未命中并重建。
+- 开关: `WAL_CACHE=off|auto|build|read`(默认 auto: 命中读、未命中不写;`build` 显式构建)。
+- 风险: 磁盘占用(~10-15%);CWD 污染(隐藏目录 + 文档说明);mtime 粒度;多进程并发写(临时文件 + 原子 rename)。
+
+**收益预估**: 首次构建仍 ~2-3 分钟(17.5GB 级);之后 `sigs/count/topsig` 从 2m40s-3min/次
+降到秒级-亚秒级(仅读缓存),42M 信号元数据也直接从缓存反序列化。
