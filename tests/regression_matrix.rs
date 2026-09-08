@@ -571,3 +571,26 @@ fn matrix_fst_writer_time_section_uncompressed_fallback() {
     assert_eq!(t.signal_value(&name, 10).unwrap(), ScalarValue::Vector(b"00000000".to_vec()));
     let _ = std::fs::remove_file(&fst);
 }
+
+/// 26) 常量条件折叠: 不引用信号/INDEX 且无副作用的条件在每个索引取值相同,
+///     count/find/step 直接 O(1) 给出结果(而非逐索引求值), 且语义与逐拍一致。
+#[test]
+fn matrix_constant_condition_fold() {
+    let p = tmp("constfold", "$timescale 1ns $end\n$scope module t $end\n$var wire 8 ! d $end\n$enddefinitions $end\n\
+#0\nb00000010 !\n#10\nb00000011 !\n#20\nb00001111 !\n#30\nb00000010 !\n");
+    let e = |c: &str| eval_with(&p, c);
+    let ints = |v: Vec<i64>| Value::List(WList::from_vec(v.into_iter().map(Value::Int).collect()));
+    let all = e("(count/step (= 1 1))");
+    assert_eq!(all, Value::Int(4));
+    assert_eq!(e("(count (= 1 1))"), all);
+    assert_eq!(e("(count (> 5 3))"), all);
+    assert_eq!(e("(count (&& (= 1 1) (= 2 2)))"), all);
+    assert_eq!(e("(count (not (= 1 2)))"), all);
+    assert_eq!(e("(count (= 1 2))"), Value::Int(0));
+    assert_eq!(e("(find (= 1 2))"), ints(vec![]));
+    assert_eq!(e("(length (find (= 1 1)))"), all);
+    assert_eq!(e("(find (= 1 1) 2)"), ints(vec![0, 1]));
+    // 引用信号的表达式不得被当成常量
+    assert_eq!(e("(count (= (get \"t.d\") 3))"), e("(count/step (= (get \"t.d\") 3))"));
+    assert_eq!(e("(count (= (get \"t.d\") 3))"), Value::Int(1));
+}

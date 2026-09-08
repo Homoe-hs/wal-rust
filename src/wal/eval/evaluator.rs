@@ -1490,6 +1490,15 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
                 )));
             }
 
+            // 常量条件: 全索引或空集 → O(1)
+            if let Some(v) = self.const_cond_value(&resolved_cond) {
+                let out: Vec<i64> = if v {
+                    let max = { self.traces.read().ok().and_then(|t| t.first_trace().map(|tr| tr.max_index())).unwrap_or(0) };
+                    (0..=max as i64).take(max_results).collect()
+                } else { Vec::new() };
+                return Ok(Value::List(WList::from_vec(out.into_iter().map(Value::Int).collect())));
+            }
+
             // P1 统一引擎: 变更点并集区间扫描
             if let Some((idxs, _n)) = self.interval_scan(&resolved_cond)? {
                 let mut out: Vec<i64> = idxs.into_iter().map(|i| i as i64).collect();
@@ -1761,6 +1770,20 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
             return Ok(Value::Int(total as i64));
         }
 
+        // 常量条件(不引用信号/INDEX, 无副作用): 每个索引取值相同 → O(1)
+        if let Some(v) = self.const_cond_value(&resolved_cond) {
+            let total = if v {
+                let t = self.traces.read().unwrap_or_else(|e| e.into_inner());
+                t.first_trace().map(|tr| tr.max_index() + 1).unwrap_or(0)
+            } else { 0 };
+            if let Ok(mut t) = self.traces.write() {
+                for (tid, idx) in &saved {
+                    let _ = t.set_index(tid, *idx);
+                }
+            }
+            return Ok(Value::Int(total as i64));
+        }
+
         // Fast path 2: try decomposing (&& cond1 cond2) or (|| cond1 cond2)
         if let Some(result) = self.decompose_and_count(&resolved_cond, &traces_ids)? {
             return Ok(Value::Int(result));
@@ -1820,6 +1843,19 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
     ///   再求值一次——电平部分若仍为真,按区间长度 -1 累加(否则漏计区间内部索引)。
     /// 返回 None 表示表达式未引用任何信号,或引用了随索引变化的 INDEX/TS
     /// (区间内部不恒定,交给逐拍回退)。
+    /// 常量条件折叠: 返回 Some(truthy) 表示该条件不依赖信号/索引,
+    /// 每个索引取值相同(调用方据此直接得出结果, O(1))。
+    fn const_cond_value(&mut self, cond: &Value) -> Option<bool> {
+        let mut names: Vec<String> = Vec::new();
+        let mut has_edge = false;
+        let mut idx_dep = false;
+        collect_cond_signals(cond, &mut names, &mut has_edge, &mut idx_dep);
+        if !names.is_empty() || idx_dep || !cond_is_foldable(cond, &self.env) {
+            return None;
+        }
+        self.eval_value(cond.clone()).ok().map(|v| v.is_truthy())
+    }
+
     fn interval_scan(&mut self, cond: &Value) -> Result<Option<(Vec<usize>, usize)>, String> {
         // 调试/回归用逃生口: 禁用统一引擎 → 全部走逐拍路径(测试的独立 oracle)
         if std::env::var_os("WAL_NO_ENGINE").is_some() {
@@ -1986,6 +2022,14 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
         };
         if ids.is_empty() {
             return Ok((Vec::new(), 0));
+        }
+        // 常量条件: 全索引或空集 → O(1)
+        if let Some(v) = self.const_cond_value(cond) {
+            let max = {
+                let t = self.traces.read().unwrap_or_else(|e| e.into_inner());
+                t.first_trace().map(|tr| tr.max_index()).unwrap_or(0)
+            };
+            return Ok(if v { ((0..=max).collect(), max + 1) } else { (Vec::new(), 0) });
         }
         // P1 统一引擎: 变更点并集区间扫描等价于"逐索引求值"
         // (边界之间值恒定, 边沿只可能在边界为真), 先试引擎。
@@ -2524,6 +2568,35 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
 /// 收集条件表达式中引用的信号名 + 是否含边沿谓词。
 /// 识别形式: (get "name") / (get sym) / (rising|falling|changes|is-x|is-z "name"|sym)。
 /// 其余符号若绑定为字符串也按信号名处理(resolve_cond_names 之前调用)。
+/// 有副作用/控制流的操作符: 出现在条件里就不能做"求值一次"的常量折叠。
+const IMPURE_CONDS: &[&str] = &[
+    "set!", "print", "printf", "whenever", "save", "csv", "import", "load",
+    "define", "def", "while", "for",
+];
+
+/// 条件是否可以安全地"求值一次"(不引用信号/INDEX、无副作用、无闭包调用)。
+/// 用于常量条件折叠: 此类条件在每个索引上取值相同 → count/find 为 O(1)。
+fn cond_is_foldable(expr: &Value, env: &Environment) -> bool {
+    match expr {
+        Value::List(lst) => {
+            if let Some(Value::Symbol(op)) = lst.0.first() {
+                if IMPURE_CONDS.contains(&op.name.as_str()) {
+                    return false;
+                }
+                if matches!(env.lookup(&op.name), Some(Value::Closure(_)) | Some(Value::Macro(_))) {
+                    return false;
+                }
+            }
+            lst.0.iter().all(|v| cond_is_foldable(v, env))
+        }
+        Value::Symbol(sym) => !matches!(
+            env.lookup(&sym.name),
+            Some(Value::Closure(_)) | Some(Value::Macro(_))
+        ),
+        _ => true,
+    }
+}
+
 /// 收集条件表达式引用的信号名。
 /// `idx_dep`: 表达式引用了随"索引"变化的伪信号(INDEX/TS)——此类条件
 /// 在区间内部并非恒定,区间扫描不适用(必须逐索引求值)。

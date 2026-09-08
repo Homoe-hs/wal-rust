@@ -144,6 +144,11 @@ pub enum Node {
 再只在该集合上求值 INDEX 部分 → O(命中数) 而非 O(索引数)。当前为保证语义先直接
 回退逐拍(正确性优先,性能后补)。
 
+6. **0 个信号引用 = 常量条件**。不引用信号/INDEX 且无副作用的条件在每个索引取值相同,
+   `count`/`find`/`count/step` 直接 O(1) 给出结果(全索引或空集),不再逐索引求值。
+   纯度判定:`collect_cond_signals` 为空且 AST 无 `set!`/`print`/`while`/… 且无闭包调用;
+   引用信号的表达式绝不折叠(与逐拍 oracle 对拍在矩阵 `matrix_constant_condition_fold`)。
+
 #### 独立 oracle:`WAL_NO_ENGINE=1`
 
 引擎与"逐拍路径"若共享同一套实现,对拍就是自证。`WAL_NO_ENGINE=1` 让
