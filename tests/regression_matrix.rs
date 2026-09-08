@@ -160,3 +160,30 @@ fn matrix_wide_vector_int_compare() {
     assert_eq!(e("(count (= (get \"t.d\") 128))"), Value::Int(1));
     assert_eq!(e("(count/step (= (get \"t.d\") 255))"), Value::Int(1));
 }
+
+/// P1 统一引擎: 变更点并集区间扫描 —— 任意表达式快路径 == 逐拍 oracle。
+#[test]
+fn matrix_interval_engine_equals_oracle() {
+    let p = tmp("eng", "$timescale 1ns $end\n$scope module t $end\n$var wire 8 ! d $end\n$enddefinitions $end\n\
+#0\nb00000010 !\n#10\nb00000011 !\n#20\nb00001111 !\n#30\nb11111111 !\n#40\nb00000010 !\n");
+    let e = |c: &str| eval_with(&p, c);
+    // 区间恒定条件(无 x/z, 逐拍 oracle 可用)
+    assert_eq!(e("(count (&& (> (get \"t.d\") 2) (< (get \"t.d\") 200)))"),
+               e("(count/step (&& (> (get \"t.d\") 2) (< (get \"t.d\") 200)))"));
+    assert_eq!(e("(count (|| (= (get \"t.d\") 2) (= (get \"t.d\") 255)))"),
+               e("(count/step (|| (= (get \"t.d\") 2) (= (get \"t.d\") 255)))"));
+    // 边沿谓词参与(只在边界为真)
+    assert_eq!(e("(count (&& (changes \"t.d\") (> (get \"t.d\") 2)))"),
+               e("(count/step (&& (changes \"t.d\") (> (get \"t.d\") 2)))"));
+    assert_eq!(e("(count (rising \"t.d\"))"), e("(count/step (rising \"t.d\"))"));
+    // find 与 oracle 一致(区间展开)
+    let a = e("(length (find (&& (> (get \"t.d\") 2) (< (get \"t.d\") 200))))");
+    let b = e("(length (find/step (&& (> (get \"t.d\") 2) (< (get \"t.d\") 200))))");
+    assert_eq!(a, b);
+    // 引擎不污染游标
+    let mut ev = Evaluator::new();
+    ev.load_trace(&p.to_string_lossy(), "t").unwrap();
+    ev.eval("(step 3)").unwrap();
+    ev.eval("(count (&& (> (get \"t.d\") 2) (< (get \"t.d\") 200)))").unwrap();
+    assert_eq!(ev.eval("INDEX").unwrap(), Value::Int(3));
+}

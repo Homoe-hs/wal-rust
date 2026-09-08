@@ -622,6 +622,16 @@ fn op_get(args: &[Value], env: &mut Environment, eval: &mut Evaluator) -> Result
     }
     let name = extract_name(&args[0])?;
 
+    // 区间扫描覆盖(统一引擎): 边界处的当前值
+    if let Some(cur) = env.sig_override_cur(&name) {
+        let (hi, lo) = if args.len() == 3 {
+            (extract_int(&args[1])? as u32, extract_int(&args[2])? as u32)
+        } else {
+            (1023, 0)
+        };
+        return Ok(slice_value(cur, hi, lo));
+    }
+
     // Check virtual signals first
     if env.is_virtual_signal(&name) {
         if let Some(expr) = env.lookup(&name) {
@@ -941,9 +951,48 @@ fn scalar_is_zero(sv: Option<&ScalarValue>) -> Option<bool> {
     }
 }
 
+fn scalar_has_x(v: &ScalarValue) -> bool {
+    match v {
+        ScalarValue::Bit(b) => *b == b'x' || *b == b'X',
+        ScalarValue::Vector(vec) => vec.iter().any(|&b| b == b'x' || b == b'X'),
+        _ => false,
+    }
+}
+
+fn scalar_has_z(v: &ScalarValue) -> bool {
+    match v {
+        ScalarValue::Bit(b) => *b == b'z' || *b == b'Z',
+        ScalarValue::Vector(vec) => vec.iter().any(|&b| b == b'z' || b == b'Z'),
+        _ => false,
+    }
+}
+
+/// 边沿判定(与逐拍路径同一语义): 向量按"零/非零",位按 0↔1;x 不算。
+fn edge_rising(prev: Option<&ScalarValue>, cur: Option<&ScalarValue>) -> bool {
+    match (scalar_is_zero(prev), scalar_is_zero(cur)) {
+        (Some(true), Some(false)) => return true,
+        _ => {}
+    }
+    matches!((prev, cur),
+        (Some(ScalarValue::Bit(b'0')), Some(ScalarValue::Bit(b'1'))))
+}
+
+fn edge_falling(prev: Option<&ScalarValue>, cur: Option<&ScalarValue>) -> bool {
+    match (scalar_is_zero(prev), scalar_is_zero(cur)) {
+        (Some(false), Some(true)) => return true,
+        _ => {}
+    }
+    matches!((prev, cur),
+        (Some(ScalarValue::Bit(b'1')), Some(ScalarValue::Bit(b'0'))))
+}
+
 fn op_rising(args: &[Value], env: &mut Environment, _eval: &mut Evaluator) -> Result<Value, String> {
     ensure_arity(args, 1)?;
     let name = extract_name(&args[0])?;
+    // 区间扫描覆盖(统一引擎): 直接用边界处的 (prev, cur) 求值
+    if let Some((prev, cur)) = env.sig_override_pair(&name) {
+        return Ok(Value::Bool(edge_rising(prev.as_ref(), Some(&cur))));
+    }
     if let Some(traces) = env.get_traces() {
         let traces = traces.read().unwrap_or_else(|e| e.into_inner());
         if let Some(trace) = traces.first_trace() {
@@ -968,6 +1017,9 @@ fn op_rising(args: &[Value], env: &mut Environment, _eval: &mut Evaluator) -> Re
 fn op_falling(args: &[Value], env: &mut Environment, _eval: &mut Evaluator) -> Result<Value, String> {
     ensure_arity(args, 1)?;
     let name = extract_name(&args[0])?;
+    if let Some((prev, cur)) = env.sig_override_pair(&name) {
+        return Ok(Value::Bool(edge_falling(prev.as_ref(), Some(&cur))));
+    }
     if let Some(traces) = env.get_traces() {
         let traces = traces.read().unwrap_or_else(|e| e.into_inner());
         if let Some(trace) = traces.first_trace() {
@@ -992,6 +1044,9 @@ fn op_falling(args: &[Value], env: &mut Environment, _eval: &mut Evaluator) -> R
 fn op_is_x(args: &[Value], env: &mut Environment, _eval: &mut Evaluator) -> Result<Value, String> {
     ensure_arity(args, 1)?;
     let name = extract_name(&args[0])?;
+    if let Some(cur) = env.sig_override_cur(&name) {
+        return Ok(Value::Bool(scalar_has_x(&cur)));
+    }
     if let Some(traces) = env.get_traces() {
         let traces = traces.read().unwrap_or_else(|e| e.into_inner());
         if let Some(trace) = traces.first_trace() {
@@ -1011,6 +1066,9 @@ fn op_is_x(args: &[Value], env: &mut Environment, _eval: &mut Evaluator) -> Resu
 fn op_is_z(args: &[Value], env: &mut Environment, _eval: &mut Evaluator) -> Result<Value, String> {
     ensure_arity(args, 1)?;
     let name = extract_name(&args[0])?;
+    if let Some(cur) = env.sig_override_cur(&name) {
+        return Ok(Value::Bool(scalar_has_z(&cur)));
+    }
     if let Some(traces) = env.get_traces() {
         let traces = traces.read().unwrap_or_else(|e| e.into_inner());
         if let Some(trace) = traces.first_trace() {
@@ -1030,6 +1088,12 @@ fn op_is_z(args: &[Value], env: &mut Environment, _eval: &mut Evaluator) -> Resu
 fn op_changes(args: &[Value], env: &mut Environment, _eval: &mut Evaluator) -> Result<Value, String> {
     ensure_arity(args, 1)?;
     let name = extract_name(&args[0])?;
+    if let Some((prev, cur)) = env.sig_override_pair(&name) {
+        return Ok(Value::Bool(match prev {
+            Some(p) => p != cur,
+            None => false,
+        }));
+    }
     if let Some(traces) = env.get_traces() {
         let traces = traces.read().unwrap_or_else(|e| e.into_inner());
         if let Some(trace) = traces.first_trace() {

@@ -1463,6 +1463,15 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
                 )));
             }
 
+            // P1 统一引擎: 变更点并集区间扫描
+            if let Some((idxs, _n)) = self.interval_scan(&resolved_cond)? {
+                let mut out: Vec<i64> = idxs.into_iter().map(|i| i as i64).collect();
+                out.sort();
+                out.dedup();
+                if out.len() > max_results { out.truncate(max_results); }
+                return Ok(Value::List(WList::from_vec(out.into_iter().map(Value::Int).collect())));
+            }
+
             // Fallback: evaluate condition at each step. Queries are full-timeline:
             // always scan from INDEX 0 (never from the current cursor position) and
             // restore the cursor afterwards (152GB round P0-b).
@@ -1730,6 +1739,16 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
             return Ok(Value::Int(result));
         }
 
+        // P1 统一引擎: 变更点并集区间扫描(任意表达式, O(变更点) 而非 O(时间戳))
+        if let Some((_idxs, n)) = self.interval_scan(&resolved_cond)? {
+            if let Ok(mut t) = self.traces.write() {
+                for (tid, idx) in &saved {
+                    let _ = t.set_index(tid, *idx);
+                }
+            }
+            return Ok(Value::Int(n as i64));
+        }
+
         // Fallback: evaluate condition at each step. Queries are full-timeline:
         // always scan from INDEX 0 (never from the current cursor position) and
         // restore the cursor afterwards. The literal fast paths above scan from 0
@@ -1762,6 +1781,113 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
             }
         }
         Ok(Value::Int(count))
+    }
+
+    /// P1 统一引擎: 变更点并集区间扫描。
+    ///
+    /// 收集 cond 中引用的信号,取各信号变更点的**并集**作为扫描边界;
+    /// 边界之间所有被引用信号的值恒定,因此用**同一个解释器** + 信号值覆盖
+    /// (op_get / 边沿谓词读覆盖表)在边界处求值即可。
+    /// - 不含边沿谓词(rising/falling/changes): 条件在区间内恒定 → 按区间长度计入;
+    /// - 含边沿谓词: 边沿只可能在边界处为真 → 只计边界点。
+    /// 返回 None 表示表达式未引用任何信号(交给逐拍回退或常量折叠)。
+    fn interval_scan(&mut self, cond: &Value) -> Result<Option<(Vec<usize>, usize)>, String> {
+        let mut names: Vec<String> = Vec::new();
+        let mut has_edge = false;
+        collect_cond_signals(cond, &mut names, &mut has_edge);
+        if names.is_empty() {
+            return Ok(None);
+        }
+
+        // 取第一条 trace 的信号表(与 op_get / 逐拍路径一致)
+        let (ids, max_index, per_sig) = {
+            let t = self.traces.read().unwrap_or_else(|e| e.into_inner());
+            let ids = t.trace_ids();
+            let tr = match t.first_trace() { Some(tr) => tr, None => return Ok(None) };
+            let sigs = tr.signals();
+            let mut per_sig: Vec<(String, Vec<(usize, ScalarValue)>, ScalarValue)> = Vec::new();
+            for n in &names {
+                let resolved = resolve_signal_name(n, &sigs).unwrap_or_else(|| n.clone());
+                let base = tr.signal_value(&resolved, 0)
+                    .unwrap_or(ScalarValue::Bit(b'x'));
+                let cps = tr.change_points(&resolved).unwrap_or_default();
+                per_sig.push((resolved, cps, base));
+            }
+            (ids, tr.max_index(), per_sig)
+        };
+
+        // 覆盖表: 原始名与解析后全名都建键(op_get 可能用任一形式)
+        let map: std::rc::Rc<std::cell::RefCell<std::collections::HashMap<
+            String, (Option<ScalarValue>, ScalarValue)>>> =
+            std::rc::Rc::new(std::cell::RefCell::new(std::collections::HashMap::new()));
+        {
+            let mut m = map.borrow_mut();
+            for (raw, (resolved, _, base)) in names.iter().zip(per_sig.iter()) {
+                m.insert(resolved.clone(), (None, base.clone()));
+                m.insert(raw.clone(), (None, base.clone()));
+            }
+        }
+        self.env.set_sig_override(map.clone());
+
+        // 边界 = 0 ∪ 各信号变更点(idx>0)
+        let mut bounds: Vec<usize> = vec![0];
+        for (_, cps, _) in &per_sig {
+            for (i, _) in cps {
+                if *i > 0 { bounds.push(*i); }
+            }
+        }
+        bounds.sort_unstable();
+        bounds.dedup();
+
+        let mut ptr: Vec<usize> = vec![0; per_sig.len()];
+        let mut indices: Vec<usize> = Vec::new();
+        let mut count: usize = 0;
+
+        let result = (|| -> Result<(), String> {
+            for bi in 0..bounds.len() {
+                let b = bounds[bi];
+                if b > 0 {
+                    let mut m = map.borrow_mut();
+                    for (si, (name, cps, _)) in per_sig.iter().enumerate() {
+                        while ptr[si] < cps.len() && cps[ptr[si]].0 < b { ptr[si] += 1; }
+                        if ptr[si] < cps.len() && cps[ptr[si]].0 == b {
+                            let e = m.get_mut(name).unwrap();
+                            e.0 = Some(e.1.clone());
+                            e.1 = cps[ptr[si]].1.clone();
+                            ptr[si] += 1;
+                        }
+                    }
+                }
+                if let Ok(mut t) = self.traces.write() {
+                    for tid in &ids {
+                        let _ = t.set_index(tid, b);
+                    }
+                }
+                let truthy = self.eval_value(cond.clone())?.is_truthy();
+                if truthy {
+                    if has_edge {
+                        count += 1;
+                        indices.push(b);
+                    } else {
+                        let next = bounds.get(bi + 1).copied().unwrap_or(max_index + 1);
+                        count += next - b;
+                        indices.extend(b..next);
+                    }
+                }
+            }
+            Ok(())
+        })();
+
+        // 清理: 卸载覆盖表 + 游标归零(与逐拍路径的"不污染"约定一致)
+        self.env.set_sig_override(std::rc::Rc::new(std::cell::RefCell::new(
+            std::collections::HashMap::new())));
+        if let Ok(mut t) = self.traces.write() {
+            for tid in &ids {
+                let _ = t.set_index(tid, 0);
+            }
+        }
+        result?;
+        Ok(Some((indices, count)))
     }
 
     /// Official-WAL semantics: evaluate cond at EVERY waveform index.
@@ -2282,6 +2408,43 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
                 unsafe { func(args, &mut *env_ptr, &mut *eval_ptr) }
             }
             None => Err(format!("Unknown operator: {:?}", op)),
+        }
+    }
+}
+
+
+/// 收集条件表达式中引用的信号名 + 是否含边沿谓词。
+/// 识别形式: (get "name") / (get sym) / (rising|falling|changes|is-x|is-z "name"|sym)。
+/// 其余符号若绑定为字符串也按信号名处理(resolve_cond_names 之前调用)。
+fn collect_cond_signals(expr: &Value, out: &mut Vec<String>, has_edge: &mut bool) {
+    if let Value::List(lst) = expr {
+        if lst.len() >= 2 {
+            if let Value::Symbol(op) = &lst[0] {
+                match op.name.as_str() {
+                    "get" | "rising" | "falling" | "changes" | "is-x" | "is-z"
+                    | "sample-at" | "signal-width" => {
+                        if matches!(op.name.as_str(), "rising" | "falling" | "changes") {
+                            *has_edge = true;
+                        }
+                        let arg = &lst[1];
+                        let name = match arg {
+                            Value::String(s) => Some(s.clone()),
+                            Value::Symbol(s) => Some(s.name.clone()),
+                            _ => None,
+                        };
+                        if let Some(n) = name {
+                            if !out.contains(&n) {
+                                out.push(n);
+                            }
+                        }
+                        return;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        for item in lst.iter() {
+            collect_cond_signals(item, out, has_edge);
         }
     }
 }

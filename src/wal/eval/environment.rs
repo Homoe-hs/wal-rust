@@ -18,6 +18,9 @@ pub struct Environment {
     scope: String,
     group: String,
     traces: Option<SharedTraceContainer>,
+    /// 区间扫描引擎的信号值覆盖: name → (prev, cur)。op_get/边沿谓词优先读它,
+    /// 从而在"变更点并集"边界上用同一解释器求值(统一引擎)。
+    sig_override: Option<Rc<RefCell<std::collections::HashMap<String, (Option<crate::trace::ScalarValue>, crate::trace::ScalarValue)>>>>,
 }
 
 impl Environment {
@@ -30,6 +33,7 @@ impl Environment {
             scope: String::new(),
             group: String::new(),
             traces: None,
+            sig_override: None,
         }
     }
 
@@ -42,6 +46,7 @@ impl Environment {
             scope: String::new(),
             group: String::new(),
             traces: None,
+            sig_override: None,
         }
     }
 
@@ -61,6 +66,27 @@ impl Environment {
         self.traces.clone().or_else(|| {
             self.parent.as_ref().and_then(|p| p.borrow().get_traces())
         })
+    }
+
+    /// 区间扫描: 安装/更新信号值覆盖表(闭包子环境通过 parent 链共享同一表)。
+    pub fn set_sig_override(
+        &mut self,
+        map: Rc<RefCell<std::collections::HashMap<String, (Option<crate::trace::ScalarValue>, crate::trace::ScalarValue)>>>,
+    ) {
+        self.sig_override = Some(map);
+    }
+
+    pub fn sig_override_pair(&self, name: &str) -> Option<(Option<crate::trace::ScalarValue>, crate::trace::ScalarValue)> {
+        if let Some(m) = &self.sig_override {
+            if let Some(v) = m.borrow().get(name) {
+                return Some(v.clone());
+            }
+        }
+        self.parent.as_ref().and_then(|p| p.borrow().sig_override_pair(name))
+    }
+
+    pub fn sig_override_cur(&self, name: &str) -> Option<crate::trace::ScalarValue> {
+        self.sig_override_pair(name).map(|(_, c)| c)
     }
 
     pub fn child(&self) -> Environment {
@@ -170,6 +196,7 @@ impl Clone for Environment {
             scope: self.scope.clone(),
             group: self.group.clone(),
             traces: self.traces.clone(),
+            sig_override: self.sig_override.clone(),
         }
     }
 }
