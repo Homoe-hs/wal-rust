@@ -594,3 +594,35 @@ fn matrix_constant_condition_fold() {
     assert_eq!(e("(count (= (get \"t.d\") 3))"), e("(count/step (= (get \"t.d\") 3))"));
     assert_eq!(e("(count (= (get \"t.d\") 3))"), Value::Int(1));
 }
+
+/// 27) 多 trace: 信号分布在多条 trace 时, 引擎/&&||分解/getwave/at 都必须跨 trace 查找。
+///     回归点: 分解优化对"不含该信号的 trace"用原始名去查 → 报错 → 塞空集 → && 恒 0;
+///     getwave/wave/at 曾只看第一条 trace。
+#[test]
+fn matrix_multitrace_engine_and_builtins() {
+    let a = tmp("mta2", "$timescale 1ns $end\n$scope module a $end\n$var wire 1 ! c $end\n$enddefinitions $end\n\
+#0\n0!\n#10\n1!\n#20\n0!\n#30\n1!\n");
+    let b = tmp("mtb2", "$timescale 1ns $end\n$scope module b $end\n$var wire 8 \" v $end\n$enddefinitions $end\n\
+#0\nb00000010 \"\n#10\nb00000011 \"\n#20\nb00000011 \"\n#30\nb00000100 \"\n");
+    let mut e = Evaluator::new();
+    e.load_trace(&a.to_string_lossy(), "t1").unwrap();
+    e.load_trace(&b.to_string_lossy(), "t2").unwrap();
+    let mut ev = |c: &str| e.eval(c).unwrap();
+    // c = 0,1,0,1 → changes {1,2,3}; v = 2,3,3,4 → v==3 {1,2}, v==4 {3}
+    assert_eq!(ev("(find (changes \"c\"))"), Value::List(WList::from_vec(vec![Value::Int(1), Value::Int(2), Value::Int(3)])));
+    assert_eq!(ev("(count (&& (rising \"c\") (= (get \"v\") 3)))"), Value::Int(1));
+    assert_eq!(ev("(count (&& (rising \"c\") (= (get \"v\") 3)))"),
+               ev("(count/step (&& (rising \"c\") (= (get \"v\") 3)))"), "引擎必须等于逐拍 oracle");
+    assert_eq!(ev("(count (|| (rising \"c\") (= (get \"v\") 4)))"), Value::Int(2));
+    assert_eq!(ev("(count (&& (changes \"c\") (= (get \"v\") 3)))"), Value::Int(2));
+    // 第二条 trace 里的信号: getwave / at 必须找得到
+    assert_eq!(ev("(getwave \"v\")"), Value::List(WList::from_vec(vec![
+        Value::List(WList::from_vec(vec![Value::Int(0), Value::Int(2)])),
+        Value::List(WList::from_vec(vec![Value::Int(10), Value::Int(3)])),
+        Value::List(WList::from_vec(vec![Value::Int(30), Value::Int(4)])),
+    ])));
+    assert_eq!(ev("(at \"v\" 10)"), Value::List(WList::from_vec(vec![Value::Int(10), Value::Int(3)])));
+    // 找不到的信号给出跨 trace 的清晰错误
+    let err = e.eval("(getwave \"nosuchsig\")").unwrap_err();
+    assert!(err.contains("not found in any loaded trace"), "unexpected error: {}", err);
+}

@@ -149,6 +149,14 @@ pub enum Node {
    纯度判定:`collect_cond_signals` 为空且 AST 无 `set!`/`print`/`while`/… 且无闭包调用;
    引用信号的表达式绝不折叠(与逐拍 oracle 对拍在矩阵 `matrix_constant_condition_fold`)。
 
+7. **多 trace 必须跨 trace 查找**。信号可能只存在于其中一条 trace:
+   - `interval_scan` 逐个 trace 解析,用**含该信号的 trace** 的变更点;时间线长度取
+     各 trace `max_index` 的最大值(与逐拍"任一还能步进就继续"一致);
+   - `&&`/`||` 分解优化必须**跳过**不含该信号的 trace(曾用原始名去查 → 报错 → 塞空集
+     → `&&` 恒 0),并把含它的各 trace 结果取并集;
+   - `getwave`/`wave`/`at` 改为跨 trace 查找(`with_signal_trace`),错误信息列出全部
+     trace 的候选。
+
 #### 独立 oracle:`WAL_NO_ENGINE=1`
 
 引擎与"逐拍路径"若共享同一套实现,对拍就是自证。`WAL_NO_ENGINE=1` 让

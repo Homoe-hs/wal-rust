@@ -1193,29 +1193,42 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
                 } else {
                     return Ok(None); // unknown sub → fallback step scan
                 };
+            // 多 trace: 信号只存在于其中一条 → 该信号的结果是"各含它的 trace 的并集";
+            // 不含它的 trace 必须**跳过**(曾用原始名去查 → 报错 → 塞空集 → && 被清空)。
+            let mut set: Vec<usize> = Vec::new();
+            let mut found_any = false;
             if let Ok(t) = self.traces.read() {
                 for tid in trace_ids {
                     if let Some(tr) = t.get(tid) {
                         let sigs = tr.signals();
-                        let resolved = resolve_signal_name(&sig, &sigs)
-                            .unwrap_or_else(|| sig.clone());
+                        let resolved = match resolve_signal_name(&sig, &sigs) {
+                            Some(r) => r,
+                            None => continue,
+                        };
+                        found_any = true;
                         match tr.find_indices(&resolved, cond.clone()) {
                             Ok(idxs) => {
                                 if std::env::var("WAL_DEBUG_FIND").is_ok() {
                                     eprintln!("decompose: sig={} cond={:?} n={}", resolved, cond, idxs.len());
                                 }
-                                idx_sets.push(idxs);
+                                set.extend(idxs);
                             }
                             Err(e) => {
                                 if std::env::var("WAL_DEBUG_FIND").is_ok() {
                                     eprintln!("decompose ERR: sig={} cond={:?} err={}", resolved, cond, e);
                                 }
-                                idx_sets.push(Vec::new());
+                                return Ok(None); // 解码/解析失败 → 回退逐拍(不伪造空集)
                             }
                         }
                     }
                 }
             }
+            if !found_any {
+                return Ok(None); // 任何 trace 都没有这个信号 → 回退
+            }
+            set.sort_unstable();
+            set.dedup();
+            idx_sets.push(set);
         }
 
         if idx_sets.is_empty() {
@@ -1268,18 +1281,29 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
                     if target <= 1 && target >= 0 { FindCondition::Value(target as u8) }
                     else { FindCondition::ValueI64(target) }
                 };
+                let mut set: Vec<usize> = Vec::new();
+                let mut found_any = false;
                 if let Ok(t) = self.traces.read() {
                     for tid in trace_ids {
                         if let Some(tr) = t.get(tid) {
                             let sigs = tr.signals();
-                            let resolved = resolve_signal_name(&sig, &sigs)
-                                .unwrap_or_else(|| sig.clone());
+                            let resolved = match resolve_signal_name(&sig, &sigs) {
+                                Some(r) => r,
+                                None => continue,
+                            };
+                            found_any = true;
                             if let Ok(idxs) = tr.find_indices(&resolved, cond.clone()) {
-                                idx_sets.push(idxs);
+                                set.extend(idxs);
                             }
                         }
                     }
                 }
+                if !found_any {
+                    return Ok(None);
+                }
+                set.sort_unstable();
+                set.dedup();
+                idx_sets.push(set);
             }
         }
 
@@ -1871,28 +1895,45 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
             return Ok(None);
         }
 
-        // 取第一条 trace 的信号表(与 op_get / 逐拍路径一致)
+        // 信号可以来自任意一条 trace(多文件场景): 逐个 trace 解析,
+        // 索引空间与逐拍路径一致(同一 INDEX 施加到所有 trace)。
         let (ids, saved, max_index, per_sig) = {
             let t = self.traces.read().unwrap_or_else(|e| e.into_inner());
             let ids = t.trace_ids();
+            if ids.is_empty() {
+                return Ok(None);
+            }
             let saved: Vec<(String, usize)> = ids.iter()
                 .filter_map(|tid| t.get(tid).map(|tr| (tid.clone(), tr.index())))
                 .collect();
-            let tr = match t.first_trace() { Some(tr) => tr, None => return Ok(None) };
-            let sigs = tr.signals();
+            // 时间线长度 = 各 trace max_index 的最大值(与逐拍"任一还能步进就继续"一致)
+            let max_index = ids.iter()
+                .filter_map(|tid| t.get(tid).map(|tr| tr.max_index()))
+                .max()
+                .unwrap_or(0);
             let mut per_sig: Vec<(Vec<String>, Vec<(usize, ScalarValue)>, ScalarValue)> = Vec::new();
             for n in &names {
-                // 信号不在第一条 trace(如多 trace 场景的第二个文件)→ 引擎不适用,
-                // 交给逐拍回退(op_get 会跨 trace 查找)。
-                let resolved = match resolve_signal_name(n, &sigs) {
-                    Some(r) => r,
+                let mut found: Option<(String, Vec<(usize, ScalarValue)>, ScalarValue)> = None;
+                for tid in &ids {
+                    let tr = match t.get(tid) { Some(tr) => tr, None => continue };
+                    let sigs = tr.signals();
+                    let resolved = match resolve_signal_name(n, &sigs) {
+                        Some(r) => r,
+                        None => continue,
+                    };
+                    // 数据不可用(如 FST 解码失败)→ 传播错误而不是伪造 x 值
+                    let base = tr.signal_value(&resolved, 0)
+                        .map_err(|e| format!("interval_scan: {}: {}", resolved, e))?;
+                    let cps = tr.change_points(&resolved)
+                        .map_err(|e| format!("interval_scan: {}: {}", resolved, e))?;
+                    found = Some((resolved, cps, base));
+                    break;
+                }
+                let (resolved, cps, base) = match found {
+                    Some(x) => x,
+                    // 任何 trace 里都没有该信号 → 交给逐拍回退(报错口径一致)
                     None => return Ok(None),
                 };
-                // 数据不可用(如 FST 解码失败)→ 传播错误而不是伪造 x 值
-                let base = tr.signal_value(&resolved, 0)
-                    .map_err(|e| format!("interval_scan: {}: {}", resolved, e))?;
-                let cps = tr.change_points(&resolved)
-                    .map_err(|e| format!("interval_scan: {}: {}", resolved, e))?;
                 // 原始名与解析名都要建键: 解释器里 op_get/边沿谓词可能用任一形式,
                 // 更新时必须同时写所有别名(否则读到的永远是初值快照)。
                 let mut keys = vec![resolved];
@@ -1901,7 +1942,7 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
                 }
                 per_sig.push((keys, cps, base));
             }
-            (ids, saved, tr.max_index(), per_sig)
+            (ids, saved, max_index, per_sig)
         };
 
         // 覆盖表: 原始名与解析后全名都建键(op_get 可能用任一形式)

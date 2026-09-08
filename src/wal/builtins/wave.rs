@@ -47,6 +47,36 @@ fn with_first_trace<R>(env: &Environment, f: impl FnOnce(&dyn Trace) -> Result<R
     f(tr)
 }
 
+/// 在多 trace 中查找信号所在的 trace: 逐个 trace 解析短名/子串,
+/// 找到即回调 (trace, 解析后全名)。全部未命中 → 给出带候选的清晰错误。
+/// (op_get 早已跨 trace 查找; getwave/wave/at 曾只看第一条 trace。)
+fn with_signal_trace<R>(
+    env: &Environment,
+    name: &str,
+    f: impl FnOnce(&dyn Trace, &str) -> Result<R, String>,
+) -> Result<R, String> {
+    let traces = env.get_traces()
+        .ok_or_else(|| "No waveform loaded".to_string())?;
+    let guard = traces.read().unwrap_or_else(|e| e.into_inner());
+    let ids = guard.trace_ids();
+    let mut candidates: Vec<String> = Vec::new();
+    for tid in &ids {
+        let tr = match guard.get(tid) { Some(tr) => tr, None => continue };
+        match resolve_signal(tr, name) {
+            Ok(resolved) => return f(tr, &resolved),
+            Err(_) => {
+                for s in tr.signals().iter().filter(|s| s.contains(name)).take(5) {
+                    if !candidates.contains(s) { candidates.push(s.clone()); }
+                }
+            }
+        }
+    }
+    Err(format!(
+        "Signal '{}' not found in any loaded trace ({} candidates: {:?})",
+        name, candidates.len(), candidates
+    ))
+}
+
 /// Resolve a signal name (exact or unique substring) against a trace.
 fn resolve_signal(tr: &dyn Trace, name: &str) -> Result<String, String> {
     let sigs = tr.signals();
@@ -158,9 +188,8 @@ fn op_getwave(args: &[Value], env: &mut Environment, _eval: &mut Evaluator) -> R
         return Err("(getwave \"sig\") expected".to_string());
     }
     let name = extract_string(&args[0])?;
-    with_first_trace(env, |tr| {
-        let sig = resolve_signal(tr, &name)?;
-        let points = tr.change_points(&sig)?;
+    with_signal_trace(env, &name, |tr, sig| {
+        let points = tr.change_points(sig)?;
         let mut out = Vec::with_capacity(points.len());
         for (idx, sv) in points {
             let t = tr.timestamp_at(idx).unwrap_or(0);
@@ -176,9 +205,8 @@ fn op_wave(args: &[Value], env: &mut Environment, _eval: &mut Evaluator) -> Resu
     }
     let name = extract_string(&args[0])?;
     let (t0, t1) = parse_window(&args[1..]);
-    with_first_trace(env, |tr| {
-        let sig = resolve_signal(tr, &name)?;
-        let points = windowed_changes(tr, &sig, t0, t1)?;
+    with_signal_trace(env, &name, |tr, sig| {
+        let points = windowed_changes(tr, sig, t0, t1)?;
         let mut out = Vec::with_capacity(points.len());
         for (t, sv) in points {
             out.push(tv_pair(t, &sv));
@@ -193,9 +221,8 @@ fn op_at(args: &[Value], env: &mut Environment, _eval: &mut Evaluator) -> Result
     }
     let name = extract_string(&args[0])?;
     let target = extract_int(&args[1])? as u64;
-    with_first_trace(env, |tr| {
-        let sig = resolve_signal(tr, &name)?;
-        let points = tr.change_points(&sig)?;
+    with_signal_trace(env, &name, |tr, sig| {
+        let points = tr.change_points(sig)?;
         let timed: Vec<(u64, ScalarValue)> = points.iter()
             .map(|(idx, sv)| (tr.timestamp_at(*idx).unwrap_or(0), sv.clone()))
             .collect();
