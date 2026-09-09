@@ -835,3 +835,68 @@ fn matrix_ambiguous_signal_message() {
     let err2 = e.eval("(at \"nosuchsig\" 10)").unwrap_err();
     assert!(err2.contains("not found"), "不存在的名字应提示未找到: {}", err2);
 }
+
+/// 38) VCD 解析健壮性: real 值行(VCS 双空格)、CRLF、制表符分隔、无扩展名(magic 识别)、
+///     空 dump 段、$timescale 带乘数、EVCD 明确拒绝。
+#[test]
+fn matrix_vcd_parser_robustness() {
+    // real 值行: VCS 写 "r1.500000000000000  #"(两个空格)
+    let real_vcd = "$timescale 1ns $end\n$scope module t $end\n$var real 64 ! r $end\n$enddefinitions $end\n\
+#0\nr0.000000000000000  !\n#10\nr1.500000000000000  !\n#20\nr-0.250000000000000  !\n";
+    let p = tmp("real2sp", real_vcd);
+    let e = |c: &str| eval_with(&p, c);
+    assert_eq!(e("(count (changes \"t.r\"))"), Value::Int(2));
+    assert_eq!(e("(at \"t.r\" 10)"), Value::List(WList::from_vec(vec![Value::Int(10), Value::Float(1.5)])));
+    assert_eq!(e("(at \"t.r\" 20)"), Value::List(WList::from_vec(vec![Value::Int(20), Value::Float(-0.25)])));
+    assert_eq!(e("(count (> (get \"t.r\") 0))"), Value::Int(1), "索引 0 是 0.0, 之后 1.5 与 -0.25");
+
+    // CRLF: 行尾 \r 不能影响时间戳/值/变更列表
+    let lf = "$timescale 1ns $end\n$scope module t $end\n$var wire 8 ! d $end\n$var wire 1 \" c $end\n$enddefinitions $end\n\
+#0\nb00000001 !\n0\"\n#10\nb00000010 !\n1\"\n#20\nb00000011 !\n0\"\n";
+    let crlf: String = lf.replace('\n', "\r\n");
+    let pl = tmp("lf", lf);
+    let pc = tmp("crlf", &crlf);
+    for q in ["(count (changes \"d\"))", "(count (rising \"c\"))", "(getwave \"d\")", "(at \"d\" 20)", "(length (SIGNALS))"] {
+        assert_eq!(eval_with(&pl, q), eval_with(&pc, q), "CRLF 与 LF 必须一致: {}", q);
+    }
+    assert_eq!(eval_with(&pc, "(count (changes \"d\"))"), Value::Int(2));
+
+    // 制表符分隔: 值不能被 tab 污染(否则 00000001 会变成 2)
+    let tabbed = "$timescale 1ns $end\n$scope module t $end\n$var wire 8 ! d $end\n$enddefinitions $end\n\
+#0\nb00000001\t!\n#10\nb00000010\t!\n";
+    let pt = tmp("tab", tabbed);
+    assert_eq!(eval_with(&pt, "(getwave \"t.d\")"), Value::List(WList::from_vec(vec![
+        Value::List(WList::from_vec(vec![Value::Int(0), Value::Int(1)])),
+        Value::List(WList::from_vec(vec![Value::Int(10), Value::Int(2)])),
+    ])));
+
+    // 无扩展名: 靠 magic($date/$timescale)识别
+    let noext = std::env::temp_dir().join(format!("wal_reg_noext_{}", std::process::id()));
+    std::fs::write(&noext, lf).unwrap();
+    let mut e2 = Evaluator::new();
+    e2.load_trace(&noext.to_string_lossy(), "t").unwrap();
+    assert_eq!(e2.eval("(count (changes \"t.d\"))").unwrap(), Value::Int(2));
+
+    // 空 dump 段: 时间线为空 → 0, 不报越界
+    let empty = "$timescale 1ns $end\n$scope module t $end\n$var wire 1 ! c $end\n$enddefinitions $end\n";
+    let pe = tmp("empty", empty);
+    assert_eq!(eval_with(&pe, "(count (changes \"t.c\"))"), Value::Int(0));
+    assert_eq!(eval_with(&pe, "(count (= (get \"t.c\") 0))"), Value::Int(0));
+
+    // $timescale 带乘数: 10ps = 10^-11 s
+    let ts10 = "$timescale 10ps $end\n$scope module t $end\n$var wire 1 ! c $end\n$enddefinitions $end\n#0\n0!\n#10\n1!\n";
+    let pt2 = tmp("ts10", ts10);
+    let t = load(&pt2);
+    assert_eq!(t.timescale_exp(), Some(-11));
+
+    // EVCD($dumpports)明确拒绝
+    let evcd = "$date x $end\n$version x $end\n$timescale 1ps $end\n$scope module t $end\n$upscope $end\n$enddefinitions $end\n#0\n$dumpports\n$end\n";
+    let pev = std::env::temp_dir().join(format!("wal_reg_evcd_{}.vcd", std::process::id()));
+    std::fs::write(&pev, evcd).unwrap();
+    let mut e3 = Evaluator::new();
+    let err = e3.load_trace(&pev.to_string_lossy(), "t").unwrap_err();
+    assert!(err.contains("EVCD"), "{}", err);
+
+    let _ = std::fs::remove_file(&noext);
+    let _ = std::fs::remove_file(&pev);
+}

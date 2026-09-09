@@ -42,7 +42,10 @@ impl TraceContainer {
             use std::io::Read;
             let mut buf = [0u8; 16];
             if f.read(&mut buf).unwrap_or(0) >= 4 {
-                if &buf[..4] == b"$da" || &buf[..4] == b"$ti" || &buf[..4] == b"$ve" || &buf[..4] == b"$sc" {
+                // 注意: 必须比较 3 字节(VCD 头 `$date`/`$timescale`/`$version`/`$scope`),
+                // 之前写成 &buf[..4] == b"$da" 长度不等 → 恒假, 非 .vcd 扩展名的文件
+                // 一律被判成不支持。
+                if &buf[..3] == b"$da" || &buf[..3] == b"$ti" || &buf[..3] == b"$ve" || &buf[..3] == b"$sc" {
                     return Some("vcd");
                 }
                 if buf[0] == 0x00 || buf[0] == 0x01 || buf[0] == 0x03 || buf[0] == 0x04 {
@@ -56,7 +59,8 @@ impl TraceContainer {
     /// 压缩包 / FSDB 等"看似支持实则读不出"的格式: 明确报错, 不要静默退化。
     fn reject_unsupported(path: &Path) -> Result<(), String> {
         use std::io::Read;
-        let mut buf = [0u8; 16];
+        // 头部取样 8KB: EVCD 的 `$dumpports` / `$var port` 可能出现在前 16 字节之后
+        let mut buf = [0u8; 8192];
         let n = match std::fs::File::open(path) {
             Ok(mut f) => f.read(&mut buf).unwrap_or(0),
             Err(_) => 0,
@@ -77,6 +81,16 @@ impl TraceContainer {
         if is_fsdb {
             return Err(format!(
                 "{}: FSDB 格式暂不支持(需要 Verdi 的 fsdb reader); 请先转成 VCD/FST 再查询",
+                path.display()));
+        }
+        // EVCD($dumpports / $var port): 值行是 p<strength><strength> 语法, 与 VCD 不同,
+        // 直接拒绝而不是按普通 VCD 误读。
+        if lower.ends_with(".evcd")
+            || head.windows(10).any(|w| w == b"$dumpports")
+            || head.windows(9).any(|w| w == b"$var port")
+        {
+            return Err(format!(
+                "{}: EVCD(端口 dump)格式暂不支持; 请改用 $dumpfile/$dumpvars 生成 VCD",
                 path.display()));
         }
         Ok(())

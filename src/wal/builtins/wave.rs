@@ -589,11 +589,16 @@ fn op_timescale(args: &[Value], env: &mut Environment, _eval: &mut Evaluator) ->
         let exp = tr.timescale_exp();
         match exp {
             Some(e) => {
-                let unit = match e {
+                // VCD 的 $timescale 是"乘数 + 单位"(如 10ps = 10^-11 s);
+                // 这里把指数还原成可读形式, 而不是对非 1 倍数的指数显示 "?"。
+                // 取 <= e 的 3 的倍数(向 -inf 取整; Rust 的 / 向零截断, 负指数要再减一档)
+                let unit_step = if e % 3 == 0 { e } else { (e / 3 - 1) * 3 };
+                let mult = 10i64.pow((e - unit_step) as u32);
+                let unit = match unit_step {
                     0 => "s", -3 => "ms", -6 => "us", -9 => "ns", -12 => "ps", -15 => "fs",
                     _ => "?",
                 };
-                println!("timescale: 1{} (10^{} s)", unit, e);
+                println!("timescale: {}{} (10^{} s)", mult, unit, e);
             }
             None => println!("timescale: ?"),
         }

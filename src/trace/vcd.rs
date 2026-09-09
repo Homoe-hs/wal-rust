@@ -105,7 +105,12 @@ fn adapt_lru_capacity(file_size: usize, signal_count: usize) -> usize {
 /// not timestamps; treating them as timestamps duplicates an entry.
 #[inline]
 fn is_ts_line(line: &[u8]) -> bool {
-    line.len() > 1 && line[1..].iter().all(|c| c.is_ascii_digit())
+    // CRLF 文件的行尾带 \r → 先剥掉再判数字(VCS/Windows 工具产出的 VCD 常见)
+    let mut l = line;
+    while matches!(l.last(), Some(b'\r') | Some(b'\n') | Some(b' ')) {
+        l = &l[..l.len() - 1];
+    }
+    l.len() > 1 && l[1..].iter().all(|c| c.is_ascii_digit())
 }
 
 /// Line-scoped check at absolute position `pos` in `data` (up to the next '\n').
@@ -560,8 +565,9 @@ impl VcdTrace {
                         b'#' => {
                             // only real timestamp lines: '#<digits>'. Icarus dumps
                             // 1-bit value lines like "#%" (value '#' + id) which
-                            // start with '#' but are NOT timestamps.
-                            if line.len() > 1 && line[1..].iter().all(|c| c.is_ascii_digit()) {
+                            // start with '#' but are NOT timestamps. 走共享判定
+                            // (会剥掉 CRLF 的 \r / \n)。
+                            if is_ts_line(line) {
                                 current_timestamp = parse_timestamp_fast(line);
                                 ts_seen += 1;
                                 ts.push(current_timestamp);
@@ -952,15 +958,19 @@ impl VcdTrace {
                 // the separator, so a mid-value id byte can NEVER be followed
                 // by '\n' at the right offset — exact by construction (digit
                 // ids like "1" in a 32-bit bit-stream included).
-                let mut needle = Vec::with_capacity(id_len + 1);
-                needle.extend_from_slice(&target_id);
-                needle.push(b'\n');
+                // 只搜 id 本身, 命中后校验行尾是 '\n' 或 CRLF 的 '\r'
+                // (此前 needle 带 '\n', CRLF 文件永远搜不到 → 变更列表为空)。
+                let needle = target_id.to_vec();
                 let mut p = 0usize;
                 while p < chunk.len() {
                     let pos = match memchr::memmem::find(&chunk[p..], &needle) {
                         Some(n) => p + n,
                         None => break,
                     };
+                    if !matches!(chunk.get(pos + id_len), Some(b'\n') | Some(b'\r')) {
+                        p = pos + 1;
+                        continue;
+                    }
                     let line_start = match memchr::memrchr(b'\n', &chunk[..pos]) {
                         Some(n) => n + 1,
                         None => 0,
@@ -977,7 +987,7 @@ impl VcdTrace {
                     //     是值字符(无空格速写 `b00x0"`) → 要求整行解析出的 id 一致。
                     let exact = !line.is_empty()
                         && line[0] != b'$'
-                        && (id_start == 0 || line[id_start - 1] == b' ')
+                        && (id_start == 0 || line[id_start - 1] == b' ' || line[id_start - 1] == b'\t')
                         || (!line.is_empty()
                             && line[0] != b'$'
                             && id_start > 0
@@ -990,7 +1000,13 @@ impl VcdTrace {
                         let val = match line[0] {
                             b'b' => {
                                 let ve = id_start.saturating_sub(1);
-                                let vs = if ve > 1 && line[ve] == b' ' { &line[1..ve] } else { &line[1..id_start] };
+                                // 分隔符可能是空格或制表符 → 必须排除, 否则 tab 被当成一位
+                                // (值会被左移一位: 00000001 → 2)
+                                let vs = if ve > 1 && (line[ve] == b' ' || line[ve] == b'\t') {
+                                    &line[1..ve]
+                                } else {
+                                    &line[1..id_start]
+                                };
                                 VcdValue::Vector(vs.to_vec())
                             }
                             b'r' => match std::str::from_utf8(&line[1..id_start])
@@ -1414,18 +1430,24 @@ fn parse_value_change_fast(line: &[u8]) -> Option<(u64, VcdValue)> {
     let len = line.len();
     if len < 2 { return None; }
 
-    // Find last space by scanning backwards — VCD lines are short (2-50 bytes)
+    // Find last separator (space/tab) by scanning backwards — VCD lines are short
     let mut sp = len;
     for i in (0..len).rev() {
-        if line[i] == b' ' {
+        if line[i] == b' ' || line[i] == b'\t' {
             sp = i;
             break;
         }
     }
 
-    let (value_part, sig_id_bytes) = if sp < len {
-        // Space found: "b1010 !" or "0 !"
-        (&line[..sp], &line[sp+1..])
+    let (value_part, mut sig_id_bytes) = if sp < len {
+        // Space found: "b1010 !" or "0 !"; VCS 的 real 行是 "r1.5  #"(两个空格),
+        // 反向找最后一个空格后 value_part 会带尾随空格 → 必须 trim(否则 f64 解析失败,
+        // real 信号 (get) 退化成 "x")。
+        let mut vp = &line[..sp];
+        while !vp.is_empty() && (vp[vp.len() - 1] == b' ' || vp[vp.len() - 1] == b'\t') {
+            vp = &vp[..vp.len() - 1];
+        }
+        (vp, &line[sp+1..])
     } else {
         // No space: "0!" (scalar) or "b1010!" (vector no-space)
         let first = line[0];
@@ -1435,7 +1457,7 @@ fn parse_value_change_fast(line: &[u8]) -> Option<(u64, VcdValue)> {
             // No-space vector: "b1010!" → find boundary between binary digits and signal ID
             // Binary digits are '0','1','x','z'; signal ID starts with printable ASCII
             let split = 1 + line[1..].iter()
-                .position(|&b| !matches!(b, b'0' | b'1' | b'x' | b'z' | b'X' | b'Z'))
+                .position(|&b| !matches!(b, b'0' | b'1' | b'x' | b'z' | b'X' | b'Z' | b' ' | b'\t'))
                 .unwrap_or(line.len().saturating_sub(1));
             if split > 1 && split < line.len() {
                 (&line[..split], &line[split..])
@@ -1447,6 +1469,10 @@ fn parse_value_change_fast(line: &[u8]) -> Option<(u64, VcdValue)> {
         }
     };
 
+    // 去掉行尾 \r(CRLF 文件)→ 否则 id 哈希不匹配, 所有值都读不到
+    while matches!(sig_id_bytes.last(), Some(b'\r')) {
+        sig_id_bytes = &sig_id_bytes[..sig_id_bytes.len() - 1];
+    }
     // 只排除空 id;`$` 开头的 id 是合法 VCD 标识符(如 counter 夹具的 rst `$`),
     // 指令行由调用方按"行首 $`"过滤, 不能在这里按 id 首字符误杀。
     if sig_id_bytes.is_empty() { return None; }
@@ -1778,6 +1804,17 @@ impl Trace for VcdTrace {
     }
 
     fn signal_value(&self, name: &str, offset: usize) -> Result<ScalarValue, String> {
+        if self.timestamps.len() == 0 {
+            // 只有头、没有 dump 段(空/截断到定义结束): 时间线为空 → 返回初值
+            let sig_idx = self.resolve_idx(name).ok_or_else(|| format!("Unknown signal: {}", name))?;
+            let width = self.signal_widths.get(sig_idx as usize).copied().unwrap_or(1) as usize;
+            let init = self.initial_value_at(sig_idx);
+            let sv = value_to_scalar(&init);
+            return Ok(match sv {
+                ScalarValue::Bit(b) if (b == b'x' || b == b'z') && width > 1 => ScalarValue::Vector(vec![b; width]),
+                other => other,
+            });
+        }
         let idx = if offset < self.timestamps.len() {
             offset
         } else {
@@ -1886,6 +1923,9 @@ impl Trace for VcdTrace {
         }
         let sig_idx = self.resolve_idx(name)
             .ok_or_else(|| format!("Unknown signal: {}", name))?;
+        if self.timestamps.len() == 0 {
+            return Ok(Vec::new()); // 空时间线
+        }
         if std::env::var("WAL_DEBUG_FIND").is_ok() {
             eprintln!("  sig_idx={} id={:?} anchors={}",
                       sig_idx,
