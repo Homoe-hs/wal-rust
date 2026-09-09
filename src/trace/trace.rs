@@ -74,6 +74,41 @@ pub trait Trace {
         None
     }
 
+    /// 严格解析: 名字必须唯一(exact 或唯一叶子/子串); 有歧义 → Err(候选列表)。
+    /// 与 `resolve_name` 的区别: 后者取第一个匹配, 这里用于 `at/getwave` 等
+    /// "名字有歧义就要报错"的入口。
+    fn resolve_name_strict(&self, name: &str) -> Result<String, String> {
+        let sigs = self.signals();
+        if let Some(s) = sigs.iter().find(|s| s.as_str() == name) {
+            return Ok(s.clone());
+        }
+        let matches: Vec<&String> = sigs.iter().filter(|s| s.contains(name)).collect();
+        if matches.len() == 1 {
+            return Ok(matches[0].clone());
+        }
+        Err(format!(
+            "signal '{}' not found or ambiguous ({} candidates: {:?})",
+            name,
+            matches.len(),
+            matches.iter().take(5).map(|s| s.as_str()).collect::<Vec<_>>()
+        ))
+    }
+
+    /// 找不到信号时的近似候选(按编辑距离/包含关系排序, 最多 k 个)。
+    /// 默认实现会拉整张信号表; 后端应覆盖为按需遍历(大波形上差别巨大)。
+    fn suggest_names(&self, name: &str, k: usize) -> Vec<String> {
+        let sigs = self.signals();
+        let mut scored: Vec<(usize, &String)> = sigs.iter()
+            .map(|s| {
+                let leaf = s.rsplit('.').next().unwrap_or(s.as_str());
+                (crate::wal::builtins::signal::lev_distance_local(name, s)
+                    .min(crate::wal::builtins::signal::lev_distance_local(name, leaf)), s)
+            })
+            .collect();
+        scored.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+        scored.iter().take(k).map(|(_, s)| (*s).clone()).collect()
+    }
+
     /// 致命解码错误(文件损坏/编码不支持)。一旦发生,任何"静默吞错"的查询路径
     /// 都可能给出看似正常的错误结果(如 count=0);顶层求值结束前必须上报。
     fn fatal_error(&self) -> Option<String> {

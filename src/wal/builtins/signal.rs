@@ -412,17 +412,16 @@ fn op_whenever(args: &[Value], env: &mut Environment, eval: &mut Evaluator) -> R
             };
             if let Some(trace) = {
                 let t = traces.read().unwrap_or_else(|e| e.into_inner());
-                t.first_trace().map(|tr| (tr.id().clone(), tr.signals()))
+                t.first_trace().map(|tr| (tr.id().clone(), tr.resolve_name(&sig_name)))
             } {
-                let (tid, sigs) = trace;
-                let (resolved, _candidates) = fuzzy_match_signal(&sig_name, &sigs);
+                let (tid, resolved) = trace;
                 if std::env::var("WAL_DEBUG_FIND").is_ok() {
-                    eprintln!("whenever changed: sig={} resolved={:?} sigs_len={}", sig_name, resolved, sigs.len());
+                    eprintln!("whenever changed: sig={} resolved={:?}", sig_name, resolved);
                 }
                 if let Some(resolved) = resolved {
                     if let Ok(indices) = {
                         let t = traces.read().unwrap_or_else(|e| e.into_inner());
-                        t.find_indices(resolved, FindCondition::Changed)
+                        t.find_indices(&resolved, FindCondition::Changed)
                     } {
                         for &idx in &indices {
                             {
@@ -459,14 +458,13 @@ fn op_whenever(args: &[Value], env: &mut Environment, eval: &mut Evaluator) -> R
             };
             if let Some(trace) = {
                 let t = traces.read().unwrap_or_else(|e| e.into_inner());
-                t.first_trace().map(|tr| (tr.id().clone(), tr.signals()))
+                t.first_trace().map(|tr| (tr.id().clone(), tr.resolve_name(&sig_name)))
             } {
-                let (tid, sigs) = trace;
-                let (resolved, _candidates) = fuzzy_match_signal(&sig_name, &sigs);
+                let (tid, resolved) = trace;
                 if let Some(resolved) = resolved {
                     if let Ok(indices) = {
                         let t = traces.read().unwrap_or_else(|e| e.into_inner());
-                        t.find_indices(resolved, cond_enum)
+                        t.find_indices(&resolved, cond_enum)
                     } {
                         for &idx in &indices {
                             {
@@ -667,47 +665,26 @@ fn op_get(args: &[Value], env: &mut Environment, eval: &mut Evaluator) -> Result
         let traces = traces.read().unwrap_or_else(|e| e.into_inner());
         // Search every loaded trace (not just the first): the same short name
         // may live in a second -l file (multi-trace get, feedback round B12).
-        let mut all_sigs: Vec<String> = Vec::new();
+        // 模糊匹配走 trace.resolve_name(零分配): 此前每个 trace 都 signals() 拉整张表
+        // (4M 信号 ≈ 0.6-0.8s/次)。候选提示只在最终失败时用 suggest_names 取前 5 个。
+        let mut preview: Vec<String> = Vec::new();
         for trace in traces.traces_iter() {
             for candidate in &candidates {
-                match trace.signal_value(candidate, trace.index()) {
-                    Ok(sv) => return Ok(slice_value(sv, hi, lo)),
-                    Err(_) => continue,
-                }
-            }
-            let sigs = trace.signals();
-            all_sigs.extend(sigs.iter().cloned());
-            // Fuzzy fallback: try suffix / substring matching
-            let (matched, cands) = fuzzy_match_signal(&name, &sigs);
-            if cands.len() > 1 {
-                log::warn!("signal '{}' is ambiguous: matches {:?}, using '{}'",
-                    name, &cands[..cands.len().min(5)], matched.as_ref().map(|s| s.as_str()).unwrap_or("?"));
-            }
-            if let Some(matched) = matched {
-                if let Ok(sv) = trace.signal_value(matched, trace.index()) {
+                if let Ok(sv) = trace.signal_value(candidate, trace.index()) {
                     return Ok(slice_value(sv, hi, lo));
                 }
             }
+            if let Some(matched) = trace.resolve_name(&name) {
+                if let Ok(sv) = trace.signal_value(&matched, trace.index()) {
+                    return Ok(slice_value(sv, hi, lo));
+                }
+            }
+            if preview.is_empty() {
+                preview = trace.suggest_names(&name, 5);
+            }
         }
-        // 最近似候选: 编辑距离/包含关系排序(跨全部 trace;与 FST 侧提示一致)
-        if !all_sigs.is_empty() {
-            let preview: Vec<String> = {
-                let mut scored: Vec<(usize, &String)> = all_sigs.iter()
-                    .map(|s| {
-                        // score against the full name and its last component:
-                        // the common "tb_x.dut." prefix dominates full-name
-                        // distance, so the leaf name is the useful part.
-                        let leaf = s.rsplit('.').next().unwrap_or(s.as_str());
-                        let d_full = lev_distance_local(name.as_str(), s.as_str());
-                        let d_leaf = lev_distance_local(name.as_str(), leaf);
-                        (d_full.min(d_leaf), s)
-                    })
-                    .collect();
-                scored.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(b.1)));
-                scored.iter().take(5).map(|(_, s)| (*s).clone()).collect()
-            };
-            return Err(format!("signal '{}' not found. Closest signals: {:?}",
-                name, preview));
+        if !preview.is_empty() {
+            return Err(format!("signal '{}' not found. Closest signals: {:?}", name, preview));
         }
     }
     Err(format!("signal '{}' not found.", name))
@@ -1326,7 +1303,7 @@ pub fn register_signal(disp: &mut Dispatcher) {
     disp.register(Operator::TraceFile, op_trace_file);
 }
 /// Local Levenshtein distance (for "closest signal" hints on not-found).
-fn lev_distance_local(a: &str, b: &str) -> usize {
+pub(crate) fn lev_distance_local(a: &str, b: &str) -> usize {
     let a: Vec<char> = a.chars().collect();
     let b: Vec<char> = b.chars().collect();
     let mut prev: Vec<usize> = (0..=b.len()).collect();

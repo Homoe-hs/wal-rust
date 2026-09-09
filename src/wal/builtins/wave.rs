@@ -59,44 +59,28 @@ fn with_signal_trace<R>(
         .ok_or_else(|| "No waveform loaded".to_string())?;
     let guard = traces.read().unwrap_or_else(|e| e.into_inner());
     let ids = guard.trace_ids();
-    let mut candidates: Vec<String> = Vec::new();
+    let mut ambiguous: Option<String> = None;
     for tid in &ids {
         let tr = match guard.get(tid) { Some(tr) => tr, None => continue };
-        match resolve_signal(tr, name) {
+        match tr.resolve_name_strict(name) {
             Ok(resolved) => return f(tr, &resolved),
-            Err(_) => {
-                for s in tr.signals().iter().filter(|s| s.contains(name)).take(5) {
-                    if !candidates.contains(s) { candidates.push(s.clone()); }
+            Err(e) => {
+                // 歧义(有多个候选)是可操作的错误 → 直接返回; 否则继续找别的 trace
+                if ambiguous.is_none() && e.contains("ambiguous") {
+                    ambiguous = Some(e);
                 }
             }
         }
     }
-    if !candidates.is_empty() {
-        // 有候选但不唯一 → 明确说"歧义", 别让用户以为信号不存在
-        return Err(format!(
-            "signal '{}' is ambiguous ({} candidates: {:?}) — 请用完整名字",
-            name, candidates.len(), candidates
-        ));
-    }
-    Err(format!("signal '{}' not found in any loaded trace.", name))
+    Err(ambiguous.unwrap_or_else(|| {
+        format!("signal '{}' not found in any loaded trace.", name)
+    }))
 }
 
-/// Resolve a signal name (exact or unique substring) against a trace.
+/// Resolve a signal name strictly (exact or UNIQUE substring; 有歧义即报错)。
+/// 走 trace.resolve_name_strict(零分配), 不再每次拉整张信号表。
 fn resolve_signal(tr: &dyn Trace, name: &str) -> Result<String, String> {
-    let sigs = tr.signals();
-    if sigs.iter().any(|s| s == name) {
-        return Ok(name.to_string());
-    }
-    let matches: Vec<&String> = sigs.iter().filter(|s| s.contains(name)).collect();
-    if matches.len() == 1 {
-        return Ok(matches[0].clone());
-    }
-    Err(format!(
-        "Signal '{}' not found ({} candidates: {:?})",
-        name,
-        matches.len(),
-        matches.iter().take(5).map(|s| s.as_str()).collect::<Vec<_>>()
-    ))
+    tr.resolve_name_strict(name)
 }
 
 /// IEEE 1364-1995 §14.1.1.4 / 1800-2012 §21.2.1.4 value convention:

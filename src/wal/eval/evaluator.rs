@@ -1695,8 +1695,7 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
                     let t = self.traces.read().unwrap_or_else(|e| e.into_inner());
                     for tid in &traces_ids {
                         if let Some(tr) = t.get(tid) {
-                            let sigs = tr.signals();
-                            // Resolve signal names in all entries
+                            // Resolve signal names in all entries(零分配)
                             let resolved_entries: Vec<BatchEntry> = batch_entries.iter()
                                 .map(|entry| match entry {
                                     BatchEntry::Simple(name, cond) => {

@@ -1983,6 +1983,33 @@ impl Trace for VcdTrace {
         self.resolve_idx(name).map(|i| self.signals[i as usize].to_string())
     }
 
+    fn resolve_name_strict(&self, name: &str) -> Result<String, String> {
+        // exact 优先
+        if let Some(i) = self.name_to_idx.get(name) {
+            return Ok(self.signals[*i as usize].to_string());
+        }
+        fn leaf(s: &str) -> &str { s.rsplitn(2, '.').next().unwrap_or("") }
+        let allow_leaf = name.len() <= 8 || !name.contains('.');
+        let mut hits: Vec<String> = Vec::new();
+        for s in self.signals.iter() {
+            let matched = (allow_leaf && leaf(s) == name) || s.contains(name);
+            if matched {
+                if !hits.is_empty() {
+                    hits.push(s.to_string());
+                    return Err(format!(
+                        "signal '{}' is ambiguous ({} candidates: {:?}) — 请用完整名字",
+                        name, hits.len(), &hits[..hits.len().min(5)]
+                    ));
+                }
+                hits.push(s.to_string());
+            }
+        }
+        match hits.len() {
+            1 => Ok(hits.pop().unwrap()),
+            _ => Err(format!("signal '{}' not found in any loaded trace.", name)),
+        }
+    }
+
     fn defined_initial_value(&self, name: &str) -> Option<ScalarValue> {
         let idx = self.resolve_idx(name)?;
         let init = self.initial_value_at(idx);
