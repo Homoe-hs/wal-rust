@@ -928,3 +928,47 @@ fn matrix_fst_real_roundtrip() {
     assert_eq!(t.signal_value(&rname, 3).unwrap(), ScalarValue::Real(4.5));
     let _ = std::fs::remove_file(&fst);
 }
+
+/// 40) 分块扫描的时间戳归属: 当"单个时间戳的变化行"超过一个 chunk 时,
+///     该 chunk 内没有 '#' 的值行曾因 local_idx 缺失被静默丢弃
+///     (大文件/每拍变化数极多的波形会丢数据)。这里构造 8 个时间戳 × 200k 行。
+#[test]
+fn matrix_cross_chunk_timestamp_attribution() {
+    let dir = std::env::temp_dir();
+    let p = dir.join(format!("wal_reg_chunk_{}.vcd", std::process::id()));
+    let n_sig = 200_000usize;
+    let n_ts = 8usize;
+    {
+        use std::io::Write;
+        let f = std::fs::File::create(&p).unwrap();
+        let mut w = std::io::BufWriter::new(f);
+        writeln!(w, "$timescale 1ns $end").unwrap();
+        writeln!(w, "$scope module t $end").unwrap();
+        for i in 0..n_sig {
+            let c1 = 33 + (i % 94);
+            let c2 = 33 + ((i / 94) % 94);
+            let c3 = 33 + ((i / 94 / 94) % 94);
+            writeln!(w, "$var reg 8 {}{}{} sig_{} $end", c1 as u8 as char, c2 as u8 as char, c3 as u8 as char, i).unwrap();
+        }
+        writeln!(w, "$upscope $end").unwrap();
+        writeln!(w, "$enddefinitions $end").unwrap();
+        for t in 0..n_ts {
+            writeln!(w, "#{}", t * 10).unwrap();
+            for i in 0..n_sig {
+                let c1 = 33 + (i % 94);
+                let c2 = 33 + ((i / 94) % 94);
+                let c3 = 33 + ((i / 94 / 94) % 94);
+                writeln!(w, "b{:08b} {}{}{}", t, c1 as u8 as char, c2 as u8 as char, c3 as u8 as char).unwrap();
+            }
+        }
+    }
+    let t = load(&p);
+    // 每个信号都有 n_ts 个变更点(值 0..7 互不相同)
+    for name in ["sig_0", "sig_100000", "sig_199999"] {
+        let full = t.signals().iter().find(|s| s.contains(name)).cloned()
+            .unwrap_or_else(|| panic!("{} not found", name));
+        let idx = t.find_indices(&full, FindCondition::Changed).unwrap();
+        assert_eq!(idx.len(), n_ts - 1, "{}: 跨 chunk 的变更点不得丢失 (got {:?})", name, idx);
+    }
+    let _ = std::fs::remove_file(&p);
+}

@@ -203,17 +203,17 @@ pub struct VcdTrace {
     filename: String,
     signals: Vec<std::sync::Arc<str>>,   // interned once, shared with name_to_idx
     #[allow(dead_code)]
-    signal_ids: HashMap<u64, u32>,       // hash → index
+    signal_ids: FxHashMap<u64, u32>,       // hash → index
     id_blob: Vec<u8>,          // concatenated signal ids (allocated once)
     id_offsets: Vec<u32>,      // per-signal start offset into id_blob
     signal_widths: Vec<u32>,               // dense by signal index (declared width)
     /// $dumpvars snapshot: signal index → initial value before the first '#'
     /// timestamp line (missing entry ⇒ 'x', the VCD default).
     initial_values: HashMap<u32, VcdValue>,
-    name_to_idx: HashMap<std::sync::Arc<str>, u32>,
+    name_to_idx: FxHashMap<std::sync::Arc<str>, u32>,
     /// 短名/叶子名/子串解析缓存(一次 O(N) 扫描,之后 O(1));
     /// 所有读取路径共用,避免"op_get 能解析、边沿谓词不能"的不一致。
-    name_cache: std::cell::RefCell<HashMap<String, Option<u32>>>,
+    name_cache: std::cell::RefCell<FxHashMap<String, Option<u32>>>,
 
     // Event signals (VCD event type — auto-reset to 0 at each timestamp boundary)
     event_signals: HashSet<u32>,
@@ -294,13 +294,18 @@ impl VcdTrace {
 
         // ====== PASS 1a: Scan header (single-thread) ======
         let mut signals = Vec::with_capacity(256);
-        let mut signal_ids: HashMap<u64, u32> = HashMap::with_capacity(256);
+        let mut signal_ids: FxHashMap<u64, u32> = FxHashMap::with_capacity_and_hasher(256, FxBuild::default());
         let mut id_blob: Vec<u8> = Vec::new();
         let mut id_offsets: Vec<u32> = Vec::new();
         let mut signal_widths: Vec<u32> = Vec::new();
-        let mut name_to_idx: HashMap<std::sync::Arc<str>, u32> = HashMap::with_capacity(256);
+        let mut name_to_idx: FxHashMap<std::sync::Arc<str>, u32> = FxHashMap::with_capacity_and_hasher(256, FxBuild::default());
         let mut event_signals: HashSet<u32> = HashSet::new();
         let mut header_end_offset: u64 = 0;
+
+        // 复用缓冲: 每个信号的全名拼接 + 预拼 scope 前缀(避免 per-signal join)
+        let mut name_buf = String::with_capacity(256);
+        let mut scope_prefix = String::new();
+        let mut scope_prefix_lens: Vec<usize> = Vec::new();
 
         // Track $scope / $upscope for hierarchical signal names
         let mut scope_stack: Vec<String> = Vec::new();
@@ -324,13 +329,15 @@ impl VcdTrace {
                 if hl.len() > 4 && hl[1] == b'v' && hl[2] == b'a' && hl[3] == b'r' {
                     if let Some((sig_hash, short_name, width, id_bytes, is_event)) = parse_var_decl_fast2(hl) {
                         let idx = signals.len() as u32;
-                        // Build full hierarchical name from scope stack
-                        let full_name = if scope_stack.is_empty() {
-                            short_name.clone()
-                        } else {
-                            format!("{}.{}", scope_stack.join("."), short_name)
-                        };
-                        let interned: std::sync::Arc<str> = std::sync::Arc::from(full_name);
+                        // Build full hierarchical name: 复用 buffer + 预拼好的 scope 前缀
+                        // (此前每个信号都 scope_stack.join(".") 一次, 深层次时是热点)
+                        name_buf.clear();
+                        if !scope_prefix.is_empty() {
+                            name_buf.push_str(&scope_prefix);
+                            name_buf.push('.');
+                        }
+                        name_buf.push_str(&String::from_utf8_lossy(short_name));
+                        let interned: std::sync::Arc<str> = std::sync::Arc::from(name_buf.as_str());
                         signals.push(interned.clone());
                         signal_ids.insert(sig_hash, idx);
                         id_offsets.push(id_blob.len() as u32);
@@ -345,8 +352,11 @@ impl VcdTrace {
                 } else if hl.starts_with(b"$scope") {
                     // $scope module name $end → push scope name
                     if let Some(scope_name) = parse_scope_name(hl) {
+                        scope_prefix_lens.push(scope_prefix.len());
+                        if !scope_prefix.is_empty() { scope_prefix.push('.'); }
+                        scope_prefix.push_str(&scope_name);
                         scope_stack.push(scope_name);
-                        scopes.push(scope_stack.join("."));
+                        scopes.push(scope_prefix.clone());
                     }
                 } else if hl.starts_with(b"$timescale") {
                     // 单行: "$timescale 1ns $end"; 多行: "$timescale\n 1ns\n $end".
@@ -360,6 +370,7 @@ impl VcdTrace {
                     }
                 } else if hl.starts_with(b"$upscope") {
                     scope_stack.pop();
+                    if let Some(l) = scope_prefix_lens.pop() { scope_prefix.truncate(l); }
                 } else if hl.starts_with(b"$enddefinitions") {
                     header_end_offset = line_offset + hl.len() as u64 + 1;
                     break;
@@ -744,7 +755,7 @@ impl VcdTrace {
         let trace = VcdTrace {
             id, filename,
             signals, signal_ids, id_blob, id_offsets, signal_widths, initial_values, name_to_idx,
-            name_cache: std::cell::RefCell::new(HashMap::new()), event_signals, event_change_points,
+            name_cache: std::cell::RefCell::new(FxHashMap::default()), event_signals, event_change_points,
             timestamps: build_ts_store(timestamps), timestamp_offsets, sparse_index,
             lru_cache: RefCell::new(lru::LruCache::new(lru_cap)),
             signal_cache: Mutex::new(HashMap::new()),
@@ -940,11 +951,13 @@ impl VcdTrace {
                         Some(n) => {
                             let abs = p + n;
                             if abs == 0 || chunk[abs - 1] == b'\n' {
-                                let line = match memchr::memchr(b'\n', &chunk[abs..]) {
-                                    Some(nl) => &chunk[abs..abs + nl],
-                                    None => &chunk[abs..],
-                                };
-                                if is_ts_line(line) {
+                                // 廉价校验: '#' 后必须是数字且直到行尾都是数字
+                                // (此前每个 '#' 都要再 memchr 找行尾 → 百万级时间戳时
+                                //  这一遍就占扫描时间的大头)
+                                let rest = &chunk[abs + 1..];
+                                let mut k = 0usize;
+                                while k < rest.len() && rest[k].is_ascii_digit() { k += 1; }
+                                if k > 0 && matches!(rest.get(k), Some(b'\n') | Some(b'\r') | None) {
                                     ts_pos.push(abs);
                                 }
                             }
@@ -1019,9 +1032,14 @@ impl VcdTrace {
                         // value line belongs to the LAST '#' before it; a value
                         // line before the file's FIRST '#' is the $dumpvars
                         // block (already captured as the initial value) — skip.
+                        // 若本 chunk 内没有 '#'(该时间戳的变化行跨过了 chunk 边界),
+                        // 用 u32::MAX 标记"属于上一个 chunk 的最后一个 #"
+                        // (此前直接丢弃 → 每时间戳变化数 > chunk 大小时静默漏值)。
                         let after = ts_pos.partition_point(|&p0| p0 < line_start);
                         if after > 0 {
                             hits.push(((after - 1) as u32, pos, val));
+                        } else {
+                            hits.push((u32::MAX, pos, val));
                         }
                     }
                     p = pos + 1;
@@ -1037,7 +1055,12 @@ impl VcdTrace {
             let mut base = 0usize;
             for (ts_count, hits) in results {
                 for (local_idx, _pos, val) in hits {
-                    let ts_idx = base + local_idx as usize;
+                    let ts_idx = if local_idx == u32::MAX {
+                        if base == 0 { continue; } // 文件首个 '#' 之前 = $dumpvars 块
+                        base - 1
+                    } else {
+                        base + local_idx as usize
+                    };
                     match all.last_mut() {
                         Some((i, v)) if *i as usize == ts_idx => *v = val,
                         _ => all.push((ts_idx as u32, val)),
@@ -1335,6 +1358,35 @@ impl VcdTrace {
     }
 }
 
+// ================ 快速哈希(FxHash, 波形内部表用) ================
+// 波形里的哈希表都是"内部数据"(信号名/ID), 不需要 SipHash 的抗碰撞性;
+// SipHash 在大文件加载/查询的每行查找上是热点。
+#[derive(Default)]
+struct FxHasher { hash: u64 }
+const FX_SEED: u64 = 0x51_7c_c1_b7_27_22_0a_95;
+impl std::hash::Hasher for FxHasher {
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        let mut b = bytes;
+        while b.len() >= 8 {
+            let v = u64::from_le_bytes(b[..8].try_into().unwrap());
+            self.hash = (self.hash.rotate_left(5) ^ v).wrapping_mul(FX_SEED);
+            b = &b[8..];
+        }
+        for &x in b {
+            self.hash = (self.hash.rotate_left(5) ^ x as u64).wrapping_mul(FX_SEED);
+        }
+    }
+    #[inline] fn write_u64(&mut self, i: u64) { self.hash = (self.hash.rotate_left(5) ^ i).wrapping_mul(FX_SEED); }
+    #[inline] fn write_u32(&mut self, i: u32) { self.write_u64(i as u64); }
+    #[inline] fn write_usize(&mut self, i: usize) { self.write_u64(i as u64); }
+    #[inline] fn write_u8(&mut self, i: u8) { self.write_u64(i as u64); }
+    #[inline] fn finish(&self) -> u64 { self.hash }
+}
+type FxBuild = std::hash::BuildHasherDefault<FxHasher>;
+type FxHashMap<K, V> = std::collections::HashMap<K, V, FxBuild>;
+type FxHashSet<T> = std::collections::HashSet<T, FxBuild>;
+
 // ================ FAST BYTE-LEVEL PARSE FUNCTIONS ================
 
 /// Parse timestamp: "#12345" → 12345
@@ -1368,11 +1420,12 @@ fn parse_scope_name(line: &[u8]) -> Option<String> {
 #[allow(dead_code)]
 fn parse_var_decl_fast(line: &[u8]) -> Option<(u64, String, usize)> {
     let (hash, name, width, _, _) = parse_var_decl_fast2(line)?;
-    Some((hash, name, width))
+    Some((hash, String::from_utf8_lossy(name).into_owned(), width))
 }
 
-/// Parse a $var declaration, also returning raw signal ID bytes and is_event flag
-fn parse_var_decl_fast2(line: &[u8]) -> Option<(u64, String, usize, Vec<u8>, bool)> {
+/// Parse a $var declaration → (id_hash, name, width, id_bytes, is_event)。
+/// 返回的都是 line 的切片(零分配;此前每个信号要分配 name String + id Vec)。
+fn parse_var_decl_fast2(line: &[u8]) -> Option<(u64, &[u8], usize, &[u8], bool)> {
     // Find width (3rd field), signal ID (4th field), name (5th field to $end)
     let mut parts = [0usize; 6]; // start offsets of fields
     let mut part = 0;
@@ -1410,14 +1463,15 @@ fn parse_var_decl_fast2(line: &[u8]) -> Option<(u64, String, usize, Vec<u8>, boo
     // Signal ID: bytes from parts[3] to next space
     let id_start = parts[3];
     let id_end = line[id_start..].iter().position(|&b| b == b' ').map(|p| id_start + p).unwrap_or(line.len());
-    let sig_hash = hash_sig_id(&line[id_start..id_end]);
-    let id_bytes = line[id_start..id_end].to_vec();
+    let id_bytes = &line[id_start..id_end];
+    let sig_hash = hash_sig_id(id_bytes);
 
-    // Name: from parts[4] to $end (spaces are valid in signal names)
+    // Name: from parts[4] to $end (spaces are valid in signal names); 去掉尾部空白
     let name_start = parts[4];
     let name_end = line[name_start..].iter().position(|&b| b == b'$').map(|p| name_start + p).unwrap_or(line.len());
-    let name_str = std::str::from_utf8(&line[name_start..name_end]).ok()?;
-    let name = name_str.trim().to_string();
+    let mut ne = name_end;
+    while ne > name_start && (line[ne - 1] == b' ' || line[ne - 1] == b'\t') { ne -= 1; }
+    let name = &line[name_start..ne];
 
     Some((sig_hash, name, width, id_bytes, is_event))
 }
@@ -1715,8 +1769,8 @@ impl VcdTrace {
         let mut id_offsets: Vec<u32> = Vec::new();
         let mut signal_widths: Vec<u32> = Vec::with_capacity(n_sigs);
         let mut initial_values: HashMap<u32, VcdValue> = HashMap::new();
-        let mut signal_ids: HashMap<u64, u32> = HashMap::with_capacity(n_sigs);
-        let mut name_to_idx: HashMap<std::sync::Arc<str>, u32> = HashMap::with_capacity(n_sigs);
+        let mut signal_ids: FxHashMap<u64, u32> = FxHashMap::with_capacity_and_hasher(n_sigs, FxBuild::default());
+        let mut name_to_idx: FxHashMap<std::sync::Arc<str>, u32> = FxHashMap::with_capacity_and_hasher(n_sigs, FxBuild::default());
         for i in 0..n_sigs {
             let name = String::from_utf8(r.bytes()?).ok()?;
             let idb = r.bytes()?;
@@ -1767,7 +1821,7 @@ impl VcdTrace {
         Some(VcdTrace {
             id, filename,
             signals, signal_ids, id_blob, id_offsets, signal_widths, initial_values, name_to_idx,
-            name_cache: std::cell::RefCell::new(HashMap::new()),
+            name_cache: std::cell::RefCell::new(FxHashMap::default()),
             event_signals, event_change_points,
             timestamps, timestamp_offsets, sparse_index,
             lru_cache: RefCell::new(lru::LruCache::new(lru_cap)),
