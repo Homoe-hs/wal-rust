@@ -1480,23 +1480,14 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
                     if target <= 1 && target >= 0 { FindCondition::Value(target as u8) }
                     else { FindCondition::ValueI64(target) }
                 };
-                if let Ok(t) = self.traces.read() {
-                    for tid in &traces {
-                        if let Some(tr) = t.get(tid) {
-                            let resolved = tr.resolve_name(&sig_name)
-                                .unwrap_or_else(|| sig_name.clone());
-                            if let Ok(idxs) = tr.find_indices(&resolved, cond.clone()) {
-                                found.extend(idxs.into_iter().map(|i| i as i64));
-                            }
-                        }
-                    }
-                    found.sort();
-                    found.dedup();
-                    if found.len() > max_results { found.truncate(max_results); }
-                    return Ok(Value::List(WList::from_vec(
-                        found.into_iter().map(Value::Int).collect()
-                    )));
-                }
+                let idxs = self.find_indices_all_traces(&sig_name, &cond, &traces)?;
+                found.extend(idxs.into_iter().map(|i| i as i64));
+                found.sort();
+                found.dedup();
+                if found.len() > max_results { found.truncate(max_results); }
+                return Ok(Value::List(WList::from_vec(
+                    found.into_iter().map(Value::Int).collect()
+                )));
             }
 
             // Fast path 2: try decomposing (&& ...) or (|| ...)
@@ -1773,21 +1764,13 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
                 if target <= 1 && target >= 0 { FindCondition::Value(target as u8) }
                 else { FindCondition::ValueI64(target) }
             };
-            let total: usize = {
-                let t = self.traces.read().unwrap_or_else(|e| e.into_inner());
-                let mut sum = 0usize;
-                for tid in &traces_ids {
-                    if let Some(tr) = t.get(tid) {
-                        let resolved = tr.resolve_name(&sig_name)
-                            .unwrap_or_else(|| sig_name.clone());
-                        if let Ok(idxs) = tr.find_indices(&resolved, cond.clone()) {
-                            sum += idxs.len();
-                        }
-                    }
+            let idxs = self.find_indices_all_traces(&sig_name, &cond, &traces_ids)?;
+            if let Ok(mut t) = self.traces.write() {
+                for (tid, idx) in &saved {
+                    let _ = t.set_index(tid, *idx);
                 }
-                sum
-            };
-            return Ok(Value::Int(total as i64));
+            }
+            return Ok(Value::Int(idxs.len() as i64));
         }
 
         // 常量条件(不引用信号/INDEX, 无副作用): 每个索引取值相同 → O(1)
@@ -1863,6 +1846,37 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
     ///   再求值一次——电平部分若仍为真,按区间长度 -1 累加(否则漏计区间内部索引)。
     /// 返回 None 表示表达式未引用任何信号,或引用了随索引变化的 INDEX/TS
     /// (区间内部不恒定,交给逐拍回退)。
+    /// 跨 trace 查找信号并求索引集。
+    /// 任一条 trace 都没有该信号 → Err(不再静默给 0, 拼写错误要有提示);
+    /// 某条 trace 解码失败 → 传播该错误。
+    fn find_indices_all_traces(
+        &self,
+        name: &str,
+        cond: &FindCondition,
+        traces_ids: &[String],
+    ) -> Result<Vec<usize>, String> {
+        let t = self.traces.read().unwrap_or_else(|e| e.into_inner());
+        let mut found_any = false;
+        let mut out: Vec<usize> = Vec::new();
+        let mut first_err: Option<String> = None;
+        for tid in traces_ids {
+            let tr = match t.get(tid) { Some(tr) => tr, None => continue };
+            let resolved = match tr.resolve_name(name) { Some(r) => r, None => continue };
+            found_any = true;
+            match tr.find_indices(&resolved, cond.clone()) {
+                Ok(idxs) => out.extend(idxs),
+                Err(e) => { if first_err.is_none() { first_err = Some(e); } }
+            }
+        }
+        if let Some(e) = first_err { return Err(e); }
+        if !found_any {
+            return Err(format!("signal '{}' not found in any loaded trace.", name));
+        }
+        out.sort_unstable();
+        out.dedup();
+        Ok(out)
+    }
+
     /// 常量条件折叠: 返回 Some(truthy) 表示该条件不依赖信号/索引,
     /// 每个索引取值相同(调用方据此直接得出结果, O(1))。
     fn const_cond_value(&mut self, cond: &Value) -> Option<bool> {
@@ -1907,9 +1921,10 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
                 .filter_map(|tid| t.get(tid).map(|tr| tr.max_index()))
                 .max()
                 .unwrap_or(0);
-            let mut per_sig: Vec<(Vec<String>, Vec<(usize, ScalarValue)>, ScalarValue)> = Vec::new();
+            // (别名键, 变更点, 索引0的值, $dumpvars 确定初值)
+            let mut per_sig: Vec<(Vec<String>, Vec<(usize, ScalarValue)>, ScalarValue, Option<ScalarValue>)> = Vec::new();
             for n in &names {
-                let mut found: Option<(String, Vec<(usize, ScalarValue)>, ScalarValue)> = None;
+                let mut found: Option<(String, Vec<(usize, ScalarValue)>, ScalarValue, Option<ScalarValue>)> = None;
                 for tid in &ids {
                     let tr = match t.get(tid) { Some(tr) => tr, None => continue };
                     let resolved = match tr.resolve_name(n) {
@@ -1919,12 +1934,13 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
                     // 数据不可用(如 FST 解码失败)→ 传播错误而不是伪造 x 值
                     let base = tr.signal_value(&resolved, 0)
                         .map_err(|e| format!("interval_scan: {}: {}", resolved, e))?;
+                    let init = tr.defined_initial_value(&resolved);
                     let cps = tr.change_points(&resolved)
                         .map_err(|e| format!("interval_scan: {}: {}", resolved, e))?;
-                    found = Some((resolved, cps, base));
+                    found = Some((resolved, cps, base, init));
                     break;
                 }
-                let (resolved, cps, base) = match found {
+                let (resolved, cps, base, init) = match found {
                     Some(x) => x,
                     // 任何 trace 里都没有该信号 → 交给逐拍回退(报错口径一致)
                     None => return Ok(None),
@@ -1935,7 +1951,7 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
                 if !keys.contains(n) {
                     keys.push(n.clone());
                 }
-                per_sig.push((keys, cps, base));
+                per_sig.push((keys, cps, base, init));
             }
             (ids, saved, max_index, per_sig)
         };
@@ -1946,9 +1962,10 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
             std::rc::Rc::new(std::cell::RefCell::new(std::collections::HashMap::new()));
         {
             let mut m = map.borrow_mut();
-            for (keys, _, base) in per_sig.iter() {
+            for (keys, _, base, init) in per_sig.iter() {
                 for k in keys {
-                    m.insert(k.clone(), (None, base.clone()));
+                    // 索引 0 的前驱 = $dumpvars 确定初值(无则 None)
+                    m.insert(k.clone(), (init.clone(), base.clone()));
                 }
             }
         }
@@ -1959,7 +1976,7 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
 
         // 边界 = 0 ∪ 各信号变更点(idx>0)
         let mut bounds: Vec<usize> = vec![0];
-        for (_, cps, _) in &per_sig {
+        for (_, cps, _, _) in &per_sig {
             for (i, _) in cps {
                 if *i > 0 { bounds.push(*i); }
             }
@@ -1969,7 +1986,7 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
 
         if std::env::var("WAL_DEBUG_FIND").is_ok() {
             eprintln!("interval_scan: names={:?} has_edge={} cps={:?} bounds={:?}",
-                names, has_edge, per_sig.iter().map(|(k, c, _)| (k.join("|"), c.len())).collect::<Vec<_>>(), bounds);
+                names, has_edge, per_sig.iter().map(|(k, c, _, _)| (k.join("|"), c.len())).collect::<Vec<_>>(), bounds);
         }
         let mut ptr: Vec<usize> = vec![0; per_sig.len()];
         let mut indices: Vec<usize> = Vec::new();
@@ -1980,7 +1997,7 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
                 let b = bounds[bi];
                 if b > 0 {
                     let mut m = map.borrow_mut();
-                    for (si, (keys, cps, _)) in per_sig.iter().enumerate() {
+                    for (si, (keys, cps, _, _)) in per_sig.iter().enumerate() {
                         while ptr[si] < cps.len() && cps[ptr[si]].0 < b { ptr[si] += 1; }
                         let changed = ptr[si] < cps.len() && cps[ptr[si]].0 == b;
                         let newv = if changed { Some(cps[ptr[si]].1.clone()) } else { None };

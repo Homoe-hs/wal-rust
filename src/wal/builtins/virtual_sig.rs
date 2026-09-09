@@ -56,8 +56,15 @@ fn value_to_vcd_bit(v: &Value) -> (String, u32) {
         }
         Value::Bool(b) => (if *b { "1".to_string() } else { "0".to_string() }, 1),
         Value::Float(f) => (if *f == 0.0 { "0".to_string() } else { "1".to_string() }, 1),
-        // x/z-aware get returns bit-strings for vectors with unknown bits.
-        Value::String(s) => (s.clone(), s.len() as u32),
+        // x/z-aware get returns bit-strings for vectors with unknown bits;
+        // 其它字符串(如信号名)不是波形值 → 置 x 串(调用方会跳过并告警)。
+        Value::String(s) => {
+            if s.chars().all(|c| matches!(c, '0' | '1' | 'x' | 'z' | 'X' | 'Z')) {
+                (s.to_ascii_lowercase(), s.len() as u32)
+            } else {
+                ("x".repeat(s.len().max(1)), s.len().max(1) as u32)
+            }
+        }
         Value::Nil => ("0".to_string(), 1),
         _ => ("0".to_string(), 1),
     }
@@ -146,6 +153,12 @@ fn op_dump_trace(args: &[Value], env: &mut Environment, eval: &mut Evaluator) ->
     if sigs.is_empty() {
         return Err("dump-trace: no virtual signals defined (use defsig first)".to_string());
     }
+    if path.to_ascii_lowercase().ends_with(".fst") {
+        return Err(format!(
+            "dump-trace: '{}': 只支持 VCD 输出(.fst 暂不支持; 请写 .vcd, 或先用外部工具转换)",
+            path
+        ));
+    }
 
     let max_idx = if let Some(traces) = env.get_traces() {
         let traces = traces.read().unwrap_or_else(|e| e.into_inner());
@@ -167,10 +180,24 @@ fn op_dump_trace(args: &[Value], env: &mut Environment, eval: &mut Evaluator) ->
     writeln!(file, "$timescale 1ns $end").ok();
     writeln!(file, "$scope module virtual $end").ok();
 
-    let mut handles: Vec<(String, u32, String, String)> = Vec::new();
+    // (id, width, 初值位串, 名字, 表达式)
+    let mut handles: Vec<(String, u32, String, String, Value)> = Vec::new();
     for (i, (name, expr)) in sigs.iter().enumerate() {
         let id = format!("s{}", i + 1);
         if let Ok(val) = eval.eval_value_public(expr.clone()) {
+            // 非波形值(信号名等字符串 / 闭包)没有 VCD 表示 → 跳过并告警
+            let representable = match &val {
+                Value::String(s) => s.chars().all(|c| matches!(c, '0' | '1' | 'x' | 'z' | 'X' | 'Z')),
+                Value::Closure(_) | Value::Macro(_) => false,
+                _ => true,
+            };
+            if !representable {
+                eprintln!(
+                    "warning: dump-trace: 跳过虚拟信号 '{}' — 其值 {:?} 不是波形值(位串/整数)",
+                    name, val
+                );
+                continue;
+            }
             let (mut bits_str, mut width) = value_to_vcd_bit(&val);
             // Widen by the underlying signal's declared width (a 45-bit value
             // read as int at the first sample must not be declared as 32 bits).
@@ -183,7 +210,7 @@ fn op_dump_trace(args: &[Value], env: &mut Environment, eval: &mut Evaluator) ->
             let vtype = if width > 1 { "reg" } else { "wire" };
             let range = if width > 1 { format!(" [{}:0]", width - 1) } else { String::new() };
             writeln!(file, "$var {} {} {} {}{} $end", vtype, width, id, name, range).ok();
-            handles.push((id, width, bits_str, name.clone()));
+            handles.push((id, width, bits_str, name.clone(), expr.clone()));
         }
     }
 
@@ -191,7 +218,7 @@ fn op_dump_trace(args: &[Value], env: &mut Environment, eval: &mut Evaluator) ->
     writeln!(file, "$enddefinitions $end").ok();
     writeln!(file, "$dumpvars").ok();
 
-    for (id, _width, bits_str, _name) in &handles {
+    for (id, _width, bits_str, _name, _expr) in &handles {
         if bits_str.len() == 1 {
             writeln!(file, "{}{}", bits_str, id).ok();
         } else {
@@ -202,7 +229,7 @@ fn op_dump_trace(args: &[Value], env: &mut Environment, eval: &mut Evaluator) ->
 
     // Phase 3: Batch evaluate and dump
     let mut last_values: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-    for (id, _width, bits_str, _name) in &handles {
+    for (id, _width, bits_str, _name, _expr) in &handles {
         last_values.insert(id.clone(), bits_str.clone());
     }
 
@@ -218,7 +245,12 @@ fn op_dump_trace(args: &[Value], env: &mut Environment, eval: &mut Evaluator) ->
 
         eprintln!("Dumping {} indices, {} virtual signals...", max_idx, sigs.len());
         for idx in 1..=max_idx {
-            writeln!(file, "#{}", idx).ok();
+            // 用源波形的时间戳(而不是索引号), 否则导出的时标与原始波形对不上
+            let ts = {
+                let traces = traces_rc.read().unwrap_or_else(|e| e.into_inner());
+                traces.first_trace().and_then(|t| t.timestamp_at(idx)).unwrap_or(idx as u64)
+            };
+            writeln!(file, "#{}", ts).ok();
 
             let mut all_ended = true;
             {
@@ -231,9 +263,9 @@ fn op_dump_trace(args: &[Value], env: &mut Environment, eval: &mut Evaluator) ->
             }
             if all_ended { break; }
 
-            for (i, (_name, expr)) in sigs.iter().enumerate() {
-                let id = &handles[i].0;
-                let width = handles[i].1;
+            for (id, width, _init, _name, expr) in handles.iter() {
+                let id = id;
+                let width = *width;
                 if let Ok(val) = eval.eval_value_public(expr.clone()) {
                     let (bits_str, _) = value_to_vcd_bit(&val);
                     // Fit to the declared width (left-pad / keep low bits), so

@@ -692,3 +692,134 @@ fn matrix_col_sidecar_cross_process_hit() {
     assert_eq!(out3, "=> (2 6 10 14 18 22 26 30 34 38 42 46 50 54 58 62)");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// 30) `==`/`!==` 别名: WAL 词法把 `==` 拆成两个 `=`, 以前 `(== a b)` 静默为 false。
+#[test]
+fn matrix_double_equals_alias() {
+    let p = tmp("eqeq", "$timescale 1ns $end\n$scope module t $end\n$var wire 1 ! c $end\n$enddefinitions $end\n\
+#0\n0!\n#10\n1!\n#20\n0!\n");
+    let e = |c: &str| eval_with(&p, c);
+    // 游标在索引 0, 该处 c=0
+    assert_eq!(e("(== (get \"t.c\") 0)"), Value::Bool(true));
+    assert_eq!(e("(== (get \"t.c\") 1)"), Value::Bool(false));
+    assert_eq!(e("(count (== (get \"t.c\") 1))"), Value::Int(1));
+    assert_eq!(e("(count (== (get \"t.c\") 1))"), e("(count (= (get \"t.c\") 1))"));
+    assert_eq!(e("(!== (get \"t.c\") 1)"), Value::Bool(true));
+    assert_eq!(e("(=== (get \"t.c\") 0)"), Value::Bool(true));
+}
+
+/// 31) 1bit 标量的 x 是未知态, 不等于 0(此前 `(get)` 给 0、count/step 与 count 分叉)。
+#[test]
+fn matrix_scalar_x_is_not_zero() {
+    let p = tmp("xz", "$timescale 1ns $end\n$scope module t $end\n$var wire 1 ! v $end\n$enddefinitions $end\n\
+#0\nx!\n#10\nx!\n#20\n0!\n#30\n1!\n#40\nx!\n");
+    let e = |c: &str| eval_with(&p, c);
+    assert_eq!(e("(get \"t.v\")"), Value::String("x".to_string()));
+    assert_eq!(e("(count (= (get \"t.v\") 0))"), Value::Int(1), "只有 idx2 的确定 0");
+    assert_eq!(e("(count/step (= (get \"t.v\") 0))"), Value::Int(1), "逐拍必须与快路径一致");
+    assert_eq!(e("(count (is-x \"t.v\"))"), Value::Int(3));
+    // find_indices 直查(与 count 子命令同一路径)
+    let t = load(&p);
+    let name = t.signals().iter().find(|s| s.ends_with('v')).unwrap().clone();
+    assert_eq!(t.find_indices(&name, FindCondition::ValueI64(0)).unwrap(), vec![2]);
+}
+
+/// 32) $dumpvars 确定初值 → 索引 0 的首条变化算边沿/变化(此前丢失首个上升沿)。
+#[test]
+fn matrix_dumpvars_first_edge_at_index_zero() {
+    let p = tmp("firstedge", "$timescale 1ns $end\n$scope module t $end\n$var wire 1 ! c $end\n$enddefinitions $end\n\
+$dumpvars\n0!\n$end\n#0\n1!\n#10\n0!\n#20\n1!\n");
+    let e = |c: &str| eval_with(&p, c);
+    // c = 1,0,1: 索引 0 的 0→1 是上升沿
+    assert_eq!(e("(count (rising \"t.c\"))"), Value::Int(2));
+    assert_eq!(e("(find (rising \"t.c\"))"), Value::List(WList::from_vec(vec![Value::Int(0), Value::Int(2)])));
+    assert_eq!(e("(count/step (rising \"t.c\"))"), Value::Int(2));
+    assert_eq!(e("(count (falling \"t.c\"))"), Value::Int(1));
+    // c = 1,0,1 → 三次变化(含索引 0 的 dumpvars 0→1)
+    assert_eq!(e("(count (changes \"t.c\"))"), Value::Int(3));
+    assert_eq!(e("(count/step (changes \"t.c\"))"), Value::Int(3));
+    // 初值为 x(无 dumpvars)时索引 0 不算边沿
+    let p2 = tmp("noxinit", "$timescale 1ns $end\n$scope module t $end\n$var wire 1 ! c $end\n$enddefinitions $end\n\
+#0\n1!\n#10\n0!\n");
+    let e2 = |c: &str| eval_with(&p2, c);
+    assert_eq!(e2("(count (rising \"t.c\"))"), Value::Int(0), "x→1 不是上升沿");
+    assert_eq!(e2("(count (changes \"t.c\"))"), Value::Int(1), "x→1 不算变化");
+}
+
+/// 33) 拼写错误的信号名必须报错, 不能静默返回 0/()/false。
+#[test]
+fn matrix_unknown_signal_errors() {
+    let p = tmp("unknown", "$timescale 1ns $end\n$scope module t $end\n$var wire 1 ! c $end\n$enddefinitions $end\n#0\n0!\n#10\n1!\n");
+    let mut e = Evaluator::new();
+    e.load_trace(&p.to_string_lossy(), "t").unwrap();
+    for q in [
+        "(count (= (get \"nosuch\") 1))",
+        "(find (= (get \"nosuch\") 1))",
+        "(count (rising \"nosuch\"))",
+        "(count (is-x \"nosuch\"))",
+        "(count (changes \"nosuch\"))",
+        "(count (&& (= (get \"nosuch\") 1) (= (get \"t.c\") 1)))",
+    ] {
+        let r = e.eval(q);
+        assert!(r.is_err(), "{} 必须报错, 得到 {:?}", q, r);
+        assert!(r.unwrap_err().contains("not found"), "{}: 错误信息应含 not found", q);
+    }
+    // 正常查询仍然工作
+    assert_eq!(e.eval("(count (= (get \"t.c\") 1))").unwrap(), Value::Int(1));
+}
+
+/// 34) 压缩波形/FSDB 必须明确报错, 不能静默给 0。
+#[test]
+fn matrix_reject_compressed_and_fsdb() {
+    let dir = std::env::temp_dir().join(format!("wal_reg_fmt_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let gz = dir.join("a.vcd.gz");
+    std::fs::write(&gz, [0x1f, 0x8b, 0x08, 0x00]).unwrap();
+    let bz2 = dir.join("a.vcd.bz2");
+    std::fs::write(&bz2, b"BZh91AY&SY").unwrap();
+    let fsdb = dir.join("a.fsdb");
+    std::fs::write(&fsdb, b"\x00\x00\x00\x00FSDB\x00\x00").unwrap();
+    for (path, want) in [(&gz, "gzip"), (&bz2, "bzip2"), (&fsdb, "FSDB")] {
+        let mut e = Evaluator::new();
+        let err = e.load_trace(&path.to_string_lossy(), "t").unwrap_err();
+        assert!(err.contains(want), "{}: 错误信息应提到 {}: {}", path.display(), want, err);
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 35) dump-trace: 字符串值跳过并告警、.fst 明确拒绝、输出用真实时间戳。
+#[test]
+fn matrix_dump_trace_writer_contract() {
+    let p = tmp("dumptr", "$timescale 1ns $end\n$scope module t $end\n$var wire 1 ! c $end\n$enddefinitions $end\n\
+#0\n0!\n#10\n1!\n#20\n0!\n");
+    let out = std::env::temp_dir().join(format!("wal_reg_dump_{}.vcd", std::process::id()));
+    let out_s = out.to_string_lossy().to_string();
+    let mut e = Evaluator::new();
+    e.load_trace(&p.to_string_lossy(), "t").unwrap();
+    // 字符串虚拟信号不可表示 → 跳过(不写入非法 VCD), 数值信号正常导出
+    e.eval(&format!("(defsig s \"clk\") (defsig v (get \"t.c\")) (dump-trace \"{}\")", out_s)).unwrap();
+    let text = std::fs::read_to_string(&out).unwrap();
+    assert!(!text.contains("bclk"), "字符串值不得当位串写出: {}", text);
+    assert!(text.contains("#10") && text.contains("#20"), "应使用源波形时间戳: {}", text);
+    // .fst 路径明确拒绝
+    let fst = out.with_extension("fst");
+    let err = e.eval(&format!("(dump-trace \"{}\")", fst.to_string_lossy())).unwrap_err();
+    assert!(err.contains(".fst"), "{}", err);
+    // 导出的 VCD 可被读回
+    let mut e2 = Evaluator::new();
+    e2.load_trace(&out_s, "t").unwrap();
+    assert_eq!(e2.eval("(count (rising \"v\"))").unwrap(), Value::Int(1));
+    let _ = std::fs::remove_file(&out);
+}
+
+/// 36) 整数除法 (div): 向零取整; `/` 仍是浮点除法。
+#[test]
+fn matrix_integer_division() {
+    let p = tmp("div", "$timescale 1ns $end\n$scope module t $end\n$var wire 1 ! c $end\n$enddefinitions $end\n#0\n0!\n");
+    let e = |c: &str| eval_with(&p, c);
+    assert_eq!(e("(div 10 3)"), Value::Int(3));
+    assert_eq!(e("(div -10 3)"), Value::Int(-3));
+    assert_eq!(e("(div 10 -3)"), Value::Int(-3));
+    assert_eq!(e("(div 9 3)"), Value::Int(3));
+    assert_eq!(e("(/ 10 3)"), Value::Float(10.0 / 3.0));
+}

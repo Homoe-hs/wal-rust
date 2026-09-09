@@ -153,3 +153,22 @@ error: FST 信号 t.d 的数据: Unexpected signal value: 0!defi。该 FST 值�
 
 **复现/回归**:`cargo test --test fuzz_vcd_fst_diff`(默认 40 波形,可用
 `WAL_FUZZ_N=300 WAL_FUZZ_SEED=...` 加码;失败时自动把波形写到 `.tools/fuzz_fail.*`)。
+
+## 现场报告处置(0.12.37)
+
+| 编号 | 现象 | 处置 |
+|---|---|---|
+| B1 | `(== a b)` 恒假 | 词法把 `==` 拆成两个 `=` → 语法树 `(= = a b)`。解析后归一化 `(= = …)`/`(= = = …)` → `(= …)`,`!==` 同理。**修复** |
+| B2 | 1bit 标量 x 的三路口径不一致(`x == 0` 有的真有的假) | `VcdValue::to_i64`/FST `sv_to_i64` 对 x/z 返回 None;`(get)` 的位切片对 x/z 返回位串 `"x"`。**修复**(与向量口径一致) |
+| B14 | dumpvars 初值 → 首条变化 的跨界边丢失 | 新增 `Trace::defined_initial_value`:索引 0 的前驱 = **确定的** $dumpvars 初值(初值含 x/z 或后端无初值概念 → 仍无前驱)。变更列/逐拍/区间引擎三条路径统一。**修复** |
+| B6 | 未知信号静默退 0 | count/find/whenever 快路径与 `rising/falling/changes/is-x/is-z` 全部改为报错(`signal '…' not found`);顺带让这些谓词支持多 trace。**修复** |
+| B11 | .gz/.bz2 静默退化 | 加载前按 magic(1f 8b / BZh)明确报错"请先解压"。**修复** |
+| B8 | FSDB 直接 panic / 错误信息误导 | 按扩展名与 magic 识别 FSDB,给出"FSDB 暂不支持,请转 VCD/FST"的明确错误。**修复** |
+| 截断 VCD | 静默接受 | 缺少 `$enddefinitions` 时打印截断告警。**修复** |
+| B3 | `dump-trace` 写 `.fst` 名不副实 / 字符串值当位串写 / 时标用索引号 | `.fst` 路径明确拒绝;非波形值(字符串/闭包)跳过并告警;输出改用源波形真实时间戳。**修复** |
+| B4 | `(doc <符号>)` 报错、核心算子无文档 | `(doc sym)` 接受符号;补齐 get/at/rising/falling/changes/is-x/is-z/count/find/whenever/=/==/!=/&&/\|\|/not/div/help 等条目。**修复** |
+| B5 | `/` 返回浮点,硬件语境要整除 | 新增 `(div a b)` 整数除法(向零取整);`/` 保持浮点。**新增** |
+| B7 | RSS 27–32GB 与"<2GB"宣传不符 | 计量口径问题:波形经 mmap 读取,RSS 含**文件页驻留**;堆内存为 O(信号数+变更列)。文档已写明口径(见 waveform-io-plan.md)。跨进程旁挂列缓存(0.12.36)已消除重复全文件扫描 |
+| B9 | 脚本模式 + 深层宽信号挂起 >14min | 本地未复现;需要最小复现脚本 |
+
+**语义确认(非 bug)**:`count <wave> <sig>` 默认 `=1`(值计数,非变化计数);`changes` 只计跳变、`topsig` 计"值事件"(含初值),两者相差 1 是定义差异。

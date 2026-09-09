@@ -100,9 +100,13 @@ fn sv_to_i64(sv: &SignalValue) -> Option<i64> {
     let bs = sv_bit_string(sv)?;
     if bs.is_empty() { return None; }
     let bytes = bs.as_bytes();
-    // Match hand-rolled reader semantics: 1-bit x/z treated as 0
+    // 1-bit x/z 是未知态 → None(与 VCD 侧 to_i64 同口径)
     if bytes.len() == 1 {
-        return Some(if bytes[0] == b'1' { 1 } else { 0 });
+        return match bytes[0] {
+            b'0' => Some(0),
+            b'1' => Some(1),
+            _ => None,
+        };
     }
     if !bytes.iter().all(|&b| b == b'0' || b == b'1') { return None; }
     if bytes.len() > 64 {

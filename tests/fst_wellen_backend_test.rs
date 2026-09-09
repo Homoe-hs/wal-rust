@@ -301,9 +301,10 @@ fn test_wellen_backend_initial_x_semantics() {
         trace.find_indices("top.clk", FindCondition::ValueI64(1)).unwrap(),
         vec![1]
     );
+    // x 是未知态, 不等于 0 (与 VCD 侧同一口径): 只有 idx2 的确定 0 匹配。
     assert_eq!(
         trace.find_indices("top.clk", FindCondition::ValueI64(0)).unwrap(),
-        vec![0, 2]
+        vec![2]
     );
     // changes: x→1 at idx1, 1→0 at idx2.
     assert_eq!(

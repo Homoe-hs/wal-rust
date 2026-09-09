@@ -68,6 +68,12 @@ pub trait Trace {
         sigs.iter().find(|s| s.contains(name)).cloned()
     }
 
+    /// 波形开始前**已确定**的初值($dumpvars 快照;含 x/z 或后端无初值概念 → None)。
+    /// 用于索引 0 的边沿判定: dumpvars 0 → 首条变化 1 是一次真实上升沿。
+    fn defined_initial_value(&self, _name: &str) -> Option<ScalarValue> {
+        None
+    }
+
     /// 致命解码错误(文件损坏/编码不支持)。一旦发生,任何"静默吞错"的查询路径
     /// 都可能给出看似正常的错误结果(如 count=0);顶层求值结束前必须上报。
     fn fatal_error(&self) -> Option<String> {

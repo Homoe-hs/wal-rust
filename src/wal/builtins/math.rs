@@ -135,6 +135,17 @@ fn op_div(args: &[Value], _env: &mut Environment, _eval: &mut Evaluator) -> Resu
     Ok(Value::Float(a / b))
 }
 
+/// 整数除法(向零取整)。`/` 保持浮点除法。
+fn op_div_int(args: &[Value], _env: &mut Environment, _eval: &mut Evaluator) -> Result<Value, String> {
+    ensure_arity(args, 2)?;
+    let a = extract_int(&args[0])?;
+    let b = extract_int(&args[1])?;
+    if b == 0 {
+        return Err("Division by zero".to_string());
+    }
+    Ok(Value::Int(a.wrapping_div(b)))
+}
+
 fn op_exp(args: &[Value], _env: &mut Environment, _eval: &mut Evaluator) -> Result<Value, String> {
     ensure_arity(args, 2)?;
     // When both operands are int, return int (matching golden behavior)
@@ -269,6 +280,7 @@ pub fn register_math(disp: &mut Dispatcher) {
     disp.register(crate::wal::ast::Operator::Sub, op_sub);
     disp.register(crate::wal::ast::Operator::Mul, op_mul);
     disp.register(crate::wal::ast::Operator::Div, op_div);
+    disp.register(crate::wal::ast::Operator::DivInt, op_div_int);
     disp.register(crate::wal::ast::Operator::Exp, op_exp);
     disp.register(crate::wal::ast::Operator::Floor, op_floor);
     disp.register(crate::wal::ast::Operator::Ceil, op_ceil);

@@ -79,7 +79,12 @@ impl VcdValue {
     /// Convert to i64 (binary vector parsed MSB-first)
     pub fn to_i64(&self) -> Option<i64> {
         match self {
-            VcdValue::Bit(b) => Some(if *b == b'1' { 1 } else { 0 }),
+            // x/z 是未知态: 不能当 0(否则 `x == 0` 为真, 与位串比较口径矛盾)
+            VcdValue::Bit(b) => match *b {
+                b'0' => Some(0),
+                b'1' => Some(1),
+                _ => None,
+            },
             VcdValue::Vector(v) => {
                 if v.is_empty() { return None; }
                 // Check for unknowns

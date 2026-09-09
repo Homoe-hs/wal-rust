@@ -31,7 +31,10 @@ impl WalParser {
         if root.has_error() {
             return Err("Parse error: syntax error or mismatched parentheses".to_string());
         }
-        let result = expr_from_node(root, source)?;
+        let mut result = expr_from_node(root, source)?;
+        // 词法把 `==`/`===` 拆成多个 `=`: 归一化 (= = a b) → (= a b), 否则
+        // `(== x 1)` 会静默得到 false(而不是报错)。
+        normalize_eq_aliases(&mut result);
         // Unwrap single-expression program: return the child, not the wrapping list
         if root.kind() == "program" {
             if let Value::List(ref lst) = result {
@@ -41,6 +44,27 @@ impl WalParser {
             }
         }
         Ok(result)
+    }
+}
+
+/// `==`/`===` 在 WAL 词法里是多个 `=` token → 语法树变成 `(= = ...)` / `(= = = ...)`。
+/// 这里把 `=`/`!=` 之后多余的前导 `=` 符号去掉, 使 `(== a b)` 等价于 `(= a b)`。
+fn normalize_eq_aliases(v: &mut Value) {
+    if let Value::List(lst) = v {
+        for item in lst.0.iter_mut() {
+            normalize_eq_aliases(item);
+        }
+        let is_eq_op = matches!(&lst.0.first(), Some(Value::Symbol(s)) if s.name == "=" || s.name == "!=");
+        if !is_eq_op {
+            return;
+        }
+        // 去掉操作数前导的 `=` 符号(=/=== 被拆开的残余)
+        while lst.0.len() > 1 {
+            match &lst.0[1] {
+                Value::Symbol(s) if s.name == "=" => { lst.0.remove(1); }
+                _ => break,
+            }
+        }
     }
 }
 

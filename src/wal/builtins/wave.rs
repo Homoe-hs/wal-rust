@@ -550,7 +550,28 @@ const DOCS: &[(&str, &str)] = &[
     ("freq", "(freq \"clk\") → clock frequency in Hz"),
     ("save", "(save \"out.csv\" \"sig\"...) → export time/value columns to CSV"),
     ("fmt-time", "(fmt-time t [\"clk\"]) → t formatted with the waveform's timescale (e.g. 1.06ms); with a clock signal: \"beat N (1.06ms)\""),
-    ("doc", "(doc \"cmd\") → one-line documentation for a command"),
+    ("doc", "(doc \"cmd\"|cmd) → one-line documentation for a command"),
+    // ---- 核心查询算子(内测反馈: 这些以前查不到文档) ----
+    ("get", "(get \"sig\" [hi lo]) → 索引处取值; 含 x/z 时返回位串(如 \"x\"/\"00x1\"), 否则整数"),
+    ("at", "(at \"sig\" t) → (时间 值): t 时刻最后写入的值; 首变化前返回 (0 初值)"),
+    ("rising", "(rising \"sig\") → 该索引处是否 0→非零(含 x/z 不算)"),
+    ("falling", "(falling \"sig\") → 该索引处是否非零→0"),
+    ("changes", "(changes \"sig\") → 该索引处值是否变化(x/z 之间的变化不算)"),
+    ("is-x", "(is-x \"sig\") → 该索引处值是否含 x"),
+    ("is-z", "(is-z \"sig\") → 该索引处值是否含 z"),
+    ("count", "(count cond [cond...]) → 满足条件的索引数; (count/step cond) 逐索引等价形式"),
+    ("find", "(find cond [limit]) → 满足条件的索引列表; (find/step cond) 逐索引等价形式"),
+    ("whenever", "(whenever cond body...) → 在每个满足条件的索引处执行 body"),
+    ("=", "(= a b ...) → 相等比较; 含 x/z 时按位串比较(== 是同一算子的别名)"),
+    ("==", "(== a b) → 与 (= a b) 相同"),
+    ("!=", "(!= a b) → 不等比较"),
+    ("&&", "(&& a b ...) → 逻辑与(短路)"),
+    ("||", "(|| a b ...) → 逻辑或(短路)"),
+    ("not", "(not x) → 逻辑非(等价于 !)"),
+    ("div", "(div a b) → 整数除法(向零取整); / 是浮点除法"),
+    ("help", "(help) → 打印算子/命令总览"),
+    ("sigs", "(sigs \"pat\" [n]) → 信号名列表(子命令, 也可用 find-sig)"),
+    ("topsig", "(topsig [n]) → 变化最多的信号(子命令)"),
     // NOTE: keep the unit semantics visible in (help) as well.
     ("timescale", "Times are in the waveform's NATIVE unit: raw numbers from getwave/wave/at/edges are ps/ns/... per the file's $timescale (see the load summary). Only period/freq and fmt-time convert to seconds / human units."),
 ];
@@ -580,7 +601,11 @@ fn op_doc(args: &[Value], _env: &mut Environment, _eval: &mut Evaluator) -> Resu
     if args.len() != 1 {
         return Err("(doc \"cmd\") expected".to_string());
     }
-    let topic = extract_string(&args[0])?;
+    let topic = match &args[0] {
+        Value::String(s) => s.clone(),
+        Value::Symbol(s) => s.name.clone(),
+        _ => return Err("(doc \"cmd\") expected".to_string()),
+    };
     if let Some((_, doc)) = DOCS.iter().find(|(n, _)| *n == topic) {
         println!("{}", doc);
     } else {

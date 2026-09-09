@@ -28,7 +28,11 @@ impl TraceContainer {
 
     fn detect_format(path: &Path) -> Option<&'static str> {
         let fname = path.to_string_lossy().to_lowercase();
-        if fname.ends_with(".vcd") || fname.ends_with(".vcd.gz") || fname.ends_with(".vcd.bz2") {
+        if fname.ends_with(".vcd.gz") || fname.ends_with(".vcd.bz2") {
+            // 压缩包由 reject_unsupported 明确拒绝(见 load)
+            return None;
+        }
+        if fname.ends_with(".vcd") {
             return Some("vcd");
         }
         if fname.ends_with(".fst") {
@@ -49,7 +53,37 @@ impl TraceContainer {
         None
     }
 
+    /// 压缩包 / FSDB 等"看似支持实则读不出"的格式: 明确报错, 不要静默退化。
+    fn reject_unsupported(path: &Path) -> Result<(), String> {
+        use std::io::Read;
+        let mut buf = [0u8; 16];
+        let n = match std::fs::File::open(path) {
+            Ok(mut f) => f.read(&mut buf).unwrap_or(0),
+            Err(_) => 0,
+        };
+        let lower = path.to_string_lossy().to_lowercase();
+        if n >= 2 && buf[0] == 0x1f && buf[1] == 0x8b {
+            return Err(format!(
+                "{}: gzip 压缩波形暂不支持, 请先解压(如 gunzip)再查询", path.display()));
+        }
+        if n >= 3 && &buf[..3] == b"BZh" {
+            return Err(format!(
+                "{}: bzip2 压缩波形暂不支持, 请先解压(如 bunzip2)再查询", path.display()));
+        }
+        let head = &buf[..n];
+        let is_fsdb = lower.ends_with(".fsdb")
+            || head.windows(4).any(|w| w == b"FSDB")
+            || (n >= 8 && head[..4] == [0, 0, 0, 0] && &head[4..8] == b"FSDB");
+        if is_fsdb {
+            return Err(format!(
+                "{}: FSDB 格式暂不支持(需要 Verdi 的 fsdb reader); 请先转成 VCD/FST 再查询",
+                path.display()));
+        }
+        Ok(())
+    }
+
     pub fn load(&mut self, path: &Path, id: TraceId) -> Result<(), String> {
+        Self::reject_unsupported(path)?;
         let fmt = Self::detect_format(path)
             .ok_or_else(|| format!("Unsupported file format: {}", path.display()))?;
 

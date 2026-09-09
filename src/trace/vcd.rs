@@ -364,6 +364,11 @@ impl VcdTrace {
 
         // If no $enddefinitions found, use current position
         if header_end_offset == 0 {
+            // 文件被截断(或不是 VCD): 明确告警, 否则用户拿到的是"部分信号/空结果"
+            eprintln!(
+                "warning: {}: 未找到 $enddefinitions — 文件可能被截断或不是完整 VCD(信号/时间戳可能不完整)",
+                filename
+            );
             header_end_offset = reader.current_offset();
         }
 
@@ -1845,6 +1850,12 @@ impl Trace for VcdTrace {
         self.resolve_idx(name).map(|i| self.signals[i as usize].to_string())
     }
 
+    fn defined_initial_value(&self, name: &str) -> Option<ScalarValue> {
+        let idx = self.resolve_idx(name)?;
+        let init = self.initial_value_at(idx);
+        if vcd_is_defined(&init) { Some(value_to_scalar(&init)) } else { None }
+    }
+
     fn signals(&self) -> Vec<String> {
         self.signals.iter().map(|s| s.to_string()).collect()
     }
@@ -2255,6 +2266,15 @@ impl Trace for VcdTrace {
 }
 
 /// Check if current value matches the condition
+/// 是否"确定值"(不含 x/z)——决定 $dumpvars 初值能否作为索引 0 的前驱。
+fn vcd_is_defined(val: &VcdValue) -> bool {
+    match val {
+        VcdValue::Bit(b) => *b == b'0' || *b == b'1',
+        VcdValue::Vector(v) => !v.is_empty() && v.iter().all(|b| *b == b'0' || *b == b'1'),
+        VcdValue::Real(_) => true,
+    }
+}
+
 fn vcd_is_zero(val: &VcdValue) -> Option<bool> {
     match val {
         // x/z 不是"确定的非零"——返回 None 让调用方回退到位比较
@@ -2291,8 +2311,14 @@ fn eval_change_list(
     let mut indices = Vec::new();
     // 索引 0 没有前驱: 若首个变更点就在 0, prev 必须为 None(否则 x→v 会被
     // 误判为"变化", 与逐拍 op_changes / 区间扫描引擎不一致)。
+    // 索引 0 没有前驱 —— 但若 $dumpvars 给了**确定**初值, 该初值就是索引 0 的前驱:
+    // dumpvars 0 → #0 1 是一次真实上升沿(初值为 x/无初值时才视为无前驱)。
     let first_is_zero = changes.first().map(|(i, _)| *i as usize) == Some(0);
-    let mut prev_val: Option<VcdValue> = if first_is_zero { None } else { Some(initial.clone()) };
+    let mut prev_val: Option<VcdValue> = if first_is_zero {
+        if vcd_is_defined(initial) { Some(initial.clone()) } else { None }
+    } else {
+        Some(initial.clone())
+    };
     // Initial held segment [0, first change): level conditions see it; edges
     // use the initial value as their previous value (x→x not a change, x→0/1
     // never a rise/fall).

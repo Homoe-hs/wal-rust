@@ -719,13 +719,13 @@ fn slice_value(sv: ScalarValue, hi: u32, lo: u32) -> Value {
         return scalar_to_value(sv);
     }
     match sv {
-        ScalarValue::Bit(b) => {
-            if lo == 0 {
-                Value::Int(if b == b'1' { 1 } else { 0 })
-            } else {
-                Value::Int(0)
-            }
-        }
+        ScalarValue::Bit(b) => match b {
+            // x/z 保持未知: 1bit 与向量口径一致(返回位串而不是 0)
+            b'x' | b'X' => Value::String("x".to_string()),
+            b'z' | b'Z' => Value::String("z".to_string()),
+            _ if lo == 0 => Value::Int(if b == b'1' { 1 } else { 0 }),
+            _ => Value::Int(0),
+        },
         ScalarValue::Vector(v) => {
             // v[0] is the MSB of the signal (same convention as wal's to_int)
             let width = v.len() as u32;
@@ -989,6 +989,36 @@ fn edge_falling(prev: Option<&ScalarValue>, cur: Option<&ScalarValue>) -> bool {
         (Some(ScalarValue::Bit(b'1')), Some(ScalarValue::Bit(b'0'))))
 }
 
+/// 跨 trace 定位信号并读取 (prev, cur):
+/// - `Ok(None)`: 没有加载任何波形(与旧行为一致, 谓词为 false)
+/// - `Ok(Some((prev, cur)))`: 找到信号; idx==0 时 prev = $dumpvars 确定初值(无则 None)
+/// - `Err`: 所有 trace 都没有这个信号(拼写错误要报错, 不能静默 false)
+fn edge_values_at_cursor(
+    env: &Environment,
+    name: &str,
+) -> Result<Option<(Option<ScalarValue>, ScalarValue)>, String> {
+    let traces = match env.get_traces() { Some(t) => t, None => return Ok(None) };
+    let traces = traces.read().unwrap_or_else(|e| e.into_inner());
+    let mut any_trace = false;
+    for tr in traces.traces_iter() {
+        any_trace = true;
+        let resolved = match tr.resolve_name(name) { Some(r) => r, None => continue };
+        let idx = tr.index();
+        let cur = match tr.signal_value(&resolved, idx) { Ok(v) => v, Err(_) => continue };
+        let prev = if idx == 0 {
+            tr.defined_initial_value(&resolved)
+        } else {
+            tr.signal_value(&resolved, idx - 1).ok()
+        };
+        return Ok(Some((prev, cur)));
+    }
+    if any_trace {
+        Err(format!("signal '{}' not found in any loaded trace.", name))
+    } else {
+        Ok(None)
+    }
+}
+
 fn op_rising(args: &[Value], env: &mut Environment, _eval: &mut Evaluator) -> Result<Value, String> {
     ensure_arity(args, 1)?;
     if env.edge_off() { return Ok(Value::Bool(false)); }
@@ -997,22 +1027,13 @@ fn op_rising(args: &[Value], env: &mut Environment, _eval: &mut Evaluator) -> Re
     if let Some((prev, cur)) = env.sig_override_pair(&name) {
         return Ok(Value::Bool(edge_rising(prev.as_ref(), Some(&cur))));
     }
-    if let Some(traces) = env.get_traces() {
-        let traces = traces.read().unwrap_or_else(|e| e.into_inner());
-        if let Some(trace) = traces.first_trace() {
-            let idx = trace.index();
-            if idx == 0 {
-                return Ok(Value::Bool(false));
-            }
-            let cur = trace.signal_value(&name, idx).ok();
-            let prev = trace.signal_value(&name, idx - 1).ok();
-            match (scalar_is_zero(prev.as_ref()), scalar_is_zero(cur.as_ref())) {
-                (Some(true), Some(false)) => return Ok(Value::Bool(true)),
-                _ => {}
-            }
-            if let (Some(ScalarValue::Bit(c)), Some(ScalarValue::Bit(p))) = (&cur, &prev) {
-                return Ok(Value::Bool(*c == b'1' && *p == b'0'));
-            }
+    if let Some((prev, cur)) = edge_values_at_cursor(env, &name)? {
+        match (scalar_is_zero(prev.as_ref()), scalar_is_zero(Some(&cur))) {
+            (Some(true), Some(false)) => return Ok(Value::Bool(true)),
+            _ => {}
+        }
+        if let (ScalarValue::Bit(c), Some(ScalarValue::Bit(p))) = (&cur, &prev) {
+            return Ok(Value::Bool(*c == b'1' && *p == b'0'));
         }
     }
     Ok(Value::Bool(false))
@@ -1025,22 +1046,13 @@ fn op_falling(args: &[Value], env: &mut Environment, _eval: &mut Evaluator) -> R
     if let Some((prev, cur)) = env.sig_override_pair(&name) {
         return Ok(Value::Bool(edge_falling(prev.as_ref(), Some(&cur))));
     }
-    if let Some(traces) = env.get_traces() {
-        let traces = traces.read().unwrap_or_else(|e| e.into_inner());
-        if let Some(trace) = traces.first_trace() {
-            let idx = trace.index();
-            if idx == 0 {
-                return Ok(Value::Bool(false));
-            }
-            let cur = trace.signal_value(&name, idx).ok();
-            let prev = trace.signal_value(&name, idx - 1).ok();
-            match (scalar_is_zero(prev.as_ref()), scalar_is_zero(cur.as_ref())) {
-                (Some(false), Some(true)) => return Ok(Value::Bool(true)),
-                _ => {}
-            }
-            if let (Some(ScalarValue::Bit(c)), Some(ScalarValue::Bit(p))) = (&cur, &prev) {
-                return Ok(Value::Bool(*c == b'0' && *p == b'1'));
-            }
+    if let Some((prev, cur)) = edge_values_at_cursor(env, &name)? {
+        match (scalar_is_zero(prev.as_ref()), scalar_is_zero(Some(&cur))) {
+            (Some(false), Some(true)) => return Ok(Value::Bool(true)),
+            _ => {}
+        }
+        if let (ScalarValue::Bit(c), Some(ScalarValue::Bit(p))) = (&cur, &prev) {
+            return Ok(Value::Bool(*c == b'0' && *p == b'1'));
         }
     }
     Ok(Value::Bool(false))
@@ -1052,18 +1064,13 @@ fn op_is_x(args: &[Value], env: &mut Environment, _eval: &mut Evaluator) -> Resu
     if let Some(cur) = env.sig_override_cur(&name) {
         return Ok(Value::Bool(scalar_has_x(&cur)));
     }
-    if let Some(traces) = env.get_traces() {
-        let traces = traces.read().unwrap_or_else(|e| e.into_inner());
-        if let Some(trace) = traces.first_trace() {
-            if let Ok(sv) = trace.signal_value(&name, trace.index()) {
-                let has_x = match &sv {
-                    ScalarValue::Bit(b) => *b == b'x',
-                    ScalarValue::Vector(v) => v.iter().any(|b| *b == b'x'),
-                    _ => false,
-                };
-                return Ok(Value::Bool(has_x));
-            }
-        }
+    if let Some((_, cur)) = edge_values_at_cursor(env, &name)? {
+        let has_x = match &cur {
+            ScalarValue::Bit(b) => *b == b'x' || *b == b'X',
+            ScalarValue::Vector(v) => v.iter().any(|b| *b == b'x' || *b == b'X'),
+            _ => false,
+        };
+        return Ok(Value::Bool(has_x));
     }
     Ok(Value::Bool(false))
 }
@@ -1074,18 +1081,13 @@ fn op_is_z(args: &[Value], env: &mut Environment, _eval: &mut Evaluator) -> Resu
     if let Some(cur) = env.sig_override_cur(&name) {
         return Ok(Value::Bool(scalar_has_z(&cur)));
     }
-    if let Some(traces) = env.get_traces() {
-        let traces = traces.read().unwrap_or_else(|e| e.into_inner());
-        if let Some(trace) = traces.first_trace() {
-            if let Ok(sv) = trace.signal_value(&name, trace.index()) {
-                let has_z = match &sv {
-                    ScalarValue::Bit(b) => *b == b'z',
-                    ScalarValue::Vector(v) => v.iter().any(|b| *b == b'z'),
-                    _ => false,
-                };
-                return Ok(Value::Bool(has_z));
-            }
-        }
+    if let Some((_, cur)) = edge_values_at_cursor(env, &name)? {
+        let has_z = match &cur {
+            ScalarValue::Bit(b) => *b == b'z' || *b == b'Z',
+            ScalarValue::Vector(v) => v.iter().any(|b| *b == b'z' || *b == b'Z'),
+            _ => false,
+        };
+        return Ok(Value::Bool(has_z));
     }
     Ok(Value::Bool(false))
 }
@@ -1100,33 +1102,12 @@ fn op_changes(args: &[Value], env: &mut Environment, _eval: &mut Evaluator) -> R
             None => false,
         }));
     }
-    if let Some(traces) = env.get_traces() {
-        let traces = traces.read().unwrap_or_else(|e| e.into_inner());
-        if let Some(trace) = traces.first_trace() {
-            let idx = trace.index();
-            if idx == 0 {
-                return Ok(Value::Bool(false));
-            }
-            // same resolution as (get): exact candidates + fuzzy fallback
-            let resolved = {
-                let sigs = trace.signals();
-                let candidates = [
-                    name.clone(),
-                    format!("{}{}", env.get_scope(), name),
-                    format!("{}{}", env.get_group(), name),
-                ];
-                candidates.iter().find(|c| sigs.iter().any(|s| s == *c))
-                    .cloned()
-                    .or_else(|| fuzzy_match_signal(&name, &sigs).0.cloned())
-                    .unwrap_or(name.clone())
-            };
-            let cur = trace.signal_value(&resolved, idx).ok();
-            let prev = trace.signal_value(&resolved, idx - 1).ok();
-            // whole-value comparison (vectors included)
-            if let (Some(c), Some(p)) = (cur, prev) {
-                return Ok(Value::Bool(c != p));
-            }
+    if let Some((prev, cur)) = edge_values_at_cursor(env, &name)? {
+        // whole-value comparison (vectors included); 索引 0 用 $dumpvars 确定初值
+        if let Some(p) = prev {
+            return Ok(Value::Bool(cur != p));
         }
+        return Ok(Value::Bool(false));
     }
     Ok(Value::Bool(false))
 }
