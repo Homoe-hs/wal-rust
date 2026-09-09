@@ -212,19 +212,31 @@ impl<W: Write> FstWriter<W> {
     #[inline]
     pub fn emit_value_change(&mut self, handle: u32, value: &[u8]) {
         let time_idx = self.current_time_idx();
-        // Normalize to the declared width (VCD semantics: value is left-padded with '0')
+        let var_type = self.signals
+            .get(handle.saturating_sub(1) as usize)
+            .map(|s| s.var_type)
+            .unwrap_or(VarType::VcdWire);
+        // Normalize to the declared width (VCD semantics: value is left-padded with '0').
+        // real 信号例外: 值就是 8 字节 f64, 不能按位宽(64)补齐。
         let width = self.signals
             .get(handle.saturating_sub(1) as usize)
             .map(|s| s.width as usize)
             .unwrap_or_else(|| value.len());
-        let mut v = value.to_vec();
-        if v.len() < width {
-            let mut padded = vec![b'0'; width - v.len()];
-            padded.extend_from_slice(&v);
-            v = padded;
-        } else if v.len() > width {
-            v.drain(..v.len() - width);
-        }
+        let mut v = if matches!(var_type, VarType::Real) {
+            let mut b = vec![0u8; 8];
+            for (i, x) in value.iter().take(8).enumerate() { b[i] = *x; }
+            b
+        } else {
+            let mut v = value.to_vec();
+            if v.len() < width {
+                let mut padded = vec![b'0'; width - v.len()];
+                padded.extend_from_slice(&v);
+                v = padded;
+            } else if v.len() > width {
+                v.drain(..v.len() - width);
+            }
+            v
+        };
 
         // Snapshot the checkpoint at the start of each block
         if self.block_entries.is_empty() {
@@ -310,7 +322,17 @@ impl<W: Write> FstWriter<W> {
 
             // Encode chain entry
             let val = &ent.value;
-            if width <= 1 && val.len() <= 1 {
+            let var_type = self.signals.get(h.saturating_sub(1))
+                .map(|s| s.var_type)
+                .unwrap_or(VarType::VcdWire);
+            if matches!(var_type, VarType::Real) {
+                // 实数值: LSB=1 的非二进制形式 + 8 字节 f64(小端, 与 header 端序一致)
+                let vli = (tdelta as u64) << 1 | 1;
+                chain_raw[h].extend_from_slice(&encode_varint(vli));
+                let mut b = [0u8; 8];
+                for (i, x) in val.iter().take(8).enumerate() { b[i] = *x; }
+                chain_raw[h].extend_from_slice(&b);
+            } else if width <= 1 && val.len() <= 1 {
                 let byte = *val.first().unwrap_or(&b'x');
                 if byte == b'0' || byte == b'1' {
                     // Binary scalar: LSB=0, val_bit=(vli>>1)&1, tdelta=vli>>2

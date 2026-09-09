@@ -900,3 +900,31 @@ fn matrix_vcd_parser_robustness() {
     let _ = std::fs::remove_file(&noext);
     let _ = std::fs::remove_file(&pev);
 }
+
+/// 39) FST 实数信号: writer/reader 往返 + 变更列表。
+///     回归点: real 链编码曾按"位宽 64 的字符"写出 → wellen 解码越界;
+///     现在按 fstapi 规则写 LSB=1 的 varint + 8 字节 f64。
+#[test]
+fn matrix_fst_real_roundtrip() {
+    use wal_rust::fst::{FstOptions, FstWriter, ScopeType, VarType};
+    let fst = std::env::temp_dir().join(format!("wal_reg_real_{}.fst", std::process::id()));
+    {
+        let mut w = FstWriter::create(&fst, FstOptions::default()).unwrap();
+        w.push_scope("t", ScopeType::VcdModule);
+        let r = w.create_var("r", 64, VarType::Real);
+        let c = w.create_var("c", 1, VarType::VcdWire);
+        w.pop_scope();
+        for i in 0..4u64 {
+            w.emit_time_change(i * 10);
+            w.emit_value_change(r, &(i as f64 * 1.5).to_le_bytes());
+            w.emit_value_change(c, if i % 2 == 0 { b"0" } else { b"1" });
+        }
+        w.close().unwrap();
+    }
+    let t = wal_rust::trace::FstTrace::load(&fst, "t".to_string()).expect("real FST 必须可读");
+    let rname = t.signals().iter().find(|s| s.ends_with('r')).cloned().unwrap();
+    assert_eq!(t.find_indices(&rname, FindCondition::Changed).unwrap(), vec![1, 2, 3]);
+    assert_eq!(t.signal_value(&rname, 0).unwrap(), ScalarValue::Real(0.0));
+    assert_eq!(t.signal_value(&rname, 3).unwrap(), ScalarValue::Real(4.5));
+    let _ = std::fs::remove_file(&fst);
+}

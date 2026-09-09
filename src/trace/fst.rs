@@ -87,6 +87,30 @@ fn bytes_is_zero(bs: &[u8]) -> Option<bool> {
     }
 }
 
+/// 变更比较用的规范化表示: 位串带 tag 0, real 带 tag 1(8 字节 f64)。
+/// 只有位串需要 x/z 归一化; real 直接按位模式比较。
+fn sv_repr(sv: &SignalValue) -> Option<Vec<u8>> {
+    match sv {
+        SignalValue::Real(f) => {
+            let mut v = Vec::with_capacity(9);
+            v.push(1u8);
+            v.extend_from_slice(&f.to_bits().to_le_bytes());
+            Some(v)
+        }
+        _ => sv_bit_string(sv).map(|s| {
+            let mut v = Vec::with_capacity(s.len() + 1);
+            v.push(0u8);
+            v.extend_from_slice(s.as_bytes());
+            v
+        }),
+    }
+}
+
+/// 从变更比较表示里取出位串(tag 0); real(tag 1)没有边沿/零值语义。
+fn repr_bits(r: &[u8]) -> Option<&[u8]> {
+    if r.first() == Some(&0) { Some(&r[1..]) } else { None }
+}
+
 fn sv_is_zero(sv: &SignalValue) -> Option<bool> {
     bytes_is_zero(sv_bit_string(sv)?.as_bytes())
 }
@@ -137,13 +161,13 @@ fn find_cond_matches(
         // falling = 反之。只按单个 bit 比较会让**向量信号永远没有边沿**
         // (sv_as_bit 对多位返回 None)——内网 "NE/changes 漂移" 的根因之一。
         FindCondition::Rising => {
-            match (prev_val.as_ref().and_then(|p| bytes_is_zero(p)), sv_is_zero(sv)) {
+            match (prev_val.as_ref().and_then(|p| repr_bits(p)).and_then(bytes_is_zero), sv_is_zero(sv)) {
                 (Some(true), Some(false)) => true,
                 _ => prev_bit == Some(b'0') && curr_bit == Some(b'1'),
             }
         }
         FindCondition::Falling => {
-            match (prev_val.as_ref().and_then(|p| bytes_is_zero(p)), sv_is_zero(sv)) {
+            match (prev_val.as_ref().and_then(|p| repr_bits(p)).and_then(bytes_is_zero), sv_is_zero(sv)) {
                 (Some(false), Some(true)) => true,
                 _ => prev_bit == Some(b'1') && curr_bit == Some(b'0'),
             }
@@ -180,20 +204,27 @@ fn find_cond_matches(
         FindCondition::Changed => prev_val.as_ref().map(|p| {
             // Initial 'x' may be represented as "x" (bit form) while an
             // explicit x-run is "xxxx…" — same state, not a change.
-            fn norm(bs: &[u8]) -> Vec<u8> {
-                if bs.iter().all(|&b| b == b'x' || b == b'X') {
-                    vec![b'x']
-                } else if bs.iter().all(|&b| b == b'z' || b == b'Z') {
-                    vec![b'z']
-                } else {
-                    bs.to_vec()
+            // real 值(tag 1)直接比较, 不做 x/z 归一化。
+            fn norm(r: &[u8]) -> Vec<u8> {
+                if r.first() != Some(&0) {
+                    return r.to_vec();
                 }
+                let bs = &r[1..];
+                let mut v = vec![0u8];
+                if !bs.is_empty() && bs.iter().all(|&b| b == b'x' || b == b'X') {
+                    v.push(b'x');
+                } else if !bs.is_empty() && bs.iter().all(|&b| b == b'z' || b == b'Z') {
+                    v.push(b'z');
+                } else {
+                    v.extend_from_slice(bs);
+                }
+                v
             }
-            norm(p) != norm(&sv_bit_string(sv).unwrap_or_default().into_bytes())
+            norm(p) != norm(&sv_repr(sv).unwrap_or_default())
         }).unwrap_or(false),
     };
-    if let Some(bs) = sv_bit_string(sv) {
-        *prev_val = Some(bs.into_bytes());
+    if let Some(r) = sv_repr(sv) {
+        *prev_val = Some(r);
     }
     matched
 }
