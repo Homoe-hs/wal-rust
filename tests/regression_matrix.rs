@@ -823,3 +823,15 @@ fn matrix_integer_division() {
     assert_eq!(e("(div 9 3)"), Value::Int(3));
     assert_eq!(e("(/ 10 3)"), Value::Float(10.0 / 3.0));
 }
+
+/// 37) 歧义信号名: 有候选但不唯一时必须说"歧义"并列出候选, 而不是"未找到"。
+#[test]
+fn matrix_ambiguous_signal_message() {
+    let p = tmp("ambig", "$timescale 1ns $end\n$scope module top $end\n$var wire 1 ! c $end\n$scope module sub $end\n$var wire 1 \" c $end\n$upscope $end\n$upscope $end\n$enddefinitions $end\n#0\n0!\n0\"\n#10\n1!\n1\"\n");
+    let mut e = Evaluator::new();
+    e.load_trace(&p.to_string_lossy(), "t").unwrap();
+    let err = e.eval("(at \"c\" 10)").unwrap_err();
+    assert!(err.contains("ambiguous"), "应提示歧义: {}", err);
+    let err2 = e.eval("(at \"nosuchsig\" 10)").unwrap_err();
+    assert!(err2.contains("not found"), "不存在的名字应提示未找到: {}", err2);
+}

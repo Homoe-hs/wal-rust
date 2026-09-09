@@ -71,10 +71,14 @@ fn with_signal_trace<R>(
             }
         }
     }
-    Err(format!(
-        "Signal '{}' not found in any loaded trace ({} candidates: {:?})",
-        name, candidates.len(), candidates
-    ))
+    if !candidates.is_empty() {
+        // 有候选但不唯一 → 明确说"歧义", 别让用户以为信号不存在
+        return Err(format!(
+            "signal '{}' is ambiguous ({} candidates: {:?}) — 请用完整名字",
+            name, candidates.len(), candidates
+        ));
+    }
+    Err(format!("signal '{}' not found in any loaded trace.", name))
 }
 
 /// Resolve a signal name (exact or unique substring) against a trace.

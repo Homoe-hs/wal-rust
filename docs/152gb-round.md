@@ -172,3 +172,31 @@ error: FST 信号 t.d 的数据: Unexpected signal value: 0!defi。该 FST 值�
 | B9 | 脚本模式 + 深层宽信号挂起 >14min | 本地未复现;需要最小复现脚本 |
 
 **语义确认(非 bug)**:`count <wave> <sig>` 默认 `=1`(值计数,非变化计数);`changes` 只计跳变、`topsig` 计"值事件"(含初值),两者相差 1 是定义差异。
+
+## 真实 VCS 波形验证(0.12.38)
+
+用 VM 里的 VCS O-2018.09-SP2 生成了两类真实波形(自建目录, 未触碰他人工作目录):
+
+**A. 握手/初值/dumpoff 场景**(3 层层次、512b/1024b 向量、`$dumpvars`、`$dumpoff`/`$dumpon`):
+
+| 查询 | 结果 |
+|---|---|
+| `(count (rising "valid"))` | **12**(与 TB 里 12 次握手完全一致) |
+| `(count (rising "clk"))` / falling / changes | 29 / 30 / 61 |
+| `(count (is-x "clk"))` | 1(dumpoff→dumpon 之间只有 1 个索引, 与文件结构一致) |
+| `(getwave "tri_sig")` | `((0 "z") (245000 "x") (345000 "z") (385000 0))` |
+
+**VCD ≡ FST**(`vcd2fst` 转换后)在 14 条查询上**全部一致**,含 512b/1024b 向量、
+x/z、dumpoff 窗口、`is-x`/`is-z`。
+
+**B. 深层宽信号**(30 层层次、每层 1024b 寄存器):`-c` 内联与脚本模式均为 0.01s
+(B9"脚本模式挂起"未复现;需要现场最小复现)。
+
+**FSDB**:VCS 直接产出的 `.fsdb` 被明确拒绝并提示转换(不再 panic)。
+
+**注意**:VCS 的 `$dumpvars` 块写在 `#0` 之后且内容是 t=0 的**最终**值,因此
+"dumpvars 初值 ≠ #0 值"这种跨界边在 VCS 输出里不出现;B14 的修复仍按语义生效,
+由合成夹具 `matrix_dumpvars_first_edge_at_index_zero` 覆盖。
+
+**其他**:歧义信号名(`wide` 在 5 个层次都有)现在报"ambiguous + 候选列表",
+不再误报"not found"。
