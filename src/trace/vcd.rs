@@ -100,6 +100,42 @@ fn adapt_lru_capacity(file_size: usize, signal_count: usize) -> usize {
     (base * file_factor).max(50_000).min(5_000_000) as usize
 }
 
+/// 并行估算 header 里的 `$var` 数量(用于一次性预留容量, 避免反复扩容/重哈希)。
+/// 指数扩张地并行查找 `$enddefinitions` 定位 header 末端(小 header 只扫几 MB,
+/// 大 header 才逐步扩大), 再并行统计 `$var ` 次数。找不到 → 0(退化为按需增长)。
+fn estimate_var_count(data: &[u8], cap_bytes: usize) -> usize {
+    use rayon::prelude::*;
+    let n_threads = num_cpus::get().max(4);
+    let hard_cap = data.len().min(cap_bytes);
+    let mut hi = (8usize << 20).min(hard_cap);
+    let mut header_end: Option<usize> = None;
+    loop {
+        let chunk = (hi / n_threads).max(1 << 20);
+        let ranges: Vec<(usize, usize)> = (0..n_threads)
+            .map(|i| (i * chunk, ((i + 1) * chunk + 16).min(hi)))
+            .filter(|(a, b)| a < b)
+            .collect();
+        if let Some(p) = ranges.par_iter()
+            .filter_map(|&(a, b)| memchr::memmem::find(&data[a..b], b"$enddefinitions").map(|o| a + o))
+            .min()
+        {
+            header_end = Some(p);
+            break;
+        }
+        if hi >= hard_cap {
+            break;
+        }
+        hi = (hi * 4).min(hard_cap);
+    }
+    let Some(end) = header_end else { return 0 };
+    // 统计: 边界多算几个无妨(只是容量估计)
+    let chunk = (end / n_threads).max(1 << 20);
+    data[..end]
+        .par_chunks(chunk)
+        .map(|c| memchr::memmem::find_iter(c, b"$var").count())
+        .sum()
+}
+
 /// True for real VCD timestamp lines ("#<digits>"). Icarus Verilog dumps
 /// 1-bit value lines like "#%" (value '#' + id) that start with '#' but are
 /// not timestamps; treating them as timestamps duplicates an entry.
@@ -291,14 +327,20 @@ impl VcdTrace {
             }
         }
         let est_ts = (file_len / 200).max(1024) as usize;
+        // 预估信号数并一次性预留(4M 信号时反复扩容会吃掉一半时间)
+        let est_vars = {
+            let mmap = reader.data.clone();
+            estimate_var_count(&mmap[..], 2usize << 30)
+        };
 
         // ====== PASS 1a: Scan header (single-thread) ======
-        let mut signals = Vec::with_capacity(256);
-        let mut signal_ids: FxHashMap<u64, u32> = FxHashMap::with_capacity_and_hasher(256, FxBuild::default());
+        let cap0 = est_vars.max(256);
+        let mut signals = Vec::with_capacity(cap0);
+        let mut signal_ids: FxHashMap<u64, u32> = FxHashMap::with_capacity_and_hasher(cap0, FxBuild::default());
         let mut id_blob: Vec<u8> = Vec::new();
-        let mut id_offsets: Vec<u32> = Vec::new();
-        let mut signal_widths: Vec<u32> = Vec::new();
-        let mut name_to_idx: FxHashMap<std::sync::Arc<str>, u32> = FxHashMap::with_capacity_and_hasher(256, FxBuild::default());
+        let mut id_offsets: Vec<u32> = Vec::with_capacity(cap0);
+        let mut signal_widths: Vec<u32> = Vec::with_capacity(cap0);
+        let mut name_to_idx: FxHashMap<std::sync::Arc<str>, u32> = FxHashMap::with_capacity_and_hasher(cap0, FxBuild::default());
         let mut event_signals: HashSet<u32> = HashSet::new();
         let mut header_end_offset: u64 = 0;
 
