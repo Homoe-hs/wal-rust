@@ -608,6 +608,14 @@ fn op_doc(args: &[Value], _env: &mut Environment, _eval: &mut Evaluator) -> Resu
     Ok(Value::Nil)
 }
 
+/// 已文档化的主题名(供 (help) 列表展示)
+pub(crate) fn documented_topics() -> Vec<String> {
+    let mut v: Vec<String> = DOCS.iter().map(|(n, _)| (*n).to_string()).collect();
+    v.sort();
+    v.dedup();
+    v
+}
+
 /// 打印某主题的文档(供 `doc` 特殊形式与内置实现共用)。
 pub(crate) fn print_doc(topic: &str) {
     if let Some((_, doc)) = DOCS.iter().find(|(n, _)| *n == topic) {

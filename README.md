@@ -1,12 +1,25 @@
 # wal-rust — WAL: Waveform Analysis Language
 
-High-performance Rust implementation of [WAL](https://wal-lang.org), supporting VCD/FST waveform analysis at scale. **v0.12.0: 58.7GB(3.5M 信号)加载 ~12s;同信号二次查询毫秒级;RSS 7.7GB** — 详见 [Performance](#performance)。
+High-performance Rust implementation of [WAL](https://wal-lang.org), supporting VCD/FST waveform analysis at scale.
+
+**当前(v0.12.44)** — 58.7GB 合成波(3.5M 信号 / 1.5M 时间戳 / 1.65G 变更):
+
+| 场景 | 代价 |
+|:--|:--|
+| 加载 | **82s 冷读**(页缓存暖 42s),进程堆 ~3GB |
+| 任意表达式 `count`/`find` | 统一区间扫描引擎,**O(变更点)**(旧版逐拍 >90s 超时) |
+| 同一信号再次查询(同进程) | **≈0s**(已解码变更列复用) |
+| 同一信号再次查询(新进程) | **3.35s**(索引 + 列缓存命中;旧版 114s 全扫) |
+| 多探针工作流 | `--stdin` 会话模式:一次加载,几十个探针不再重复加载/全扫 |
+
+> 内存口径:RSS 含 mmap 文件页驻留;进程**堆**是 O(信号数 + 被查询信号的变更列)。
+> 详见 [Performance](#performance) 与 [docs/waveform-io-plan.md](docs/waveform-io-plan.md)。
 
 ```bash
 $ wal-rust '(+ 1 2)'
 => 3
 
-$ wal-rust '(load "trace.vcd") (signals)'
+$ wal-rust '(load "trace.vcd") (SIGNALS)'
 ```
 
 ---
@@ -20,7 +33,7 @@ cp target/release/wal-rust ~/.local/bin/
 
 # Evaluate expressions inline (auto-detected)
 wal-rust '(+ 1 2)'
-wal-rust '(load "dump.vcd") (signals)'
+wal-rust '(load "dump.vcd") (SIGNALS)'
 
 # Run a script file
 wal-rust script.wal
@@ -30,12 +43,15 @@ wal-rust repl
 
 # Explicit subcommands (still work)
 wal-rust run -l dump.vcd script.wal
-wal-rust run -c '(signals)'
+wal-rust run -c '(SIGNALS)'
 
 # One-shot queries (no WAL expression needed — shell/CI friendly)
 wal-rust count dump.vcd clk 1                        # count signal==VALUE timestamps
 wal-rust sigs dump.vcd "wdata" 20                    # signal names containing pattern
 wal-rust topsig dump.vcd                             # most-active signals (change count)
+
+# Session mode: one load, many probes (大波形上的推荐用法)
+printf '(count (changes "clk"))\n(get "state")\n' | wal-rust --stdin -l dump.vcd
 
 # Stop at the first script error (CI-friendly; default continues)
 wal-rust run --halt-on-error script.wal -l dump.vcd
@@ -76,7 +92,7 @@ wal-rust -l sim.vcd '(getwave "clk")'                    # all change points (t 
 wal-rust -l sim.vcd '(edges "clk" 100000 200000)'        # change times in a window
 wal-rust -l sim.vcd '(at "sig" 1515000)'                 # value at time t
 wal-rust -l sim.vcd '(fmt-time 1515000)'                 # → "1.51us" human time
-wal-rust -l sim.vcd '(assert-eq "sig" t0 t1 1)'          # sig == 1 throughout?
+wal-rust -l sim.vcd '(assert-eq "sig" 100000 200000 1)'  # sig == 1 throughout [t0,t1]?
 wal-rust -l sim.vcd '(count (&& (= (get "awvalid") 1) (= (get "awready") 1)))'  # handshakes
 
 # 3. Scripts / REPL
@@ -93,8 +109,16 @@ wal-rust repl                                 # interactive
 - **Signal names**: `(find-sig "p")` or `sigs` for lookups; not-found errors
   give nearest-name hints. `SIGNALS` prints bounded (`...(N items)`), so
   90k-signal waves stay terminal-friendly.
-- **Full reference**: `(doc "edges")` one-liner for any command, `(help)` for
-  the operator list.
+- **x/z 语义(权威口径)**: [docs/4-state-semantics.md](docs/4-state-semantics.md)。
+  要点:`x` 不等于 0(`(= (get a) 0)` 假、`(!= (get a) 0)` 真);`x→1` 算变化但
+  **不算上升沿**;索引 0 没有前驱,除非 `$dumpvars` 给了确定初值(此时工具会告警提示);
+  `count`/`count/step`/`count` 子命令/`find` 全入口同口径。
+- **游标语义**:`(get s)` 取**当前 `INDEX`** 处的值,不随 `map`/遍历位置变化;
+  按时间取值用 `(at s T)` 或 `(sample-at s idx)`。
+- **多探针**:`--stdin` 会话模式在单进程内复用加载与列缓存;跨进程则靠
+  `./.wal-rust-cache/` 下的索引 + 列缓存(默认 `WAL_CACHE=auto`,只写执行目录)。
+- **Full reference**: `(doc "edges")` one-liner for any command,
+  `(doc <任意名字>)`(未知主题会列出全部可用主题),`(help)` 总览。
 
 ---
 
@@ -277,6 +301,15 @@ wal-rust repl                                 # interactive
 
 ## Waveform Analysis
 
+### 四值语义与游标(先读这一节)
+
+- 权威口径:[docs/4-state-semantics.md](docs/4-state-semantics.md);`(doc semantics)` 可取摘要。
+- `x` **不是** 0:`(= (get a) 0)` 为假、`(!= (get a) 0)` 为真;含 x/z 的值以**位串**返回(`"00x1"`)。
+- 边沿:`x→1` / `x→0` **不算** rising/falling(但算一次 `changes`);
+  索引 0 没有前驱,除非 `$dumpvars` 给了确定初值 —— 这种情况工具会打印一次性 warning。
+- `(get s)` 取**当前 INDEX** 处的值,不随 `map`/遍历位置变化;按时间用 `(at s T)` / `(sample-at s idx)`。
+- 各聚合入口同口径:`count` / `count/step` / `count` 子命令 / `find` / `getwave` / `whenever`。
+
 ### Loading
 
 ```lisp
@@ -306,7 +339,7 @@ trace-file      ;; file path
 (step -5)            ;; go back 5 steps
 
 ;; Signal value access
-(signals)            ;; list all signal names
+(SIGNALS)            ;; list all signal names
 (get "clk")          ;; signal value at current index
 (get "data_bus")     ;; vector signal value
 
@@ -357,18 +390,20 @@ These work with actual timestamps (in the waveform's native unit; use
 (edges "clk" 0 1000000)             ;; change timestamps in a window
 (at "clk" 5000)                     ;; value at time t
 (wave "clk" t0 t1)                  ;; windowed change points (held value first)
-(assert-eq "sig" t0 t1 1)           ;; true if sig equals v throughout [t0,t1]
+(assert-eq "sig" 100000 200000 1)   ;; true if sig equals v throughout [t0,t1]
 (count (is-x "sig"))                ;; how much of the signal is unknown
 (search "sig" "101" t0 t1)          ;; bit-pattern occurrence timestamps
 (period "clk")                      ;; average clock period (seconds)
 (freq "clk")                        ;; clock frequency (Hz)
 ```
 
-`(count cond)` / `(find cond)` sample **signal change points** (fast, single-pass
-mmap), which matches debugging intuition. The official WAL semantics (evaluate at
-**every** index) are available as `(count/step cond)` / `(find/step cond)` — use
-them when you need per-timestamp truth (they scan index-by-index, so large waves
-are slower). `(whenever ...)` stays per-index with the `"changed"` sampling mode.
+`(count cond)` / `(find cond)` 求值**每一个索引**(官方 WAL 语义),由统一区间扫描引擎
+实现:区间内部值恒定的部分按**区间长度**累加,含边沿谓词时只在边界取值 + 区间内部按
+"边沿恒假"再求值一次 → 成本 O(变更点 × 表达式),而不是逐索引解释执行。
+`(count/step cond)` / `(find/step cond)` 是**逐索引等价形式**(用于对拍/教学;大波形上慢很多,
+因为每个索引真的求值一次)。`WAL_NO_ENGINE=1` 可强制走逐拍路径,作为独立 oracle。
+`(whenever cond body)` 在每个命中索引处执行 body;`(whenever "changed" "sig" cond body)`
+只在信号变化点采样。
 
 Big list results are rendered bounded (`(...(N items))`), so `(print SIGNALS)`
 on a 90k-signal wave stays terminal-friendly.
@@ -384,7 +419,7 @@ on a 90k-signal wave stays terminal-friendly.
 ;; Groups (signal name prefixes)
 (groups "_clk" "_data")               ;; find common prefixes
 (in-group "mem" (get "addr"))         ;; evaluate in group context
-(in-groups (list "mem" "cpu") (signals))
+(in-groups (list "mem" "cpu") (SIGNALS))
 
 ;; Syntax sugar
 ~top.sub        ;; equivalent to (in-scope "top.sub")
@@ -405,14 +440,17 @@ analyze TileLink bus protocols:
 
 ---
 
-> **注**: TileLink 分析操作符（`tl-handshakes`、`tl-latency`、`tl-bandwidth`）和 VCD→FST 转换（`convert`）已从 wal-rust 核心中移除。这些是协议/工具特定的功能，不应属于语言核心。如需使用，可以通过 WAL 宏实现。
+> **注**: TileLink 分析操作符（`tl-handshakes`、`tl-latency`、`tl-bandwidth`）与 VCD→FST 转换器
+> 已从 wal-rust 核心移除（协议/工具特定功能不适合放在语言核心；转换也违背"只专注波形"的定位）。
+> 数值转换算子仍在: `(convert/bin x)`、`(int->string x)`、`(string->int s)`。
 
 ## FST Format Support
 
 **Read backend: [wellen](https://crates.io/crates/wellen)** (`wellen::simple::read` in
 `src/trace/fst.rs`) — the legacy hand-rolled reader is retired from the query path.
-**Write backend: hand-rolled `FstWriter`** (`src/fst/`) used by roundtrip tests and
-the VCD→FST converter.
+**Write backend: hand-rolled `FstWriter`** (`src/fst/`) — 用于往返测试与实验性导出,
+**不是转换器**(wal-rust 不做格式转换;`dump-trace` 只写 VCD,`.fst` 路径会明确拒绝)。
+真实 VCS 波形已验证 VCD≡FST 一致(含 512/1024 位向量、x/z、`$dumpoff`/`$dumpon` 窗口)。
 
 | Format | Encoding | Status |
 |:-------|:---------|:-------|
@@ -432,12 +470,13 @@ wal-rust/
 │   ├── cli.rs               # clap argument parsing
 │   ├── lib.rs               # Crate library root, re-exports
 │   ├── wal/                 # WAL language core
-│   │   ├── ast/             # Operator (128 variants), Value, Symbol, WList, Closure, Macro
-│   │   ├── lexer/           # Tokenizer: Token, TokenKind (27 variants), Position
-│   │   ├── parser/          # WalParser (tree-sitter + @/#/~ transforms)
-│   │   ├── eval/            # Evaluator, Environment (Rc<RefCell>), Dispatcher, SemanticChecker
-│   │   ├── builtins/        # 128 operators across 12 modules
-│   │   └── repl/            # Interactive REPL (rustyline)
+│   │   ├── ast/             # Operator (125 个名字), Value, Symbol, WList, Closure, Macro
+│   │   ├── lexer/           # Tokenizer: Token, TokenKind, Position
+│   │   ├── parser/          # WalParser (tree-sitter + @/#/~ transforms, ==/% 归一化)
+│   │   ├── eval/            # Evaluator, Environment (Rc<RefCell>), Dispatcher,
+│   │   │                    #   统一区间扫描引擎 interval_scan(值覆盖 + 边沿区间语义)
+│   │   ├── builtins/        # 145 个注册算子 / 12 个模块
+│   │   └── repl/            # 交互 REPL(rustyline);--stdin 会话模式在 main.rs
 │   ├── vcd/                 # VCD parsing
 │   │   ├── reader.rs        # MmapReader (madvise + memchr + zero-copy + compression detection)
 │   │   ├── parser.rs        # MmapVcdParser + VcdParser
@@ -451,11 +490,27 @@ wal-rust/
 │   └── trace/               # Waveform interface
 │       ├── trace.rs          # Trace trait, ScalarValue, FindCondition, TraceId
 │       ├── container.rs     # TraceContainer, SharedTraceContainer (Arc<RwLock<>>)
-│       ├── vcd.rs           # VcdTrace (parallel two-pass + sparse index + LRU)
-│       └── fst.rs           # FstTrace via wellen (on-demand data + LRU)
+│       ├── vcd.rs           # VcdTrace: 并行两遍扫描 + 稀疏锚点 + 列/旁挂缓存 + LRU
+│       └── fst.rs           # FstTrace via wellen(惰性解码 + 安全包装)
 ├── tree-sitter-wal/         # WAL grammar
-└── stress_tests/            # Generated stress test files
+├── tests/                   # 语义矩阵(38) + golden 小波(3) + 随机差分(3) + 集成测试
+├── scripts/                 # diff_find.sh(语义对拍门禁) / perf_history.sh / 生成器
+└── docs/                    # 4-state-semantics(四值口径) / query-engine-design /
+                             #   waveform-io-plan(缓存设计) / 152gb-round(现场复盘)
 ```
+
+### 缓存与一致性地基
+
+| 机制 | 作用 |
+|:--|:--|
+| 同进程变更列缓存 | 同一信号第二次查询 ≈0s(`anchored_changes` 先查已解码列) |
+| `./.wal-rust-cache/<wave>-<len>-<mtime>-v1.wcol` | 跨进程索引(跳过加载),写在实际执行命令的目录 |
+| `<...>-v1.cols/<fnv(名字)>.col` | 按信号落盘的列缓存(只缓存被查询过的信号) |
+| `WAL_COL_CACHE_MB` | 加载时按预算预建列,之后所有信号查询免扫 |
+| `tests/regression_matrix.rs` | 快路径 == 逐拍 oracle;含子进程 `WAL_NO_ENGINE=1` 独立对拍 |
+| `tests/golden_tiny.rs` | 手算黄金值(表达式 + CLI 子命令 + 会话模式) |
+| `tests/fuzz_vcd_fst_diff.rs` | 随机波形:VCD↔FST 等价 + 引擎↔逐拍 + 缓存路径 |
+| `scripts/diff_find.sh` | 与上一版二进制逐值对拍(语义零回归门禁) |
 
 ### Key Design Decisions
 
@@ -503,27 +558,53 @@ Configure in `~/.config/opencode/opencode.json`:
 
 ## Performance
 
-### 大波形基准(2026-09-07,v0.12.0)
+### 大波形基准(2026-09-09,v0.12.44)
 
-合成 58.7GB(3.5M 信号 / 1.5M 时间戳 / ~1.65G 变更,与 152GB 同构):
+合成波形与本机(16 核 / NVMe)实测。**同表内对比才有意义**(绝对秒数受页缓存影响很大):
 
-| 指标 | v0.11.11 基线 | v0.12.0 | 变化 |
+**58.7GB**(3.5M 信号 / 1.5M 时间戳 / ~1.65G 变更)
+
+| 指标 | v0.11.11 基线 | v0.12.44 | 说明 |
 |:-----|:-------------|:--------|:-----|
-| 纯加载(pass-1b 索引) | 360s | **~12s** | **30x** |
-| 冷查询(加载 + 首个 count) | 674s | ~282s | 2.4x |
-| 同信号第二次查询(同进程) | 208s | **毫秒级** | 消除 |
-| 峰值 RSS | 11.4GB | **7.7GB** | -32% |
+| 纯加载 | 360s | **82s(冷) / 42s(暖)** | 行采样加载 + 并行分块索引 |
+| 冷查询(加载 + 首个 count) | 674s | **216s** | 加载 + 一次全文件扫描 |
+| 同进程第二次同信号查询 | 208s | **≈0s** | 变更列内存复用 |
+| 新进程同信号查询 | 114s | **3.35s** | `.wcol` 索引 + 旁挂列缓存命中 |
+| 峰值 RSS | 11.4GB | 3.0GB(加载) / 7.0GB(扫描中) | 含 mmap 文件页 |
 
-> 说明: 初值快照语义统一、per-index 最后写入、`$dumpvars` 初值、set! 词法穿透
-> 等均为 0.12.x 行为;快/慢路径分叉按 [查询引擎设计](docs/query-engine-design.md)
-> 在 0.12.x 内收敛为统一区间扫描引擎。
+**构造成本画像(1GB 真实 VCS 波形,300k 拍 × 260 信号)**
+
+| 路径 | 代价 |
+|:--|:--|
+| 采样加载 | ~2.5s/GB(冷)/ 0.4s/GB(暖) |
+| 冷扫描(页缓存暖) | ~2.7GB/s |
+| 全量建列 `WAL_COL_CACHE_MB=2000` | 12s/GB + 4.5GB RSS,之后**所有信号查询免费** |
+| 旁挂列缓存命中(第二次进程) | 0.03s |
+
+**多信号 / 头解析(4M 信号,131MB header)**
+
+| 指标 | 0.12.41 之前 | 现在 |
+|:--|:--|:--|
+| 头解析 | 3.5–4.7s | **1.26s** |
+| 1M 信号查询(83MB) | 0.86s | **0.35s** |
+
+手段:`$var` 计数预估容量、零分配解析、scope 前缀缓存、FxHash、名字解析零整表分配。
+
+### 测量口径(重要)
+
+- **RSS ≠ 堆**:波形经 mmap 读取,内核把映射页也算进 RSS;
+  进程堆是 O(信号数 + 被查询信号的变更列)。看堆用 `smaps_rollup` 的 Private_Dirty。
+- 页缓存状态会让同一条命令在 42s–82s 之间波动;比较时请在同一轮内 A/B。
+- 复现脚本:`bash scripts/perf_history.sh <wave> <sig> <tag>`(结果追加到
+  `bench/perf-history.csv`),回归闸:`bash scripts/diff_find.sh`。
 
 ### 早期基准(历史)
 
 | 指标 | 值 |
 |:-----|:---|
 | 155GB VCD 加载(旧实现) | 9 min 05 sec |
-| 152GB 内网实测(0.11.x) | count 数分钟-数十分钟(已由 0.12.x 改善) |
+| 152GB 实际 dump(0.11.x) | count 数分钟–数十分钟;0.12.x 起同信号重复查询≈0,跨进程 3.35s |
+| 17.5GB 实际 dump(0.12.36 现场) | 单探针 35–130s(冷/暖);`--stdin` 会话模式与列缓存可显著摊薄 |
 
 ### Stress Tests(保持)
 

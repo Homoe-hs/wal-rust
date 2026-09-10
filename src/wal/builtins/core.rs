@@ -317,25 +317,57 @@ fn op_help(args: &[Value], _env: &mut Environment, _eval: &mut Evaluator) -> Res
         }
         None => {
             let mut text = String::from(
-                "WAL builtin reference.\n\
-                 4-state semantics (authoritative): docs/4-state-semantics.md — x is NOT 0;\n\
-                 x->1 is a change but not a rising edge; index 0 has no predecessor unless\n\
-                 $dumpvars gave a defined initial; (get s) reads at the CURRENT INDEX.\n\
-                 Query:    count find whenever rising falling changes is-x is-z\n\
-                 Access:   get sample-at signal-width SIGNALS all-scopes\n\
-                 Navigate: INDEX TS MAX-INDEX step\n\
-                 Language: + - * / = != < > if do define set! fn map fold print printf\n\
-                 Traces:   load unload\n\
-                 NOTE: getwave/wave/at/edges return timestamps in the waveform's\n\
-                 NATIVE unit (ps/ns/... per the file timescale; see the load summary).\n\
-                 Use (period)/(freq)/(fmt-time) for seconds/human units.\n\
-                 Time queries:\n",
+                "wal-rust builtin reference\n\
+                 ==========================\n\
+                 四值语义(权威口径见 docs/4-state-semantics.md):\n\
+                   x 不是 0: (= (get a) 0) 假, (!= (get a) 0) 真\n\
+                   x->1 算一次变化, 但不算上升沿; x->x / x->z 不算变化\n\
+                   索引 0 没有前驱, 除非 $dumpvars 给了确定初值\n\
+                   (get s) 取**当前 INDEX** 处的值, 不随 map/遍历位置变化; 按时间取用 (at s T)\n\
+                 \n\
+                 查询(任意表达式走统一区间扫描引擎: 成本 O(变更点), 而非 O(时间戳)):\n\
+                   count cond [cond...]      满足条件的索引数(count/step 为逐索引等价形式)\n\
+                   find cond [limit]         满足条件的索引列表(find/step 同理)\n\
+                   whenever cond body...     在每个命中索引处执行 body\n\
+                   rising/falling/changes    边沿与变化谓词\n\
+                   is-x / is-z               未知位 / 高阻\n\
+                   count-rise/count-fall/count-edges/edges  窗口内边沿与变化\n\
+                 \n\
+                 取值与变更列:\n\
+                   get \"sig\" [hi lo]          当前索引处的值(含 x/z 时返回位串, 如 \"00x1\")\n\
+                   sample-at \"sig\" idx        指定索引处的值\n\
+                   getwave/wave/at/edges     变更点 / 窗口 / 某时刻的值(时间为波形原生单位)\n\
+                   signal-width SIGNALS all-scopes SCOPES  CS CG LOCAL-SIGNALS\n\
+                 \n\
+                 导航与元信息:\n\
+                   INDEX TS MAX-INDEX step / load unload / timescale / fmt-time\n\
+                 \n\
+                 语言:\n\
+                   + - * / div mod(%) ** = == != < > <= >= && || not\n\
+                   if do cond case when unless while define defun let set! fn lambda\n\
+                   map fold filter print printf save import\n\
+                 \n\
+                 CLI 子命令(不需要 WAL 表达式):\n\
+                   wal-rust count <wave> <sig> [value]   值计数(默认 =1; 变化数用 (count (changes s)))\n\
+                   wal-rust sigs  <wave> <pattern> [n]   信号名列表\n\
+                   wal-rust topsig <wave> [n]            最活跃信号(按变化数)\n\
+                   wal-rust --stdin -l <wave>            会话模式: 逐行读表达式, 单进程复用加载与缓存\n\
+                 \n\
+                 缓存与对拍:\n\
+                   WAL_CACHE=off|auto|build|read   跨进程索引+列缓存(默认 auto; 目录 = 执行命令的\n\
+                                                   当前目录 ./.wal-rust-cache/, 不写波形目录)\n\
+                   WAL_COL_CACHE_MB=<MB>           加载时按预算预建列(之后所有查询免扫)\n\
+                   WAL_NO_ENGINE=1                 禁用统一引擎(纯逐拍) → 回归对拍用的独立 oracle\n\
+                 \n\
+                 时间单位: getwave/wave/at/edges 返回波形原生单位(ps/ns/...);\n\
+                 period/freq/fmt-time 换算成秒/人类可读。\n\
+                 \n\
+                 细节: (doc \"count\") / (doc semantics); (doc 未知主题) 会列出全部可用主题。\n\
+                 ==========================\n"
             );
-            for line in crate::wal::builtins::wave::operator_help_lines() {
-                text.push_str(&line);
-                text.push('\n');
-            }
-            text.push_str("Try (help \"count\") or (doc \"getwave\") for a specific builtin.");
+            text.push_str("\n文档化的主题(用 (doc <名字>) 查询):\n  ");
+            text.push_str(&crate::wal::builtins::wave::documented_topics().join(", "));
+            text.push_str("\n也可以用 (help \"count\") 看某个算子的完整说明。");
             text
         }
         _ => format!("No help for '{}'. Try (help) for the overview.", topic.unwrap_or_default()),

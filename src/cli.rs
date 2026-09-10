@@ -14,7 +14,7 @@ use std::path::PathBuf;
                   input is an existing file → executed as WAL script\n  \
                   no input → shows help\n\n\
                   Features:\n  \
-                  - Full WAL language support (82 operators, macros, @/#/~ syntax)\n  \
+                  - WAL language: 125 named operators, macros, @/#/~ syntax, scripts + REPL\n  \
                   - mmap-based on-demand VCD loading (two-pass scan + sparse index + LRU cache)\n  \
                   - Handles 150GB+ dumps; process HEAP is O(signals + queried columns)\n  \
                     (RSS additionally counts mmap'd file pages — see docs/waveform-io-plan.md)\n  \
