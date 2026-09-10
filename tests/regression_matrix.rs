@@ -286,6 +286,20 @@ fn matrix_vcd_fst_consistency() {
     let _ = std::fs::remove_file(&fst);
 }
 
+/// id 后缀歧义(标量行 + 数字 id): 值字符与 id 字符同形(1-bit 值 `0`/`1`,
+/// 而 id 也以 `1` 结尾)时, 任何"按行尾匹配 ID"的廉价预筛都必须再用解析出的
+/// ID 复核 —— 行 `1 11` 以 `1` 结尾, 但它的 ID 是 `11`。
+/// (2026-09-10: 融合索引路径漏了这次比较, count(= (get "a") 1) 由 3 变 4。)
+#[test]
+fn matrix_digit_id_scalar_suffix() {
+    let p = tmp("digid", "$timescale 1ns $end\n$scope module t $end\n$var wire 1 1 a $end\n$var wire 1 11 c $end\n$enddefinitions $end\n\
+$dumpvars\n0 1\n1 11\n$end\n#10\n1 1\n#20\n1 11\n#30\n0 1\n1 11\n#40\n1 1\n");
+    let e = |c: &str| eval_with(&p, c);
+    assert_eq!(e("(count (= (get \"t.a\") 1))"), Value::Int(3));
+    assert_eq!(e("(at \"t.a\" 40)"), Value::List(WList::from_vec(vec![Value::Int(40), Value::Int(1)])));
+    assert_eq!(e("(count (changes \"t.a\"))"), Value::Int(3));
+}
+
 /// id 后缀歧义: 目标 id "1" 不得命中更长的 id "11" 的行(锚定扫描误配回归)。
 #[test]
 fn matrix_id_suffix_ambiguity() {

@@ -1913,6 +1913,12 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
         if names.is_empty() || idx_dep {
             return Ok(None);
         }
+        // 前置声明: 让波形后端有机会把"索引构建"与"这些信号的变更列提取"
+        // 合并成一次遍历(冷启动只读一遍文件; 缓存命中时是空操作)。
+        {
+            let t = self.traces.read().unwrap_or_else(|e| e.into_inner());
+            t.prepare(&names);
+        }
 
         // 信号可以来自任意一条 trace(多文件场景): 逐个 trace 解析,
         // 索引空间与逐拍路径一致(同一 INDEX 施加到所有 trace)。

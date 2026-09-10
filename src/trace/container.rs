@@ -20,6 +20,13 @@ impl TraceContainer {
         None
     }
 
+    /// 查询前置声明(见 `Trace::prepare`): 转发给所有 trace。
+    pub fn prepare(&self, names: &[String]) {
+        for tr in self.traces.values() {
+            tr.prepare(names);
+        }
+    }
+
     pub fn new() -> Self {
         Self {
             traces: HashMap::new(),

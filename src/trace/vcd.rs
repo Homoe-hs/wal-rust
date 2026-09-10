@@ -234,6 +234,30 @@ impl TsStore {
     }
 }
 
+/// dump 区(时间戳之后)的索引。**懒构建**: `(load)` 只读文件头(scope/$var/
+/// $dumpvars), 时间戳表/采样锚点/事件点在首次真正需要时按需构建。
+///
+/// 为什么懒: 构建索引要完整读一遍 dump 区。以前它在 load 里无条件跑, 于是
+/// "一次查询"在冷盘上要读两遍文件(索引一遍 + 扫描一遍); 查询前能声明需要
+/// 哪些信号(`prepare`)时, 变更列在同一次遍历里一起算出来 —— 冷启动只读一遍。
+pub struct DumpIndex {
+    /// 时间戳表(INDEX ↔ 时间值)
+    timestamps: TsStore,
+    /// 每 64 个时间戳取一个 '#' 行偏移(随机访问的锚点)
+    timestamp_offsets: Vec<u64>,
+    /// 每信号采样锚点 (ts, offset), 升序追加
+    sparse_index: HashMap<u32, Vec<(u64, u64)>>,
+    /// 事件信号(先写后清零)的变更索引
+    event_change_points: HashMap<u32, Vec<usize>>,
+}
+
+/// 单个 chunk 的遍历产出:
+/// (时间戳, 时间戳偏移, 采样锚点, 事件变更, 列缓存项, 查询目标变更)
+type ChunkSweep = (
+    Vec<u64>, Vec<u64>, Vec<(u32, u64, u64)>, Vec<(u32, u64)>,
+    Vec<(u32, i64, u128, u64, u8)>, Vec<(u32, u32, VcdValue)>,
+);
+
 pub struct VcdTrace {
     id: TraceId,
     filename: String,
@@ -260,28 +284,26 @@ pub struct VcdTrace {
 
     // Event signals (VCD event type — auto-reset to 0 at each timestamp boundary)
     event_signals: HashSet<u32>,
-    // Pre-recorded change point INDICES for event signals (built during PASS 1b)
-    event_change_points: HashMap<u32, Vec<usize>>,
-
-    // Pass 1: sparse index — per-signal (ts, offset) anchors, built chunk-local
-    // and appended in ascending order (no BTreeMap: one contiguous Vec each).
-    timestamps: TsStore,
-    timestamp_offsets: Vec<u64>,
-    sparse_index: HashMap<u32, Vec<(u64, u64)>>,
+    /// dump 区索引(懒构建;见 DumpIndex 注释)
+    dump_index: std::cell::OnceCell<DumpIndex>,
+    /// 头解析时的时间戳数估计(仅用于预分配容量)
+    est_ts: usize,
 
     // Pass 2: LRU cache
     lru_cache: RefCell<lru::LruCache<(u32, u64), VcdValue>>,
     signal_cache: Mutex<HashMap<u32, DecodedSignal>>,
     /// Budgeted in-memory columnar change lists built during load; covered
     /// signals answer queries with zero file re-scan (B/C 内存内核).
-    col_cache: HashMap<u32, Col>,
+    col_cache: std::cell::RefCell<HashMap<u32, Col>>,
     /// Budget-exhausted signals get offsets-only columns (bytes pulled on
     /// demand from the mmap).
-    off_cache: HashMap<u32, OffCol>,
+    off_cache: std::cell::RefCell<HashMap<u32, OffCol>>,
 
     // Persistent mmap
     reader: RefCell<crate::vcd::reader::MmapReader>,
     header_end_offset: u64,
+    /// dump 区数据起点($dumpvars 块之后第一个 '#' 行 / 或头结束处)
+    dump_data_start: u64,
 
     // Scopes
     scopes: Vec<String>,
@@ -291,7 +313,6 @@ pub struct VcdTrace {
 
     // Runtime
     current_index: usize,
-    max_index: usize,
 }
 
 impl VcdTrace {
@@ -364,7 +385,6 @@ impl VcdTrace {
     }
     pub fn load(path: &Path, id: TraceId) -> Result<Self, String> {
         use rayon::prelude::*;
-        use std::sync::Arc;
 
         let filename = path.to_string_lossy().to_string();
         let mut reader = crate::vcd::reader::MmapReader::new(path)
@@ -498,7 +518,6 @@ impl VcdTrace {
             libc::madvise(data.as_ptr() as *mut libc::c_void, data.len(), libc::MADV_SEQUENTIAL);
         }
         let dump_start = header_end_offset as usize;
-        let dump_len = data.len() - dump_start;
 
         // Capture the $dumpvars snapshot (lines between header end and the
         // first '#' timestamp). These are the values held at t0 — used as the
@@ -564,11 +583,55 @@ impl VcdTrace {
             pos = line_start;
         }
 
-        // Skip $dumpvars section to first timestamp
-        let actual_start = pos;
+        let lru_cap = std::num::NonZeroUsize::new(adapt_lru_capacity(file_len, name_meta.len()))
+            .unwrap_or(std::num::NonZeroUsize::MIN);
+        let trace = VcdTrace {
+            id, filename,
+            names_blob, name_meta, name_index, signal_ids,
+            id_blob, id_offsets, signal_widths, init_off, init_blob,
+            name_cache: std::cell::RefCell::new(FxHashMap::default()),
+            warned_xinit: std::cell::RefCell::new(std::collections::HashSet::new()),
+            event_signals,
+            dump_index: std::cell::OnceCell::new(),
+            est_ts,
+            lru_cache: RefCell::new(lru::LruCache::new(lru_cap)),
+            signal_cache: Mutex::new(HashMap::new()),
+            col_cache: std::cell::RefCell::new(HashMap::new()),
+            off_cache: std::cell::RefCell::new(HashMap::new()),
+            reader: RefCell::new(reader),
+            header_end_offset,
+            dump_data_start: pos as u64,
+            scopes,
+            timescale_exp,
+            current_index: 0,
+        };
+        Ok(trace)
+    }
 
+    /// 构建 dump 区索引(时间戳表 + 采样锚点 + 事件点)。
+    ///
+    /// 由 `dump()` 懒触发 —— `(load)` 只读文件头($scope/$var/$dumpvars),
+    /// 谁需要 dump 区数据谁付这一遍扫描; 跨进程缓存命中时整块跳过。
+    fn build_dump_index(&self, want: &[u32]) -> DumpIndex {
+        use rayon::prelude::*;
+        let mmap = self.reader.borrow().data.clone();
+        let data: &[u8] = &mmap[..];
+        // Sequential access hint: the scan touches every page of the dump once
+        // — favors readahead over page-fault-by-page stalls (cold files).
+        unsafe {
+            libc::madvise(data.as_ptr() as *mut libc::c_void, data.len(), libc::MADV_SEQUENTIAL);
+        }
+        let dump_start = self.header_end_offset as usize;
+        let dump_len = data.len().saturating_sub(dump_start);
+        let actual_start = (self.dump_data_start as usize).min(data.len());
+        let est_ts = self.est_ts;
         let n_threads = num_cpus::get();
-        let chunk_size = dump_len / n_threads;
+        let chunk_size = (dump_len / n_threads).max(1);
+        // 查询目标信号: 同一次遍历里把它们的完整变更列一并算出来(零额外 IO)
+        let want_ids: Vec<(u32, Vec<u8>)> = want.iter()
+            .filter_map(|&sg| self.id_bytes(sg).map(|b| (sg, b.to_vec())))
+            .collect();
+        let mut want_changes: Vec<(u32, u32, VcdValue)> = Vec::new();
 
         // Find chunk boundaries at timestamp-line starts. A boundary must fall
         // exactly at a '#' line start (never inside a value block), so each
@@ -602,11 +665,10 @@ impl VcdTrace {
 
         // Shared read-only data for parallel threads
         let col_enabled = col_cache_budget() > 0;
-        let col_enabled_arc = Arc::new(col_enabled);
-        let signal_ids_arc = Arc::new(signal_ids);
-        let widths_arc = Arc::new(signal_widths.clone());
-        let has_events = !event_signals.is_empty();
-        let event_sigs_arc = Arc::new(event_signals.clone());
+        let has_events = !self.event_signals.is_empty();
+        let sid_all = &self.signal_ids;
+        let widths_all = &self.signal_widths;
+        let event_all = &self.event_signals;
 
         // Parallel processing
         let sparse_interval: u64 = 100;
@@ -615,9 +677,6 @@ impl VcdTrace {
         // Stream in batches: each batch's whole-column output is merged into
         // the final maps BEFORE the next batch is collected — transient chunk
         // memory stays bounded (~1-2GB) instead of the whole dump.
-        let mut timestamps: Vec<u64> = Vec::with_capacity(est_ts);
-        let mut timestamp_offsets: Vec<u64> = Vec::with_capacity(est_ts);
-        let mut event_change_ts: HashMap<u32, Vec<u64>> = HashMap::new();
         // ====== MERGE STATE (spans all batches) ======
         let mut timestamps: Vec<u64> = Vec::with_capacity(est_ts);
         let mut timestamp_offsets: Vec<u64> = Vec::with_capacity(est_ts);
@@ -625,8 +684,8 @@ impl VcdTrace {
         let mut sparse_index: HashMap<u32, Vec<(u64, u64)>> = HashMap::with_capacity(128);
         let col_budget = col_cache_budget();
         let mut col_bytes: usize = 0;
-        let mut col_cache: HashMap<u32, Col> = HashMap::new();
-        let mut off_cache: HashMap<u32, OffCol> = HashMap::new();
+        let mut col_cache: HashMap<u32, Col> = self.col_cache.take();
+        let mut off_cache: HashMap<u32, OffCol> = self.off_cache.take();
         let mut col_ts_base: usize = 0;
         let mut col_ts_next: usize = 0;
 
@@ -634,22 +693,36 @@ impl VcdTrace {
         let stream: Vec<&[usize]> = boundaries.windows(2).collect();
         let batch_list: Vec<Vec<&[usize]>> = stream.chunks(COL_BATCH).map(|c| c.to_vec()).collect();
         for batch in batch_list {
-            let all: Vec<(Vec<u64>, Vec<u64>, Vec<(u32, u64, u64)>, Vec<(u32, u64)>, Vec<(u32, i64, u128, u64, u8)>)> = batch
+            let all: Vec<ChunkSweep> = batch
                 .par_iter()
             .map(|w| {
                 let chunk_start = w[0];
                 let chunk_end = w[1];
                 let chunk = &data[chunk_start..chunk_end];
-                let sid = signal_ids_arc.clone();
-                let evt = event_sigs_arc.clone();
-                let widths = widths_arc.clone();
-                let col_on = *col_enabled_arc;
+                let sid = sid_all;
+                let evt = event_all;
+                let widths = widths_all;
+                let col_on = col_enabled;
+                // 冷文件: 先让内核按大块预读本 chunk(逐页 4KB 缺页在 58.7GB 上
+                // 会比 1MB 顺序读多花一倍 sys 时间)。分窗口调用, 避免一次排队过多。
+                unsafe {
+                    const WIN: usize = 64 << 20;
+                    let mut off = 0usize;
+                    while off < chunk.len() {
+                        let n = (chunk.len() - off).min(WIN);
+                        libc::madvise(chunk[off..].as_ptr() as *mut libc::c_void, n,
+                                      libc::MADV_WILLNEED);
+                        off += n;
+                    }
+                }
 
                 let mut ts = Vec::new();
                 let mut ts_offsets = Vec::new();
                 let mut si: Vec<(u32, u64, u64)> = Vec::new();
                 let mut cols: Vec<(u32, i64, u128, u64, u8)> = Vec::new();
                 let mut event_cp: Vec<(u32, u64)> = Vec::new();
+                // 查询目标信号的变更(本块内 ts 序号; u32::MAX = 属于上一块最后一个 ts)
+                let mut want_hits: Vec<(u32, u32, VcdValue)> = Vec::new();
                 let mut current_timestamp: u64 = 0;
                 let base_offset = chunk_start as u64;
                 let mut ts_seen: i64 = 0;
@@ -695,24 +768,67 @@ impl VcdTrace {
                             // Column cache off → parse only the sampled fraction
                             // (fast load, 0.12.2 speed); on → parse every line
                             // once for anchors AND the columnar change list.
-                            if has_events || col_on || sampled {
-                                if let Some((sig_hash, value)) = parse_value_change_fast(line) {
-                                    if let Some(sig_idx) = sid.find(sig_hash) {
-                                        if sampled {
-                                            si.push((sig_idx, current_timestamp, base_offset + line_start as u64));
+                            // 查询目标信号的行无论采样与否都要处理 —— 索引与变更列
+                            // 在同一次遍历里算出来, 冷启动不再多读一遍文件。
+                            let hot = has_events || col_on || sampled;
+                            if !want_ids.is_empty() {
+                                // 查询目标的**廉价预筛**: 先比行尾字节, 再比 <id> 结尾与
+                                // 分隔符 —— 命中才做完整拆分。逐行只要一两次比较就能滤掉
+                                // 绝大部分行(否则每行一次反向找分隔符 + 拆分, 983MB 真实
+                                // dump 上从 0.25s 退化到 0.95s)。
+                                let body = match line.last() {
+                                    Some(b'\r') => &line[..line.len() - 1],
+                                    _ => line,
+                                };
+                                if let Some(&tail) = body.last() {
+                                    for (wsig, wid) in &want_ids {
+                                        if wid.last() != Some(&tail) || !body.ends_with(wid.as_slice()) {
+                                            continue;
                                         }
-                                        if has_events && evt.contains(&sig_idx) {
-                                            event_cp.push((sig_idx, current_timestamp));
+                                        let n = body.len() - wid.len();
+                                        if n > 0 {
+                                            let sep = body[n - 1];
+                                            if sep != b' ' && sep != b'\t'
+                                                && !matches!(sep, b'0' | b'1' | b'x' | b'X' | b'z' | b'Z') {
+                                                continue;
+                                            }
                                         }
-                                        if col_on {
-                                            let vw = match &value {
-                                                VcdValue::Vector(v) => v.len(),
-                                                VcdValue::Bit(_) => 1,
-                                                _ => 0,
-                                            };
-                                            if vw >= 1 && vw <= 64 {
-                                                if let Some(st) = col_states_from_vcd(&value, vw) {
-                                                    cols.push((sig_idx, ts_seen - 1, st, base_offset + line_start as u64, vw as u8));
+                                        // 预筛只是"可能命中"; 真正判定必须用解析出的 ID
+                                        // (行 `1 11` 以 '1' 结尾且前一字符是值字符 '1', 但它的
+                                        //  ID 是 `11` —— 少这一次比较就会把别的信号记成目标信号)。
+                                        if let Some((value_part, idb)) = split_value_id(line) {
+                                            if idb == wid.as_slice() {
+                                                let ts_local = if ts_seen > 0 { (ts_seen - 1) as u32 } else { u32::MAX };
+                                                want_hits.push((*wsig, ts_local,
+                                                    vcd_value_of(value_part).unwrap_or(VcdValue::Bit(b'x'))));
+                                            }
+                                        }
+                                        break;
+                                    }
+                                }
+                            }
+                            if hot {
+                                if let Some((value_part, idb)) = split_value_id(line) {
+                                    {
+                                        let value = match vcd_value_of(value_part) { Some(v) => v, None => continue };
+                                        let sig_hash = hash_sig_id(idb);
+                                        if let Some(sig_idx) = sid.find(sig_hash) {
+                                            if sampled {
+                                                si.push((sig_idx, current_timestamp, base_offset + line_start as u64));
+                                            }
+                                            if has_events && evt.contains(&sig_idx) {
+                                                event_cp.push((sig_idx, current_timestamp));
+                                            }
+                                            if col_on {
+                                                let vw = match &value {
+                                                    VcdValue::Vector(v) => v.len(),
+                                                    VcdValue::Bit(_) => 1,
+                                                    _ => 0,
+                                                };
+                                                if vw >= 1 && vw <= 64 {
+                                                    if let Some(st) = col_states_from_vcd(&value, vw) {
+                                                        cols.push((sig_idx, ts_seen - 1, st, base_offset + line_start as u64, vw as u8));
+                                                    }
                                                 }
                                             }
                                         }
@@ -732,7 +848,7 @@ impl VcdTrace {
                     // correct (the intermediate/final order must be preserved).
                     cols.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
                 }
-                (ts, ts_offsets, si, event_cp, cols)
+                (ts, ts_offsets, si, event_cp, cols, want_hits)
             })
             .collect();
 
@@ -744,8 +860,21 @@ impl VcdTrace {
             }
         }
 
-        for (chunk_ts, chunk_offsets, chunk_si, chunk_evt, chunk_cols) in all {
+        for (chunk_ts, chunk_offsets, chunk_si, chunk_evt, chunk_cols, chunk_want) in all {
             col_ts_next = col_ts_base + chunk_ts.len();
+            for (wsig, local_ts, val) in chunk_want {
+                // 本块首个 '#' 之前的行属于上一块最后一个时间戳(块 0 = $dumpvars 块 → 跳过)
+                let gts = if local_ts == u32::MAX {
+                    if col_ts_base == 0 { continue; }
+                    (col_ts_base - 1) as u32
+                } else {
+                    (col_ts_base + local_ts as usize) as u32
+                };
+                match want_changes.last_mut() {
+                    Some((s0, i0, v0)) if *s0 == wsig && *i0 == gts => *v0 = val,
+                    _ => want_changes.push((wsig, gts, val)),
+                }
+            }
             timestamps.extend(chunk_ts);
             timestamp_offsets.extend(chunk_offsets);
             for (sig_idx, s_ts, s_off) in chunk_si {
@@ -833,65 +962,89 @@ impl VcdTrace {
             event_change_points.insert(*sig_idx, indices);
         }
 
-        let signal_ids = Arc::try_unwrap(signal_ids_arc).unwrap_or_else(|arc| (*arc).clone());
         // Sample offsets: keep every 64th. read_signal_value_at locates exact
         // '#' lines with a short memchr scan from the sampled anchor.
         let timestamp_offsets: Vec<u64> = timestamp_offsets.iter().step_by(64).copied().collect();
-        let max_index = if timestamps.is_empty() { 0 } else { timestamps.len() - 1 };
-        let lru_cap = std::num::NonZeroUsize::new(adapt_lru_capacity(file_len, name_meta.len()))
-            .unwrap_or(std::num::NonZeroUsize::MIN);
-
         // Release file pages touched by the full PASS-1b scan: queries re-read
         // on demand. Keeps steady-state RSS at heap size, not file size.
         unsafe {
-            let data = reader.data();
             libc::madvise(data.as_ptr() as *mut libc::c_void, data.len(), libc::MADV_DONTNEED);
         }
-        reader.seek_to(0).map_err(|e| format!("Seek error: {}", e))?;
+        let _ = self.reader.borrow_mut().seek_to(0);
 
         if std::env::var("WAL_DEBUG_FIND").is_ok() {
             let sparse_entries: usize = sparse_index.values().map(|m| m.len()).sum();
-            let event_entries: usize = event_change_ts.values().map(|v| v.len()).sum();
+            let event_entries: usize = event_change_points.values().map(|v| v.len()).sum();
             eprintln!("load: ts={} offsets={} sparse_entries={} event_entries={} signals={}",
-                      timestamps.len(), timestamp_offsets.len(), sparse_entries, event_entries, name_meta.len());
+                      timestamps.len(), timestamp_offsets.len(), sparse_entries, event_entries, self.name_count());
         }
-        let trace = VcdTrace {
-            id, filename,
-            names_blob, name_meta, name_index, signal_ids,
-            id_blob, id_offsets, signal_widths, init_off, init_blob,
-            name_cache: std::cell::RefCell::new(FxHashMap::default()),
-            warned_xinit: std::cell::RefCell::new(std::collections::HashSet::new()),
-            event_signals, event_change_points,
-            timestamps: build_ts_store(timestamps), timestamp_offsets, sparse_index,
-            lru_cache: RefCell::new(lru::LruCache::new(lru_cap)),
-            signal_cache: Mutex::new(HashMap::new()),
-            col_cache,
-            off_cache,
-            reader: RefCell::new(reader),
-            header_end_offset,
-            scopes,
-            timescale_exp,
-            current_index: 0, max_index,
-        };
-        // auto 模式只对较大波形写回: 小文件解析本来就毫秒级,写缓存只会污染目录。
-        // build 是显式要求写回, 始终写。
-        let should_write_cache = match cmode {
-            CacheMode::Build => true,
-            CacheMode::Auto => (file_len as u64) >= cache_min_bytes(),
-            _ => false,
-        };
-        if should_write_cache {
-            if let Some(cp) = cache_file_for(path) {
-                trace.save_cache(&cp);
+
+        // 目标信号的变更列: 写进 signal_cache(同进程复用) + 旁挂列缓存(跨进程)
+        if !want_changes.is_empty() {
+            let mut by_sig: HashMap<u32, Vec<(u32, VcdValue)>> = HashMap::new();
+            for (wsig, gts, val) in want_changes {
+                by_sig.entry(wsig).or_default().push((gts, val));
+            }
+            for (wsig, all) in by_sig {
+                if all.len() > 1 {
+                    self.try_cache_decoded_signal(wsig, &all, CacheType::FullScan);
+                    self.save_col_sidecar(wsig, &all);
+                }
             }
         }
-        Ok(trace)
+        let dump = DumpIndex {
+            timestamps: build_ts_store(timestamps),
+            timestamp_offsets,
+            sparse_index,
+            event_change_points,
+        };
+        // 跨进程索引缓存写回(auto 只对大波形: 小文件本来就是毫秒级)
+        let should_write = match cache_mode() {
+            CacheMode::Build => true,
+            CacheMode::Auto => (self.reader.borrow().data_len() as u64) >= cache_min_bytes(),
+            _ => false,
+        };
+        if should_write {
+            if let Some(cp) = cache_file_for(std::path::Path::new(&self.filename)) {
+                self.save_cache(&cp, &dump);
+            }
+        }
+        dump
+    }
+
+
+    /// dump 区索引(懒构建)。**这是唯一入口** —— 所有需要时间戳表/锚点/事件点的
+    /// 路径都经它, 保证只有一套实现、按需付费。
+    #[inline]
+    fn dump(&self) -> &DumpIndex {
+        self.dump_index.get_or_init(|| self.build_dump_index(&[]))
+    }
+
+    /// 需要 dump 区数据、且"顺带想要这些信号的变更列"时用这个入口:
+    /// 索引还没建 → 同一次遍历里把变更列一起算出来(写进 signal_cache);
+    /// 索引已建(或已被别人用别的 want 建过) → 直接返回, 变更列走常规冷扫描。
+    fn ensure_dump_index(&self, want: &[u32]) -> &DumpIndex {
+        if let Some(d) = self.dump_index.get() { return d; }
+        self.dump_index.get_or_init(|| self.build_dump_index(want))
+    }
+
+    /// 查询前置声明: 告诉 trace 这次查询要碰哪些信号(名字可解析任意一条 trace 的
+    /// 命名规则)。默认空实现 —— 只有能"顺手算出来"的后端需要。
+    pub fn prepare_names(&self, names: &[String]) {
+        if self.dump_index.get().is_some() || names.is_empty() { return; }
+        let mut want: Vec<u32> = Vec::new();
+        for n in names {
+            if let Some(i) = self.name_index.find_verified(hash_name(n.as_bytes()), |i| self.name_at(i) == n.as_str()) {
+                want.push(i);
+            }
+        }
+        if !want.is_empty() { let _ = self.ensure_dump_index(&want); }
     }
 
     /// Find the index of a given timestamp (returns nearest <= target)
     #[allow(dead_code)]
     fn find_timestamp_index(&self, target: u64) -> usize {
-        match self.timestamps.search(target) {
+        match self.dump().timestamps.search(target) {
             Ok(i) => i,
             Err(0) => 0,
             Err(i) => i - 1,
@@ -902,19 +1055,21 @@ impl VcdTrace {
     /// timestamp at (idx >> 6) * 64 (<= idx). Exact lines are located by a
     /// short memchr scan from this anchor.
     fn ts_line_anchor(&self, ts_idx: usize) -> u64 {
+        let d = self.dump();
         let b = ts_idx >> 6;
-        if b < self.timestamp_offsets.len() {
-            self.timestamp_offsets[b]
+        if b < d.timestamp_offsets.len() {
+            d.timestamp_offsets[b]
         } else {
-            *self.timestamp_offsets.last().unwrap_or(&(self.header_end_offset as u64))
+            *d.timestamp_offsets.last().unwrap_or(&(self.header_end_offset as u64))
         }
     }
     /// Sampled offset anchor strictly after a timestamp index (next sample).
     /// Returns u64::MAX when past the last sample (caller uses file end).
     fn ts_end_anchor(&self, ts_idx: usize) -> u64 {
+        let d = self.dump();
         let b = (ts_idx >> 6) + 1;
-        if b < self.timestamp_offsets.len() {
-            self.timestamp_offsets[b]
+        if b < d.timestamp_offsets.len() {
+            d.timestamp_offsets[b]
         } else {
             u64::MAX
         }
@@ -959,7 +1114,7 @@ impl VcdTrace {
     /// Last sparse anchor with ts ≤ target (entries are appended in ascending
     /// ts order — binary search instead of BTreeMap range probes).
     fn sparse_anchor(&self, sig_idx: u32, target_ts: u64) -> Option<(u64, u64)> {
-        let v = self.sparse_index.get(&sig_idx)?;
+        let v = self.dump().sparse_index.get(&sig_idx)?;
         let idx = v.partition_point(|(ts, _)| *ts <= target_ts);
         if idx == 0 { None } else { Some(v[idx - 1]) }
     }
@@ -985,7 +1140,8 @@ impl VcdTrace {
             return Ok(all);
         }
         // In-memory column (built during load) — zero file re-scan.
-        if let Some(col) = self.col_cache.get(&sig_idx) {
+        let col_ref = self.col_cache.borrow();
+        if let Some(col) = col_ref.get(&sig_idx) {
             let mut out = Vec::with_capacity(col.idxs.len());
             for (i, st) in col.states.iter().enumerate() {
                 out.push((col.idxs[i], vcd_from_states(*st, col.width)));
@@ -1002,7 +1158,8 @@ impl VcdTrace {
         }
         // Offsets-only column: walk ts indices, pull the value lines from the
         // mmap on demand (DuckDB-style byte-range reads — a few KB per signal).
-        if let Some(off) = self.off_cache.get(&sig_idx) {
+        let off_ref = self.off_cache.borrow();
+        if let Some(off) = off_ref.get(&sig_idx) {
             let mmap = self.reader.borrow().data.clone();
             let data: &[u8] = &mmap[..];
             let mut out = Vec::with_capacity(off.idxs.len());
@@ -1156,7 +1313,7 @@ impl VcdTrace {
         let is_event = self.event_signals.contains(&sig_idx);
 
         // 1. Target index and scan end
-        let target_idx = match self.timestamps.search(target_timestamp) {
+        let target_idx = match self.dump().timestamps.search(target_timestamp) {
             Ok(i) => i,
             Err(0) => return VcdValue::Bit(b'x'),
             Err(i) => i - 1,
@@ -1169,7 +1326,7 @@ impl VcdTrace {
         }
         let sparse_anchor = self.sparse_anchor(sig_idx, target_timestamp);
         let scan_start = sparse_anchor
-            .and_then(|(ts, _)| self.timestamps.search(ts).ok())
+            .and_then(|(ts, _)| self.dump().timestamps.search(ts).ok())
             .map(|i| self.ts_line_anchor(i))
             .unwrap_or(self.header_end_offset) as usize;
         if std::env::var("WAL_DEBUG_FIND").is_ok() {
@@ -1184,7 +1341,7 @@ impl VcdTrace {
         let next_ts_idx = target_idx + 1;
         let mmap = self.reader.borrow().data.clone();
         let data = &mmap[..];
-        let scan_end = if next_ts_idx < self.timestamps.len() {
+        let scan_end = if next_ts_idx < self.dump().timestamps.len() {
             let e = self.ts_end_anchor(next_ts_idx);
             if e == u64::MAX { data.len() } else { e as usize }
         } else {
@@ -1662,22 +1819,19 @@ fn parse_var_decl_fast2(line: &[u8]) -> Option<(u64, &[u8], usize, &[u8], bool)>
 #[inline(always)]
 fn parse_value_change_fast(line: &[u8]) -> Option<(u64, VcdValue)> {
     let (value_part, sig_id_bytes) = split_value_id(line)?;
-    let sig_hash = hash_sig_id(sig_id_bytes);
-    let vfirst = value_part[0];
+    Some((hash_sig_id(sig_id_bytes), vcd_value_of(value_part)?))
+}
 
-    let value = match vfirst {
-        b'b' => VcdValue::Vector(value_part[1..].to_vec()),
-        b'r' => {
-            if let Ok(s) = std::str::from_utf8(&value_part[1..]) {
-                if let Ok(r) = s.parse::<f64>() {
-                    VcdValue::Real(r)
-                } else { return None; }
-            } else { return None; }
-        }
-        _ => VcdValue::Bit(vfirst),
-    };
-
-    Some((sig_hash, value))
+/// 值部分的取值规则(加载/扫描两条路径共用, 避免"同一行两种解释"):
+/// `b…` → Vector, `r…` → Real(解析失败 None), 其它 → 单比特 Bit。
+#[inline]
+fn vcd_value_of(value_part: &[u8]) -> Option<VcdValue> {
+    match value_part.first()? {
+        b'b' => Some(VcdValue::Vector(value_part[1..].to_vec())),
+        b'r' => std::str::from_utf8(&value_part[1..]).ok()?
+            .trim().parse::<f64>().ok().map(VcdValue::Real),
+        other => Some(VcdValue::Bit(*other)),
+    }
 }
 
 /// 把一行值行拆成 (值部分, 信号 ID), 去掉 CRLF 的 '\r'; 非值行返回 None。
@@ -1876,7 +2030,7 @@ impl<'a> BufR<'a> {
 
 impl VcdTrace {
     /// 写出可再生缓存(失败静默, 缓存不影响正确性)。
-    fn save_cache(&self, path: &std::path::Path) {
+    fn save_cache(&self, path: &std::path::Path, d: &DumpIndex) {
         let mut w = BufW::new();
         w.b.extend_from_slice(b"WALVC001");
         w.u32(1);
@@ -1907,24 +2061,24 @@ impl VcdTrace {
             }
         }
         // timestamps
-        match &self.timestamps {
+        match &d.timestamps {
             TsStore::Uniform { start, step, count } => { w.u8(0); w.u64(*start); w.u64(*step); w.u64(*count); }
             TsStore::Dense(v) => { w.u8(1); w.u32(v.len() as u32); for &t in v { w.u64(t); } }
         }
         // timestamp_offsets
-        w.u32(self.timestamp_offsets.len() as u32);
-        for &o in &self.timestamp_offsets { w.u64(o); }
+        w.u32(d.timestamp_offsets.len() as u32);
+        for &o in &d.timestamp_offsets { w.u64(o); }
         // sparse_index
-        w.u32(self.sparse_index.len() as u32);
-        for (sig, v) in &self.sparse_index {
+        w.u32(d.sparse_index.len() as u32);
+        for (sig, v) in &d.sparse_index {
             w.u32(*sig); w.u32(v.len() as u32);
             for &(ts, off) in v { w.u64(ts); w.u64(off); }
         }
         // event signals + change points
         w.u32(self.event_signals.len() as u32);
         for s in &self.event_signals { w.u32(*s); }
-        w.u32(self.event_change_points.len() as u32);
-        for (sig, pts) in &self.event_change_points {
+        w.u32(d.event_change_points.len() as u32);
+        for (sig, pts) in &d.event_change_points {
             w.u32(*sig); w.u32(pts.len() as u32);
             for &p in pts { w.u64(p as u64); }
         }
@@ -2021,30 +2175,43 @@ impl VcdTrace {
             for _ in 0..n { v.push(r.u64()? as usize); }
             event_change_points.insert(sig, v);
         }
-        let max_index = if timestamps.len() == 0 { 0 } else { timestamps.len() - 1 };
         let lru_cap = std::num::NonZeroUsize::new(64 * 1024).unwrap();
         let filename = vcd.to_string_lossy().to_string();
+        let dump = DumpIndex {
+            timestamps, timestamp_offsets, sparse_index, event_change_points,
+        };
+        let est_ts = dump.timestamps.len();
         Some(VcdTrace {
             id, filename,
             names_blob, name_meta, name_index, signal_ids,
             id_blob, id_offsets, signal_widths, init_off, init_blob,
             name_cache: std::cell::RefCell::new(FxHashMap::default()),
             warned_xinit: std::cell::RefCell::new(std::collections::HashSet::new()),
-            event_signals, event_change_points,
-            timestamps, timestamp_offsets, sparse_index,
+            event_signals,
+            dump_index: {
+                let c = std::cell::OnceCell::new();
+                let _ = c.set(dump);
+                c
+            },
+            est_ts,
             lru_cache: RefCell::new(lru::LruCache::new(lru_cap)),
             signal_cache: Mutex::new(HashMap::new()),
-            col_cache: HashMap::new(),
-            off_cache: HashMap::new(),
+            col_cache: std::cell::RefCell::new(HashMap::new()),
+            off_cache: std::cell::RefCell::new(HashMap::new()),
             reader: RefCell::new(reader),
             header_end_offset,
+            dump_data_start: header_end_offset,
             scopes, timescale_exp,
-            current_index: 0, max_index,
+            current_index: 0,
         })
     }
 }
 
 impl Trace for VcdTrace {
+    fn prepare(&self, names: &[String]) {
+        self.prepare_names(names);
+    }
+
     fn id(&self) -> &TraceId {
         &self.id
     }
@@ -2055,10 +2222,10 @@ impl Trace for VcdTrace {
 
     fn step(&mut self, steps: usize) -> Result<(), String> {
         let new_index = self.current_index.saturating_add(steps);
-        if new_index > self.max_index {
+        if new_index > self.max_index() {
             return Err(format!(
                 "Step {} would exceed max index {}",
-                steps, self.max_index
+                steps, self.max_index()
             ));
         }
         self.current_index = new_index;
@@ -2066,7 +2233,7 @@ impl Trace for VcdTrace {
     }
 
     fn signal_value(&self, name: &str, offset: usize) -> Result<ScalarValue, String> {
-        if self.timestamps.len() == 0 {
+        if self.dump().timestamps.len() == 0 {
             // 只有头、没有 dump 段(空/截断到定义结束): 时间线为空 → 返回初值
             let sig_idx = self.resolve_idx(name).ok_or_else(|| format!("Unknown signal: {}", name))?;
             let width = self.signal_widths.get(sig_idx as usize).copied().unwrap_or(1) as usize;
@@ -2077,16 +2244,16 @@ impl Trace for VcdTrace {
                 other => other,
             });
         }
-        let idx = if offset < self.timestamps.len() {
+        let idx = if offset < self.dump().timestamps.len() {
             offset
         } else {
             return Err(format!(
                 "signal_value: offset {} out of range (max {}) for signal '{}'",
-                offset, self.timestamps.len().max(1u64 as usize)-1, name
+                offset, self.dump().timestamps.len().max(1u64 as usize)-1, name
             ));
         };
 
-        let target_time = self.timestamps.get(idx);
+        let target_time = self.dump().timestamps.get(idx);
         let sig_idx = self.resolve_idx(name)
             .ok_or_else(|| format!(
                 "signal '{}' not found. Available signals (first 5): {:?}",
@@ -2192,12 +2359,13 @@ impl Trace for VcdTrace {
     }
 
     fn max_index(&self) -> usize {
-        self.max_index
+        let d = self.dump();
+        if d.timestamps.len() == 0 { 0 } else { d.timestamps.len() - 1 }
     }
 
     fn set_index(&mut self, index: usize) -> Result<(), String> {
-        if index > self.max_index {
-            return Err(format!("Index {} exceeds max {}", index, self.max_index));
+        if index > self.max_index() {
+            return Err(format!("Index {} exceeds max {}", index, self.max_index()));
         }
         self.current_index = index;
         Ok(())
@@ -2213,7 +2381,9 @@ impl Trace for VcdTrace {
         }
         let sig_idx = self.resolve_idx(name)
             .ok_or_else(|| format!("Unknown signal: {}", name))?;
-        if self.timestamps.len() == 0 {
+        // 先声明"我要这个信号的变更列": 索引尚未构建时, 时间戳表与变更列在
+        // 同一次遍历里一起算出(冷启动只读一遍文件)。
+        if self.ensure_dump_index(&[sig_idx]).timestamps.len() == 0 {
             return Ok(Vec::new()); // 空时间线
         }
         if matches!(cond, FindCondition::Rising | FindCondition::Falling) {
@@ -2223,7 +2393,7 @@ impl Trace for VcdTrace {
             eprintln!("  sig_idx={} id={:?} anchors={}",
                       sig_idx,
                       self.id_bytes(sig_idx),
-                      self.sparse_index.get(&sig_idx).map(|m| m.len()).unwrap_or(0));
+                      self.dump().sparse_index.get(&sig_idx).map(|m| m.len()).unwrap_or(0));
             let idb = self.id_bytes(sig_idx).unwrap_or_default().to_vec();
             let h = crate::trace::vcd::hash_sig_id(&idb);
             eprintln!("  hash={:#x} sid has it: {}", h,
@@ -2232,7 +2402,7 @@ impl Trace for VcdTrace {
 
         // Event signal fast path: change points already recorded during load
         if self.event_signals.contains(&sig_idx) {
-            if let Some(points) = self.event_change_points.get(&sig_idx) {
+            if let Some(points) = self.dump().event_change_points.get(&sig_idx) {
                 if matches!(&cond,
                     FindCondition::Value(1) | FindCondition::ValueI64(1)
                     | FindCondition::Rising | FindCondition::Neq(0)
@@ -2242,7 +2412,7 @@ impl Trace for VcdTrace {
                 }
                 if matches!(&cond, FindCondition::Neq(1) | FindCondition::Low) {
                     // All timestamps except event points
-                    let all: Vec<usize> = (0..=self.max_index).collect();
+                    let all: Vec<usize> = (0..=self.max_index()).collect();
                     let points_set: std::collections::HashSet<usize> = points.iter().copied().collect();
                     return Ok(all.into_iter().filter(|i| !points_set.contains(i)).collect());
                 }
@@ -2253,7 +2423,7 @@ impl Trace for VcdTrace {
         // Single authoritative per-index semantics over the change list.
         let all = self.anchored_changes(sig_idx)?;
         let init = self.initial_value_at(sig_idx);
-        Ok(eval_change_list(self.max_index, &all, &init, &cond))
+        Ok(eval_change_list(self.max_index(), &all, &init, &cond))
     }
 
     fn find_indices_batch(&self, entries: &[BatchEntry]) -> Result<Vec<(String, Vec<usize>)>, String> {
@@ -2384,7 +2554,7 @@ impl Trace for VcdTrace {
                         if std::env::var("WAL_DEBUG_FIND").is_ok() {
                             eprintln!("batch seed[{}] sig={}", i, bs.sig_idx);
                         }
-                        Some(self.read_signal_value_at(bs.sig_idx, self.timestamps.get(boundary_ts[i] - 1)))
+                        Some(self.read_signal_value_at(bs.sig_idx, self.dump().timestamps.get(boundary_ts[i] - 1)))
                     }).collect()
                 } else {
                     vec![None; batch_sigs.len()]
@@ -2572,7 +2742,7 @@ impl Trace for VcdTrace {
     }
 
     fn timestamp_at(&self, index: usize) -> Option<u64> {
-        if index < self.timestamps.len() { Some(self.timestamps.get(index)) } else { None }
+        if index < self.dump().timestamps.len() { Some(self.dump().timestamps.get(index)) } else { None }
     }
 
     fn timescale_exp(&self) -> Option<i8> {
@@ -2583,7 +2753,7 @@ impl Trace for VcdTrace {
         let sig_idx = self.resolve_idx(name)
             .ok_or_else(|| format!("Unknown signal: {}", name))?;
         // Event signals: change points already recorded during load
-        if let Some(points) = self.event_change_points.get(&sig_idx) {
+        if let Some(points) = self.dump().event_change_points.get(&sig_idx) {
             let mut out = Vec::with_capacity(points.len());
             for &i in points {
                 let idx = i as usize;
@@ -2597,7 +2767,7 @@ impl Trace for VcdTrace {
         // sparse-index prepend is gone with the sampled anchors.
         let all = self.anchored_changes(sig_idx)?;
         let init = self.initial_value_at(sig_idx);
-        let mut changes = eval_change_list(self.max_index, &all, &init, &FindCondition::Changed);
+        let mut changes = eval_change_list(self.max_index(), &all, &init, &FindCondition::Changed);
         if let Some(&(first_idx, _)) = all.first() {
             let fi = first_idx as usize;
             if changes.first() != Some(&fi) {

@@ -50,6 +50,11 @@ pub trait Trace {
     /// record (unlike `find_indices` with `Changed`, which skips it).
     fn change_points(&self, name: &str) -> Result<Vec<(usize, ScalarValue)>, String>;
 
+    /// 查询前置声明: 本次查询会碰这些信号(按该 trace 自己的命名规则解析)。
+    /// 能"顺手算出来"的后端可把"构建索引"和"提取这些信号的变更列"合并成
+    /// 一次遍历(冷启动少读一遍文件); 默认无操作。
+    fn prepare(&self, _names: &[String]) {}
+
     /// Timescale exponent: the time unit is 10^n seconds (None if unknown).
     fn timescale_exp(&self) -> Option<i8>;
 
