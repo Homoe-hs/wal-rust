@@ -80,3 +80,30 @@ find_indices/change_points 共用 `anchored_changes()`(缓存列或冷扫描),�
 ## 0.12.3 — count-var 快路径
 `(define v (get s)) (count (= (get s) v))` 原走逐拍回退(每拍一次完整值读)
 → 0.12.3 在查询期把绑定变量替换为字面量,走锚定扫描;11.5GB >90s→26s。
+
+## 0.13.0 (2026-09-10) — 信号头 arena + 开放寻址(A1)
+
+动机: 4M 信号波形光**解析 header** 就要 2.3-2.9s / 1.2GB,而 4M 个 `$comment`
+只要 0.15s —— 代价是**每信号**的(独立 `Arc<str>` + `FxHashMap` 名字表 +
+每信号 `HashMap` 初值条目),不是每字节的。
+
+改造三件:
+1. 名字 arena: `names_blob: Vec<u8>` + `name_meta: Vec<u64>`(低 32 位偏移 /
+   高 32 位长度),`Arc<str>` 与逐信号分配全部消失;
+2. `OpenIndex`: 开放寻址哈希表(线性探测,`mix64(h)` 打散 —— 直接用 FNV 低位
+   是周期性的,4M 信号会退化到 19.4s),名字表与 ID 表共用;
+3. `$dumpvars` 初值改紧凑 blob(`init_off: Vec<u32>` + `init_blob: Vec<u8>`),
+   取代 `HashMap<u32, VcdValue>`。
+
+| 指标(交错 A/B 两轮) | 0.12.45 | 0.13.0 |
+|:--|--:|--:|
+| 4M 信号头解析 wall | 2.35–2.90s | **1.59–1.82s** |
+| 4M 信号峰值 RSS | 1.21–1.24GB | **968MB** |
+| 1M 信号(83MB) wall | 0.63s | **0.45s** |
+| 1M 信号 + dumpvars 初值 RSS | 347MB | **282MB** |
+
+语义零变化: `tests/regression_matrix.rs` 38/38、`tests/fuzz_vcd_fst_diff.rs`
+N=300 三闸全绿、`scripts/diff_find.sh` ALL MATCH;bench_2g `(count (= (get "s0") 1))`
+= 77629、bench_10g(58.7GB) = 92871 与旧版一致。
+跨进程缓存向后兼容: v0.12.x 写的 `.wcol` + 旁挂 `.col` 被 0.13.0 直接命中
+(58.7GB 同查询 **2.47s**)。

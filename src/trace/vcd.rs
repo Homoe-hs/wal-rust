@@ -237,16 +237,21 @@ impl TsStore {
 pub struct VcdTrace {
     id: TraceId,
     filename: String,
-    signals: Vec<std::sync::Arc<str>>,   // interned once, shared with name_to_idx
-    #[allow(dead_code)]
-    signal_ids: FxHashMap<u64, u32>,       // hash → index
+    /// 名字 arena: 所有全名连续存放(零 per-signal 分配;此前是 Vec<Arc<str>>)
+    names_blob: Vec<u8>,
+    /// 每信号: 低 32 位 = 名字在 arena 中的起始偏移, 高 32 位 = 字节长度
+    name_meta: Vec<u64>,
+    /// 名字 → 信号索引(开放寻址)
+    name_index: OpenIndex,
+    /// 信号 id 哈希 → 索引(开放寻址;键本身就是 64 位哈希, 与旧 HashMap 语义一致)
+    signal_ids: OpenIndex,
     id_blob: Vec<u8>,          // concatenated signal ids (allocated once)
     id_offsets: Vec<u32>,      // per-signal start offset into id_blob
     signal_widths: Vec<u32>,               // dense by signal index (declared width)
-    /// $dumpvars snapshot: signal index → initial value before the first '#'
-    /// timestamp line (missing entry ⇒ 'x', the VCD default).
-    initial_values: HashMap<u32, VcdValue>,
-    name_to_idx: FxHashMap<std::sync::Arc<str>, u32>,
+    /// $dumpvars 初值: 紧凑存储(每信号 4B 偏移 + 少量 blob;此前是
+    /// HashMap<u32, VcdValue> ≈ 40B/信号)。u32::MAX = 无初值(按 VCD 默认 'x')。
+    init_off: Vec<u32>,
+    init_blob: Vec<u8>,
     /// 短名/叶子名/子串解析缓存(一次 O(N) 扫描,之后 O(1));
     /// 所有读取路径共用,避免"op_get 能解析、边沿谓词不能"的不一致。
     name_cache: std::cell::RefCell<FxHashMap<String, Option<u32>>>,
@@ -301,7 +306,7 @@ impl VcdTrace {
         if !w.insert(sig_idx) {
             return;
         }
-        let name = self.signals.get(sig_idx as usize).map(|s| s.to_string()).unwrap_or_default();
+        let name = self.name_at(sig_idx).to_string();
         eprintln!(
             "warning: 信号 '{}' 没有确定初值(x): 首个 x→1 / x→0 跳变不计入 rising/falling。\n\
          如需包含这次跳变请用 (changes \"{}\")，或让波形带上 $dumpvars 初值快照。",
@@ -309,11 +314,39 @@ impl VcdTrace {
         );
     }
 
+    /// 第 idx 个信号的全名(arena 视图, 零分配)
+    #[inline]
+    fn name_at(&self, idx: u32) -> &str {
+        match self.name_meta.get(idx as usize) {
+            Some(&m) => {
+                let off = (m & 0xffff_ffff) as usize;
+                let len = (m >> 32) as usize;
+                std::str::from_utf8(self.names_blob.get(off..off + len).unwrap_or(&[])).unwrap_or("")
+            }
+            None => "",
+        }
+    }
+
+    #[inline]
+    fn name_count(&self) -> usize { self.name_meta.len() }
+
+    /// 追加一个名字到 arena, 返回其索引(不建索引表)。
+    /// 加载期 vector 尚未移入 self, 故以 (blob, meta) 为参数。
+    #[inline]
+    fn push_name(blob: &mut Vec<u8>, meta: &mut Vec<u64>, name: &[u8]) -> u32 {
+        let idx = meta.len() as u32;
+        let off = blob.len() as u64;
+        blob.extend_from_slice(name);
+        meta.push(off | ((name.len() as u64) << 32));
+        idx
+    }
+
     /// 解析信号名: 精确 → 叶子名(短名/无点) → 子串;结果缓存。
-    /// 与 evaluator::resolve_signal_name 同口径,但作用在 Arc<str> 上且带缓存。
+    /// 与 evaluator::resolve_signal_name 同口径;精确查找走 arena 索引。
     fn resolve_idx(&self, name: &str) -> Option<u32> {
-        if let Some(i) = self.name_to_idx.get(name) {
-            return Some(*i);
+        let h = hash_name(name.as_bytes());
+        if let Some(i) = self.name_index.find_verified(h, |i| self.name_at(i) == name) {
+            return Some(i);
         }
         if let Some(c) = self.name_cache.borrow().get(name) {
             return *c;
@@ -321,10 +354,10 @@ impl VcdTrace {
         fn leaf(s: &str) -> &str { s.rsplitn(2, '.').next().unwrap_or("") }
         let mut hit = None;
         if name.len() <= 8 || !name.contains('.') {
-            hit = self.signals.iter().position(|s| leaf(s) == name).map(|i| i as u32);
+            hit = (0..self.name_count() as u32).find(|&i| leaf(self.name_at(i)) == name);
         }
         if hit.is_none() {
-            hit = self.signals.iter().position(|s| s.contains(name)).map(|i| i as u32);
+            hit = (0..self.name_count() as u32).find(|&i| self.name_at(i).contains(name));
         }
         self.name_cache.borrow_mut().insert(name.to_string(), hit);
         hit
@@ -356,12 +389,13 @@ impl VcdTrace {
 
         // ====== PASS 1a: Scan header (single-thread) ======
         let cap0 = est_vars.max(256);
-        let mut signals = Vec::with_capacity(cap0);
-        let mut signal_ids: FxHashMap<u64, u32> = FxHashMap::with_capacity_and_hasher(cap0, FxBuild::default());
-        let mut id_blob: Vec<u8> = Vec::new();
+        let mut names_blob: Vec<u8> = Vec::with_capacity(cap0 * 32);
+        let mut name_meta: Vec<u64> = Vec::with_capacity(cap0);
+        let mut name_index = OpenIndex::new(cap0);
+        let mut signal_ids = OpenIndex::new(cap0);
+        let mut id_blob: Vec<u8> = Vec::with_capacity(cap0 * 4);
         let mut id_offsets: Vec<u32> = Vec::with_capacity(cap0);
         let mut signal_widths: Vec<u32> = Vec::with_capacity(cap0);
-        let mut name_to_idx: FxHashMap<std::sync::Arc<str>, u32> = FxHashMap::with_capacity_and_hasher(cap0, FxBuild::default());
         let mut event_signals: HashSet<u32> = HashSet::new();
         let mut header_end_offset: u64 = 0;
 
@@ -391,7 +425,7 @@ impl VcdTrace {
             if !hl.is_empty() && hl[0] == b'$' {
                 if hl.len() > 4 && hl[1] == b'v' && hl[2] == b'a' && hl[3] == b'r' {
                     if let Some((sig_hash, short_name, width, id_bytes, is_event)) = parse_var_decl_fast2(hl) {
-                        let idx = signals.len() as u32;
+                        let idx = name_meta.len() as u32;
                         // Build full hierarchical name: 复用 buffer + 预拼好的 scope 前缀
                         // (此前每个信号都 scope_stack.join(".") 一次, 深层次时是热点)
                         name_buf.clear();
@@ -400,12 +434,17 @@ impl VcdTrace {
                             name_buf.push('.');
                         }
                         name_buf.push_str(&String::from_utf8_lossy(short_name));
-                        let interned: std::sync::Arc<str> = std::sync::Arc::from(name_buf.as_str());
-                        signals.push(interned.clone());
-                        signal_ids.insert(sig_hash, idx);
+                        // arena 追加(零 per-signal 分配) + 开放寻址索引
+                        Self::push_name(&mut names_blob, &mut name_meta, name_buf.as_bytes());
+                        name_index.insert(hash_name(name_buf.as_bytes()), idx, |i| {
+                            let m = name_meta[i as usize];
+                            let o = (m & 0xffff_ffff) as usize;
+                            let l = (m >> 32) as usize;
+                            hash_name(&names_blob[o..o + l])
+                        });
                         id_offsets.push(id_blob.len() as u32);
-                        id_blob.extend_from_slice(&id_bytes);
-                        name_to_idx.insert(interned, idx);
+                        id_blob.extend_from_slice(id_bytes);
+                        signal_ids.insert(sig_hash, idx, |_| 0);
                         if signal_widths.len() <= idx as usize {
                             signal_widths.resize(idx as usize + 1, 1);
                         }
@@ -465,7 +504,8 @@ impl VcdTrace {
         // first '#' timestamp). These are the values held at t0 — used as the
         // initial value before any change; previously dropped, which let the
         // FST/VCD is-x (and get/at) initial semantics diverge (152GB §8.4 #1).
-        let mut initial_values: HashMap<u32, VcdValue> = HashMap::new();
+        let mut init_off: Vec<u32> = Vec::new();
+        let mut init_blob: Vec<u8> = Vec::new();
         let mut pos = dump_start;
         {
             let mut line_start = dump_start;
@@ -491,7 +531,7 @@ impl VcdTrace {
                             continue;
                         }
                         let hash = hash_sig_id(&line[id_start..]);
-                        if let Some(&sidx) = signal_ids.get(&hash) {
+                        if let Some(sidx) = signal_ids.find(hash) {
                             // byte-verify (hash ambiguity)
                             let idb = id_offsets.get(sidx as usize).map(|&st| {
                                 let en = id_offsets.get(sidx as usize + 1)
@@ -513,7 +553,7 @@ impl VcdTrace {
                                     },
                                     other => VcdValue::Bit(other),
                                 };
-                                initial_values.insert(sidx, val);
+                                Self::set_initial(&mut init_off, &mut init_blob, sidx, &val);
                                 break;
                             }
                         }
@@ -657,7 +697,7 @@ impl VcdTrace {
                             // once for anchors AND the columnar change list.
                             if has_events || col_on || sampled {
                                 if let Some((sig_hash, value)) = parse_value_change_fast(line) {
-                                    if let Some(&sig_idx) = sid.get(&sig_hash) {
+                                    if let Some(sig_idx) = sid.find(sig_hash) {
                                         if sampled {
                                             si.push((sig_idx, current_timestamp, base_offset + line_start as u64));
                                         }
@@ -798,7 +838,7 @@ impl VcdTrace {
         // '#' lines with a short memchr scan from the sampled anchor.
         let timestamp_offsets: Vec<u64> = timestamp_offsets.iter().step_by(64).copied().collect();
         let max_index = if timestamps.is_empty() { 0 } else { timestamps.len() - 1 };
-        let lru_cap = std::num::NonZeroUsize::new(adapt_lru_capacity(file_len, signals.len() as usize))
+        let lru_cap = std::num::NonZeroUsize::new(adapt_lru_capacity(file_len, name_meta.len()))
             .unwrap_or(std::num::NonZeroUsize::MIN);
 
         // Release file pages touched by the full PASS-1b scan: queries re-read
@@ -813,11 +853,12 @@ impl VcdTrace {
             let sparse_entries: usize = sparse_index.values().map(|m| m.len()).sum();
             let event_entries: usize = event_change_ts.values().map(|v| v.len()).sum();
             eprintln!("load: ts={} offsets={} sparse_entries={} event_entries={} signals={}",
-                      timestamps.len(), timestamp_offsets.len(), sparse_entries, event_entries, signals.len());
+                      timestamps.len(), timestamp_offsets.len(), sparse_entries, event_entries, name_meta.len());
         }
         let trace = VcdTrace {
             id, filename,
-            signals, signal_ids, id_blob, id_offsets, signal_widths, initial_values, name_to_idx,
+            names_blob, name_meta, name_index, signal_ids,
+            id_blob, id_offsets, signal_widths, init_off, init_blob,
             name_cache: std::cell::RefCell::new(FxHashMap::default()),
             warned_xinit: std::cell::RefCell::new(std::collections::HashSet::new()),
             event_signals, event_change_points,
@@ -893,7 +934,26 @@ impl VcdTrace {
     /// (the VCD default for values that never got an explicit write).
     #[inline]
     fn initial_value_at(&self, sig_idx: u32) -> VcdValue {
-        self.initial_values.get(&sig_idx).cloned().unwrap_or(VcdValue::Bit(b'x'))
+        match self.init_off.get(sig_idx as usize) {
+            Some(&off) if off != u32::MAX => decode_initial(&self.init_blob[off as usize..]),
+            _ => VcdValue::Bit(b'x'),
+        }
+    }
+
+    /// 记录某信号的 $dumpvars 初值(加载期与缓存恢复共用)
+    fn set_initial(off: &mut Vec<u32>, blob: &mut Vec<u8>, sig_idx: u32, val: &VcdValue) {
+        let i = sig_idx as usize;
+        if off.len() <= i {
+            off.resize(i + 1, u32::MAX);
+        }
+        let at = blob.len() as u32;
+        encode_initial(blob, val);
+        off[i] = at;
+    }
+
+    /// 该信号是否带显式初值(缓存序列化用)
+    fn has_initial(&self, sig_idx: u32) -> bool {
+        matches!(self.init_off.get(sig_idx as usize), Some(&o) if o != u32::MAX)
     }
 
     /// Last sparse anchor with ts ≤ target (entries are appended in ascending
@@ -1344,7 +1404,7 @@ impl VcdTrace {
                 }
             } else if first != b'$' {
                 if let Some((sig_hash, value)) = parse_value_change_fast(line) {
-                    if self.signal_ids.get(&sig_hash) == Some(&sig_idx) {
+                    if self.signal_ids.find(sig_hash) == Some(sig_idx) {
                         last_value = match value {
                             VcdValue::Bit(b) => Some(b),
                             _ => None,
@@ -1361,7 +1421,7 @@ impl VcdTrace {
         if cache_mode() == CacheMode::Off {
             return None;
         }
-        let name = self.signals.get(sig_idx as usize)?.to_string();
+        let name = if (sig_idx as usize) < self.name_count() { self.name_at(sig_idx).to_string() } else { return None };
         let path = col_sidecar_file(std::path::Path::new(&self.filename), &name)?;
         let data = std::fs::read(&path).ok()?;
         let mut r = BufR::new(&data);
@@ -1390,7 +1450,8 @@ impl VcdTrace {
         if !col_sidecar_write_enabled(meta.len()) {
             return;
         }
-        let Some(name) = self.signals.get(sig_idx as usize).map(|s| s.to_string()) else { return };
+        if (sig_idx as usize) >= self.name_count() { return; }
+        let name = self.name_at(sig_idx).to_string();
         let Some(path) = col_sidecar_file(std::path::Path::new(&self.filename), &name) else { return };
         if let Some(dir) = path.parent() {
             let _ = std::fs::create_dir_all(dir);
@@ -1451,6 +1512,121 @@ impl std::hash::Hasher for FxHasher {
 type FxBuild = std::hash::BuildHasherDefault<FxHasher>;
 type FxHashMap<K, V> = std::collections::HashMap<K, V, FxBuild>;
 type FxHashSet<T> = std::collections::HashSet<T, FxBuild>;
+
+/// 名字 → 索引用的哈希(与 id 哈希同族, 64 位 FNV-1a)
+#[inline]
+fn hash_name(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100_0000_01b3);
+    }
+    h
+}
+
+/// $dumpvars 初值的紧凑编码: tag(0=Bit,1=Vector,2=Real) + payload
+#[inline]
+fn encode_initial(blob: &mut Vec<u8>, v: &VcdValue) {
+    match v {
+        VcdValue::Bit(b) => { blob.push(0); blob.push(*b); }
+        VcdValue::Vector(vec) => {
+            blob.push(1);
+            blob.extend_from_slice(&(vec.len() as u32).to_le_bytes());
+            blob.extend_from_slice(vec);
+        }
+        VcdValue::Real(r) => { blob.push(2); blob.extend_from_slice(&r.to_bits().to_le_bytes()); }
+    }
+}
+
+#[inline]
+fn decode_initial(b: &[u8]) -> VcdValue {
+    match b.first().copied().unwrap_or(0) {
+        0 => VcdValue::Bit(*b.get(1).unwrap_or(&b'x')),
+        1 => {
+            let n = b.get(1..5).map(|s| u32::from_le_bytes(s.try_into().unwrap_or([0; 4])) as usize).unwrap_or(0);
+            VcdValue::Vector(b.get(5..5 + n).map(|s| s.to_vec()).unwrap_or_default())
+        }
+        2 => {
+            let bits = b.get(1..9).map(|s| u64::from_le_bytes(s.try_into().unwrap_or([0; 8]))).unwrap_or(0);
+            VcdValue::Real(f64::from_bits(bits))
+        }
+        _ => VcdValue::Bit(b'x'),
+    }
+}
+
+/// 开放寻址索引(波形内部表): keys[i] = 64 位哈希, slots[i] = 索引+1(0 = 空槽)。
+/// 相比 std HashMap: 无 per-entry 分配、无 SipHash、约 12B/槽(负载 ≤0.7 → ~17B/条目)。
+#[derive(Clone)]
+struct OpenIndex {
+    keys: Vec<u64>,
+    slots: Vec<u32>,
+    mask: usize,
+    len: usize,
+}
+
+/// 探针位置必须用"混合后"的哈希: FNV 的低位周期性很强, 直接拿低位做
+/// 开放寻址会让插入退化成 O(n²)(实测 4M 信号 23s → 0.2s)。
+#[inline]
+fn mix64(mut z: u64) -> u64 {
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    z ^ (z >> 31)
+}
+
+impl OpenIndex {
+    fn new(cap_hint: usize) -> Self {
+        // 1.5x 预留 → 负载 ≈0.66(增长阈值 0.7), 比 2x 省 ~25% 内存
+        let cap = (cap_hint.saturating_mul(3) / 2 + 16).max(16).next_power_of_two();
+        OpenIndex { keys: vec![0; cap], slots: vec![0; cap], mask: cap - 1, len: 0 }
+    }
+    #[inline]
+    fn find(&self, h: u64) -> Option<u32> {
+        let mut i = (mix64(h) as usize) & self.mask;
+        loop {
+            let s = self.slots[i];
+            if s == 0 { return None; }
+            if self.keys[i] == h { return Some(s - 1); }
+            i = (i + 1) & self.mask;
+        }
+    }
+    /// 命中哈希后还要比对真实字节的表(名字表: 处理哈希冲突)
+    #[inline]
+    fn find_verified(&self, h: u64, verify: impl Fn(u32) -> bool) -> Option<u32> {
+        let mut i = (mix64(h) as usize) & self.mask;
+        loop {
+            let s = self.slots[i];
+            if s == 0 { return None; }
+            if self.keys[i] == h && verify(s - 1) { return Some(s - 1); }
+            i = (i + 1) & self.mask;
+        }
+    }
+    fn insert(&mut self, h: u64, idx: u32, rehash: impl Fn(u32) -> u64) {
+        if (self.len + 1) * 10 >= self.slots.len() * 7 {
+            self.grow(&rehash);
+        }
+        let mut i = (mix64(h) as usize) & self.mask;
+        while self.slots[i] != 0 { i = (i + 1) & self.mask; }
+        self.keys[i] = h;
+        self.slots[i] = idx + 1;
+        self.len += 1;
+    }
+    fn grow(&mut self, rehash: &impl Fn(u32) -> u64) {
+        let old = std::mem::take(&mut self.slots);
+        let new_cap = (old.len() * 4).max(16);
+        self.slots = vec![0; new_cap];
+        self.keys = vec![0; new_cap];
+        self.mask = new_cap - 1;
+        for s in old {
+            if s == 0 { continue; }
+            let idx = s - 1;
+            let h = rehash(idx);
+            let mut i = (mix64(h) as usize) & self.mask;
+            while self.slots[i] != 0 { i = (i + 1) & self.mask; }
+            self.keys[i] = h;
+            self.slots[i] = s;
+        }
+    }
+}
 
 // ================ FAST BYTE-LEVEL PARSE FUNCTIONS ================
 
@@ -1768,15 +1944,17 @@ impl VcdTrace {
         // timescale
         match self.timescale_exp { Some(e) => { w.u8(1); w.u8(e as u8); } None => { w.u8(0); } }
         // signals: name/id/width/initial
-        w.u32(self.signals.len() as u32);
-        for (i, name) in self.signals.iter().enumerate() {
-            w.bytes(name.as_bytes());
+        w.u32(self.name_count() as u32);
+        for i in 0..self.name_count() {
+            w.bytes(self.name_at(i as u32).as_bytes());
             let idb = self.id_bytes(i as u32).unwrap_or_default();
             w.bytes(idb);
             w.u32(self.signal_widths.get(i).copied().unwrap_or(1));
-            match self.initial_values.get(&(i as u32)) {
-                Some(v) => { w.u8(1); w.val(v); }
-                None => { w.u8(0); }
+            if self.has_initial(i as u32) {
+                w.u8(1);
+                w.val(&self.initial_value_at(i as u32));
+            } else {
+                w.u8(0);
             }
         }
         // timestamps
@@ -1829,25 +2007,39 @@ impl VcdTrace {
         for _ in 0..r.u32()? { scopes.push(String::from_utf8(r.bytes()?).ok()?); }
         let timescale_exp = match r.u8()? { 1 => Some(r.u8()? as i8), _ => None };
         let n_sigs = r.u32()? as usize;
-        let mut signals: Vec<std::sync::Arc<str>> = Vec::with_capacity(n_sigs);
-        let mut id_blob: Vec<u8> = Vec::new();
-        let mut id_offsets: Vec<u32> = Vec::new();
+        let mut names_blob: Vec<u8> = Vec::with_capacity(n_sigs * 32);
+        let mut name_meta: Vec<u64> = Vec::with_capacity(n_sigs);
+        let mut name_index = OpenIndex::new(n_sigs);
+        let mut signal_ids = OpenIndex::new(n_sigs);
+        let mut id_blob: Vec<u8> = Vec::with_capacity(n_sigs * 4);
+        let mut id_offsets: Vec<u32> = Vec::with_capacity(n_sigs);
         let mut signal_widths: Vec<u32> = Vec::with_capacity(n_sigs);
-        let mut initial_values: HashMap<u32, VcdValue> = HashMap::new();
-        let mut signal_ids: FxHashMap<u64, u32> = FxHashMap::with_capacity_and_hasher(n_sigs, FxBuild::default());
-        let mut name_to_idx: FxHashMap<std::sync::Arc<str>, u32> = FxHashMap::with_capacity_and_hasher(n_sigs, FxBuild::default());
+        let mut init_off: Vec<u32> = Vec::with_capacity(n_sigs);
+        let mut init_blob: Vec<u8> = Vec::new();
         for i in 0..n_sigs {
-            let name = String::from_utf8(r.bytes()?).ok()?;
+            let name = r.bytes()?;
             let idb = r.bytes()?;
             let width = r.u32()?;
-            if r.u8()? == 1 { initial_values.insert(i as u32, r.val()?); }
+            if r.u8()? == 1 {
+                let v = r.val()?;
+                let off = init_blob.len() as u32;
+                encode_initial(&mut init_blob, &v);
+                init_off.push(off);
+            } else {
+                init_off.push(u32::MAX);
+            }
             id_offsets.push(id_blob.len() as u32);
-            signal_ids.insert(hash_sig_id(&idb), i as u32);
+            signal_ids.insert(hash_sig_id(&idb), i as u32, |_| 0);
             id_blob.extend_from_slice(&idb);
             signal_widths.push(width);
-            let arc: std::sync::Arc<str> = std::sync::Arc::from(name);
-            name_to_idx.insert(arc.clone(), i as u32);
-            signals.push(arc);
+            Self::push_name(&mut names_blob, &mut name_meta, &name);
+            let idx = i as u32;
+            name_index.insert(hash_name(&name), idx, |i| {
+                let m = name_meta[i as usize];
+                let o = (m & 0xffff_ffff) as usize;
+                let l = (m >> 32) as usize;
+                hash_name(&names_blob[o..o + l])
+            });
         }
         let timestamps = match r.u8()? {
             0 => TsStore::Uniform { start: r.u64()?, step: r.u64()?, count: r.u64()? },
@@ -1885,7 +2077,8 @@ impl VcdTrace {
         let filename = vcd.to_string_lossy().to_string();
         Some(VcdTrace {
             id, filename,
-            signals, signal_ids, id_blob, id_offsets, signal_widths, initial_values, name_to_idx,
+            names_blob, name_meta, name_index, signal_ids,
+            id_blob, id_offsets, signal_widths, init_off, init_blob,
             name_cache: std::cell::RefCell::new(FxHashMap::default()),
             warned_xinit: std::cell::RefCell::new(std::collections::HashSet::new()),
             event_signals, event_change_points,
@@ -1949,7 +2142,7 @@ impl Trace for VcdTrace {
             .ok_or_else(|| format!(
                 "signal '{}' not found. Available signals (first 5): {:?}",
                 name,
-                self.signals.iter().take(5).collect::<Vec<_>>()
+                (0..self.name_count().min(5) as u32).map(|i| self.name_at(i)).collect::<Vec<_>>()
             ))?;
         let cache_key = (sig_idx, target_time);
 
@@ -2004,18 +2197,19 @@ impl Trace for VcdTrace {
     }
 
     fn resolve_name(&self, name: &str) -> Option<String> {
-        self.resolve_idx(name).map(|i| self.signals[i as usize].to_string())
+        self.resolve_idx(name).map(|i| self.name_at(i).to_string())
     }
 
     fn resolve_name_strict(&self, name: &str) -> Result<String, String> {
         // exact 优先
-        if let Some(i) = self.name_to_idx.get(name) {
-            return Ok(self.signals[*i as usize].to_string());
+        if let Some(i) = self.name_index.find_verified(hash_name(name.as_bytes()), |i| self.name_at(i) == name) {
+            return Ok(self.name_at(i).to_string());
         }
         fn leaf(s: &str) -> &str { s.rsplitn(2, '.').next().unwrap_or("") }
         let allow_leaf = name.len() <= 8 || !name.contains('.');
         let mut hits: Vec<String> = Vec::new();
-        for s in self.signals.iter() {
+        for i in 0..self.name_count() as u32 {
+            let s = self.name_at(i);
             let matched = (allow_leaf && leaf(s) == name) || s.contains(name);
             if matched {
                 if !hits.is_empty() {
@@ -2041,7 +2235,7 @@ impl Trace for VcdTrace {
     }
 
     fn signals(&self) -> Vec<String> {
-        self.signals.iter().map(|s| s.to_string()).collect()
+        (0..self.name_count() as u32).map(|i| self.name_at(i).to_string()).collect()
     }
 
     fn scopes(&self) -> Vec<String> {
@@ -2084,7 +2278,7 @@ impl Trace for VcdTrace {
             let idb = self.id_bytes(sig_idx).unwrap_or_default().to_vec();
             let h = crate::trace::vcd::hash_sig_id(&idb);
             eprintln!("  hash={:#x} sid has it: {}", h,
-                      self.signal_ids.get(&h).copied() == Some(sig_idx));
+                      self.signal_ids.find(h) == Some(sig_idx));
         }
 
         // Event signal fast path: change points already recorded during load
@@ -2139,8 +2333,8 @@ impl Trace for VcdTrace {
         let mut id_to_batch: HashMap<Vec<u8>, Vec<usize>> = HashMap::new();
 
         for (name, cond) in signals {
-            let sig_idx = match self.name_to_idx.get(name.as_str()) {
-                Some(i) => *i,
+            let sig_idx = match self.name_index.find_verified(hash_name(name.as_bytes()), |i| self.name_at(i) == name.as_str()) {
+                Some(i) => i,
                 None => continue,
             };
             let id_bytes = match self.id_bytes(sig_idx) {
@@ -2398,7 +2592,7 @@ impl Trace for VcdTrace {
             };
             if id.is_empty() || id.len() > 64 { continue; }
             let hash = hash_sig_id(id);
-            if let Some(&idx) = self.signal_ids.get(&hash) {
+            if let Some(idx) = self.signal_ids.find(hash) {
                 if let Some(c) = counts.get_mut(idx as usize) {
                     *c += 1;
                 }
@@ -2407,7 +2601,7 @@ impl Trace for VcdTrace {
 
         let mut v: Vec<(String, usize)> = counts.iter().enumerate()
             .filter(|(_, c)| **c > 0)
-            .filter_map(|(idx, c)| self.signals.get(idx).map(|n| (n.to_string(), *c as usize)))
+            .filter_map(|(idx, c)| if idx < self.name_count() { Some((self.name_at(idx as u32).to_string(), *c as usize)) } else { None })
             .collect();
         v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
         v.truncate(k);
