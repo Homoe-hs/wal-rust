@@ -1027,28 +1027,23 @@ impl VcdTrace {
             }
             return Ok(out);
         }
-        // Cold anchored scan (signals without any index).
-        // Two lightweight passes per chunk:
-        //   1. '#' timestamp line positions (→ per-chunk ts_idx table)
-        //   2. memmem over the chunk for `<id>\n` — value lines can never
-        //      contain "space id newline", so hits are exact by construction
-        //      (digit ids inside 32-bit bit-streams included). Each hit is
-        //      parsed lazily and collapsed per timestamp (last write wins).
+        // 冷扫描(该信号没有任何索引): **单遍逐行**, 与加载期同一套行循环。
+        //
+        // 旧实现每 chunk 走两遍: ① memchr('#') 收时间戳位置 ② memmem(id) 找变更行。
+        // ② 对"ID 字符在数据里高频出现"的信号是灾难: 合成夹具里 s0 的 VCD ID 是
+        // `1`, 而二进制值行全是 0/1 —— memmem 每命中一次只前进 1 字节, 11.5GB
+        // 上 s0 的扫描烧掉 265 CPU·s, 同文件 s1(ID `2`)只要 ~0。逐行单遍把
+        // 代价变成 O(行数)(与 ID 内容无关), 同时省掉 ① 的一整遍 IO。
         let target_id = self.id_bytes(sig_idx)
-            .ok_or_else(|| "find_indices: signal ID bytes not found".to_string())?
-            .to_vec();
-        let target_hash = hash_sig_id(&target_id);
+            .ok_or_else(|| "find_indices: signal ID bytes not found".to_string())?;
         use rayon::prelude::*;
         let shared_mmap = self.reader.borrow().data.clone();
-        let id_len = target_id.len();
         let hdr_end = self.header_end_offset as usize;
         let data_len = shared_mmap.len();
         let n_threads = num_cpus::get().max(4);
         let chunk_size = (data_len.saturating_sub(hdr_end) / n_threads.max(1)).max(64 * 1024);
 
-        // Newline-aligned boundaries (value lines stay with their data; the ts
-        // of a value line before the chunk's first '#' is resolved via the
-        // chunk's ts base — no rewind needed).
+        // 换行对齐的分块边界(值行不会跨块; 块首值行的时间戳归属见下)
         let mut boundaries = vec![hdr_end];
         for i in 1..n_threads {
             let mut p = hdr_end + i * chunk_size;
@@ -1062,126 +1057,70 @@ impl VcdTrace {
         }
         boundaries.push(data_len);
 
-        // (chunk '#'-counts, per-chunk hits: (ts_idx, pos, value))
+        // (本块 '#' 行数, 命中: (块内 ts 序号或 u32::MAX, pos, value))
         let results: Vec<(usize, Vec<(u32, usize, VcdValue)>)> = boundaries[..boundaries.len() - 1]
             .par_iter()
             .enumerate()
             .map(|(ci, &start)| {
                 let end = boundaries[ci + 1];
                 let chunk = &shared_mmap[start..end];
-                let mut ts_pos: Vec<usize> = Vec::new();
+                let mut hits: Vec<(u32, usize, VcdValue)> = Vec::new();
+                let mut ts_count = 0usize;
+                // 本块内最后一个 '#' 的序号; u32::MAX = 本块还没有 '(该行属于上一块)
+                let mut cur_ts = u32::MAX;
                 let mut p = 0usize;
                 while p < chunk.len() {
-                    match memchr::memchr(b'#', &chunk[p..]) {
-                        Some(n) => {
-                            let abs = p + n;
-                            if abs == 0 || chunk[abs - 1] == b'\n' {
-                                // 廉价校验: '#' 后必须是数字且直到行尾都是数字
-                                // (此前每个 '#' 都要再 memchr 找行尾 → 百万级时间戳时
-                                //  这一遍就占扫描时间的大头)
-                                let rest = &chunk[abs + 1..];
-                                let mut k = 0usize;
-                                while k < rest.len() && rest[k].is_ascii_digit() { k += 1; }
-                                if k > 0 && matches!(rest.get(k), Some(b'\n') | Some(b'\r') | None) {
-                                    ts_pos.push(abs);
+                    let line_start = p;
+                    let line_end = match memchr::memchr(b'\n', &chunk[p..]) {
+                        Some(n) => p + n,
+                        None => chunk.len(),
+                    };
+                    let line = &chunk[line_start..line_end];
+                    p = line_end + 1;
+                    match line.first() {
+                        None => {}
+                        Some(b'#') => {
+                            if is_ts_line(line) {
+                                ts_count += 1;
+                                cur_ts = (ts_count - 1) as u32;
+                            }
+                        }
+                        Some(b'$') => {}
+                        Some(_) => {
+                            if let Some((value_part, id)) = split_value_id(line) {
+                                if id == target_id {
+                                    // 取值与 parse_value_change_fast 同一套规则
+                                    let vfirst = value_part[0];
+                                    let value = match vfirst {
+                                        b'b' => VcdValue::Vector(value_part[1..].to_vec()),
+                                        b'r' => match std::str::from_utf8(&value_part[1..])
+                                            .unwrap_or("0").trim().parse::<f64>()
+                                        {
+                                            Ok(r) => VcdValue::Real(r),
+                                            Err(_) => VcdValue::Bit(b'x'),
+                                        },
+                                        other => VcdValue::Bit(other),
+                                    };
+                                    hits.push((cur_ts, line_start, value));
                                 }
                             }
-                            p = abs + 1;
-                        }
-                        None => break,
-                    }
-                }
-                let mut hits: Vec<(u32, usize, VcdValue)> = Vec::new();
-                // Search for `<id>\n` (id at line end). Values never contain
-                // the separator, so a mid-value id byte can NEVER be followed
-                // by '\n' at the right offset — exact by construction (digit
-                // ids like "1" in a 32-bit bit-stream included).
-                // 只搜 id 本身, 命中后校验行尾是 '\n' 或 CRLF 的 '\r'
-                // (此前 needle 带 '\n', CRLF 文件永远搜不到 → 变更列表为空)。
-                let needle = target_id.to_vec();
-                let mut p = 0usize;
-                while p < chunk.len() {
-                    let pos = match memchr::memmem::find(&chunk[p..], &needle) {
-                        Some(n) => p + n,
-                        None => break,
-                    };
-                    if !matches!(chunk.get(pos + id_len), Some(b'\n') | Some(b'\r')) {
-                        p = pos + 1;
-                        continue;
-                    }
-                    let line_start = match memchr::memrchr(b'\n', &chunk[..pos]) {
-                        Some(n) => n + 1,
-                        None => 0,
-                    };
-                    let line_end = pos + id_len;   // needle guarantees '\n' here
-                    let line = &chunk[line_start..line_end];
-                    let id_start = pos - line_start;
-                    // exact id position: preceded by ' ' or a single value char,
-                    // line doesn't start with '$'
-                    // 精确校验(避免"更长 id 以目标 id 结尾"的误配, 例如目标 "1"
-                    // 命中 `b0101 11` 的尾字符):
-                    //  1) 命中处到行尾恰为目标 id(needle 保证);
-                    //  2) 前一字符是空格/行首 → 合法;
-                    //     是值字符(无空格速写 `b00x0"`) → 要求整行解析出的 id 一致。
-                    let exact = !line.is_empty()
-                        && line[0] != b'$'
-                        && (id_start == 0 || line[id_start - 1] == b' ' || line[id_start - 1] == b'\t')
-                        || (!line.is_empty()
-                            && line[0] != b'$'
-                            && id_start > 0
-                            && matches!(line[id_start - 1],
-                                b'0' | b'1' | b'x' | b'X' | b'z' | b'Z')
-                            && parse_value_change_fast(line)
-                                .map(|(h, _)| h == target_hash)
-                                .unwrap_or(false));
-                    if exact {
-                        let val = match line[0] {
-                            b'b' => {
-                                let ve = id_start.saturating_sub(1);
-                                // 分隔符可能是空格或制表符 → 必须排除, 否则 tab 被当成一位
-                                // (值会被左移一位: 00000001 → 2)
-                                let vs = if ve > 1 && (line[ve] == b' ' || line[ve] == b'\t') {
-                                    &line[1..ve]
-                                } else {
-                                    &line[1..id_start]
-                                };
-                                VcdValue::Vector(vs.to_vec())
-                            }
-                            b'r' => match std::str::from_utf8(&line[1..id_start])
-                                .unwrap_or("0").trim().parse::<f64>() {
-                                Ok(r) => VcdValue::Real(r),
-                                Err(_) => VcdValue::Bit(b'x'),
-                            },
-                            other => VcdValue::Bit(other),
-                        };
-                        // value line belongs to the LAST '#' before it; a value
-                        // line before the file's FIRST '#' is the $dumpvars
-                        // block (already captured as the initial value) — skip.
-                        // 若本 chunk 内没有 '#'(该时间戳的变化行跨过了 chunk 边界),
-                        // 用 u32::MAX 标记"属于上一个 chunk 的最后一个 #"
-                        // (此前直接丢弃 → 每时间戳变化数 > chunk 大小时静默漏值)。
-                        let after = ts_pos.partition_point(|&p0| p0 < line_start);
-                        if after > 0 {
-                            hits.push(((after - 1) as u32, pos, val));
-                        } else {
-                            hits.push((u32::MAX, pos, val));
                         }
                     }
-                    p = pos + 1;
                 }
-                (ts_pos.len(), hits)
+                (ts_count, hits)
             })
             .collect();
 
-        // Merge in chunk order (each chunk's hits are file order); per-chunk
-        // ts base = prefix of '#' counts; collapse same-ts (last write wins).
+        // 按块序合并(块内已是文件序); 块内首个 '#' 之前的值行属于上一块的最后一个
+        // 时间戳(u32::MAX); 整个文件首个 '#' 之前 = $dumpvars 块(已作为初值, 跳过)。
+        // 同一时间戳多次写入折叠为最后一次(last write wins)。
         let mut all: Vec<(u32, VcdValue)> = Vec::new();
         {
             let mut base = 0usize;
             for (ts_count, hits) in results {
                 for (local_idx, _pos, val) in hits {
                     let ts_idx = if local_idx == u32::MAX {
-                        if base == 0 { continue; } // 文件首个 '#' 之前 = $dumpvars 块
+                        if base == 0 { continue; }
                         base - 1
                     } else {
                         base + local_idx as usize
@@ -1722,6 +1661,31 @@ fn parse_var_decl_fast2(line: &[u8]) -> Option<(u64, &[u8], usize, &[u8], bool)>
 /// Ultra-fast byte parsing — no from_utf8(), no memchr, no allocations
 #[inline(always)]
 fn parse_value_change_fast(line: &[u8]) -> Option<(u64, VcdValue)> {
+    let (value_part, sig_id_bytes) = split_value_id(line)?;
+    let sig_hash = hash_sig_id(sig_id_bytes);
+    let vfirst = value_part[0];
+
+    let value = match vfirst {
+        b'b' => VcdValue::Vector(value_part[1..].to_vec()),
+        b'r' => {
+            if let Ok(s) = std::str::from_utf8(&value_part[1..]) {
+                if let Ok(r) = s.parse::<f64>() {
+                    VcdValue::Real(r)
+                } else { return None; }
+            } else { return None; }
+        }
+        _ => VcdValue::Bit(vfirst),
+    };
+
+    Some((sig_hash, value))
+}
+
+/// 把一行值行拆成 (值部分, 信号 ID), 去掉 CRLF 的 '\r'; 非值行返回 None。
+///
+/// 扫描路径只要 ID(用 memcmp 与目标 ID 比对, 免去每行一次哈希+查表),
+/// 加载/缓存路径要 (hash, VcdValue)。
+#[inline]
+fn split_value_id(line: &[u8]) -> Option<(&[u8], &[u8])> {
     let len = line.len();
     if len < 2 { return None; }
 
@@ -1770,24 +1734,9 @@ fn parse_value_change_fast(line: &[u8]) -> Option<(u64, VcdValue)> {
     }
     // 只排除空 id;`$` 开头的 id 是合法 VCD 标识符(如 counter 夹具的 rst `$`),
     // 指令行由调用方按"行首 $`"过滤, 不能在这里按 id 首字符误杀。
-    if sig_id_bytes.is_empty() { return None; }
+    if sig_id_bytes.is_empty() || value_part.is_empty() { return None; }
 
-    let sig_hash = hash_sig_id(sig_id_bytes);
-    let vfirst = value_part[0];
-
-    let value = match vfirst {
-        b'b' => VcdValue::Vector(value_part[1..].to_vec()),
-        b'r' => {
-            if let Ok(s) = std::str::from_utf8(&value_part[1..]) {
-                if let Ok(r) = s.parse::<f64>() {
-                    VcdValue::Real(r)
-                } else { return None; }
-            } else { return None; }
-        }
-        _ => VcdValue::Bit(vfirst),
-    };
-
-    Some((sig_hash, value))
+    Some((value_part, sig_id_bytes))
 }
 
 
@@ -2382,24 +2331,38 @@ impl Trace for VcdTrace {
 
         // Only '#' at line start counts (see find_indices); record count BEFORE
         // the boundary position so a boundary '#' line belongs to the next chunk.
+        //
+        // 每块用 memchr 定位 '#'(SIMD), 并行统计后前缀和 —— 旧实现是**逐字节
+        // 标量循环**扫整个 dump(58.7GB ≈ 数百 CPU·s, 且完全不并行)。
         let boundary_ts: Vec<usize> = {
-            let mut ts = vec![0usize; boundaries.len()];
-            let mut count = 0usize;
-            let mut bi = 1usize;
-            let start = hdr_end;
-            for (i, &b) in shared_mmap[start..].iter().enumerate() {
-                while bi < boundaries.len() && start + i >= boundaries[bi] {
-                    ts[bi] = count;
-                    bi += 1;
-                }
-                let line_start = i == 0 || shared_mmap[start + i - 1] == b'\n';
-                if line_start && b == b'#' && is_ts_line_at(&shared_mmap, start + i) {
-                    count += 1;
-                }
-            }
-            while bi < boundaries.len() {
-                ts[bi] = count;
-                bi += 1;
+            let counts: Vec<usize> = boundaries[..boundaries.len() - 1]
+                .par_iter()
+                .enumerate()
+                .map(|(i, &bs)| {
+                    let seg = &shared_mmap[bs..boundaries[i + 1]];
+                    let mut count = 0usize;
+                    let mut p = 0usize;
+                    while p < seg.len() {
+                        match memchr::memchr(b'#', &seg[p..]) {
+                            Some(n) => {
+                                let abs = p + n;
+                                if (abs == 0 || seg[abs - 1] == b'\n') && is_ts_line_at(seg, abs) {
+                                    count += 1;
+                                }
+                                p = abs + 1;
+                            }
+                            None => break,
+                        }
+                    }
+                    count
+                })
+                .collect();
+            let mut ts = Vec::with_capacity(boundaries.len());
+            let mut acc = 0usize;
+            ts.push(0);
+            for c in counts {
+                acc += c;
+                ts.push(acc);
             }
             ts
         };

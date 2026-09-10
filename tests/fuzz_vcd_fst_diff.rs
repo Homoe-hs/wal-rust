@@ -98,31 +98,45 @@ fn gen_wave(rng: &mut Rng) -> (Vec<Sig>, Vec<u64>) {
     (sigs, times)
 }
 
+/// VCD ID 生成: 混入**数字 ID**(`1`/`0`/`x...`)。
+///
+/// 这不是装饰: 值行里全是 0/1/x/z, 若某个信号的 ID 就是 `1`, 任何
+/// "在整块里搜索 ID 字节" 的实现都会被值里海量的 `1` 打爆(实测 11.5GB 上
+/// 单信号扫描 265 CPU·s, 而 ID 不在值里的信号只要 ~0)。ID 还必须互为前缀
+/// (`1` 与 `11` 并存), 才能覆盖"命中是更长 ID 的后缀"这类误配。
+fn vcd_id(i: usize) -> String {
+    match i % 4 {
+        0 => format!("{}", i + 1),        // "1", "5", "9", ...   ← 与值字符冲突
+        1 => format!("1{}", i + 1),       // "12", "16", ...      ← 以 '1' 结尾
+        2 => format!("{}", b'!' + (i % 90) as u8), // 普通可打印 ID
+        _ => format!("x{}", i + 1),       // "x4", ...            ← 与值字符 'x' 冲突
+    }
+}
+
 fn to_vcd(sigs: &[Sig], times: &[u64]) -> String {
     let mut s = String::from("$timescale 1ns $end\n$scope module t $end\n");
     for (i, sig) in sigs.iter().enumerate() {
-        // id 用可打印字符
-        s.push_str(&format!("$var wire {} {} {} $end\n", sig.width, (b'!' + i as u8) as char, sig.name));
+        s.push_str(&format!("$var wire {} {} {} $end\n", sig.width, vcd_id(i), sig.name));
     }
     s.push_str("$upscope $end\n$enddefinitions $end\n");
     for (ti, t) in times.iter().enumerate() {
         s.push_str(&format!("#{}\n", t));
         for (i, sig) in sigs.iter().enumerate() {
-            let id = (b'!' + i as u8) as char;
+            let id = vcd_id(i);
             let v = &sig.values[ti];
             if sig.deltas[ti] && ti > 0 {
                 // 同索引先写一个不同的值(毛刺),再写最终值
                 let mut glitch = v.clone();
                 if glitch[0] == b'0' { glitch[0] = b'1'; } else { glitch[0] = b'0'; }
-                emit_vcd_value(&mut s, &glitch, id);
+                emit_vcd_value(&mut s, &glitch, &id);
             }
-            emit_vcd_value(&mut s, v, id);
+            emit_vcd_value(&mut s, v, &id);
         }
     }
     s
 }
 
-fn emit_vcd_value(s: &mut String, v: &[u8], id: char) {
+fn emit_vcd_value(s: &mut String, v: &[u8], id: &str) {
     if v.len() == 1 {
         s.push_str(&format!("{}{}\n", v[0] as char, id));
     } else {
