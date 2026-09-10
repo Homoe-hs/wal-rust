@@ -438,6 +438,16 @@ pub fn eval_value(&mut self, value: Value) -> Result<Value, String> {
                         return self.eval_quote(&rest);
                     } else if op == Operator::RelEval {
                         return self.eval_releval(&rest);
+                    } else if op == Operator::Doc {
+                        // (doc sym): 参数不求值 —— 否则 `(doc semantics)` 会先报
+                        // "Undefined symbol"(文档本来就要能查任意名字)
+                        let topic = match rest.first() {
+                            Some(Value::Symbol(sy)) => sy.name.clone(),
+                            Some(Value::String(s)) => s.clone(),
+                            _ => return Err("(doc \"cmd\"|cmd) expected".to_string()),
+                        };
+                        crate::wal::builtins::wave::print_doc(&topic);
+                        return Ok(Value::Nil);
                     } else if op == Operator::Find {
                         return self.eval_find(&rest);
                     } else if op == Operator::FindG {

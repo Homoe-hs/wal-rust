@@ -16,9 +16,11 @@ use std::path::PathBuf;
                   Features:\n  \
                   - Full WAL language support (82 operators, macros, @/#/~ syntax)\n  \
                   - mmap-based on-demand VCD loading (two-pass scan + sparse index + LRU cache)\n  \
-                  - Supports files up to 150GB+ with <2GB memory footprint\n  \
-                  - FST format read/write support\n  \
-                  - Interactive REPL with rustyline",
+                  - Handles 150GB+ dumps; process HEAP is O(signals + queried columns)\n  \
+                    (RSS additionally counts mmap'd file pages — see docs/waveform-io-plan.md)\n  \
+                  - FST read support (wellen); FST write is for tests/export, not a converter\n  \
+                  - Interactive REPL with rustyline, plus --stdin session mode\n  \
+                    (one load, many probes: wal-rust --stdin -l big.vcd < probes.txt)",
     after_help = "QUICK START (waveform analysis):\n  \
                   wal-rust -l trace.vcd '(SIGNALS)'                          # list signals\n  \
                   wal-rust -l trace.vcd '(count (= (get \"clk\") 1))'          # count high cycles\n  \
@@ -39,6 +41,8 @@ use std::path::PathBuf;
                   get — signal value at current INDEX; sample-at — at given index\n  \
                   SIGNALS / INDEX / TS / MAX-INDEX — special variables\n  \
                   step — advance trace index; + - * / if do define set! — language\n\n\
+                  x/z semantics (authoritative): docs/4-state-semantics.md —\n  \
+                  x is NOT 0; x→1 is a change but NOT a rising edge; (get s) reads at CURRENT INDEX.\n\n\
                   See https://wal-lang.org for WAL language documentation."
 )]
 #[command(subcommand_required = false)]
@@ -60,6 +64,17 @@ pub struct Args {
     /// Stop at the first script error instead of continuing (CI-friendly)
     #[arg(long = "halt-on-error", global = true, help = "Stop at the first script error instead of continuing")]
     pub halt_on_error: bool,
+
+    /// 会话模式: 从 stdin 逐行读 WAL 表达式, 单进程内复用加载/缓存
+    /// (大波形上每个探针不再重新加载 + 全扫)
+    #[arg(
+        long = "stdin",
+        help = "Read WAL expressions line by line from stdin and evaluate them in ONE process.\n\
+Waveforms given with -l are loaded once; every subsequent probe reuses the in-memory\n\
+index and per-signal column cache, so probing a 17GB dump interactively is fast.\n\
+Example: wal-rust --stdin -l big.vcd < probes.txt"
+    )]
+    pub stdin: bool,
 
     #[command(subcommand)]
     pub command: Option<Command>,
@@ -168,6 +183,10 @@ pub enum ExecMode {
         code: String,
         load: Vec<PathBuf>,
     },
+    /// 会话模式: 逐行读 stdin 的表达式, 单进程复用加载与缓存
+    StdinSession {
+        load: Vec<PathBuf>,
+    },
     /// Start the interactive REPL
     Repl,
     /// count <wave> <sig> [value]
@@ -209,6 +228,9 @@ impl Args {
 
         // No subcommand — auto-detect
         let load = self.load;
+        if self.stdin {
+            return ExecMode::StdinSession { load };
+        }
 
         match self.input {
             None => ExecMode::Repl, // no input → help shown by clap

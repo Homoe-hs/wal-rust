@@ -26,6 +26,10 @@ impl WalParser {
     }
 
     pub fn parse_expr(&mut self, source: &str) -> Result<Value, String> {
+        // `%` 不是 tree-sitter 语法里的 token(改语法需重新生成 parser.c),
+        // 在解析前把字符串字面量之外的 `%` 归一化成 `mod `。
+        let expanded = expand_percent_operator(source);
+        let source: &str = expanded.as_ref();
         let tree = self.parse(source)?;
         let root = tree.root_node();
         if root.has_error() {
@@ -45,6 +49,52 @@ impl WalParser {
         }
         Ok(result)
     }
+}
+
+/// 把字符串字面量之外的独立 `%` token 换成 `mod `(两边保持空格分隔)。
+/// 返回 Cow: 没有 `%` 时零拷贝。
+fn expand_percent_operator(src: &str) -> std::borrow::Cow<'_, str> {
+    if !src.contains('%') {
+        return std::borrow::Cow::Borrowed(src);
+    }
+    let bytes = src.as_bytes();
+    let mut out = String::with_capacity(src.len() + 8);
+    let mut i = 0usize;
+    let mut in_str = false;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if in_str {
+            out.push(b as char);
+            if b == b'\\' && i + 1 < bytes.len() {
+                out.push(bytes[i + 1] as char);
+                i += 2;
+                continue;
+            }
+            if b == b'"' { in_str = false; }
+            i += 1;
+            continue;
+        }
+        if b == b'"' {
+            in_str = true;
+            out.push('"');
+            i += 1;
+            continue;
+        }
+        if b == b'%' {
+            // 独立 token 才替换(前一个字符是分隔符、后一个是分隔符/结尾)
+            let prev_ok = i == 0 || matches!(bytes[i - 1], b' ' | b'\t' | b'\n' | b'(' | b'[');
+            let next_ok = i + 1 >= bytes.len()
+                || matches!(bytes[i + 1], b' ' | b'\t' | b'\n' | b')' | b']');
+            if prev_ok && next_ok {
+                out.push_str("mod ");
+                i += 1;
+                continue;
+            }
+        }
+        out.push(b as char);
+        i += 1;
+    }
+    std::borrow::Cow::Owned(out)
 }
 
 /// `==`/`===` 在 WAL 词法里是多个 `=` token → 语法树变成 `(= = ...)` / `(= = = ...)`。

@@ -202,6 +202,7 @@ impl Operator {
     "round",
     "abs",
     "mod",
+    "%",
     "div",
     "bor",
     "band",
@@ -346,6 +347,7 @@ impl Operator {
             "round" => Some(Operator::Round),
             "abs" => Some(Operator::Abs),
             "mod" => Some(Operator::Mod),
+            "%" => Some(Operator::Mod),
 
             // Bitwise
             "bor" => Some(Operator::Bor),

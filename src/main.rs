@@ -49,6 +49,12 @@ fn main() {
         ExecMode::Repl => {
             run_repl();
         }
+        ExecMode::StdinSession { load } => {
+            if let Err(e) = run_stdin_session(&load) {
+                eprintln!("error: {}", e);
+                process::exit(1);
+            }
+        }
         ExecMode::Count { wave, sig, value } => {
             if let Err(e) = cmd_count(&wave, &sig, value) {
                 eprintln!("error: {}", e);
@@ -207,6 +213,40 @@ fn run_wal_file(path: &Path, load: &[PathBuf], code: Option<&str>, halt_on_error
 
 fn run_repl() {
     wal::repl::run_repl();
+}
+
+/// 会话模式: 从 stdin 逐行读表达式, **单进程**内复用加载与所有缓存。
+/// 大波形的一次加载(以及每个信号首次扫描后的列缓存)因此只付一次。
+fn run_stdin_session(load: &[PathBuf]) -> Result<(), String> {
+    use std::io::BufRead;
+    let mut eval = wal::eval::Evaluator::new();
+    for (i, path) in load.iter().enumerate() {
+        let tid = format!("t{}", i + 1);
+        eval.load_trace(&path.to_string_lossy(), &tid)
+            .map_err(|e| format!("{}: {}", path.display(), e))?;
+    }
+    let stdin = std::io::stdin();
+    let mut buf = String::new();
+    loop {
+        buf.clear();
+        let n = stdin.lock().read_line(&mut buf).map_err(|e| e.to_string())?;
+        if n == 0 { break; }
+        let line = buf.trim();
+        if line.is_empty() || line.starts_with(';') { continue; }
+        if line == "(exit)" || line == "exit" { break; }
+        match eval.eval(line) {
+            Ok(v) => {
+                if !matches!(v, wal::ast::Value::Nil) {
+                    println!("=> {}", v);
+                }
+            }
+            Err(e) => {
+                if e.starts_with("exit:") { break; }
+                println!("error: {}", e);
+            }
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

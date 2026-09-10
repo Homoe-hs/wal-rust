@@ -318,6 +318,9 @@ fn op_help(args: &[Value], _env: &mut Environment, _eval: &mut Evaluator) -> Res
         None => {
             let mut text = String::from(
                 "WAL builtin reference.\n\
+                 4-state semantics (authoritative): docs/4-state-semantics.md — x is NOT 0;\n\
+                 x->1 is a change but not a rising edge; index 0 has no predecessor unless\n\
+                 $dumpvars gave a defined initial; (get s) reads at the CURRENT INDEX.\n\
                  Query:    count find whenever rising falling changes is-x is-z\n\
                  Access:   get sample-at signal-width SIGNALS all-scopes\n\
                  Navigate: INDEX TS MAX-INDEX step\n\

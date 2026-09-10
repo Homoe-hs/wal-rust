@@ -539,6 +539,9 @@ const DOCS: &[(&str, &str)] = &[
     ("save", "(save \"out.csv\" \"sig\"...) → export time/value columns to CSV"),
     ("fmt-time", "(fmt-time t [\"clk\"]) → t formatted with the waveform's timescale (e.g. 1.06ms); with a clock signal: \"beat N (1.06ms)\""),
     ("doc", "(doc \"cmd\"|cmd) → one-line documentation for a command"),
+    ("semantics", "四值语义(权威口径): docs/4-state-semantics.md — 索引模型/取值与显示/比较/真值/边沿/聚合一致性"),
+    ("x-semantics", "x 不是 0: (= x 0) 为假, (!= x 0) 为真, x→1 算变化但不算上升沿, 索引 0 无前驱(除 $dumpvars 给确定初值)"),
+    ("INDEX", "INDEX 是当前游标索引; (get s) 取该索引处的值, 不随 map/遍历位置变化; 按时间取值用 (at s T)"),
     // ---- 核心查询算子(内测反馈: 这些以前查不到文档) ----
     ("get", "(get \"sig\" [hi lo]) → 索引处取值; 含 x/z 时返回位串(如 \"x\"/\"00x1\"), 否则整数"),
     ("at", "(at \"sig\" t) → (时间 值): t 时刻最后写入的值; 首变化前返回 (0 初值)"),
@@ -557,6 +560,8 @@ const DOCS: &[(&str, &str)] = &[
     ("||", "(|| a b ...) → 逻辑或(短路)"),
     ("not", "(not x) → 逻辑非(等价于 !)"),
     ("div", "(div a b) → 整数除法(向零取整); / 是浮点除法"),
+    ("mod", "(mod a b) 或 (% a b) → 取模"),
+    ("%", "(% a b) → 与 (mod a b) 相同"),
     ("help", "(help) → 打印算子/命令总览"),
     ("sigs", "(sigs \"pat\" [n]) → 信号名列表(子命令, 也可用 find-sig)"),
     ("topsig", "(topsig [n]) → 变化最多的信号(子命令)"),
@@ -599,12 +604,19 @@ fn op_doc(args: &[Value], _env: &mut Environment, _eval: &mut Evaluator) -> Resu
         Value::Symbol(s) => s.name.clone(),
         _ => return Err("(doc \"cmd\") expected".to_string()),
     };
+    print_doc(&topic);
+    Ok(Value::Nil)
+}
+
+/// 打印某主题的文档(供 `doc` 特殊形式与内置实现共用)。
+pub(crate) fn print_doc(topic: &str) {
     if let Some((_, doc)) = DOCS.iter().find(|(n, _)| *n == topic) {
         println!("{}", doc);
     } else {
-        println!("No docs for '{}'. Try (help) for the operator list.", topic);
+        let mut names: Vec<&str> = DOCS.iter().map(|(n, _)| *n).collect();
+        names.sort_unstable();
+        println!("No docs for '{}'. Documented topics: {}", topic, names.join(", "));
     }
-    Ok(Value::Nil)
 }
 
 /// Format a raw timestamp (native time units) into a human-readable string

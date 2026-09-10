@@ -250,6 +250,8 @@ pub struct VcdTrace {
     /// 短名/叶子名/子串解析缓存(一次 O(N) 扫描,之后 O(1));
     /// 所有读取路径共用,避免"op_get 能解析、边沿谓词不能"的不一致。
     name_cache: std::cell::RefCell<FxHashMap<String, Option<u32>>>,
+    /// 已就"初值未定义(x)"告警过的信号(每个信号只提示一次)
+    warned_xinit: std::cell::RefCell<std::collections::HashSet<u32>>,
 
     // Event signals (VCD event type — auto-reset to 0 at each timestamp boundary)
     event_signals: HashSet<u32>,
@@ -288,6 +290,25 @@ pub struct VcdTrace {
 }
 
 impl VcdTrace {
+    /// 边沿查询的数据质量提示: 初值未定义(x/z)时, 首次 x→已知 的跳变
+    /// 不计入 rising/falling —— 用户很容易以为"少了一个边沿"是工具算错。
+    /// 每个信号只提示一次。
+    fn warn_undefined_initial(&self, sig_idx: u32) {
+        if vcd_is_defined(&self.initial_value_at(sig_idx)) {
+            return;
+        }
+        let mut w = self.warned_xinit.borrow_mut();
+        if !w.insert(sig_idx) {
+            return;
+        }
+        let name = self.signals.get(sig_idx as usize).map(|s| s.to_string()).unwrap_or_default();
+        eprintln!(
+            "warning: 信号 '{}' 没有确定初值(x): 首个 x→1 / x→0 跳变不计入 rising/falling。\n\
+         如需包含这次跳变请用 (changes \"{}\")，或让波形带上 $dumpvars 初值快照。",
+            name, name
+        );
+    }
+
     /// 解析信号名: 精确 → 叶子名(短名/无点) → 子串;结果缓存。
     /// 与 evaluator::resolve_signal_name 同口径,但作用在 Arc<str> 上且带缓存。
     fn resolve_idx(&self, name: &str) -> Option<u32> {
@@ -797,7 +818,9 @@ impl VcdTrace {
         let trace = VcdTrace {
             id, filename,
             signals, signal_ids, id_blob, id_offsets, signal_widths, initial_values, name_to_idx,
-            name_cache: std::cell::RefCell::new(FxHashMap::default()), event_signals, event_change_points,
+            name_cache: std::cell::RefCell::new(FxHashMap::default()),
+            warned_xinit: std::cell::RefCell::new(std::collections::HashSet::new()),
+            event_signals, event_change_points,
             timestamps: build_ts_store(timestamps), timestamp_offsets, sparse_index,
             lru_cache: RefCell::new(lru::LruCache::new(lru_cap)),
             signal_cache: Mutex::new(HashMap::new()),
@@ -1864,6 +1887,7 @@ impl VcdTrace {
             id, filename,
             signals, signal_ids, id_blob, id_offsets, signal_widths, initial_values, name_to_idx,
             name_cache: std::cell::RefCell::new(FxHashMap::default()),
+            warned_xinit: std::cell::RefCell::new(std::collections::HashSet::new()),
             event_signals, event_change_points,
             timestamps, timestamp_offsets, sparse_index,
             lru_cache: RefCell::new(lru::LruCache::new(lru_cap)),
@@ -2048,6 +2072,9 @@ impl Trace for VcdTrace {
             .ok_or_else(|| format!("Unknown signal: {}", name))?;
         if self.timestamps.len() == 0 {
             return Ok(Vec::new()); // 空时间线
+        }
+        if matches!(cond, FindCondition::Rising | FindCondition::Falling) {
+            self.warn_undefined_initial(sig_idx);
         }
         if std::env::var("WAL_DEBUG_FIND").is_ok() {
             eprintln!("  sig_idx={} id={:?} anchors={}",
