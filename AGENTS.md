@@ -46,7 +46,17 @@ Flags: `-l <waveform>` (repeatable), `-c <code>` (inline override), `--halt-on-e
 - **FST read backend**: wellen (`wellen::simple::read` in `src/trace/fst.rs`); legacy hand-rolled reader retired (writer stays: `src/fst/writer.rs`).
 - **Dispatcher pattern** for builtins: (1) handler in `src/wal/builtins/xxx.rs` (2) register in `builtins/mod.rs::register_all()` (3) optional `Operator` variant in `ast/operator.rs`.
 - **Global allocator**: `mimalloc` in `src/main.rs`.
-- **VCD trace loading** (v0.12.0): PASS-1a header (sequential, also captures `$dumpvars` initial snapshot). PASS-1b parallel chunks emit **flat triples `(sig, ts, off)`** (file order) which merge into lazy per-signal `Vec<(ts,off)>` sparse anchors (no more BTreeMap per signal). One `madvise(DONTNEED)` at load end.
+- **VCD trace loading** (0.13.2 起两段式, 懒索引):
+  - **load** = 只读文件头 PASS-1a($scope/$var/$dumpvars 初值快照)。58.7GB 的 `(SIGNALS)` 现在 1s 级。
+  - **dump 区索引**(`DumpIndex`: 时间戳表 / 采样锚点 / 事件点)由 `dump()` 懒构建(OnceCell),
+    谁需要 dump 区数据谁付这一遍扫描。
+  - 查询前能声明信号时(`Trace::prepare` ← `interval_scan` / `find_indices`)索引与这些信号的
+    **完整变更列**在**同一次遍历**里算出并写进 `signal_cache` + 旁挂列缓存 —— 冷启动只读一遍文件。
+    PASS-1b 并行分块仍产 flat triples `(sig, ts, off)`, 合并成每信号 `Vec<(ts,off)>` 锚点。
+  - 冷文件按 64MB 窗口 `madvise(MADV_WILLNEED)` 预读; 扫完 `madvise(DONTNEED)` 释放页。
+- **改扫描/索索引路径后必须重跑 `tests/regression_matrix.rs`**: 融合路径的"廉价预筛"(比行尾字节 /
+  `<id>` 结尾)必须用**解析出的 ID** 复核 —— 行 `1 11` 以 `1` 结尾且前一字符是值字符, 但 ID 是 `11`。
+  这类 bug 只会在真实大文件上表现为数字对不上(77629 → 30741), 闸跑得少就会漏。
 - **Signal value reads**: `read_signal_value_at()` uses sparse anchors (`partition_point` on the Vec) + memchr jump scan.
 - **Query semantics (0.12.x, single authoritative definition)**: value AT an index = LAST write in that timestamp (delta cycles collapse); initial value = `$dumpvars` snapshot else x; edges = per-index transitions (x→1 is Changed, never Rising/Falling); count/find always scan the full timeline from INDEX 0 and restore the cursor. See `docs/query-engine-design.md` §1.
 
@@ -61,6 +71,7 @@ Flags: `-l <waveform>` (repeatable), `-c <code>` (inline override), `--halt-on-e
 | `count` fast path | `(= (get "sig") 1)` uses `find_indices` directly |
 | `count &&` decomposition | `(count (&& a b) ...)` → `BatchEntry::And` → single pass |
 | `whenever` do decomposition | → independent `count` calls |
+| **懒索引 + 变更列融合** | `(load)` 只读头; 首次查询声明信号(`Trace::prepare`)→ 索引与变更列同一次遍历; 58.7GB 冷查询 216s→73s, `(load)` 63s→1s |
 | **统一区间扫描引擎** | `interval_scan`(变更点并集边界 + 解释器值覆盖): count/find/whenever/count/step 同一实现;含边沿谓词时"边界真值 + 区间内部真值(边沿强制 false)"两段计入 |
 | **旁挂列缓存(跨进程)** | 冷扫描后按信号落盘 `<cache>/<wave>-<len>-<mtime>-v1.cols/<fnv(name)>.col`;下一个进程 `anchored_changes` 直接命中(58.7GB 同查询 113.8s → 3.35s) |
 | **纯逐拍 oracle** | `WAL_NO_ENGINE=1` 让引擎直接返回 None → 全部走逐拍;矩阵在子进程里用它做独立对拍 |
@@ -91,4 +102,4 @@ gh release create <tag> --title "v0.x.x" target/x86_64-unknown-linux-gnu/release
 ```
 
 Binary requires glibc ≥ 2.17 (CentOS 7 / RHEL 7 / Ubuntu 16.04+ compatible).
-版本线: 0.12.x(0.12.0 已发布);pre-commit 钩子自动 bump 补丁号(**Cargo.toml 已暂存时不 bump**——版本变更与代码同 commit 提交)。
+版本线: 0.13.x(0.13.0 已发布);pre-commit 钩子自动 bump 补丁号(**Cargo.toml 已暂存时不 bump**——版本变更与代码同 commit 提交)。
