@@ -24,3 +24,7 @@ version,date,op,fixture,wall_s,rss_mb,note
 0.13.0,2026-09-10,header-1m-dumpvars,.tools/vmwave/p_many_dv.vcd,0.45,282,(length (SIGNALS)) == 1000000; 同轮 0.12.45 = 0.63s/348MB (初值 blob)
 0.13.0,2026-09-10,count-lit-2nd-process,bench_10g.vcd,2.47,1135,旁挂列缓存命中(v0.12.x 写的 .wcol/.col 仍可读) == 92871
 0.13.0,2026-09-10,count-lit-2g,bench_2g.vcd,21.86,10165,(count (= (get s0) 1)) == 77629; 0.12.45 同轮 30.54s (RSS 含 mmap 页, 页缓存状态不同)
+0.13.2,2026-09-10,load-header-only,bench_10g.vcd,1.08,?,仅读文件头 (SIGNALS)==3500000; 0.13.1 同命令 62.8s
+0.13.2,2026-09-10,count-lit-cold-fused,bench_10g.vcd,72.59,?,懒索引+变更列融合单遍 (count (= (get s0) 1)) == 92871; 0.13.1 = 109s, 0.12.45 = 216s
+0.13.2,2026-09-10,count-lit-cold-fused,bench_2g.vcd,10.52,?,同上 == 77629; 0.13.1 = 12.5s, 0.12.45 = 41.6s
+0.13.2,2026-09-10,count-rise-real-vcs,.tools/vmwave/big1g.vcd,0.29,?,(count (rising r000)) == 1168; 页缓存暖, 三轮 0.29/0.42/0.39 vs 旧 0.46/0.52/0.39
