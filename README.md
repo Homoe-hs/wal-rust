@@ -2,7 +2,7 @@
 
 High-performance Rust implementation of [WAL](https://wal-lang.org), supporting VCD/FST waveform analysis at scale.
 
-**当前(v0.12.44)** — 58.7GB 合成波(3.5M 信号 / 1.5M 时间戳 / 1.65G 变更):
+**当前(v0.12.45)** — 58.7GB 合成波(3.5M 信号 / 1.5M 时间戳 / 1.65G 变更):
 
 | 场景 | 代价 |
 |:--|:--|
@@ -558,7 +558,7 @@ Configure in `~/.config/opencode/opencode.json`:
 
 ## Performance
 
-### 大波形基准(2026-09-09,v0.12.44)
+### 大波形基准(2026-09-09,v0.12.45)
 
 合成波形与本机(16 核 / NVMe)实测。**同表内对比才有意义**(绝对秒数受页缓存影响很大):
 
