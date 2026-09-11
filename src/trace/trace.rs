@@ -79,6 +79,14 @@ pub trait Trace {
         None
     }
 
+    /// `$dumpvars` 快照原值(**含 x/z**; 该信号没有初值条目 → None)。
+    /// 与 `defined_initial_value` 的区别: 后者只给"确定"初值(过滤 x/z), 用于
+    /// 边沿判定; 这里要的是"t0 到底写了什么", 供 `(at s T)` 在首变化之前回退、
+    /// 以及 `(initial s)` 查询。默认 None(如 FST 后端没有独立的 dumpvars 概念)。
+    fn initial_value(&self, _name: &str) -> Option<ScalarValue> {
+        None
+    }
+
     /// 严格解析: 名字必须唯一(exact 或唯一叶子/子串); 有歧义 → Err(候选列表)。
     /// 与 `resolve_name` 的区别: 后者取第一个匹配, 这里用于 `at/getwave` 等
     /// "名字有歧义就要报错"的入口。

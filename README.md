@@ -123,6 +123,10 @@ wal-rust repl                                 # interactive
   `count`/`count/step`/`count` 子命令/`find` 全入口同口径。
 - **游标语义**:`(get s)` 取**当前 `INDEX`** 处的值,不随 `map`/遍历位置变化;
   按时间取值用 `(at s T)` 或 `(sample-at s idx)`。
+- **样本 vs 初值**:变更点(样本)只来自 `#` 段;`$dumpvars` 快照是"索引 0 之前的持值",
+  不进 `getwave` —— 所以"只有初值、之后不变"的信号 `(getwave s)` 为空(预期),
+  读它的 t0 状态用 `(get s)`/`(at s 0)`/`(initial s)`。`(at s T)` 在首变化之前返回
+  `(0 初值)`;首时间戳 >0 时索引 0 的值属于那个时间戳,不代表 t0。
 - **多探针**:`--stdin` 会话模式在单进程内复用加载与列缓存;跨进程则靠
   `./.wal-rust-cache/` 下的索引 + 列缓存(默认 `WAL_CACHE=auto`,只写执行目录)。
 - **多文件**:可 `-l a.vcd -l b.vcd` 同时加载;但**同名信号以后加载的为准**

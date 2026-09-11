@@ -845,6 +845,41 @@ fn matrix_dump_trace_writer_contract() {
     let _ = std::fs::remove_file(&out);
 }
 
+/// 样本模型(内测 §13.1): 样本 = `#` 段的变更点; `$dumpvars` 快照是**索引 0 的回退值**,
+/// 不进入 `getwave`。因此:
+///   - 只有 dumpvars、之后不变的信号: `(getwave s)` 为空(预期), 但 t0 状态可读
+///     —— `(get s)`@索引0 / `(at s 0)` / `(initial s)`;
+///   - 首时间戳 >0 的波形: `(at s T)`(T < 首变化时间)必须给**快照**, 不能给索引 0 上
+///     那次写入(修前: dumpvars s=10 + 唯一时间戳 #1000 写 s=3 → `(at s 0)` 返回 3)。
+#[test]
+fn matrix_dumpvars_sample_model() {
+    // 首时间戳 0 的常规形态
+    let p = tmp("t0", "$timescale 1ns $end\n$scope module t $end\n$var wire 4 ! only_init $end\n$var wire 4 \" init_then_write0 $end\n$enddefinitions $end\n\
+$dumpvars\nb1010 !\nb1011 \"\n$end\n#0\nb0001 \"\n#10\n");
+    let e = |c: &str| eval_with(&p, c);
+    let list = |a: i64, b: i64| Value::List(WList::from_vec(vec![Value::Int(a), Value::Int(b)]));
+    assert_eq!(e("(initial \"t.only_init\")"), Value::Int(10));
+    assert_eq!(e("(get \"t.only_init\")"), Value::Int(10), "索引 0 无写入 → 用快照");
+    assert_eq!(e("(at \"t.only_init\" 0)"), list(0, 10));
+    assert_eq!(e("(getwave \"t.only_init\")"), Value::List(WList::new()), "只有初值、无变化 → 变更点为空(样本模型)");
+    // 同一时间戳有写入 → 索引 0 取最后一次写入, 快照仍可用 (initial) 读出
+    assert_eq!(e("(initial \"t.init_then_write0\")"), Value::Int(11));
+    assert_eq!(e("(get \"t.init_then_write0\")"), Value::Int(1), "同索引 last-write-wins");
+    assert_eq!(e("(at \"t.init_then_write0\" 0)"), list(0, 1));
+    // 首时间戳 1000: (at s 0)/(at s 500) 必须给快照; (get)@索引0 给该时间戳的写入
+    let p2 = tmp("t0late", "$timescale 1ns $end\n$scope module t $end\n$var wire 4 ! s $end\n$enddefinitions $end\n\
+$dumpvars\nb1010 !\n$end\n#1000\nb0011 !\n");
+    let e2 = |c: &str| eval_with(&p2, c);
+    assert_eq!(e2("(initial \"t.s\")"), Value::Int(10));
+    assert_eq!(e2("(get \"t.s\")"), Value::Int(3), "索引 0 = 第一个时间戳(#1000)");
+    assert_eq!(e2("(at \"t.s\" 0)"), list(0, 10), "首变化之前的时刻应给快照");
+    assert_eq!(e2("(at \"t.s\" 500)"), list(0, 10));
+    assert_eq!(e2("(at \"t.s\" 1000)"), list(1000, 3));
+    // 没有初值条目 → x(与 VCD 默认一致)
+    let p3 = tmp("t0none", "$timescale 1ns $end\n$scope module t $end\n$var wire 4 ! s $end\n$enddefinitions $end\n#0\nb0101 !\n");
+    assert_eq!(eval_with(&p3, "(initial \"t.s\")"), Value::String("x".to_string()));
+}
+
 /// find-sig 通配: 无通配 = 子串(既有语义); `*`/`?` 支持 glob, 且是**子串**语义
 /// (`b*s` 能命中 `top.bus_valid`)。此前通配符静默返回空列表, 无从判断是"没有"还是"不支持"。
 #[test]

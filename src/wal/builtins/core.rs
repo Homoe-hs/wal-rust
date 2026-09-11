@@ -336,6 +336,7 @@ fn op_help(args: &[Value], _env: &mut Environment, _eval: &mut Evaluator) -> Res
                  取值与变更列:\n\
                    get \"sig\" [hi lo]          当前索引处的值(含 x/z 时返回位串, 如 \"00x1\")\n\
                    sample-at \"sig\" idx        指定索引处的值\n\
+                   initial \"sig\"              $dumpvars 快照(t0 原值; 无初值条目 → x)\n\
                    getwave/wave/at/edges     变更点 / 窗口 / 某时刻的值(时间为波形原生单位)\n\
                    signal-width SIGNALS all-scopes SCOPES  CS CG LOCAL-SIGNALS\n\
                  \n\

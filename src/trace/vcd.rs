@@ -2327,6 +2327,12 @@ impl Trace for VcdTrace {
         if vcd_is_defined(&init) { Some(value_to_scalar(&init)) } else { None }
     }
 
+    fn initial_value(&self, name: &str) -> Option<ScalarValue> {
+        let idx = self.resolve_idx(name)?;
+        if !self.has_initial(idx) { return None; }
+        Some(value_to_scalar(&self.initial_value_at(idx)))
+    }
+
     fn signals(&self) -> Vec<String> {
         (0..self.name_count() as u32).map(|i| self.name_at(i).to_string()).collect()
     }

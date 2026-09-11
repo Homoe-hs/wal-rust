@@ -237,12 +237,35 @@ fn op_at(args: &[Value], env: &mut Environment, _eval: &mut Evaluator) -> Result
                 // value at time 0 (the $dumpvars snapshot, else x) — the value
                 // held from the start of the timeline (feedback round B5:
                 // "at 恒 (0 0)"/first-change answers were both misleading).
-                let init_sv = tr.signal_value(&sig, 0).unwrap_or_else(|_| ScalarValue::Bit(b'x'));
+                //
+                // 必须用**初值快照**, 不能用 `signal_value(sig, 0)`: 索引 0 是
+                // 「第一个时间戳」, 若该时间戳恰好写了这个信号, 索引 0 的值就是那次
+                // 写入, 而不是 t0 快照 —— 首时间戳 >0 的波形上会给出未来值
+                // (例: dumpvars s=10, 唯一时间戳 #1000 写 s=3 → (at s 0) 曾返回 3)。
+                let init_sv = tr.initial_value(&sig).unwrap_or(ScalarValue::Bit(b'x'));
                 Ok(Value::List(WList::from_vec(vec![
                     Value::Int(0), scalar_to_wal(&init_sv),
                 ])))
             }
         }
+    })
+}
+
+/// `(initial "sig")` → `$dumpvars` 快照(时间 0 写入的原值)。
+///
+/// 样本模型: 信号的"样本/变更点"只来自 `#` 段; dumpvars 快照是**索引 0 的回退值**,
+/// 不进入 `getwave`/`changes`。所以"只看 dumpvars、之后没变化"的信号
+/// `(getwave s)` 为空是预期行为 —— 读它的 t0 状态要用 `(get s)`/`(at s 0)`/本算子。
+fn op_initial(args: &[Value], env: &mut Environment, _eval: &mut Evaluator) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err("(initial \"sig\") expected".to_string());
+    }
+    let name = extract_string(&args[0])?;
+    with_signal_trace(env, &name, |tr, sig| {
+        Ok(match tr.initial_value(sig) {
+            Some(sv) => scalar_to_wal(&sv),
+            None => Value::String("x".to_string()),
+        })
     })
 }
 
@@ -600,6 +623,7 @@ const DOCS: &[(&str, &str)] = &[
     ("exit", "(exit [N]) → 立即结束脚本/会话并返回退出码 N(默认 0)"),
     ("dump-trace", "(dump-trace \"out.vcd\") → 把已加载的(defsig)信号导出为 VCD; **只支持 .vcd**, .fst 输出被明确拒绝(FST 只读)"),
     ("defsig", "(defsig name (get \"sig\")) → 定义虚拟信号, 供 dump-trace 导出"),
+    ("initial", "(initial \"sig\") → $dumpvars 快照(t0 写入的原值; 没有初值条目 → x)。样本只来自 # 段, 所以「只有 dumpvars、之后不变」的信号 (getwave s) 为空, 读 t0 状态用 (get s)/(at s 0)/(initial s)"),
     ("defmacro", "(defmacro name (args...) body) → 定义宏; 展开用 (macroexpand '(m ...)), 卫生用 (gensym)"),
     ("macroexpand", "(macroexpand '(m a b)) → 展开一次宏调用, 返回展开后的表达式"),
     ("gensym", "(gensym) → 新符号, 用于写卫生宏"),
@@ -761,6 +785,7 @@ pub fn register_wave(disp: &mut Dispatcher) {
     disp.register(Operator::Edges, op_edges);
     disp.register(Operator::FindSig, op_find_sig);
     disp.register(Operator::Search, op_search);
+    disp.register(Operator::Initial, op_initial);
     disp.register(Operator::AssertEq, op_assert_eq);
     disp.register(Operator::Period, op_period);
     disp.register(Operator::Freq, op_freq);
