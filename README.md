@@ -94,6 +94,7 @@ wal-rust topsig dump.vcd                   # most-active signals by change count
 
 # 2. WAL expressions (the workhorse; wave pre-loaded with -l)
 wal-rust -l sim.vcd '(take 5 (find-sig "clk"))'          # first 5 clk-named signals
+wal-rust -l sim.vcd '(find-sig "*valid")'                # 通配: * 任意串 / ? 单字符
 wal-rust -l sim.vcd '(count (is-x "sig"))'               # how much of sig is X
 wal-rust -l sim.vcd '(getwave "clk")'                    # all change points (t v)
 wal-rust -l sim.vcd '(edges "clk" 100000 200000)'        # change times in a window
@@ -124,6 +125,9 @@ wal-rust repl                                 # interactive
   按时间取值用 `(at s T)` 或 `(sample-at s idx)`。
 - **多探针**:`--stdin` 会话模式在单进程内复用加载与列缓存;跨进程则靠
   `./.wal-rust-cache/` 下的索引 + 列缓存(默认 `WAL_CACHE=auto`,只写执行目录)。
+- **退出码(CI 可判)**:`0` = 成功;`1` = 脚本/表达式有错误、或 `assert-eq` 失败;
+  `(exit N)` = 立刻结束并返回 `N`。脚本模式默认**遇错继续执行**(后续行照跑),
+  退出码仍为非 0,`--halt-on-error` 则在第一处错误停下。REPL 不受影响。
 - **Full reference**: `(doc "edges")` one-liner for any command,
   `(doc <任意名字>)`(未知主题会列出全部可用主题),`(help)` 总览。
 
@@ -197,6 +201,26 @@ wal-rust repl                                 # interactive
 (define add5 (make-adder 5))
 (add5 3)  ;; => 8
 ```
+
+### Macros
+
+```lisp
+;; 定义宏: 参数不求值, 体是模板(quasiquote ` + 展开 , / ,@)
+(defmacro twice (x) `(do ,x ,x))
+(twice (print "hi"))                  ;; 打印 hi 两次
+
+;; 只展开不求值(调试宏的利器)
+(macroexpand '(twice (print "hi")))   ;; => (do (print "hi") (print "hi"))
+
+;; 卫生宏: (gensym) 生成不冲突的符号
+(gensym)                              ;; => GENSYM_0
+
+;; 类函数宏: 调用处展开(展开结果是列表)
+(defunm sq [x] (* x x))
+(sq 5)                                ;; => (25)
+```
+
+`(help "defmacro")` / `(doc "macroexpand")` 查签名与说明;
 
 ### Control Flow
 
@@ -371,6 +395,7 @@ data_bus@-2          ;; value of data_bus 2 steps back
 
 ;; Find signal names by substring — the first step of any debug session
 (find-sig "clk")                       ;; all names containing "clk"
+(find-sig "*valid")                   ;; 通配: `*` 任意串, `?` 单字符(无通配=子串)
 (take 5 (find-sig "wstrb"))            ;; first 5 matches
 
 ;; Global find (across all known scopes)

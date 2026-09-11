@@ -327,6 +327,48 @@ fn op_count_edges(args: &[Value], env: &mut Environment, _eval: &mut Evaluator) 
     Ok(Value::Int(0))
 }
 
+/// 信号名匹配: 不含 `*`/`?` 时等价于 `contains`(既有语义, 向后兼容);
+/// 含通配符时按 glob 匹配 —— `*` 任意串, `?` 单个字符, 大小写敏感。
+/// `(find-sig ...)` 与 CLI `sigs` 共用(此前通配符会静默返回空列表)。
+pub fn sig_name_matches(pattern: &str, name: &str) -> bool {
+    if !pattern.contains('*') && !pattern.contains('?') {
+        return name.contains(pattern);
+    }
+    // 与 `contains` 同口径: 通配模式按 `*pattern*` 匹配子串(否则 `b*s` 要求
+    // 整名以 b 开头, 与用户预期和既有语义都不一致)。
+    let mut anchored = String::with_capacity(pattern.len() + 2);
+    anchored.push('*');
+    anchored.push_str(pattern);
+    anchored.push('*');
+    glob_match(anchored.as_bytes(), name.as_bytes())
+}
+
+/// 线性回溯 glob(模式与信号名都很短, 不引入 regex 依赖)。
+fn glob_match(pat: &[u8], text: &[u8]) -> bool {
+    let (mut p, mut t) = (0usize, 0usize);
+    let (mut star, mut mark) = (usize::MAX, 0usize);
+    while t < text.len() {
+        if p < pat.len() && (pat[p] == b'?' || pat[p] == text[t]) {
+            p += 1;
+            t += 1;
+        } else if p < pat.len() && pat[p] == b'*' {
+            star = p;
+            mark = t;
+            p += 1;
+        } else if star != usize::MAX {
+            p = star + 1;
+            mark += 1;
+            t = mark;
+        } else {
+            return false;
+        }
+    }
+    while p < pat.len() && pat[p] == b'*' {
+        p += 1;
+    }
+    p == pat.len()
+}
+
 fn op_find_sig(args: &[Value], env: &mut Environment, _eval: &mut Evaluator) -> Result<Value, String> {
     if args.len() != 1 {
         return Err("(find-sig \"pattern\") expected".to_string());
@@ -334,7 +376,7 @@ fn op_find_sig(args: &[Value], env: &mut Environment, _eval: &mut Evaluator) -> 
     let pat = extract_string(&args[0])?;
     with_first_trace(env, |tr| {
         let mut out: Vec<Value> = tr.signals().into_iter()
-            .filter(|s| s.contains(&pat))
+            .filter(|s| sig_name_matches(&pat, s))
             .map(Value::String)
             .collect();
         out.sort_by(|a, b| a.to_string().cmp(&b.to_string()));
@@ -554,7 +596,15 @@ const DOCS: &[(&str, &str)] = &[
     ("find-sig", "(find-sig \"pattern\") → signal names containing the substring"),
     ("take", "(take n list) → first n elements; e.g. (take 5 (find-sig \"clk\")) or (take 5 SIGNALS)"),
     ("search", "(search \"sig\" \"101\" [t0 t1]) → timestamps where the bit pattern occurs"),
-    ("assert-eq", "(assert-eq \"sig\" t0 t1 v) → true if the signal equals v throughout [t0,t1]"),
+    ("assert-eq", "(assert-eq \"sig\" t0 t1 v) → [t0,t1] 内是否恒等于 v; 失败打印首违例并让进程退出码为 1(CI 可判)"),
+    ("exit", "(exit [N]) → 立即结束脚本/会话并返回退出码 N(默认 0)"),
+    ("dump-trace", "(dump-trace \"out.vcd\") → 把已加载的(defsig)信号导出为 VCD; **只支持 .vcd**, .fst 输出被明确拒绝(FST 只读)"),
+    ("defsig", "(defsig name (get \"sig\")) → 定义虚拟信号, 供 dump-trace 导出"),
+    ("defmacro", "(defmacro name (args...) body) → 定义宏; 展开用 (macroexpand '(m ...)), 卫生用 (gensym)"),
+    ("macroexpand", "(macroexpand '(m a b)) → 展开一次宏调用, 返回展开后的表达式"),
+    ("gensym", "(gensym) → 新符号, 用于写卫生宏"),
+    ("defunm", "(defunm name (args...) body) → 定义「类函数宏」, 调用处展开"),
+    ("e", "未实现: WAL 无 `e` 形式(wal-rust 与其上游都没有); 科学计数法字面量同样不支持(用 (* 1.5 (** 10 3)))"),
     ("period", "(period \"clk\") → average clock period in seconds"),
     ("freq", "(freq \"clk\") → clock frequency in Hz"),
     ("save", "(save \"out.csv\" \"sig\"...) → export time/value columns to CSV"),

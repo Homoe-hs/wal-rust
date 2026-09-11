@@ -1004,8 +1004,11 @@ hi
 - 查找宏定义，展开并返回展开结果（不进一步求值）
 **示例**:
 ```wal
-(macroexpand '(when #t (print "hi")))
+(defmacro twice (x) `(do ,x ,x))
+(macroexpand '(twice (print "hi")))   ;; => (do (print "hi") (print "hi"))
 ```
+> 注: 旧版示例用的 `when` 是内建特殊形式、不是宏, 展开会报 `Undefined macro: when`;
+> 现在请用自己定义的宏(或 `(doc "defmacro")` 里列出的标准库宏)。
 
 #### `gensym`
 

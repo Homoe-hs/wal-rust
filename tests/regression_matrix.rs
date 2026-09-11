@@ -845,6 +845,21 @@ fn matrix_dump_trace_writer_contract() {
     let _ = std::fs::remove_file(&out);
 }
 
+/// find-sig 通配: 无通配 = 子串(既有语义); `*`/`?` 支持 glob, 且是**子串**语义
+/// (`b*s` 能命中 `top.bus_valid`)。此前通配符静默返回空列表, 无从判断是"没有"还是"不支持"。
+#[test]
+fn matrix_find_sig_glob() {
+    let p = tmp("sigs", "$timescale 1ns $end\n$scope module top $end\n$var wire 1 ! clk $end\n$var wire 1 \" bus_valid $end\n$var wire 1 # cpu_valid $end\n$var wire 1 $ addr_bus [1:0] $end\n$upscope $end\n$enddefinitions $end\n#0\n0!\n");
+    let e = |c: &str| eval_with(&p, c);
+    let n = |c: &str| match e(c) { Value::Int(i) => i, v => panic!("{} => {:?}", c, v) };
+    assert_eq!(n("(length (find-sig \"bus\"))"), 2, "无通配仍是子串");
+    assert_eq!(n("(length (find-sig \"*valid\"))"), 2);
+    assert_eq!(n("(length (find-sig \"b*s\"))"), 2, "通配是子串语义");
+    assert_eq!(n("(length (find-sig \"?us\"))"), 2);
+    assert_eq!(n("(length (find-sig \"*\"))"), 4, "`*` 命中所有信号");
+    assert_eq!(n("(length (find-sig \"nosuch\"))"), 0);
+}
+
 /// 宽向量不再静默截断 + i64 算术溢出报错(内测 "1024b 算术注意")。
 ///
 /// 旧行为: 干净向量无条件折叠进 i64 → 1024-bit 只置 MSB 的信号读出来是 0,

@@ -18,7 +18,8 @@ use std::path::PathBuf;
                   - mmap-based on-demand VCD loading (two-pass scan + sparse index + LRU cache)\n  \
                   - Handles 150GB+ dumps; process HEAP is O(signals + queried columns)\n  \
                     (RSS additionally counts mmap'd file pages — see docs/waveform-io-plan.md)\n  \
-                  - FST read support (wellen); FST write is for tests/export, not a converter\n  \
+                  - FST read support (wellen); FST **write** is not supported (dump-trace only\n  \
+                    writes VCD — use an external converter for FST export)\n  \
                   - Interactive REPL with rustyline, plus --stdin session mode\n  \
                     (one load, many probes: wal-rust --stdin -l big.vcd < probes.txt)",
     after_help = "QUICK START (waveform analysis):\n  \

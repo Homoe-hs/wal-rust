@@ -345,7 +345,9 @@ fn op_help(args: &[Value], _env: &mut Environment, _eval: &mut Evaluator) -> Res
                  语言:\n\
                    + - * / div mod(%) ** = == != < > <= >= && || not\n\
                    if do cond case when unless while define defun let set! fn lambda\n\
-                   map fold filter print printf save import\n\
+                   map fold filter print printf save import exit assert-eq\n\
+                   defmacro defunm macroexpand gensym   (宏: (doc \"defmacro\"))\n\
+                   #name ≡ (resolve-group 'name); expr@offset ≡ (rel_eval expr offset)\n\
                  \n\
                  CLI 子命令(不需要 WAL 表达式):\n\
                    wal-rust count <wave> <sig> [value]   值计数(默认 =1; 变化数用 (count (changes s)))\n\
@@ -370,7 +372,17 @@ fn op_help(args: &[Value], _env: &mut Environment, _eval: &mut Evaluator) -> Res
             text.push_str("\n也可以用 (help \"count\") 看某个算子的完整说明。");
             text
         }
-        _ => format!("No help for '{}'. Try (help) for the overview.", topic.unwrap_or_default()),
+        _ => {
+            // 回落到 DOCS 表: 否则 defmacro/macroexpand/dump-trace 这些
+            // "(doc X) 有、(help \"X\") 说没有"的算子让人无从查起。
+            if let Some(t) = topic.as_deref() {
+                if crate::wal::builtins::wave::documented_topics().iter().any(|d| *d == t) {
+                    crate::wal::builtins::wave::print_doc(t);
+                    return Ok(Value::Nil);
+                }
+            }
+            format!("No help for '{}'. Try (help) for the overview.", topic.unwrap_or_default())
+        }
     };
     println!("{}", help_text);
     Ok(Value::Nil)

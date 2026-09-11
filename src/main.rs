@@ -357,8 +357,10 @@ fn cmd_sigs(wave: &Path, pattern: &str, limit: usize) -> Result<(), String> {
     let tc = load_one_wave(wave)?;
     let tr = tc.get(&"t".to_string()).ok_or("no trace loaded")?;
     let all = tr.signals();
-    let matched: Vec<&String> = all.iter().filter(|s| s.contains(pattern)).collect();
-    println!("{} signal(s) containing '{}':", matched.len(), pattern);
+    let matched: Vec<&String> = all.iter()
+        .filter(|s| wal::builtins::wave::sig_name_matches(pattern, s))
+        .collect();
+    println!("{} signal(s) matching '{}':", matched.len(), pattern);
     let shown = if limit == 0 { matched.len() } else { limit.min(matched.len()) };
     for m in matched.iter().take(shown) {
         println!("{}", m);
