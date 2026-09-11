@@ -592,6 +592,16 @@ fn extract_number(v: &Value) -> Result<f64, String> {
     match v {
         Value::Int(i) => Ok(*i as f64),
         Value::Float(f) => Ok(*f),
+        // 位串(含 x/z 的向量, 或有效位 >63 的向量)只能等值比较 —— 把错误说清楚,
+        // 别让人对着 "Expected number" 猜。转换入口: (string->int "1010")。
+        Value::String(s) if !s.is_empty()
+            && s.chars().all(|c| matches!(c, '0' | '1' | 'x' | 'X' | 'z' | 'Z')) =>
+        {
+            Err(format!(
+                "Expected number, got bit-string \"{}\" (位串只能等值比较 (=); \
+数值比较请用 (string->int \"...\") 先转整数, 或取有效位 ≤63 的信号)", s))
+        }
+        Value::String(s) => Err(format!("Expected number, got string \"{}\"", s)),
         _ => Err("Expected number".to_string()),
     }
 }
