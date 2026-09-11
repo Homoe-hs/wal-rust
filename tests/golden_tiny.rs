@@ -180,3 +180,73 @@ fn golden_cli_subcommands_match_expressions() {
     assert_eq!(session, "=> 5\n=> 5", "会话模式结果: {}", session);
     let _ = std::fs::remove_file(&p);
 }
+
+/// CLI 退出码契约(CI 可判):
+///   0 = 成功; 1 = 脚本/表达式错误或 assert-eq 失败; N = (exit N)。
+/// 默认(不加 --halt-on-error)遇错继续执行, 但退出码非 0 —— 这是内测报的
+/// "唯一不可用级"缺口(此前脚本错误/断言失败一律 rc=0, CI 只能解析输出)。
+#[test]
+fn golden_cli_exit_codes() {
+    let vcd = write("tiny2rc", TINY2);
+    let dir = std::env::temp_dir().join(format!("wal_golden_rc_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let script = |name: &str, body: &str| -> std::path::PathBuf {
+        let p = dir.join(name);
+        std::fs::write(&p, body).unwrap();
+        p
+    };
+    let run = |args: Vec<String>| -> (i32, String, String) {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_wal-rust"))
+            .args(&args).output().expect("spawn wal-rust");
+        (
+            out.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&out.stdout).to_string(),
+            String::from_utf8_lossy(&out.stderr).to_string(),
+        )
+    };
+    let vcds = vcd.to_string_lossy().to_string();
+
+    // 干净脚本 → 0
+    let ok = script("ok.wal", "(print 1)\n(print 2)\n");
+    let (rc, out, _) = run(vec!["run".into(), ok.to_string_lossy().into(), "-l".into(), vcds.clone()]);
+    assert_eq!(rc, 0, "干净脚本 rc={} out={}", rc, out);
+
+    // 脚本错误(默认继续) → 非 0, 且后续行仍然执行
+    let bad = script("bad.wal", "(print 1)\n(nonexistent-op 2)\n(print 3)\n");
+    let (rc, out, err) = run(vec!["run".into(), bad.to_string_lossy().into(), "-l".into(), vcds.clone()]);
+    assert_ne!(rc, 0, "脚本错误应非 0; stderr={}", err);
+    assert!(out.contains('1') && out.contains('3'), "默认继续执行: out={}", out);
+    assert!(err.contains("Error on line 2"), "stderr={}", err);
+
+    // --halt-on-error → 非 0 且在第 2 行停止
+    let (rc, out, _) = run(vec![
+        "run".into(), bad.to_string_lossy().into(), "-l".into(), vcds.clone(), "--halt-on-error".into(),
+    ]);
+    assert_ne!(rc, 0, "--halt-on-error 应非 0");
+    assert!(!out.contains('3'), "halt 后不应继续: out={}", out);
+
+    // assert-eq 失败 → 非 0 + stderr 有首违例定位; 通过 → 0
+    let a_fail = script("assert_fail.wal", "(assert-eq \"clk\" 0 100 0)\n");
+    let (rc, _, err) = run(vec!["run".into(), a_fail.to_string_lossy().into(), "-l".into(), vcds.clone()]);
+    assert_ne!(rc, 0, "assert 失败应非 0");
+    assert!(err.contains("FAILED") && err.contains("want"), "assert 诊断: stderr={}", err);
+
+    let a_ok = script("assert_ok.wal", "(assert-eq \"clk\" 0 4 0)\n");
+    let (rc, _, err) = run(vec!["run".into(), a_ok.to_string_lossy().into(), "-l".into(), vcds.clone()]);
+    assert_eq!(rc, 0, "assert 通过应 0; stderr={}", err);
+
+    // (exit N) → 立刻停止并返回 N
+    let ex = script("exit.wal", "(exit 3)\n(print \"never\")\n");
+    let (rc, out, _) = run(vec!["run".into(), ex.to_string_lossy().into(), "-l".into(), vcds.clone()]);
+    assert_eq!(rc, 3, "(exit 3) 应 rc=3");
+    assert!(!out.contains("never"), "(exit N) 之后不应执行: out={}", out);
+
+    // 表达式错误 → 非 0; (exit 7) → 7
+    let (rc, _, _) = run(vec!["(car 1)".into(), "-l".into(), vcds.clone()]);
+    assert_ne!(rc, 0, "表达式错误应非 0");
+    let (rc, _, _) = run(vec!["(exit 7)".into(), "-l".into(), vcds.clone()]);
+    assert_eq!(rc, 7, "表达式 (exit 7) 应 rc=7");
+
+    let _ = std::fs::remove_file(&vcd);
+    let _ = std::fs::remove_dir_all(&dir);
+}

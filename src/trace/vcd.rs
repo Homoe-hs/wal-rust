@@ -535,45 +535,22 @@ impl VcdTrace {
                 };
                 let line = &data[line_start..line_end];
                 if !line.is_empty() && line[0] != b'$' {
-                    // value line: <value><id> or b<bits...><id>; resolve the id
-                    // by hash (ids are 1..~5 chars; VCD ids are identifiers).
-                    let max_id_len = line.len().min(6);
-                    for id_len in (1..max_id_len).rev() {
-                        let id_start = line.len() - id_len;
-                        // separator before the id: start, space, or a single
-                        // leading value char ("0!" / "1!").
-                        if id_start > 0
-                            && line[id_start - 1] != b' '
-                            && line[id_start - 1] != b'\t'
-                            && line.len() != id_len + 1
-                        {
-                            continue;
-                        }
-                        let hash = hash_sig_id(&line[id_start..]);
-                        if let Some(sidx) = signal_ids.find(hash) {
-                            // byte-verify (hash ambiguity)
-                            let idb = id_offsets.get(sidx as usize).map(|&st| {
+                    // 值行的拆分规则与主扫描**同一套**(split_value_id):
+                    // 空格/制表符分隔、无分隔 `b1010s1`、CRLF 都可识别。
+                    // 旧实现按"试 id 长度 + 要求 id 前是空格"推断, 于是
+                    // `$dumpvars` 里未分隔的向量行 `b1010s1` 全被拒 → 宽>1 的
+                    // 纯初值信号读回来变 x(B10); 标量 `0!` 因 len==id_len+1 侥幸通过。
+                    if let Some((value_part, idb)) = split_value_id(line) {
+                        if let Some(sidx) = signal_ids.find(hash_sig_id(idb)) {
+                            // 字节复核(哈希歧义/碰撞)
+                            let id_ok = id_offsets.get(sidx as usize).map(|&st| {
                                 let en = id_offsets.get(sidx as usize + 1)
                                     .map(|&v| v as usize).unwrap_or(id_blob.len());
-                                &id_blob[st as usize..en.min(id_blob.len())]
-                            });
-                            if idb.map(|b| b == &line[id_start..]).unwrap_or(false)
-                            {
-                                let val = match line[0] {
-                                    b'b' => {
-                                        let ve = id_start.saturating_sub(1);
-                                        let vs = if ve > 1 && line[ve] == b' ' { &line[1..ve] } else { &line[1..id_start] };
-                                        VcdValue::Vector(vs.to_vec())
-                                    }
-                                    b'r' => match std::str::from_utf8(&line[1..id_start])
-                                        .unwrap_or("0").trim().parse::<f64>() {
-                                        Ok(r) => VcdValue::Real(r),
-                                        Err(_) => VcdValue::Bit(b'x'),
-                                    },
-                                    other => VcdValue::Bit(other),
-                                };
+                                id_blob.get(st as usize..en.min(id_blob.len())) == Some(idb)
+                            }).unwrap_or(false);
+                            if id_ok {
+                                let val = vcd_value_of(value_part).unwrap_or(VcdValue::Bit(b'x'));
                                 Self::set_initial(&mut init_off, &mut init_blob, sidx, &val);
-                                break;
                             }
                         }
                     }

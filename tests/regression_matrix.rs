@@ -62,6 +62,25 @@ $dumpvars\nb00001111 !\n1\"\n$end\n#0\n#10\nb10101010 !\n#20\n0\"\n");
     assert_eq!(e("(count/step (is-x \"t.v\"))"), Value::Int(0));
 }
 
+/// B10(内测): `$dumpvars` 里**未分隔**的向量行 `b1010s1` 必须识别。
+///
+/// 旧的初值快照扫描按"试 id 长度 + 要求 id 前是空格/制表符"推断 ID, 于是
+/// `b1010s1`(id 前是位字符)全被拒 → 宽>1 的纯初值信号读回来是 x(标量 `0!`
+/// 因 len==id_len+1 侥幸通过)。现在与主扫描共用 `split_value_id`。
+#[test]
+fn matrix_dumpvars_initial_unspaced() {
+    let p = tmp("dvu", "$timescale 1ns $end\n$scope module t $end\n$var wire 4 \" v $end\n$var wire 1 ! r $end\n$enddefinitions $end\n\
+$dumpvars\nb1010\"\n1!\n$end\n#0\n#10\nb0011\"\n#20\n");
+    let e = |c: &str| eval_with(&p, c);
+    assert_eq!(e("(get \"t.v\")"), Value::Int(10), "未分隔向量初值不得丢");
+    assert_eq!(e("(is-x \"t.v\")"), Value::Bool(false));
+    assert_eq!(e("(at \"t.v\" 0)"), Value::List(WList::from_vec(vec![Value::Int(0), Value::Int(10)])));
+    // 空格分隔 + CRLF 形式同样要认(同一套 split_value_id)
+    let p2 = tmp("dvu2", "$timescale 1ns $end\n$scope module t $end\n$var wire 8 \" v $end\n$enddefinitions $end\n\
+$dumpvars\nb11001010 \"\r\n$end\n#0\n#10\n");
+    assert_eq!(eval_with(&p2, "(get \"t.v\")"), Value::Int(202));
+}
+
 /// 4) P0-a: (&& (get-simple) (is-x ...)) 不得丢谓词。
 #[test]
 fn matrix_compound_is_x_not_dropped() {
@@ -823,6 +842,27 @@ fn matrix_dump_trace_writer_contract() {
     let mut e2 = Evaluator::new();
     e2.load_trace(&out_s, "t").unwrap();
     assert_eq!(e2.eval("(count (rising \"v\"))").unwrap(), Value::Int(1));
+    let _ = std::fs::remove_file(&out);
+}
+
+/// B10 round-trip: `defsig` 出来的**宽**虚信号(8bit, 只有 `$dumpvars` 初值、
+/// 之后没有变化)经 dump-trace → 新进程读回, 初值不得变 x。
+/// (修复前: 导出的 `b11001010s1` 未分隔, 初值扫描认不出 id → x。)
+#[test]
+fn matrix_dump_trace_roundtrip_wide_initial() {
+    let p = tmp("dtrw", "$timescale 1ns $end\n$scope module t $end\n$var wire 8 # d $end\n$enddefinitions $end\n\
+$dumpvars\nb11001010 #\n$end\n#0\n#10\n");
+    let out = std::env::temp_dir().join(format!("wal_reg_dtrw_{}.vcd", std::process::id()));
+    let out_s = out.to_string_lossy().to_string();
+    let mut e = Evaluator::new();
+    e.load_trace(&p.to_string_lossy(), "t").unwrap();
+    assert_eq!(e.eval("(get \"t.d\")").unwrap(), Value::Int(202));
+    e.eval(&format!("(defsig w (get \"t.d\")) (dump-trace \"{}\")", out_s)).unwrap();
+    let mut e2 = Evaluator::new();
+    e2.load_trace(&out_s, "t").unwrap();
+    let text = std::fs::read_to_string(&out).unwrap();
+    assert_eq!(e2.eval("(is-x \"w\")").unwrap(), Value::Bool(false), "round-trip 初值变 x; 导出文件=\n{}", text);
+    assert_eq!(e2.eval("(get \"w\")").unwrap(), Value::Int(202), "初值不还原; 导出文件=\n{}", text);
     let _ = std::fs::remove_file(&out);
 }
 

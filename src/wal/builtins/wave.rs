@@ -378,7 +378,7 @@ fn op_search(args: &[Value], env: &mut Environment, _eval: &mut Evaluator) -> Re
     })
 }
 
-fn op_assert_eq(args: &[Value], env: &mut Environment, _eval: &mut Evaluator) -> Result<Value, String> {
+fn op_assert_eq(args: &[Value], env: &mut Environment, eval: &mut Evaluator) -> Result<Value, String> {
     if args.len() != 4 {
         return Err("(assert-eq \"sig\" t0 t1 val) expected".to_string());
     }
@@ -386,7 +386,9 @@ fn op_assert_eq(args: &[Value], env: &mut Environment, _eval: &mut Evaluator) ->
     let t0 = extract_int(&args[1])? as u64;
     let t1 = extract_int(&args[2])? as u64;
     let expected = extract_int(&args[3])?;
-    with_first_trace(env, |tr| {
+    // with_first_trace 的闭包不能借用 eval → 先在闭包里落 flag, 出来再记账
+    let mut failed = false;
+    let out = with_first_trace(env, |tr| {
         let sig = resolve_signal(tr, &name)?;
         let points = tr.change_points(&sig)?;
         let mut violations = Vec::new();
@@ -405,13 +407,19 @@ fn op_assert_eq(args: &[Value], env: &mut Environment, _eval: &mut Evaluator) ->
         if violations.is_empty() {
             Ok(Value::Bool(true))
         } else {
+            failed = true;
             eprintln!("assert-eq {} [{},{}] == {} FAILED:", sig, t0, t1, expected);
             for v in violations.iter().take(20) {
                 eprintln!("  {}", v);
             }
             Ok(Value::Bool(false))
         }
-    })
+    });
+    if failed {
+        // CI 判据: 会话/脚本退出码非 0(返回值仍是 false, 脚本仍可分支)
+        eval.note_test_failure();
+    }
+    out
 }
 
 /// Average rising-edge interval of a clock signal in the waveform's native

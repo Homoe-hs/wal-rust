@@ -14,6 +14,9 @@ pub struct Evaluator {
     pub env: Environment,
     pub disp: Dispatcher,
     pub traces: SharedTraceContainer,
+    /// 断言失败次数(assert-eq)。builtin 不抛错(脚本可以分支判断它的布尔返回值),
+    /// 由 CLI 读这个计数决定进程退出码 —— 否则 CI 只能靠解析输出。
+    test_failures: usize,
 }
 
 impl Evaluator {
@@ -33,7 +36,18 @@ impl Evaluator {
             env,
             disp,
             traces,
+            test_failures: 0,
         }
+    }
+
+    /// 记录一次断言失败(assert-eq 违例)。
+    pub fn note_test_failure(&mut self) {
+        self.test_failures += 1;
+    }
+
+    /// 断言失败累计次数(CLI 退出码依据)。
+    pub fn test_failures(&self) -> usize {
+        self.test_failures
     }
 
     pub fn eval(&mut self, source: &str) -> Result<Value, String> {

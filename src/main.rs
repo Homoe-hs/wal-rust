@@ -35,24 +35,36 @@ fn main() {
 
     match args.resolve() {
         ExecMode::RunScript { path, load, code, halt_on_error } => {
-            if let Err(e) = run_wal_file(&path, &load, code.as_deref(), halt_on_error) {
-                eprintln!("error: {}", e);
-                process::exit(1);
+            match run_wal_file(&path, &load, code.as_deref(), halt_on_error) {
+                Ok(0) => {}
+                Ok(code) => process::exit(code),   // (exit N)
+                Err(e) => {
+                    eprintln!("error: {}", e);
+                    process::exit(1);
+                }
             }
         }
         ExecMode::EvalExpr { code, load } => {
-            if let Err(e) = eval_wal_expr(&code, &load) {
-                eprintln!("error: {}", e);
-                process::exit(1);
+            match eval_wal_expr(&code, &load) {
+                Ok(0) => {}
+                Ok(code) => process::exit(code),
+                Err(e) => {
+                    eprintln!("error: {}", e);
+                    process::exit(1);
+                }
             }
         }
         ExecMode::Repl => {
             run_repl();
         }
         ExecMode::StdinSession { load } => {
-            if let Err(e) = run_stdin_session(&load) {
-                eprintln!("error: {}", e);
-                process::exit(1);
+            match run_stdin_session(&load) {
+                Ok(0) => {}
+                Ok(code) => process::exit(code),
+                Err(e) => {
+                    eprintln!("error: {}", e);
+                    process::exit(1);
+                }
             }
         }
         ExecMode::Count { wave, sig, value } => {
@@ -76,6 +88,13 @@ fn main() {
     }
 }
 
+/// `(exit N)` 在解释器里以 `Err("exit:N")` 冒泡 → 解析成进程退出码。
+/// `(exit)` / `(exit 0)` = 正常结束(0)。
+fn parse_exit_code(err: &str) -> Option<i32> {
+    err.strip_prefix("exit:")
+        .map(|s| s.trim().parse::<i32>().unwrap_or(0))
+}
+
 fn init_eval_with_load(load: &[PathBuf]) -> Result<wal::eval::Evaluator, String> {
     let mut eval = wal::eval::Evaluator::new();
     for path in load {
@@ -87,33 +106,73 @@ fn init_eval_with_load(load: &[PathBuf]) -> Result<wal::eval::Evaluator, String>
     Ok(eval)
 }
 
-fn eval_wal_expr(code: &str, load: &[PathBuf]) -> Result<(), String> {
+fn eval_wal_expr(code: &str, load: &[PathBuf]) -> Result<i32, String> {
     let mut eval = init_eval_with_load(load)?;
-    let val = eval.eval(code)?;
-    println!("=> {}", val);
-    Ok(())
+    let before = eval.test_failures();
+    match eval.eval(code) {
+        Ok(val) => println!("=> {}", val),
+        Err(e) => {
+            if let Some(c) = parse_exit_code(&e) { return Ok(c); }
+            return Err(e);
+        }
+    }
+    // 断言失败(assert-eq): 打印已经给出首违例, 退出码让 CI 可判
+    Ok(if eval.test_failures() > before { 1 } else { 0 })
 }
 
-fn run_wal_file(path: &Path, load: &[PathBuf], code: Option<&str>, halt_on_error: bool) -> Result<(), String> {
+fn run_wal_file(path: &Path, load: &[PathBuf], code: Option<&str>, halt_on_error: bool) -> Result<i32, String> {
     let mut eval = init_eval_with_load(load)?;
 
-    // Report a script error (default: continue; --halt-on-error stops).
-    let report = |line: usize, e: String| -> Result<(), String> {
-        if !e.starts_with("exit:") {
-            if halt_on_error {
-                // stop: main() prints the final "error: ..." line
-                return Err(format!("Error on line {}: {}", line, e));
+    // 运行统计: 退出码 = 0 成功 / 1 有错误或断言失败 / `(exit N)` 的 N。
+    // 默认(不加 --halt-on-error)遇到错误继续执行, 但退出码非 0 —— 否则 CI 只能解析输出。
+    let mut errors = 0usize;
+    let mut asserts = 0usize;
+    let mut exit_code: Option<i32> = None;
+
+    // 求值一个完整表达式: 打印值、记账、处理 (exit N)。
+    // 返回 true = 脚本该停(遇到 (exit N))
+    let mut run_one = |eval: &mut wal::eval::Evaluator, text: &str, line: usize| -> Result<bool, String> {
+        let before = eval.test_failures();
+        match eval.eval(text) {
+            Ok(v) => {
+                if !matches!(v, wal::ast::Value::Nil) {
+                    println!("{}", v);
+                }
             }
-            eprintln!("Error on line {}: {}", line, e);
+            Err(e) => {
+                if let Some(c) = parse_exit_code(&e) {
+                    exit_code = Some(c);
+                    return Ok(true);
+                }
+                errors += 1;
+                if halt_on_error {
+                    return Err(format!("Error on line {}: {}", line, e));
+                }
+                eprintln!("Error on line {}: {}", line, e);
+                return Ok(false);
+            }
         }
-        Ok(())
+        let failed = eval.test_failures() - before;
+        if failed > 0 {
+            asserts += failed;
+            if halt_on_error {
+                return Err(format!("assertion failed on line {}", line));
+            }
+        }
+        Ok(false)
     };
 
     // Execute code expression if provided (overrides file)
     if let Some(code) = code {
-        let result = eval.eval(code)?;
-        println!("=> {}", result);
-        return Ok(());
+        let before = eval.test_failures();
+        match eval.eval(code) {
+            Ok(v) => println!("=> {}", v),
+            Err(e) => {
+                if let Some(c) = parse_exit_code(&e) { return Ok(c); }
+                return Err(e);
+            }
+        }
+        return Ok(if eval.test_failures() > before { 1 } else { 0 });
     }
 
     // Execute the script file
@@ -129,7 +188,7 @@ fn run_wal_file(path: &Path, load: &[PathBuf], code: Option<&str>, halt_on_error
     let mut line_number = 0;
     let mut in_string = false;
 
-    for line in source.lines() {
+    'script: for line in source.lines() {
         line_number += 1;
 
         // Strip trailing comment (outside strings)
@@ -163,14 +222,7 @@ fn run_wal_file(path: &Path, load: &[PathBuf], code: Option<&str>, halt_on_error
             if paren_depth == 0 && !in_string && !expr.trim().is_empty() {
                 let trimmed = expr.trim().to_string();
                 if !trimmed.is_empty() && !trimmed.starts_with(';') && trimmed.starts_with('(') {
-                    match eval.eval(&trimmed) {
-                        Ok(v) => {
-                            if !matches!(v, wal::ast::Value::Nil) {
-                                println!("{}", v);
-                            }
-                        }
-                        Err(e) => report(line_number, e)?,
-                    }
+                    if run_one(&mut eval, &trimmed, line_number)? { break 'script; }
                     expr.clear();
                 }
             }
@@ -183,14 +235,7 @@ fn run_wal_file(path: &Path, load: &[PathBuf], code: Option<&str>, halt_on_error
         {
             let bare = expr.trim().to_string();
             if !bare.is_empty() && !bare.starts_with(';') {
-                match eval.eval(&bare) {
-                    Ok(v) => {
-                        if !matches!(v, wal::ast::Value::Nil) {
-                            println!("{}", v);
-                        }
-                    }
-                    Err(e) => report(line_number, e)?,
-                }
+                if run_one(&mut eval, &bare, line_number)? { break 'script; }
             }
             expr.clear();
         }
@@ -203,12 +248,21 @@ fn run_wal_file(path: &Path, load: &[PathBuf], code: Option<&str>, halt_on_error
 
     // Evaluate any remaining expression at EOF
     if !expr.trim().is_empty() {
-        if let Err(e) = eval.eval(expr.trim()) {
-            report(line_number, e)?;
-        }
+        let rest = expr.trim().to_string();
+        run_one(&mut eval, &rest, line_number)?;
     }
 
-    Ok(())
+    if let Some(c) = exit_code {
+        return Ok(c);
+    }
+    if errors > 0 || asserts > 0 {
+        eprintln!(
+            "wal-rust: {} error(s), {} assertion failure(s) in {}",
+            errors, asserts, path.display()
+        );
+        return Ok(1);
+    }
+    Ok(0)
 }
 
 fn run_repl() {
@@ -217,7 +271,7 @@ fn run_repl() {
 
 /// 会话模式: 从 stdin 逐行读表达式, **单进程**内复用加载与所有缓存。
 /// 大波形的一次加载(以及每个信号首次扫描后的列缓存)因此只付一次。
-fn run_stdin_session(load: &[PathBuf]) -> Result<(), String> {
+fn run_stdin_session(load: &[PathBuf]) -> Result<i32, String> {
     use std::io::BufRead;
     let mut eval = wal::eval::Evaluator::new();
     for (i, path) in load.iter().enumerate() {
@@ -227,6 +281,8 @@ fn run_stdin_session(load: &[PathBuf]) -> Result<(), String> {
     }
     let stdin = std::io::stdin();
     let mut buf = String::new();
+    let mut errors = 0usize;
+    let mut exit_code: Option<i32> = None;
     loop {
         buf.clear();
         let n = stdin.lock().read_line(&mut buf).map_err(|e| e.to_string())?;
@@ -241,12 +297,25 @@ fn run_stdin_session(load: &[PathBuf]) -> Result<(), String> {
                 }
             }
             Err(e) => {
-                if e.starts_with("exit:") { break; }
+                if let Some(c) = parse_exit_code(&e) {
+                    exit_code = Some(c);
+                    break;
+                }
+                errors += 1;
                 println!("error: {}", e);
             }
         }
     }
-    Ok(())
+    // 会话退出码同样可判: 有探针报错/断言失败 → 1; (exit N) → N。
+    if let Some(c) = exit_code { return Ok(c); }
+    if errors > 0 {
+        eprintln!("wal-rust: {} probe error(s) in session", errors);
+        return Ok(1);
+    }
+    if eval.test_failures() > 0 {
+        return Ok(1);
+    }
+    Ok(0)
 }
 
 // ---------------------------------------------------------------------------
