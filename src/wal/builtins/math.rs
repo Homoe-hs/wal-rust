@@ -39,7 +39,8 @@ fn op_add(args: &[Value], _env: &mut Environment, eval: &mut Evaluator) -> Resul
                 if is_float {
                     float_result += *i as f64;
                 } else {
-                    result += i;
+                    result = result.checked_add(*i)
+                        .ok_or_else(|| format!("integer overflow: {} + {}", result, i))?;
                 }
             }
             Value::Float(f) => {
@@ -64,13 +65,16 @@ fn op_sub(args: &[Value], _env: &mut Environment, _eval: &mut Evaluator) -> Resu
     ensure_arity_atleast(args, 1)?;
     match &args[0] {
         Value::Int(_) => {
+            let first = extract_int(&args[0])?;
             let mut result: i64 = if args.len() == 1 {
-                -extract_int(&args[0])?
+                first.checked_neg().ok_or_else(|| format!("integer overflow: -{}", first))?
             } else {
-                extract_int(&args[0])?
+                first
             };
             for arg in &args[1..] {
-                result -= extract_int(arg)?;
+                let b = extract_int(arg)?;
+                result = result.checked_sub(b)
+                    .ok_or_else(|| format!("integer overflow: {} - {}", result, b))?;
             }
             Ok(Value::Int(result))
         }
@@ -104,7 +108,8 @@ fn op_mul(args: &[Value], _env: &mut Environment, _eval: &mut Evaluator) -> Resu
                 if is_float {
                     float_result *= *i as f64;
                 } else {
-                    result *= i;
+                    result = result.checked_mul(*i)
+                        .ok_or_else(|| format!("integer overflow: {} * {}", result, i))?;
                 }
             }
             Value::Float(f) => {
@@ -143,7 +148,9 @@ fn op_div_int(args: &[Value], _env: &mut Environment, _eval: &mut Evaluator) -> 
     if b == 0 {
         return Err("Division by zero".to_string());
     }
-    Ok(Value::Int(a.wrapping_div(b)))
+    // i64::MIN / -1 溢出(i64 装不下) → 报错而不是静默回绕/触发硬件异常
+    a.checked_div(b).map(Value::Int)
+        .ok_or_else(|| format!("integer overflow: {} / {}", a, b))
 }
 
 fn op_exp(args: &[Value], _env: &mut Environment, _eval: &mut Evaluator) -> Result<Value, String> {
@@ -195,13 +202,15 @@ fn op_mod(args: &[Value], _env: &mut Environment, _eval: &mut Evaluator) -> Resu
     if b == 0 {
         return Err("Modulo by zero".to_string());
     }
-    Ok(Value::Int(a % b))
+    a.checked_rem(b).map(Value::Int)
+        .ok_or_else(|| format!("integer overflow: {} % {}", a, b))
 }
 
 fn op_abs(args: &[Value], _env: &mut Environment, _eval: &mut Evaluator) -> Result<Value, String> {
     ensure_arity(args, 1)?;
     match &args[0] {
-        Value::Int(i) => Ok(Value::Int(i.abs())),
+        Value::Int(i) => i.checked_abs().map(Value::Int)
+            .ok_or_else(|| format!("integer overflow: abs {}", i)),
         Value::Float(f) => Ok(Value::Float(f.abs())),
         _ => Err("abs expects number".to_string()),
     }
@@ -225,7 +234,8 @@ fn op_sum(args: &[Value], _env: &mut Environment, eval: &mut Evaluator) -> Resul
                 if is_float {
                     float_sum += i as f64;
                 } else {
-                    int_sum += i;
+                    int_sum = int_sum.checked_add(i)
+                        .ok_or_else(|| format!("integer overflow: sum ... + {}", i))?;
                 }
             }
             Value::Float(f) => {

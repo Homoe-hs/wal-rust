@@ -2,7 +2,7 @@
 //! 运行: bash scripts/diff_find.sh 之外的第二道闸;P1(统一引擎)落地后
 //! 该矩阵必须原样全绿(语义冻结的验收标准)。
 use wal_rust::wal::eval::Evaluator;
-use wal_rust::wal::ast::Value;
+use wal_rust::wal::ast::{Symbol, Value};
 use wal_rust::trace::{FindCondition, ScalarValue, Trace, VcdTrace};
 use wal_rust::wal::ast::WList;
 
@@ -843,6 +843,79 @@ fn matrix_dump_trace_writer_contract() {
     e2.load_trace(&out_s, "t").unwrap();
     assert_eq!(e2.eval("(count (rising \"v\"))").unwrap(), Value::Int(1));
     let _ = std::fs::remove_file(&out);
+}
+
+/// 宽向量不再静默截断 + i64 算术溢出报错(内测 "1024b 算术注意")。
+///
+/// 旧行为: 干净向量无条件折叠进 i64 → 1024-bit 只置 MSB 的信号读出来是 0,
+/// `(= (get s) 0)` 为真(静默错误); `+ - * sum abs div` 溢出静默回绕(release)。
+#[test]
+fn matrix_wide_vector_and_overflow() {
+    let msb65 = format!("1{}", "0".repeat(64));
+    let msb1024 = format!("1{}", "0".repeat(1023));
+    let low65 = format!("{}1", "0".repeat(64));
+    let body = format!(
+        "$timescale 1ns $end\n$scope module t $end\n$var wire 65 # hi65 $end\n$var wire 65 $ lo65 $end\n$var wire 1024 % hi1024 $end\n\
+$enddefinitions $end\n#0\nb{} #\nb{} $\nb{} %\n#10\nb{} #\n",
+        msb65, low65, msb1024, low65
+    );
+    let p = tmp("widebits", &body);
+    let e = |c: &str| eval_with(&p, c);
+    // 放得进 i64 的小值仍是整数(既有语义: 128bit 信号可比 255/128)
+    assert_eq!(e("(get \"t.lo65\")"), Value::Int(1));
+    assert_eq!(e("(= (get \"t.lo65\") 1)"), Value::Bool(true));
+    // 有效位放不进 i64 → 位串, 绝不再折成 0
+    assert_eq!(e("(length (get \"t.hi65\"))"), Value::Int(65));
+    assert_eq!(e("(= (get \"t.hi65\") 0)"), Value::Bool(false));
+    assert_eq!(e("(length (get \"t.hi1024\"))"), Value::Int(1024));
+    assert_eq!(e("(= (get \"t.hi1024\") 0)"), Value::Bool(false));
+    assert_eq!(e("(signal-width \"t.hi1024\")"), Value::Int(1024));
+    // 溢出必须报错(release 下旧实现静默回绕成负数)
+    let err = |c: &str| -> String {
+        let mut e = Evaluator::new();
+        e.load_trace(&p.to_string_lossy(), "t").unwrap();
+        e.eval(c).unwrap_err()
+    };
+    for q in [
+        "(+ 9223372036854775807 1)",
+        "(- -9223372036854775808 1)",
+        "(* 9223372036854775807 2)",
+        "(sum (list 9223372036854775807 1))",
+        "(abs -9223372036854775808)",
+        "(div -9223372036854775808 -1)",
+    ] {
+        let m = err(q);
+        assert!(m.contains("overflow"), "{} 应报溢出, 实际: {}", q, m);
+    }
+    // 正常算术不受影响
+    assert_eq!(e("(+ 1 2)"), Value::Int(3));
+    assert_eq!(e("(sum (list 1 2 3))"), Value::Int(6));
+    assert_eq!(e("(- 5 3)"), Value::Int(2));
+}
+
+/// 语法糖可用性: `#name` ≡ (resolve-group 'name)、`expr@offset` ≡ (rel_eval expr offset)。
+/// 此前 `expr_from_node` 的 `"symbol"` 分支直接返回原文, 遮蔽了
+/// grouped_symbol / scoped_symbol / timed_atom 三个分支 —— README §4.1 与手册 §4.1
+/// 都承诺 `#name`, 实际却报 `Undefined symbol: #c`; `x@1` 的 offset 被吃成字符串 "@"。
+#[test]
+fn matrix_sugar_group_resolve_and_rel_eval() {
+    let p = tmp("sugar", "$timescale 1ns $end\n$scope module top $end\n$var wire 1 ! clk $end\n$var wire 1 \" rst_n $end\n$upscope $end\n$enddefinitions $end\n#0\n0!\n1\"\n#1\n1!\n");
+    let e = |c: &str| eval_with(&p, c);
+    let sym = |n: &str| Value::Symbol(Symbol::new(n));
+    // 解析形态
+    assert_eq!(e("(parse \"#clk\")"), Value::List(WList::from_vec(vec![
+        sym("resolve-group"),
+        Value::List(WList::from_vec(vec![sym("quote"), sym("clk")])),
+    ])));
+    assert_eq!(e("(parse \"clk@1\")"), Value::List(WList::from_vec(vec![
+        sym("rel_eval"), sym("clk"), Value::Int(1),
+    ])));
+    // 端到端: 组前缀 + #name; @offset 相对当前索引
+    assert_eq!(e("(in-group \"top.\" #clk)"), Value::Int(0));
+    assert_eq!(e("(in-group \"top.\" #rst_n)"), Value::Int(1));
+    assert_eq!(e("(do clk@1)"), Value::Int(1));
+    // 越界(0+2 > max_index=1) → false(rel_eval 的既有约定), 不报错
+    assert_eq!(e("(do clk@2)"), Value::Bool(false));
 }
 
 /// B10 round-trip: `defsig` 出来的**宽**虚信号(8bit, 只有 `$dumpvars` 初值、

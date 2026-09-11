@@ -133,7 +133,9 @@ fn is_whitespace_or_comment(kind: &str) -> bool {
 }
 
 fn is_anon_token(kind: &str) -> bool {
-    matches!(kind, "(" | ")" | "[" | "]" | "{" | "}" | "~" | "#" | "'" | "`" | "," | ",@")
+    // "@" 是 timed_atom 的分隔符(`expr@offset`); 漏了它时 `x@1` 的 offset
+    // 会解析成字符串 "@" → `error: reval: offset must be an integer`。
+    matches!(kind, "(" | ")" | "[" | "]" | "{" | "}" | "~" | "#" | "@" | "'" | "`" | "," | ",@")
 }
 
 fn should_skip_node(node: tree_sitter::Node) -> bool {
@@ -195,7 +197,21 @@ pub fn expr_from_node(node: tree_sitter::Node, source: &str) -> Result<Value, St
             }
             Err("Empty atom".to_string())
         }
-        "symbol" | "base_symbol" => {
+        // 注意: **不能**在这里处理 "symbol" —— 语法里
+        //   symbol = choice(base_symbol, scoped_symbol, grouped_symbol)
+        // 直接返回原文会把 `#name`(~scope / @offset)语法糖压成字面符号,
+        // 下面 grouped_symbol/scoped_symbol/timed_atom 三个分支永远不可达
+        // (README §4.1、手册 §4.1 承诺的 `#name` ≡ (resolve-group 'name) 因此失效)。
+        "symbol" => {
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                if !should_skip_node(child) {
+                    return expr_from_node(child, source);
+                }
+            }
+            Err("Empty symbol".to_string())
+        }
+        "base_symbol" => {
             let text = get_node_text(node, source);
             Ok(Value::Symbol(Symbol::new(text)))
         }

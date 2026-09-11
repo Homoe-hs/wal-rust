@@ -108,6 +108,19 @@ pub(crate) fn scalar_to_value_x_aware(sv: &ScalarValue) -> Value {
                     v.iter().map(|&b| (b as char).to_ascii_lowercase()).collect(),
                 );
             }
+            // 干净(全 0/1)向量: **有效位**放得进 i64 就给整数(128bit 信号里的小值
+            // 仍然可比 255/128 —— 既有语义), 放不进就给位串。
+            // 之前无条件折叠会静默丢高位: 1024-bit 只置 MSB 的信号读出来是 0,
+            // 于是 `(= (get s) 0)` 为真 —— 静默错误, 比报错危险。
+            let bit_len = match v.iter().position(|&b| b == b'1') {
+                Some(first_one) => v.len() - first_one,
+                None => 0, // 全 0
+            };
+            if bit_len > 63 {
+                return Value::String(
+                    v.iter().map(|&b| if b == b'1' { '1' } else { '0' }).collect(),
+                );
+            }
             let int_val = v.iter().fold(0i64, |acc, &b| {
                 (acc << 1) | if b == b'1' { 1 } else { 0 }
             });
