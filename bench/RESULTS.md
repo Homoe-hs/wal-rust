@@ -135,3 +135,16 @@ ID 复核 —— 行 `1 11` 以 `1` 结尾、前一字符还是值字符 `1`, �
 bench_2g 上 `(count (= (get "s0") 1))` 由 77629 变 30741。矩阵/diff 闸当时是绿的
 (改动后没重跑矩阵 + 构建缓存), 靠"数字对不上"才发现。修正后新增
 `matrix_digit_id_scalar_suffix`, 并确认该用例在带 bug 的构建上会失败。
+
+## 夹具重建(生成器与耗时,2026-09-10 记录)
+
+`bench/data/*.vcd` 是**合成夹具**,不进 git,可按需重建(生成器 `scripts/gen_big_vcd.py` 在库内):
+
+```bash
+python3 scripts/gen_big_vcd.py bench/data/bench_2g.vcd  700000 300000 1100   # 11.5GB, 实测 4m51s
+python3 scripts/gen_big_vcd.py bench/data/bench_10g.vcd 3500000 1500000 1100 # 58.7GB, 实测 24m49s
+```
+
+`scripts/run_bench.sh` / `scripts/perf_history.sh` 依赖这些文件;`scripts/diff_find.sh`
+在缺少 `bench/data/small.vcd` 时会自动跳过。性能数字本身在 `bench/perf-history.csv`
+与本文里,不依赖文件常驻。
