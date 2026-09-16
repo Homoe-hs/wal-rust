@@ -491,23 +491,37 @@ pub(crate) fn decode_timeline(buf: &[u8], expect_fp: u64) -> Option<(Vec<u64>, O
     Some((times, if has_first { Some(first_val) } else { None }))
 }
 
+/// 缓存根目录的**绝对**路径。
+///
+/// 必须绝对: NPI 沙箱会把 CWD 切到 `./.wal-rust-cache/npi/`, 期间用相对路径
+/// 写缓存会落进沙箱目录里(实测踩过: 文件名对、文件却"不见了")。
+fn abs_cache_root() -> std::path::PathBuf {
+    let d = crate::trace::vcd::cache_dir();
+    if d.is_absolute() {
+        return d;
+    }
+    match std::env::current_dir() {
+        Ok(cwd) => cwd.join(d),
+        Err(_) => d,
+    }
+}
+
 /// 通用缓存路径: `<cache>/<basename>-<size>-<mtime>-v1<ext>`
-fn cache_path(filename: &str, ext: &str) -> Option<std::path::PathBuf> {
+fn cache_path(cache_root: &std::path::Path, filename: &str, ext: &str) -> Option<std::path::PathBuf> {
     let p = std::path::Path::new(filename);
     let meta = std::fs::metadata(p).ok()?;
     let mtime = meta.modified().ok()
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|d| d.as_secs())?;
     let base = p.file_name()?.to_string_lossy().replace('/', "_");
-    Some(crate::trace::vcd::cache_dir()
-        .join(format!("{}-{}-{}-v1{}", base, meta.len(), mtime, ext)))
+    Some(cache_root.join(format!("{}-{}-{}-v1{}", base, meta.len(), mtime, ext)))
 }
 
-fn try_load_tree_cache(filename: &str) -> Option<TreeSnapshot> {
+fn try_load_tree_cache(cache_root: &std::path::Path, filename: &str) -> Option<TreeSnapshot> {
     if crate::trace::vcd::cache_mode() == crate::trace::vcd::CacheMode::Off {
         return None;
     }
-    let f = cache_path(filename, ".fnames")?;
+    let f = cache_path(cache_root, filename, ".fnames")?;
     let buf = std::fs::read(&f).ok()?;
     let fp = crate::trace::vcd::wave_fingerprint(std::path::Path::new(filename));
     let snap = decode_tree(&buf, fp);
@@ -517,12 +531,18 @@ fn try_load_tree_cache(filename: &str) -> Option<TreeSnapshot> {
     snap
 }
 
-fn save_tree_cache(filename: &str, names: &[String], widths: &[usize], scopes: &[String]) {
+fn save_tree_cache(
+    cache_root: &std::path::Path,
+    filename: &str,
+    names: &[String],
+    widths: &[usize],
+    scopes: &[String],
+) {
     use crate::trace::vcd::CacheMode;
     if crate::trace::vcd::cache_mode() == CacheMode::Read {
         return;
     }
-    let Some(f) = cache_path(filename, ".fnames") else { return };
+    let Some(f) = cache_path(cache_root, filename, ".fnames") else { return };
     if let Some(dir) = f.parent() {
         if std::fs::create_dir_all(dir).is_err() {
             return;
@@ -858,6 +878,8 @@ struct ScanOut {
 pub struct FsdbTrace {
     id: TraceId,
     filename: String,
+    /// 缓存根目录的**绝对**路径(进 NPI 沙箱前算好: 沙箱会把 CWD 切走)
+    cache_root: std::path::PathBuf,
     file: *mut c_void,
     sigs: Vec<Sig>,
     sig_names: Vec<String>,
@@ -908,6 +930,8 @@ impl FsdbTrace {
         let npi = npi()?;
         let filename = path.to_string_lossy().to_string();
         // 沙箱会把 CWD 切走, 所以必须给 NPI 绝对路径(用户可能传相对路径)
+        // 缓存根必须在进 NPI 沙箱**之前**算成绝对路径(沙箱里 CWD 已经变了)
+        let cache_root = abs_cache_root();
         let abs = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
         let cpath = CString::new(abs.to_string_lossy().as_bytes())
             .map_err(|_| format!("路径含 NUL 字节: {}", filename))?;
@@ -944,7 +968,7 @@ impl FsdbTrace {
             // 缓存, 第一次用到某个信号时按名字解析(`npi_fsdb_sig_by_name`)。
             let mut quoted_names: Vec<String> = Vec::new();
             let mut quoted_widths: Vec<usize> = Vec::new();
-            if let Some(snap) = try_load_tree_cache(&filename) {
+            if let Some(snap) = try_load_tree_cache(&cache_root, &filename) {
                 quoted_names = snap.names;
                 quoted_widths = snap.widths;
                 scopes = snap.scopes;
@@ -989,7 +1013,7 @@ impl FsdbTrace {
                 // 刚走完树 → 落盘, 之后的进程直接跳过遍历
                 let names: Vec<String> = sigs.iter().map(|s| s.full.clone()).collect();
                 let widths: Vec<usize> = sigs.iter().map(|s| s.width).collect();
-                save_tree_cache(&filename, &names, &widths, &scopes);
+                save_tree_cache(&cache_root, &filename, &names, &widths, &scopes);
             }
             if sigs.is_empty() {
                 (npi.close)(file);
@@ -1004,6 +1028,7 @@ impl FsdbTrace {
             Ok(FsdbTrace {
                 id,
                 filename,
+                cache_root,
                 file,
                 sigs,
                 sig_names,
@@ -1274,7 +1299,7 @@ impl FsdbTrace {
 
     /// 时间线缓存文件: 与 VCD 旁挂缓存同一套 key(路径 basename+size+mtime)。
     fn timeline_cache_file(&self) -> Option<std::path::PathBuf> {
-        cache_path(&self.filename, ".ftl")
+        cache_path(&self.cache_root, &self.filename, ".ftl")
     }
 
     /// 读时间线缓存(命中 → 直接返回, 不再碰 FSDB 数据)
