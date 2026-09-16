@@ -565,6 +565,43 @@ fn save_tree_cache(
     }
 }
 
+/// 两个**已升序去重**的时间序列 → 归并后的升序去重序列。
+/// 时间线可能有上千万个点, 逐块对全表 `sort_unstable` 是 O(块数 × n log n);
+/// 增量线性归并是 O(n)。
+fn merge_sorted_unique(a: &[u64], b: &[u64]) -> Vec<u64> {
+    if a.is_empty() {
+        return b.to_vec();
+    }
+    if b.is_empty() {
+        return a.to_vec();
+    }
+    let mut out: Vec<u64> = Vec::with_capacity(a.len() + b.len());
+    let (mut i, mut j) = (0usize, 0usize);
+    let mut push = |v: u64, out: &mut Vec<u64>| {
+        if out.last() != Some(&v) {
+            out.push(v);
+        }
+    };
+    while i < a.len() && j < b.len() {
+        if a[i] <= b[j] {
+            push(a[i], &mut out);
+            i += 1;
+        } else {
+            push(b[j], &mut out);
+            j += 1;
+        }
+    }
+    while i < a.len() {
+        push(a[i], &mut out);
+        i += 1;
+    }
+    while j < b.len() {
+        push(b[j], &mut out);
+        j += 1;
+    }
+    out
+}
+
 /// `npiFsdbTimeBasedVcIter` 实例(RAII: drop 时 iter_stop + 析构)
 struct IterObj {
     buf: Box<[u64; 8]>,
@@ -802,7 +839,37 @@ fn eval_column(
         cond,
         FindCondition::Rising | FindCondition::Falling | FindCondition::Changed
     );
-    let mut indices = Vec::new();
+    let (edges, spans) = eval_column_spans(max_index, points, initial, cond);
+    let mut indices = Vec::with_capacity(edges.len() + spans.iter().map(|(s, e)| e - s).sum::<usize>());
+    if is_edge {
+        indices = edges;
+    } else {
+        // 顺序与原实现一致: 先用初始段, 再按变更点顺序展开
+        for (s, e) in spans {
+            indices.extend(s..e);
+        }
+    }
+    indices
+}
+
+/// 与 `eval_column` **同一套判定**, 但产出的是"边沿单点 + 电平区间"而不是逐个索引。
+///
+/// 为什么必须分开: 电平条件的匹配区间可能覆盖**上亿个索引**(比如整段都是 x 的信号
+/// 上做 `(count (is-x s))`), 逐个 push 会直接吃光内存 —— 内网 174MB 波形实测
+/// `is-x` 394s / RSS 峰值 4GB, 而它真正需要的信息只是"哪些区间成立"。
+/// 计数走 `count_matches`(区间长度求和), 需要索引的 `find` 才展开。
+fn eval_column_spans(
+    max_index: usize,
+    points: &[(usize, ScalarValue)],
+    initial: Option<&ScalarValue>,
+    cond: &FindCondition,
+) -> (Vec<usize>, Vec<(usize, usize)>) {
+    let is_edge = matches!(
+        cond,
+        FindCondition::Rising | FindCondition::Falling | FindCondition::Changed
+    );
+    let mut edges: Vec<usize> = Vec::new();
+    let mut spans: Vec<(usize, usize)> = Vec::new();
     // 与 VCD 后端逐条对齐: **首个变更恰好落在索引 0 且没有确定初值**时, 索引 0
     // 没有前驱(Changed 不成立); 其余情况前驱就是 t0 快照(没有条目 → x)。
     // `count_matches` 在时间基上必须复刻这一条, 见 `global_first_change_time`。
@@ -816,7 +883,7 @@ fn eval_column(
     };
     if !is_edge && find_cond_matches(init_ref, None, cond) {
         let first_idx = points.first().map(|(i, _)| *i).unwrap_or(max_index + 1);
-        indices.extend(0..first_idx.min(max_index + 1));
+        spans.push((0, first_idx.min(max_index + 1)));
     }
     for (k, (idx, v)) in points.iter().enumerate() {
         if *idx > max_index {
@@ -828,13 +895,13 @@ fn eval_column(
             continue;
         }
         if is_edge {
-            indices.push(*idx);
+            edges.push(*idx);
         } else {
             let end = points.get(k + 1).map(|(n, _)| *n).unwrap_or(max_index + 1);
-            indices.extend(*idx..end.min(max_index + 1));
+            spans.push((*idx, end.min(max_index + 1)));
         }
     }
-    indices
+    (edges, spans)
 }
 
 // ============================ Trace 实现 ============================
@@ -1204,9 +1271,7 @@ impl FsdbTrace {
                         last = t;
                     }
                 }
-                out.times.extend_from_slice(&chunk_times);
-                out.times.sort_unstable();
-                out.times.dedup();
+                out.times = merge_sorted_unique(&out.times, &chunk_times);
                 drop(it);
                 if unload_each_chunk() {
                     if let Some(f) = npi.unload_vc {
@@ -1255,9 +1320,7 @@ impl FsdbTrace {
             if want_timeline {
                 // 增量归并: 每块结束就把时间去重进主表 → 主表长度 = 去重后的时间点数,
                 // 不随"块数 × 块内时间点数"膨胀。
-                out.times.extend_from_slice(&chunk_times);
-                out.times.sort_unstable();
-                out.times.dedup();
+                out.times = merge_sorted_unique(&out.times, &chunk_times);
             }
             drop(it);
             if unload_each_chunk() {
@@ -1889,13 +1952,22 @@ impl Trace for FsdbTrace {
             cond,
             FindCondition::Rising | FindCondition::Falling | FindCondition::Changed
         );
-        if !is_edge {
-            // 电平/取值条件要按区间长度累加, 那必须落在索引空间里 → 走通用路径
-            return self.find_indices(name, cond).map(|v| v.len());
-        }
         let idx = self
             .resolve_idx(name)
             .ok_or_else(|| format!("Unknown signal: {}", name))?;
+        if !is_edge {
+            // 电平/取值条件: 仍然需要索引空间(按区间长度累加), 但**不展开索引** ——
+            // 全程为 x 的信号上 `(count (is-x s))` 的匹配区间能覆盖上亿个索引,
+            // 逐个 push 就是 4GB/394s(内网实测)。这里只在区间上求和。
+            let tl = self.timeline()?;
+            if tl.is_empty() {
+                return Ok(0);
+            }
+            let col = self.column_indexed(idx)?;
+            let (edges, spans) =
+                eval_column_spans(tl.len() - 1, &col, self.initial_of(idx).as_ref(), &cond);
+            return Ok(edges.len() + spans.iter().map(|(s, e)| e - s).sum::<usize>());
+        }
         let col = self.column_time(idx)?;
         let init = self.initial_of(idx);
         let init_defined = init.as_ref().map(sv_is_defined).unwrap_or(false);
