@@ -37,3 +37,6 @@ _*_sim.log
 # FSDB 垫片构建产物(见 src/trace/fsdb_shim/build_shim.sh)
 src/trace/fsdb_shim/*.so
 src/trace/fsdb_shim/shim_smoke
+
+# Verdi fsdbdebug 在工作目录留下的日志目录
+fsdbdebugLog/
