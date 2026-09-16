@@ -565,6 +565,11 @@ fn save_tree_cache(
     }
 }
 
+/// 时间线"值得落盘缓存"的判据(点数够多, 或这次构建确实慢 —— 由调用方补时长判断)
+fn times_len_ok(n: usize) -> bool {
+    n >= 256
+}
+
 /// 两个**已升序去重**的时间序列 → 归并后的升序去重序列。
 /// 时间线可能有上千万个点, 逐块对全表 `sort_unstable` 是 O(块数 × n log n);
 /// 增量线性归并是 O(n)。
@@ -600,6 +605,63 @@ fn merge_sorted_unique(a: &[u64], b: &[u64]) -> Vec<u64> {
         j += 1;
     }
     out
+}
+
+// ======================= 时间线并行构建(fan-out) =======================
+//
+// 冷启动构建全局时间线要"把整个 FSDB 的每条变更过一遍", 这是内网 174MB 波形
+// 上唯一还在几百秒量级的操作。**它是纯并集, 天然可并行** —— 实测同一文件两个
+// 进程同时冷建: 串行 20.6s+23.2s, 并行墙钟 23.8s(≈2x 吞吐)。
+//
+// 并行方式刻意选**多进程**(而不是 fork/线程): NPI 的线程安全性/fork 安全性没有
+// 保证, exec 出来的 worker 是全新的进程, 每个都走正常的 npi_init/open 路径。
+// 代价是每个 worker 付一次库加载(~1s 量级), 相对几百秒的构建可以忽略。
+//
+// 开关: `WAL_FSDB_TL_JOBS=N`(默认 1 = 关闭, 保持旧行为)。分片按名字树顺序切成
+// N 段连续区间, 每段一个 worker, 各自输出"升序去重的变更时间", 父进程线性归并。
+
+/// 该区间内所有变更时间(升序去重) —— worker 的输出格式: delta-varint
+fn write_times(path: &std::path::Path, times: &[u64]) -> std::io::Result<()> {
+    let mut out = Vec::with_capacity(times.len() * 2 + 8);
+    let mut prev = 0u64;
+    for &t in times {
+        put_varint(&mut out, t - prev);
+        prev = t;
+    }
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, &out)?;
+    std::fs::rename(&tmp, path)
+}
+
+fn read_times(path: &std::path::Path) -> Option<Vec<u64>> {
+    let buf = std::fs::read(path).ok()?;
+    let mut pos = 0usize;
+    let mut prev = 0u64;
+    let mut out = Vec::new();
+    while pos < buf.len() {
+        let d = get_varint(&buf, &mut pos)?;
+        prev = prev.checked_add(d)?;
+        out.push(prev);
+    }
+    Some(out)
+}
+
+/// worker 入口: 只算 [lo, hi) 这些信号的变更时间并落盘。
+pub fn run_timeline_worker(
+    file: &std::path::Path,
+    lo: usize,
+    hi: usize,
+    out: &std::path::Path,
+) -> Result<(), String> {
+    let trace = FsdbTrace::load(file, "w".to_string())?;
+    let n = trace.sigs.len();
+    let hi = hi.min(n);
+    if lo >= hi {
+        return write_times(out, &[]).map_err(|e| e.to_string());
+    }
+    let times = trace.scan_times(&(lo..hi).collect::<Vec<usize>>())?;
+    trace.close_now();
+    write_times(out, &times).map_err(|e| e.to_string())
 }
 
 /// `npiFsdbTimeBasedVcIter` 实例(RAII: drop 时 iter_stop + 析构)
@@ -1202,6 +1264,120 @@ impl FsdbTrace {
         }
     }
 
+    /// 多进程并行构建全局时间线: 把信号按名字树顺序切成 N 段, 每段一个 worker
+    /// 子进程(exec 自身, 走正常的 npi_init/open 路径, 不 fork), 再线性归并。
+    /// 只在 `WAL_FSDB_TL_JOBS>1` 时调用; 任何一步失败都返回 Err 让调用方回退。
+    ///
+    /// 注意: 每个 worker 都是一次独立的 NPI 会话 —— 会各占**一个 Verdi 许可**,
+    /// 所以默认关闭。
+    fn parallel_timeline(&self, jobs: usize) -> Result<Vec<u64>, String> {
+        let exe = std::env::current_exe().map_err(|e| format!("current_exe: {}", e))?;
+        let n = self.sigs.len();
+        let per = n.div_ceil(jobs.max(1));
+        let tag = std::process::id();
+        let mut kids: Vec<(std::process::Child, std::path::PathBuf)> = Vec::new();
+        let mut lo = 0usize;
+        for k in 0..jobs {
+            let hi = ((k + 1) * per).min(n);
+            if lo >= hi {
+                break;
+            }
+            let out = self.cache_root.join(format!(".tl-{}-{}.part", tag, k));
+            let _ = std::fs::remove_file(&out);
+            let child = std::process::Command::new(&exe)
+                .arg("fsdb-tl-worker")
+                .arg(&self.filename)
+                .arg(lo.to_string())
+                .arg(hi.to_string())
+                .arg(&out)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .map_err(|e| format!("spawn worker: {}", e))?;
+            kids.push((child, out));
+            lo = hi;
+        }
+        let mut parts: Vec<Vec<u64>> = Vec::new();
+        let mut failed = None;
+        for (mut c, out) in kids {
+            let st = c.wait().map_err(|e| format!("wait worker: {}", e))?;
+            if !st.success() {
+                failed = Some(format!("worker 退出码 {:?}", st.code()));
+                let _ = std::fs::remove_file(&out);
+                break;
+            }
+            match read_times(&out) {
+                Some(t) => parts.push(t),
+                None => {
+                    failed = Some(format!("worker 输出无法读取: {}", out.display()));
+                    let _ = std::fs::remove_file(&out);
+                    break;
+                }
+            }
+            let _ = std::fs::remove_file(&out);
+        }
+        if let Some(e) = failed {
+            for (mut c, out) in Vec::<(std::process::Child, std::path::PathBuf)>::new() {
+                let _ = c.wait();
+                let _ = std::fs::remove_file(&out);
+            }
+            return Err(e);
+        }
+        let mut all: Vec<u64> = Vec::new();
+        for p in parts {
+            all = merge_sorted_unique(&all, &p);
+        }
+        Ok(all)
+    }
+
+    /// 只算"这些信号的变更时间并集"(升序去重) —— 并行构建时间线的 worker 用。
+    fn scan_times(&self, targets: &[usize]) -> Result<Vec<u64>, String> {
+        let npi = npi()?;
+        let chunk = chunk_size();
+        let mut all: Vec<u64> = Vec::new();
+        let mut lo = 0usize;
+        while lo < targets.len() {
+            let hi = (lo + chunk).min(targets.len());
+            let mut it = IterObj::new(npi);
+            for &i in &targets[lo..hi] {
+                if let Ok(h) = self.handle_of(i) {
+                    unsafe { (npi.iter.add)(it.this(), h) };
+                }
+            }
+            unsafe { (npi.iter.start)(it.this(), self.min_t, self.max_t) };
+            let mut chunk_times: Vec<u64> = Vec::new();
+            let mut last = u64::MAX;
+            loop {
+                let mut t: NpiTime = 0;
+                let mut sig: *mut c_void = ptr::null_mut();
+                let rc = unsafe { (npi.iter.next)(it.this(), &mut t, &mut sig) };
+                if rc <= 0 || sig.is_null() {
+                    break;
+                }
+                if t > 0 && t != last {
+                    chunk_times.push(t);
+                    last = t;
+                }
+            }
+            drop(it);
+            if unload_each_chunk() {
+                if let Some(f) = npi.unload_vc {
+                    unsafe { f(self.file) };
+                }
+            }
+            all = merge_sorted_unique(&all, &chunk_times);
+            lo = hi;
+        }
+        Ok(all)
+    }
+
+    /// 立刻关闭 FSDB(worker 写完就走, 不等 Drop)
+    pub fn close_now(&self) {
+        if let Ok(npi) = npi() {
+            unsafe { (npi.close)(self.file) };
+        }
+    }
+
     /// 融合扫描: `want_timeline` 时遍历**所有**信号(算时间线), 同时为 `want`
     /// 里的信号取变更列; 否则只遍历 `want`。
     fn scan(&self, want: &HashSet<usize>, want_timeline: bool) -> Result<ScanOut, String> {
@@ -1420,11 +1596,48 @@ impl FsdbTrace {
             return Ok(rc);
         }
         let t_begin = std::time::Instant::now();
+        // 并行构建(可选): 冷启动的时间线是全文件扫描, 是唯一还在几百秒量级的操作。
+        let jobs = std::env::var("WAL_FSDB_TL_JOBS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(1);
+        if jobs > 1 && self.sigs.len() >= 2048 {
+            match self.parallel_timeline(jobs) {
+                Ok(times) if !times.is_empty() => {
+                    if std::env::var("WAL_DEBUG_FSDB").is_ok() {
+                        eprintln!(
+                            "[fsdb] 并行构建时间线: {} workers, {} 个时间点, {}ms",
+                            jobs,
+                            times.len(),
+                            t_begin.elapsed().as_millis()
+                        );
+                    }
+                    self.first_change.set(Some(times.first().copied()));
+                    let rc = Rc::new(times);
+                    *self.timeline.borrow_mut() = Some(rc.clone());
+                    if times_len_ok(rc.len()) {
+                        self.save_timeline_cache(&rc, self.first_change.get().flatten());
+                    }
+                    return Ok(rc);
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    if std::env::var("WAL_DEBUG_FSDB").is_ok() {
+                        eprintln!("[fsdb] 并行构建失败, 回退单进程: {}", e);
+                    }
+                }
+            }
+        }
         let out = self.scan(&HashSet::new(), true)?;
         let times = out.times.clone();
         self.apply_scan(out);
         let t = self.timeline.borrow().clone();
         let t = t.ok_or_else(|| "FSDB 时间线构建失败".to_string())?;
+        // 顺手把"全局最早变更时间"填上(时间线的第一个点) —— 并行/串行两条路径
+        // 产出的缓存因此逐字节一致, 也省掉后续 `global_first_change_time()` 的探测。
+        if self.first_change.get().is_none() {
+            self.first_change.set(Some(t.first().copied()));
+        }
         let elapsed = t_begin.elapsed();
         // 只缓存"值得缓存"的: 小时间线(<1k 点)重扫也比读文件快, 而且不污染目录。
         // `WAL_CACHE=build` 时无条件写(测试/预热用)。

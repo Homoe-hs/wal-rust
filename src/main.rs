@@ -34,6 +34,17 @@ fn main() {
     let args = Args::parse();
 
     match args.resolve() {
+        ExecMode::FsdbTlWorker { file, lo, hi, out } => {
+            // 内部 worker: 只为并行构建全局时间线用(见 src/trace/fsdb.rs)。
+            // 不算入口, 不进 CLI 文档。
+            match wal_rust::trace::fsdb::run_timeline_worker(&file, lo, hi, &out) {
+                Ok(()) => std::process::exit(0),
+                Err(e) => {
+                    eprintln!("fsdb-tl-worker: {}", e);
+                    std::process::exit(2);
+                }
+            }
+        }
         ExecMode::RunScript { path, load, code, halt_on_error } => {
             match run_wal_file(&path, &load, code.as_deref(), halt_on_error) {
                 Ok(0) => {}

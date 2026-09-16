@@ -1,6 +1,6 @@
 //! CLI argument parsing and logging
 
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
@@ -116,6 +116,23 @@ wal-rust count <wave> <signal> [value]")]
     /// Top signals by number of value changes
     #[command(about = "Most-active signals (by change count):\nwal-rust topsig <wave> [limit]")]
     Topsig(TopsigArgs),
+
+    /// (internal) FSDB 时间线并行构建 worker
+    #[command(hide = true)]
+    FsdbTlWorker(FsdbTlWorkerArgs),
+}
+
+/// FSDB 时间线并行构建的内部 worker(用户不会直接调用)。
+#[derive(clap::Args, Debug)]
+pub struct FsdbTlWorkerArgs {
+    /// 波形文件
+    pub file: PathBuf,
+    /// 信号区间起点(按名字树顺序的下标)
+    pub lo: usize,
+    /// 信号区间终点(不含)
+    pub hi: usize,
+    /// 输出: 该区间内所有变更时间(升序去重, delta-varint)
+    pub out: PathBuf,
 }
 
 #[derive(Parser, Debug)]
@@ -192,6 +209,13 @@ pub enum ExecMode {
     },
     /// Start the interactive REPL
     Repl,
+    /// (internal) FSDB 时间线并行构建 worker
+    FsdbTlWorker {
+        file: PathBuf,
+        lo: usize,
+        hi: usize,
+        out: PathBuf,
+    },
     /// count <wave> <sig> [value]
     Count {
         wave: PathBuf,
@@ -226,6 +250,12 @@ impl Args {
                 Command::Count(c) => ExecMode::Count { wave: c.wave, sig: c.sig, value: c.value },
                 Command::Sigs(s) => ExecMode::Sigs { wave: s.wave, pattern: s.pattern, limit: s.limit },
                 Command::Topsig(t) => ExecMode::Topsig { wave: t.wave, limit: t.limit },
+                Command::FsdbTlWorker(w) => ExecMode::FsdbTlWorker {
+                    file: w.file,
+                    lo: w.lo,
+                    hi: w.hi,
+                    out: w.out,
+                },
             };
         }
 

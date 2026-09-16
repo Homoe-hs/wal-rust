@@ -6,7 +6,7 @@ mod trace;
 mod container;
 mod vcd;
 mod fst;
-mod fsdb;
+pub mod fsdb;
 
 pub use trace::{Trace, TraceId, ScalarValue, FindCondition, BatchEntry};
 pub use container::{TraceContainer, SharedTraceContainer, new_shared};
