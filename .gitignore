@@ -40,3 +40,6 @@ src/trace/fsdb_shim/shim_smoke
 
 # Verdi fsdbdebug 在工作目录留下的日志目录
 fsdbdebugLog/
+npi_probeLog/
+# NPI 日志目录常落在 CWD(我们的 FSDB 后端会把它挪进 .wal-rust-cache/npi/)
+*Log/

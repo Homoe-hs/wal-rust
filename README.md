@@ -1,6 +1,6 @@
 # wal-rust — WAL: Waveform Analysis Language
 
-High-performance Rust implementation of [WAL](https://wal-lang.org), supporting VCD/FST waveform analysis at scale.
+High-performance Rust implementation of [WAL](https://wal-lang.org), supporting VCD/FST/FSDB waveform analysis at scale.
 
 **当前(v0.13.2)** — 58.7GB 合成波(3.5M 信号 / 1.5M 时间戳 / 1.65G 变更):
 
@@ -350,9 +350,10 @@ wal-rust repl                                 # interactive
 ### Loading
 
 ```lisp
-;; Load VCD or FST (auto-detected by extension)
+;; Load VCD / FST / FSDB (auto-detected by extension and magic)
 (load "sim.vcd")
 (load "waveform.fst")
+(load "waveform.fsdb")   ;; 需要 Verdi 的 NPI 读库, 见 "FSDB Format Support"
 
 ;; Load with custom trace ID
 (load "sim.vcd" "trace_a")
@@ -496,6 +497,35 @@ analyze TileLink bus protocols:
 | Icarus Verilog | Big-endian | ✅ Full: gzip HIER after GEOM, signal names, scopes |
 | GTKWave examples | Big-endian | ✅ Verified: des.fst, transaction.fst, 10 test files |
 | vcd2fst (GTKWave) | Big-endian | ✅ Verified (2026-09-06): names/values decode via wellen; width suffix normalized (`sig [7:0]` → `sig` + width metadata) |
+
+---
+
+## FSDB Format Support(借 Verdi 的 NPI,纯 Rust FFI)
+
+FSDB **不做逆向、不做转换** —— 直接调用 Synopsys 正版 Verdi 的 NPI 读库 `libNPI.so`,
+调用方式是运行期 `dlopen` + `dlsym`:`wal-rust` 的二进制里**没有 C++ 依赖**,构建期也不需要
+Verdi;找不到库时 FSDB 给出明确报错,VCD/FST 通路完全不受影响。
+
+```bash
+export VERDI_HOME=/path/to/verdi     # 或 WAL_NPI_LIB=/path/to/libNPI.so
+wal-rust -l design.fsdb '(count (rising "clk"))'
+wal-rust -l design.fsdb '(find (is-x "state"))'
+```
+
+要点(细节与实测结论见 `docs/fsdb-npi.md`):
+
+* **只用归并迭代器** `npiFsdbTimeBasedVcIter`:一次遍历同时得到"全局时间线"(所有信号
+  变更时间的并集)与被查询信号的变更列;`npi_fsdb_create_vct` 用过它之后就失效,所以全程不碰。
+* **规则 A 一致**:t=0 条目是初值快照,不是 INDEX;索引 0 的值 = 该索引最后一次写入,
+  首变化之前 = 初值(无条目 → x)。
+* **环境全自动**:库路径从 `$VERDI_HOME` 推、`etc/` 资源目录自动补进 `LD_LIBRARY_PATH`、
+  NPI 的 stdout banner 静音、日志目录挪进 `./.wal-rust-cache/npi/`。
+* **许可**:NPI 在 `npi_fsdb_open` 时 checkout Verdi 许可(和打开 Verdi 一样占 seat)。
+* **验证**:`tests/fsdb_diff.rs` 是环境变量开启的同源差分门(没 Verdi 自动跳过);
+  实测 `verilog.fsdb ↔ verilog.vcd` **179 信号 × 406 索引全等**,并用 Verdi 自带的
+  `fsdbdebug -vc -vidcode N` 复核过 t=0 取值。
+* **两类已解释差异**:①VCD 把某些总线位炸开(`CH [4]…CH [0]`)而 NPI 归成一个 5bit 信号;
+  ②`$dumpvars` 抓的是 delta 之前的 x、FSDB 记的是 t=0 结算后的值(FSDB 侧与 Verdi 一致)。
 
 ---
 

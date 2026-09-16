@@ -104,7 +104,7 @@ Q 命令用会话 id 或"最近会话默认"；`-l` 仅在 `prep` 使用。
 
 | | wave-mcp | wavepeek | wal-rust 目标 |
 |---|---|---|---|
-| 波形 | FST/VCD | VCD/FST | **VCD/FST/FSDB（零专有库）** |
+| 波形 | FST/VCD | VCD/FST | **VCD/FST/FSDB**（FSDB 走 Verdi NPI,可选依赖） |
 | 查询 | 27 个 MCP 工具（原语） | CLI 子命令 | **WAL 表达式（可编程）+ 模板** |
 | 归因 | trace_x（网表驱动） | 无 | **why（纯波形信号级）** |
 | 规模 | 百万 scope | — | **155GB VCD 场景** |

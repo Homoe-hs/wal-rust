@@ -99,4 +99,6 @@
 - 波形本身可能"缺初值"(转储未包含 `$dumpvars`,或被截断):此时首边可能少 1。
   工具在边沿查询上给 warning;`scripts/` 与矩阵测试都可复现该行为。
 - 被截断的 VCD(缺 `$enddefinitions`)会打印截断告警。
-- EVCD(`$dumpports`)、FSDB、gzip/bzip2 压缩波形:明确报错,不静默降级。
+- EVCD(`$dumpports`)、gzip/bzip2 压缩波形:明确报错,不静默降级。
+- FSDB:有 Verdi 的 NPI 读库时直接读(纯 Rust FFI,见 `docs/fsdb-npi.md`);
+  没有库时明确报错并提示设置 `$VERDI_HOME`/`$WAL_NPI_LIB`,不静默降级。

@@ -45,6 +45,9 @@ impl TraceContainer {
         if fname.ends_with(".fst") {
             return Some("fst");
         }
+        if fname.ends_with(".fsdb") {
+            return Some("fsdb");
+        }
         if let Ok(mut f) = std::fs::File::open(path) {
             use std::io::Read;
             let mut buf = [0u8; 16];
@@ -57,6 +60,9 @@ impl TraceContainer {
                 }
                 if buf[0] == 0x00 || buf[0] == 0x01 || buf[0] == 0x03 || buf[0] == 0x04 {
                     return Some("fst");
+                }
+                if buf.windows(4).any(|w| w == b"FSDB") {
+                    return Some("fsdb");
                 }
             }
         }
@@ -86,9 +92,18 @@ impl TraceContainer {
             || head.windows(4).any(|w| w == b"FSDB")
             || (n >= 8 && head[..4] == [0, 0, 0, 0] && &head[4..8] == b"FSDB");
         if is_fsdb {
+            // 有 Verdi/NPI 就用 NPI 读;没有则维持原来的明确报错(不静默退化)
+            if super::fsdb::npi_available() {
+                return Ok(());
+            }
+            let why = super::fsdb::npi_unavailable_reason();
             return Err(format!(
-                "{}: FSDB 格式暂不支持(需要 Verdi 的 fsdb reader); 请先转成 VCD/FST 再查询",
-                path.display()));
+                "{}: FSDB 需要 Verdi 的 NPI 读库(libNPI.so)。\n  \
+                 设置 $VERDI_HOME(Verdi 安装根)或 $WAL_NPI_LIB(libNPI.so 绝对路径)后重试;\n  \
+                 原因: {}",
+                path.display(),
+                why
+            ));
         }
         // EVCD($dumpports / $var port): 值行是 p<strength><strength> 语法, 与 VCD 不同,
         // 直接拒绝而不是按普通 VCD 误读。
@@ -116,6 +131,11 @@ impl TraceContainer {
             }
             "fst" => {
                 let trace = FstTrace::load(path, id.clone())?;
+                self.traces.insert(id, Box::new(trace));
+                Ok(())
+            }
+            "fsdb" => {
+                let trace = super::fsdb::FsdbTrace::load(path, id.clone())?;
                 self.traces.insert(id, Box::new(trace));
                 Ok(())
             }

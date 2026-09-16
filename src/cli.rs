@@ -8,7 +8,7 @@ use std::path::PathBuf;
 #[command(version = env!("CARGO_PKG_VERSION"))]
 #[command(
     about = "WAL: Waveform Analysis Language CLI",
-    long_about = "High-performance WAL script runner and REPL for VCD/FST waveform analysis.\n\n\
+    long_about = "High-performance WAL script runner and REPL for VCD/FST/FSDB waveform analysis.\n\n\
                   Auto-detection:\n  \
                   input starts with '(' → evaluated as WAL expression\n  \
                   input is an existing file → executed as WAL script\n  \
@@ -20,6 +20,8 @@ use std::path::PathBuf;
                     (RSS additionally counts mmap'd file pages — see docs/waveform-io-plan.md)\n  \
                   - FST read support (wellen); FST **write** is not supported (dump-trace only\n  \
                     writes VCD — use an external converter for FST export)\n  \
+                  - FSDB read via Verdi's NPI (runtime-discovered libNPI.so, pure Rust FFI,\n  \
+                    no C++ shim): set $VERDI_HOME or $WAL_NPI_LIB; needs a Verdi license\n  \
                   - Interactive REPL with rustyline, plus --stdin session mode\n  \
                     (one load, many probes: wal-rust --stdin -l big.vcd < probes.txt)",
     after_help = "QUICK START (waveform analysis):\n  \
@@ -118,7 +120,7 @@ wal-rust count <wave> <signal> [value]")]
 
 #[derive(Parser, Debug)]
 pub struct CountArgs {
-    /// VCD/FST waveform path
+    /// VCD/FST/FSDB waveform path
     pub wave: PathBuf,
     /// Signal name (exact or unique substring)
     pub sig: String,
@@ -129,7 +131,7 @@ pub struct CountArgs {
 
 #[derive(Parser, Debug)]
 pub struct SigsArgs {
-    /// VCD/FST waveform path
+    /// VCD/FST/FSDB waveform path
     pub wave: PathBuf,
     /// Substring to match against signal names
     pub pattern: String,
@@ -140,7 +142,7 @@ pub struct SigsArgs {
 
 #[derive(Parser, Debug)]
 pub struct TopsigArgs {
-    /// VCD/FST waveform path
+    /// VCD/FST/FSDB waveform path
     pub wave: PathBuf,
     /// Max top signals to show (default 10)
     #[arg(default_value_t = 10)]

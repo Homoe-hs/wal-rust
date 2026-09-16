@@ -15,6 +15,8 @@ test_samples/run_tests.sh           # WAL script test runner
 bash scripts/diff_find.sh .tools/wal-rust.old target/release/wal-rust   # find semantic diff gate
 WAL_NO_ENGINE=1 target/release/wal-rust '(count (&& (rising "c") (= (get "d") 3)))' -l x.vcd  # 禁用统一引擎(纯逐拍)= 独立 oracle
 cargo test --test fuzz_vcd_fst_diff   # 随机波形差分: VCD↔FST 等价 + 引擎↔逐拍(可调 WAL_FUZZ_N/WAL_FUZZ_SEED)
+cargo run --release --example npi_probe -- design.fsdb clk   # NPI 探针(不需要 wal-rust 全功能)
+WAL_FSDB_TEST_FILE=x.fsdb WAL_FSDB_TEST_VCD=x.vcd cargo test --release --test fsdb_diff  # FSDB↔VCD 差分门(需 Verdi)
 ```
 
 ## CLI input auto-detect
@@ -34,7 +36,7 @@ Flags: `-l <waveform>` (repeatable), `-c <code>` (inline override), `--halt-on-e
 | `src/wal/` | AST, tree-sitter parser, Evaluator, builtins (11 modules) | 5,300 |
 | `src/vcd/` | VCD parser (mmap + memchr + two-pass) | 2,100 |
 | `src/fst/` | FST writer (wellen reads via `src/trace/fst.rs`; legacy reader retired) | 2,700 |
-| `src/trace/` | `Trace` trait, `VcdTrace`, `FstTrace`, `TraceContainer` | 2,200 |
+| `src/trace/` | `Trace` trait, `VcdTrace`, `FstTrace`, `FsdbTrace`, `TraceContainer` | 3,200 |
 | `tests/` | Rust integration & correctness tests (6 files, ~900 lines) | 900 |
 | `test_data/` | VCD/FST test files (counter.vcd 11K, pyvcd_100M 107MB, edge cases) | — |
 | `tree-sitter-wal/` | WAL grammar (`grammar.js`), compiled to `parser.c` via `build.rs` | — |
@@ -44,6 +46,11 @@ Flags: `-l <waveform>` (repeatable), `-c <code>` (inline override), `--halt-on-e
 
 - **tree-sitter parser**: `build.rs` compiles `tree-sitter-wal/src/parser.c`. First build compiles C code.
 - **FST read backend**: wellen (`wellen::simple::read` in `src/trace/fst.rs`); legacy hand-rolled reader retired (writer stays: `src/fst/writer.rs`).
+- **FSDB read backend**: `src/trace/fsdb.rs` —— 运行期 `dlopen` Synopsys NPI(`libNPI.so`)+
+  Itanium mangled 符号,纯 Rust FFI,无 C++ 垫片。只用 `npiFsdbTimeBasedVcIter`(用过后
+  `npi_fsdb_create_vct` 会失效);`npiFsdbValue.format` 是**入参**;库路径来自 `$VERDI_HOME`/
+  `$WAL_NPI_LIB`。细节见 `docs/fsdb-npi.md`。差分门 `tests/fsdb_diff.rs` 由
+  `WAL_FSDB_TEST_FILE` + `WAL_FSDB_TEST_VCD` 开启(没 Verdi 自动跳过)。
 - **Dispatcher pattern** for builtins: (1) handler in `src/wal/builtins/xxx.rs` (2) register in `builtins/mod.rs::register_all()` (3) optional `Operator` variant in `ast/operator.rs`.
 - **Global allocator**: `mimalloc` in `src/main.rs`.
 - **VCD trace loading** (0.13.2 起两段式, 懒索引):
