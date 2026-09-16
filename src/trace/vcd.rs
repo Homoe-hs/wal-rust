@@ -528,12 +528,49 @@ impl VcdTrace {
         let mut pos = dump_start;
         {
             let mut line_start = dump_start;
-            while line_start < data.len() && data[line_start] != b'#' {
+            // 口径 A(与内测确认): t0 的整片初值 dump **永远是初值快照, 不是 INDEX**。
+            // VCS 有两种渲染: ① `$dumpvars` 出现在任何 '#' 之前(e85 类);
+            // ② 先来一个"空 #0", 紧跟 `$dumpvars`(mini 类)。两种都按快照处理,
+            // 时间轴从第一个真正的变化步开始 —— 这样同一份仿真的 VCD/FST/FSDB
+            // 给出同一个 INDEX 空间。只跳过"空 #0 + $dumpvars"这一种组合;
+            // 若 #0 之后是真实值行(不是 dumpvars), 那它就是普通时间步, 不动。
+            let mut allow_skip_leading_zero = true;
+            while line_start < data.len() {
                 let line_end = match memchr::memchr(b'\n', &data[line_start..]) {
                     Some(n) => line_start + n,
                     None => break,
                 };
                 let line = &data[line_start..line_end];
+                // 空行/空白行不参与"首个 #0 能否跳过"的判定(mini.vcd 的 #0 前就有空行)
+                if !line.is_empty() && line[0] == b'#' {
+                    let next_is_dumpvars = {
+                        let mut p2 = line_end + 1;
+                        let mut found = false;
+                        while p2 < data.len() {
+                            let e2 = memchr::memchr(b'\n', &data[p2..]).map(|n| p2 + n).unwrap_or(data.len());
+                            let l2 = &data[p2..e2];
+                            if !l2.is_empty() {
+                                found = l2.starts_with(b"$dumpvars");
+                                break;
+                            }
+                            p2 = e2 + 1;
+                        }
+                        found
+                    };
+                    if allow_skip_leading_zero
+                        && is_ts_line(line)
+                        && parse_timestamp_fast(line) == 0
+                        && next_is_dumpvars
+                    {
+                        allow_skip_leading_zero = false;
+                        line_start = line_end + 1;
+                        continue;
+                    }
+                    break; // 时间轴起点
+                }
+                if !line.is_empty() && line[0] != b'$' {
+                    allow_skip_leading_zero = false; // 真值行 → 不再允许跳过首 #0
+                }
                 if !line.is_empty() && line[0] != b'$' {
                     // 值行的拆分规则与主扫描**同一套**(split_value_id):
                     // 空格/制表符分隔、无分隔 `b1010s1`、CRLF 都可识别。
@@ -1172,7 +1209,10 @@ impl VcdTrace {
             .ok_or_else(|| "find_indices: signal ID bytes not found".to_string())?;
         use rayon::prelude::*;
         let shared_mmap = self.reader.borrow().data.clone();
-        let hdr_end = self.header_end_offset as usize;
+        // 起点用 dump_data_start(规则 A 之后它 = 第一个真正的时间步):
+        // 用 header_end_offset 会把被跳过的 "#0 + $dumpvars" 那一段当成时间步,
+        // 于是冷扫描自己数出 12 个时间戳、而索引表是 11 个 → 索引整体错位一格。
+        let hdr_end = self.dump_data_start as usize;
         let data_len = shared_mmap.len();
         let n_threads = num_cpus::get().max(4);
         let chunk_size = (data_len.saturating_sub(hdr_end) / n_threads.max(1)).max(64 * 1024);
@@ -2458,7 +2498,7 @@ impl Trace for VcdTrace {
 
         use rayon::prelude::*;
         let shared_mmap = self.reader.borrow().data.clone();
-        let hdr_end = self.header_end_offset as usize;
+        let hdr_end = self.dump_data_start as usize; // 同 anchored_changes: 规则 A 的起点
         let data_len = shared_mmap.len();
 
         let n_threads = num_cpus::get().max(4);
@@ -2672,7 +2712,7 @@ impl Trace for VcdTrace {
     /// the 42M-signal 15-minute path: a HashMap<Vec<u8>,u32> with 42M entries).
     fn signal_change_counts_top(&self, k: usize) -> Vec<(String, usize)> {
         let data = self.reader.borrow().data.clone();
-        let hdr = self.header_end_offset as usize;
+        let hdr = self.dump_data_start as usize; // 同 anchored_changes
         let dump = &data[hdr..];
 
         let n_sigs = self.id_offsets.len();

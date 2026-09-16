@@ -845,6 +845,33 @@ fn matrix_dump_trace_writer_contract() {
     let _ = std::fs::remove_file(&out);
 }
 
+/// 口径 A(与内测确认): t0 的整片初值 dump **永远是初值快照, 不是 INDEX**。
+///
+/// VCS 有两种渲染: ① `$dumpvars` 在任何 `#` 之前;② 先一个"空 #0"再 `$dumpvars`。
+/// 两种必须给出**同一个 INDEX 空间**(否则同一份仿真的 VCD/FST/FSDB 结果不一致),
+/// 且时间轴从第一个真正的变化步开始。此前 ② 会被当成索引 0(`getwave` 多一项、
+/// `(initial)` 变 x), ② 与 FSDB 的 XTag 0(=同一个 t0 dump)对不上。
+#[test]
+fn matrix_t0_dump_is_snapshot_not_index() {
+    let head = "|$timescale 1ns $end\n$scope module t $end\n$var wire 4 ! d $end\n$var wire 1 \" c $end\n$enddefinitions $end\n";
+    let head = head.trim_start_matches('|');
+    let body = "$dumpvars\nb0011 !\n0\"\n$end\n#5\n1\"\n#10\nb0111 !\n#15\n0\"\n";
+    let shape1 = tmp("t0s1", &format!("{}{}", head, body));
+    let shape2 = tmp("t0s2", &format!("{}#0\n{}", head, body)); // 空 #0 + $dumpvars
+    for p in [&shape1, &shape2] {
+        let e = |c: &str| eval_with(p, c);
+        assert_eq!(e("(initial \"t.d\")"), Value::Int(3), "t0 dump 必须进初值");
+        assert_eq!(e("(get \"t.d\")"), Value::Int(3), "索引 0 = 第一个变化步(#5), d 未写 → 快照");
+        assert_eq!(e("(getwave \"t.d\")"), Value::List(WList::from_vec(vec![
+            Value::List(WList::from_vec(vec![Value::Int(10), Value::Int(7)])),
+        ])), "t0 dump 不得作为变更点出现在 getwave");
+        assert_eq!(e("(count (changes \"t.d\"))"), Value::Int(1));
+        assert_eq!(e("(at \"t.d\" 0)"), Value::List(WList::from_vec(vec![Value::Int(0), Value::Int(3)])));
+        assert_eq!(e("(at \"t.c\" 10)"), Value::List(WList::from_vec(vec![Value::Int(5), Value::Int(1)])));
+        assert_eq!(e("(count (rising \"t.c\"))"), Value::Int(1));
+    }
+}
+
 /// 样本模型(内测 §13.1): 样本 = `#` 段的变更点; `$dumpvars` 快照是**索引 0 的回退值**,
 /// 不进入 `getwave`。因此:
 ///   - 只有 dumpvars、之后不变的信号: `(getwave s)` 为空(预期), 但 t0 状态可读
