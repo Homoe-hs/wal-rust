@@ -33,3 +33,7 @@ _logs/
 exp/
 scratch_mt/
 _*_sim.log
+
+# FSDB 垫片构建产物(见 src/trace/fsdb_shim/build_shim.sh)
+src/trace/fsdb_shim/*.so
+src/trace/fsdb_shim/shim_smoke

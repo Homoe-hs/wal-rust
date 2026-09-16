@@ -20,8 +20,9 @@ echo "built: $OUT"
 
 # ABI 冒烟测试(按 Rust 侧将来同样的调用序列)
 SMOKE=$(dirname "$SRC")/shim_smoke.c
+OUTDIR=$(dirname "$OUT")
 if [ -f "$SMOKE" ]; then
-    gcc -o "$HERE/shim_smoke" "$SMOKE" -L"$HERE" -lwal_fsdb \
-        -L$F/linux64 -lnffr -lnsys -lz -Wl,-rpath,'$ORIGIN' -Wl,-rpath,"$F/linux64" 2>&1 | grep -v "^/usr/bin/ld: warning" || true
-    echo "smoke: $HERE/shim_smoke  (用法: LD_LIBRARY_PATH=$F/linux64 ./shim_smoke <file.fsdb> [sig])"
+    gcc -o "$OUTDIR/shim_smoke" "$SMOKE" -L"$OUTDIR" -lwal_fsdb \
+        -L$F/linux64 -lnffr -lnsys -lz -Wl,-rpath,'$ORIGIN' -Wl,-rpath,"$F/linux64"
+    echo "smoke: $OUTDIR/shim_smoke  (用法: LD_LIBRARY_PATH=$F/linux64 ./shim_smoke <file.fsdb> [sig])"
 fi
