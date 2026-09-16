@@ -524,6 +524,10 @@ wal-rust -l design.fsdb '(find (is-x "state"))'
 * **验证**:`tests/fsdb_diff.rs` 是环境变量开启的同源差分门(没 Verdi 自动跳过);
   实测 `verilog.fsdb ↔ verilog.vcd` **179 信号 × 406 索引全等**,并用 Verdi 自带的
   `fsdbdebug -vc -vidcode N` 复核过 t=0 取值。
+* **性能**: FSDB 后端把"索引空间"(= 所有信号变更时间的并集)做成**按需**才付的东西 ——
+  边沿计数 / `getwave` / `at` / 初值这类查询只读被查询的那个信号, 不再全文件扫描;
+  只有 `find`、电平/取值条件才需要索引空间。大波随机查询仍建议用 VCD/FST。
+  实测与调优过程见 `docs/fsdb-npi.md` §6。
 * **一类已解释差异**:VCD 把某些总线位炸开(`CH [4]…CH [0]`)而 NPI 归成一个 5bit 信号。
   同一轮差分还修掉了 VCD 后端的**别名 bug**(同一 idcode 在多个 scope 复用 = 同一个 net),
   修后两边初值/取值/变更点全部一致。

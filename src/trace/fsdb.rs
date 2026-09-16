@@ -87,6 +87,10 @@ const FILE_VERSION: c_int = 10;
 /// `npiFsdbTimeBasedVcIter` 的 C++ 成员(Itanium mangled, 非虚函数 → 可直接 dlsym)。
 /// 类布局只有一个 `Impl* m_impl`(8 字节), 纯 Rust 分配缓冲 + 调构造/析构即可。
 struct TimeIterSyms {
+    /// `set_max_session_load(num)`: 限制迭代器一次装载多少个 session 的数据。
+    /// NPI 默认会把加进来的信号的 VC 数据都攒在内存里(内网 174MB 波形实测峰值
+    /// 17.2GB RSS), 调小可以显著压内存。
+    set_max_session_load: Option<unsafe extern "C" fn(*mut c_void, u32)>,
     ctor: unsafe extern "C" fn(*mut c_void),
     dtor: unsafe extern "C" fn(*mut c_void),
     add: unsafe extern "C" fn(*mut c_void, *mut c_void) -> i64,
@@ -105,6 +109,8 @@ struct Npi {
     min_time: unsafe extern "C" fn(*mut c_void, *mut NpiTime) -> c_int,
     max_time: unsafe extern "C" fn(*mut c_void, *mut NpiTime) -> c_int,
     file_property_str: unsafe extern "C" fn(c_int, *mut c_void) -> *const c_char,
+    /// `npi_fsdb_unload_vc(file)`: 丢掉 NPI 为这个文件缓存的 VC 数据
+    unload_vc: Option<unsafe extern "C" fn(*mut c_void) -> c_int>,
     sig_property: unsafe extern "C" fn(c_int, *mut c_void, *mut c_int) -> c_int,
     sig_property_str: unsafe extern "C" fn(c_int, *mut c_void) -> *const c_char,
     iter_top_scope: unsafe extern "C" fn(*mut c_void) -> *mut c_void,
@@ -246,6 +252,7 @@ impl Npi {
             }
 
             let iter = TimeIterSyms {
+                set_max_session_load: sym_opt!("_ZN22npiFsdbTimeBasedVcIter20set_max_session_loadEj", unsafe extern "C" fn(*mut c_void, u32)),
                 ctor: sym!("_ZN22npiFsdbTimeBasedVcIterC1Ev", unsafe extern "C" fn(*mut c_void)),
                 dtor: sym!("_ZN22npiFsdbTimeBasedVcIterD1Ev", unsafe extern "C" fn(*mut c_void)),
                 add: sym!("_ZN22npiFsdbTimeBasedVcIter3addEPv", unsafe extern "C" fn(*mut c_void, *mut c_void) -> i64),
@@ -263,6 +270,7 @@ impl Npi {
                 min_time: sym!("_Z17npi_fsdb_min_timePvPy", unsafe extern "C" fn(*mut c_void, *mut NpiTime) -> c_int),
                 max_time: sym!("_Z17npi_fsdb_max_timePvPy", unsafe extern "C" fn(*mut c_void, *mut NpiTime) -> c_int),
                 file_property_str: sym!("_Z26npi_fsdb_file_property_str23npiFsdbFilePropertyTypePv", unsafe extern "C" fn(c_int, *mut c_void) -> *const c_char),
+                unload_vc: sym_opt!("_Z20npi_fsdb_unload_vcPv", unsafe extern "C" fn(*mut c_void) -> c_int),
                 sig_property: sym!("_Z21npi_fsdb_sig_property22npiFsdbSigPropertyTypePvPi", unsafe extern "C" fn(c_int, *mut c_void, *mut c_int) -> c_int),
                 sig_property_str: sym!("_Z25npi_fsdb_sig_property_str22npiFsdbSigPropertyTypePv", unsafe extern "C" fn(c_int, *mut c_void) -> *const c_char),
                 iter_top_scope: sym!("_Z23npi_fsdb_iter_top_scopePv", unsafe extern "C" fn(*mut c_void) -> *mut c_void),
@@ -288,7 +296,7 @@ impl Npi {
             argv.push(ptr::null_mut());
             let mut argc = (argv.len() - 1) as c_int;
             let mut argv_p = argv.as_mut_ptr();
-            let _box = NpiSandbox::enter();
+            let _box = NpiSandbox::enter(true); // init 的 banner 两个流都要静音
             let rc = init(&mut argc, &mut argv_p);
             if rc == 0 {
                 return Err(format!(
@@ -337,27 +345,36 @@ impl Drop for IterObj {
 }
 
 /// NPI 调用期间的环境隔离(RAII, drop 时无条件恢复):
-/// ① **静音 stdout** —— NPI 的版权 banner / 加载警告走 stdout, 会污染 CLI 输出
-///    (管道/脚本里直接坏掉)。`WAL_DEBUG_FSDB=1` 时不静音, 方便看 NPI 自己的报错。
+/// ① **静音 NPI 自带的输出** —— 版权 banner("NPI - Native Programming Interface,
+///    Release …"/Synopsys 法律文本)在 `npi_init` 时既可能走 stdout 也可能走 stderr
+///    (不同 Verdi 版本不一样;内网 S-2021.09 实测走 stderr)。批量脚本里这是纯噪音,
+///    而且会破坏 `| grep` 这类管道。`WAL_DEBUG_FSDB=1` 时全部保留, 方便排障。
 /// ② **CWD 切到 `./.wal-rust-cache/npi/`** —— NPI 会在 CWD 建 `<argv0>Log/` 日志
 ///    目录(`wal-rustLog/`), 不该落在用户目录里。切不进去(只读目录)就放弃隔离。
 struct NpiSandbox {
-    saved_stdout: c_int,
+    saved: [(c_int, c_int); 2],
     saved_cwd: Option<std::path::PathBuf>,
-    quiet: bool,
 }
 
 impl NpiSandbox {
-    fn enter() -> Self {
+    /// `silence_stderr` 只在 `npi_init` 时用: 打开文件阶段的版本警告(*WARN* …)
+    /// 是有用信息, 留在 stderr 上。
+    fn enter(silence_stderr: bool) -> Self {
         let quiet = std::env::var("WAL_DEBUG_FSDB").is_err();
-        let mut saved_stdout = -1;
+        let mut saved = [(-1, -1); 2];
         if quiet {
             unsafe {
                 let devnull = libc::open(b"/dev/null\0".as_ptr() as *const c_char, libc::O_WRONLY);
                 if devnull >= 0 {
-                    saved_stdout = libc::dup(1);
-                    if saved_stdout >= 0 {
-                        libc::dup2(devnull, 1);
+                    for (slot, fd) in [1, 2].into_iter().enumerate() {
+                        if fd == 2 && !silence_stderr {
+                            continue;
+                        }
+                        let dup = libc::dup(fd);
+                        if dup >= 0 {
+                            libc::dup2(devnull, fd);
+                            saved[slot] = (fd, dup);
+                        }
                     }
                     libc::close(devnull);
                 }
@@ -371,7 +388,7 @@ impl NpiSandbox {
                 saved_cwd = Some(cwd);
             }
         }
-        NpiSandbox { saved_stdout, saved_cwd, quiet }
+        NpiSandbox { saved, saved_cwd }
     }
 }
 
@@ -380,10 +397,12 @@ impl Drop for NpiSandbox {
         if let Some(cwd) = self.saved_cwd.take() {
             let _ = std::env::set_current_dir(cwd);
         }
-        if self.quiet && self.saved_stdout >= 0 {
-            unsafe {
-                libc::dup2(self.saved_stdout, 1);
-                libc::close(self.saved_stdout);
+        for (fd, dup) in self.saved {
+            if dup >= 0 {
+                unsafe {
+                    libc::dup2(dup, fd);
+                    libc::close(dup);
+                }
             }
         }
     }
@@ -537,9 +556,12 @@ fn eval_column(
         FindCondition::Rising | FindCondition::Falling | FindCondition::Changed
     );
     let mut indices = Vec::new();
-    let first_is_zero = points.first().map(|(i, _)| *i) == Some(0);
+    // 与 VCD 后端逐条对齐: **首个变更恰好落在索引 0 且没有确定初值**时, 索引 0
+    // 没有前驱(Changed 不成立); 其余情况前驱就是 t0 快照(没有条目 → x)。
+    // `count_matches` 在时间基上必须复刻这一条, 见 `global_first_change_time`。
     let init_x = ScalarValue::Bit(b'x');
     let init_ref = initial.unwrap_or(&init_x);
+    let first_is_zero = points.first().map(|(i, _)| *i) == Some(0);
     let mut prev_val: Option<ScalarValue> = if first_is_zero {
         if sv_is_defined(init_ref) { Some(init_ref.clone()) } else { None }
     } else {
@@ -579,10 +601,15 @@ struct Sig {
     is_string: bool,
 }
 
-/// 每信号变更列(按索引升序; 不含 t0 初值快照)。
+/// 每信号变更列: **时间基**(原生时间升序; 不含 t0 初值快照)。
+///
+/// 为什么存时间而不是索引: 索引空间 = "所有信号变更时间的并集", 对流式后端
+/// (FSDB 走 NPI)意味着一次全文件扫描。而 `(getwave s)`/`(at s T)`/边沿计数
+/// 只要"信号自己的变更点 + 原生时间", 存时间就能完全不碰索引空间。
+/// 需要索引时(`find`/逐拍取值)再用时间线换算, 见 `column_indexed`。
 #[derive(Default)]
 struct Column {
-    points: Vec<(usize, ScalarValue)>,
+    points: Vec<(u64, ScalarValue)>,
 }
 
 /// 一次融合扫描的产物(建时间线时顺带取被查询信号的变更列)
@@ -613,18 +640,38 @@ pub struct FsdbTrace {
     /// 首次按索引查询时构建(OnceCell 语义: 用 RefCell<Option<Rc<…>>>)
     timeline: RefCell<Option<Rc<Vec<u64>>>>,
     cols: RefCell<HashMap<usize, Rc<Column>>>,
+    /// 索引基列缓存(懒换算; 只有需要索引空间的查询才会填)
+    idx_cols: RefCell<HashMap<usize, Rc<Vec<(usize, ScalarValue)>>>>,
     initials: RefCell<HashMap<usize, Option<ScalarValue>>>,
     /// `Trace::prepare` 声明的信号: 建时间线时顺带取它们的变更列
     prepared: RefCell<Vec<usize>>,
     name_cache: RefCell<HashMap<String, Option<usize>>>,
     current_index: usize,
+    /// 全局最早变更时间(时间线第一个时间点)的懒缓存:
+    /// `Cell<Option<Option<u64>>>` = 外层"算过没", 内层"有没有变更"。
+    /// VCD 的 Changed 在索引 0 有特例, 时间基计数要知道"这个信号的首个变更
+    /// 是不是全局最早的那个"才能复刻它。
+    first_change: Cell<Option<Option<u64>>>,
+    /// 已知有效的最大索引: `set_index`/`step` 只要目标 ≤ 它就不必再问 `max_index()`
+    /// —— 而 `max_index()` 会触发**全文件扫描**(物化全局时间线)。查询结束后恢复
+    /// 游标的那次 `set_index` 就落在这一类, 否则每个查询都要白扫一遍整个 FSDB。
+    highest_valid: Cell<usize>,
     fatal: RefCell<Option<String>>,
     /// 扫描进行中: 防止 `column()` 递归触发第二次扫描
     scanning: Cell<bool>,
 }
 
-/// 分块大小: 一次往归并迭代器里塞太多信号会占大量内存(实测 90k 级信号要分块)。
-const CHUNK: usize = 4096;
+/// 分块大小: 一次往归并迭代器里塞太多信号会占大量内存。
+/// `WAL_FSDB_CHUNK` 可调(性能排查用; 分块越小 NPI 峰值内存越低, 但重复装载越多)。
+fn chunk_size() -> usize {
+    std::env::var("WAL_FSDB_CHUNK").ok().and_then(|v| v.parse().ok()).filter(|&n| n > 0).unwrap_or(4096)
+}
+
+/// 调完一块之后是否 `npi_fsdb_unload_vc`(丢掉 NPI 的文件级 VC 缓存)。
+/// 默认开: 内网 174MB 波形实测 RSS 17.2GB, 就是这份缓存在涨。
+fn unload_each_chunk() -> bool {
+    std::env::var("WAL_FSDB_KEEP_VC").is_err()
+}
 
 impl FsdbTrace {
     pub fn load(path: &Path, id: TraceId) -> Result<Self, String> {
@@ -634,14 +681,16 @@ impl FsdbTrace {
         let abs = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
         let cpath = CString::new(abs.to_string_lossy().as_bytes())
             .map_err(|_| format!("路径含 NUL 字节: {}", filename))?;
-        let _box = NpiSandbox::enter();
+        let _box = NpiSandbox::enter(false); // open 的版本警告留在 stderr
         unsafe {
             if let Some(f) = npi.is_fsdb {
                 if f(cpath.as_ptr()) == 0 {
                     return Err(format!("{}: 不是 FSDB 文件(NPI 判定)", filename));
                 }
             }
+            let t_open = std::time::Instant::now();
             let file = (npi.open)(cpath.as_ptr());
+            let ms_open = t_open.elapsed().as_millis();
             if file.is_null() {
                 return Err(format!(
                     "{}: npi_fsdb_open 失败。常见原因: ①该 FSDB 版本比本机 Verdi 的 reader 新\
@@ -657,13 +706,9 @@ impl FsdbTrace {
             let scale = Npi::cstr((npi.file_property_str)(FILE_SCALE_UNIT, file));
             let version = Npi::cstr((npi.file_property_str)(FILE_VERSION, file));
             let ts_exp = crate::vcd::convert::parse_timescale(scale.as_bytes());
-            if std::env::var("WAL_DEBUG_FSDB").is_ok() {
-                eprintln!(
-                    "[fsdb] {} version={} scale={} ({:?}) min={} max={}",
-                    filename, version, scale, ts_exp, min_t, max_t
-                );
-            }
+            let dbg = std::env::var("WAL_DEBUG_FSDB").is_ok();
 
+            let t_walk = std::time::Instant::now();
             let mut sigs: Vec<Sig> = Vec::new();
             let mut scopes: Vec<String> = Vec::new();
             let top = (npi.iter_top_scope)(file);
@@ -676,6 +721,21 @@ impl FsdbTrace {
                     walk_scope(npi, s, &mut sigs, &mut scopes);
                 }
                 (npi.iter_scope_stop)(top);
+            }
+            if dbg {
+                eprintln!(
+                    "[fsdb] {}: open {}ms, 树遍历 {}ms ({} 信号 / {} scope), version={} scale={} ({:?}) min={} max={}",
+                    filename,
+                    ms_open,
+                    t_walk.elapsed().as_millis(),
+                    sigs.len(),
+                    scopes.len(),
+                    version,
+                    scale,
+                    ts_exp,
+                    min_t,
+                    max_t
+                );
             }
             if sigs.is_empty() {
                 (npi.close)(file);
@@ -703,10 +763,13 @@ impl FsdbTrace {
                 max_t,
                 timeline: RefCell::new(None),
                 cols: RefCell::new(HashMap::new()),
+                idx_cols: RefCell::new(HashMap::new()),
                 initials: RefCell::new(HashMap::new()),
                 prepared: RefCell::new(Vec::new()),
                 name_cache: RefCell::new(HashMap::new()),
+                first_change: Cell::new(None),
                 current_index: 0,
+                highest_valid: Cell::new(0),
                 fatal: RefCell::new(None),
                 scanning: Cell::new(false),
             })
@@ -811,14 +874,67 @@ impl FsdbTrace {
         if targets.is_empty() {
             return Ok(out);
         }
+        let dbg = std::env::var("WAL_DEBUG_FSDB").is_ok();
+        let t_begin = std::time::Instant::now();
+        let chunk = chunk_size();
+        let session_load: Option<u32> = std::env::var("WAL_FSDB_SESSION_LOAD").ok().and_then(|v| v.parse().ok());
+        let mut entries = 0usize;
         let mut chunk_start = 0usize;
         while chunk_start < targets.len() {
-            let chunk_end = (chunk_start + CHUNK).min(targets.len());
+            let chunk_end = (chunk_start + chunk).min(targets.len());
             let mut it = IterObj::new(npi);
+            if let (Some(f), Some(n)) = (npi.iter.set_max_session_load, session_load) {
+                unsafe { f(it.this(), n) };
+            }
+            let t_add = std::time::Instant::now();
             for &i in &targets[chunk_start..chunk_end] {
                 unsafe { (npi.iter.add)(it.this(), self.sigs[i].handle) };
             }
+            let ms_add = t_add.elapsed().as_millis();
+            let t_start = std::time::Instant::now();
             unsafe { (npi.iter.start)(it.this(), self.min_t, self.max_t) };
+            let ms_start = t_start.elapsed().as_millis();
+            // 块内时间戳是单调的(时间优先归并), 顺手去重; 块间再归并一次。
+            let mut chunk_times: Vec<u64> = Vec::new();
+            // 纯时间线扫描(没要任何信号的值): 不做 handle→信号 映射, 每条省一次
+            // 哈希查找 —— 大波形上这个循环要跑几百万次。
+            if want_timeline && want.is_empty() {
+                let mut last = u64::MAX;
+                loop {
+                    let mut t: NpiTime = 0;
+                    let mut sig: *mut c_void = ptr::null_mut();
+                    let rc = unsafe { (npi.iter.next)(it.this(), &mut t, &mut sig) };
+                    if rc <= 0 || sig.is_null() {
+                        break;
+                    }
+                    entries += 1;
+                    if t > 0 && t != last {
+                        chunk_times.push(t);
+                        last = t;
+                    }
+                }
+                out.times.extend_from_slice(&chunk_times);
+                out.times.sort_unstable();
+                out.times.dedup();
+                drop(it);
+                if unload_each_chunk() {
+                    if let Some(f) = npi.unload_vc {
+                        unsafe { f(self.file) };
+                    }
+                }
+                if dbg {
+                    eprintln!(
+                        "[fsdb] 时间线 chunk {}/{} (+{} sigs): {} ms, 时间点 {} 条",
+                        chunk_start / chunk + 1,
+                        targets.len().div_ceil(chunk),
+                        chunk_end - chunk_start,
+                        t_begin.elapsed().as_millis(),
+                        out.times.len()
+                    );
+                }
+                chunk_start = chunk_end;
+                continue;
+            }
             loop {
                 let mut t: NpiTime = 0;
                 let mut sig: *mut c_void = ptr::null_mut();
@@ -829,6 +945,7 @@ impl FsdbTrace {
                 let Some(&idx) = self.handle_to_idx.get(&(sig as usize)) else {
                     continue;
                 };
+                entries += 1;
                 if t == 0 {
                     if want.contains(&idx) {
                         let v = self.read_value(npi, &mut it, &self.sigs[idx]);
@@ -836,21 +953,55 @@ impl FsdbTrace {
                     }
                     continue;
                 }
-                if want_timeline {
-                    out.times.push(t);
+                if want_timeline && chunk_times.last() != Some(&t) {
+                    chunk_times.push(t);
                 }
                 if want.contains(&idx) {
                     let v = self.read_value(npi, &mut it, &self.sigs[idx]);
                     out.raw.entry(idx).or_default().push((t, v));
                 }
             }
+            if want_timeline {
+                // 增量归并: 每块结束就把时间去重进主表 → 主表长度 = 去重后的时间点数,
+                // 不随"块数 × 块内时间点数"膨胀。
+                out.times.extend_from_slice(&chunk_times);
+                out.times.sort_unstable();
+                out.times.dedup();
+            }
             drop(it);
+            if unload_each_chunk() {
+                if let Some(f) = npi.unload_vc {
+                    unsafe { f(self.file) };
+                }
+            }
+            if dbg {
+                eprintln!(
+                    "[fsdb] scan chunk {}/{} (+{} sigs): add {}ms start {}ms iter {}ms → 时间点 {} 条, 累计 {}ms",
+                    chunk_start / chunk + 1,
+                    targets.len().div_ceil(chunk),
+                    chunk_end - chunk_start,
+                    ms_add,
+                    ms_start,
+                    t_begin.elapsed().as_millis() as u128 - ms_add as u128 - ms_start as u128,
+                    out.times.len(),
+                    t_begin.elapsed().as_millis()
+                );
+            }
             chunk_start = chunk_end;
         }
         if want_timeline {
             out.times.sort_unstable();
             out.times.dedup();
             out.has_timeline = true;
+        }
+        if dbg {
+            eprintln!(
+                "[fsdb] scan done: 目标 {} 信号, 归并流 {} 条, 时间点 {} 条, {} ms",
+                targets.len(),
+                entries,
+                out.times.len(),
+                t_begin.elapsed().as_millis()
+            );
         }
         Ok(out)
     }
@@ -873,48 +1024,37 @@ impl FsdbTrace {
         if has_timeline {
             *self.timeline.borrow_mut() = Some(Rc::new(times));
         }
-        let tl = self.timeline.borrow().clone().unwrap_or_else(|| Rc::new(Vec::new()));
         for (idx, v) in inits {
             self.initials.borrow_mut().entry(idx).or_insert(Some(v));
         }
         for (idx, list) in raw {
-            let mut points: Vec<(usize, ScalarValue)> = Vec::with_capacity(list.len());
+            // 同一时间戳的多次写入(delta/glitch) → 最后一次
+            let mut collapsed: Vec<(u64, ScalarValue)> = Vec::with_capacity(list.len());
             for (t, v) in list {
-                if let Ok(i) = tl.binary_search(&t) {
-                    match points.last_mut() {
-                        // 同一索引的多次写入(delta/glitch) → 最后一次
-                        Some((pi, pv)) if *pi == i => *pv = v,
-                        _ => points.push((i, v)),
-                    }
+                match collapsed.last_mut() {
+                    Some((pt, pv)) if *pt == t => *pv = v,
+                    _ => collapsed.push((t, v)),
                 }
             }
             // 值没变(毛刺回到原值)不算变更点
             let init = self.initials.borrow().get(&idx).cloned().flatten();
-            let mut collapsed: Vec<(usize, ScalarValue)> = Vec::with_capacity(points.len());
-            for (i, v) in points {
-                let prev = collapsed.last().map(|(_, p)| p).or(init.as_ref());
+            let mut out_pts: Vec<(u64, ScalarValue)> = Vec::with_capacity(collapsed.len());
+            for (t, v) in collapsed {
+                let prev = out_pts.last().map(|(_, p)| p).or(init.as_ref());
                 let same = prev.map(|p| sv_same(p, &v)).unwrap_or(false);
                 if !same {
-                    collapsed.push((i, v));
+                    out_pts.push((t, v));
                 }
             }
             self.cols.borrow_mut().entry(idx).or_insert_with(|| {
-                Rc::new(Column { points: collapsed })
+                Rc::new(Column { points: out_pts })
             });
         }
     }
 
-    /// 取信号变更列(按索引升序, 不含 t0 快照); 必要时触发扫描。
-    fn column(&self, idx: usize) -> Result<Rc<Column>, String> {
-        if let Some(c) = self.cols.borrow().get(&idx) {
-            return Ok(c.clone());
-        }
-        if !self.scanning.get() {
-            self.scanning.set(true);
-            let r = self.timeline();
-            self.scanning.set(false);
-            r?;
-        }
+    /// 取**时间基**变更列(不含 t0 快照)。**不建时间线** —— 这是
+    /// `(getwave s)`/`(at s T)`/边沿计数不做全文件扫描的关键。
+    fn column_time(&self, idx: usize) -> Result<Rc<Column>, String> {
         if let Some(c) = self.cols.borrow().get(&idx) {
             return Ok(c.clone());
         }
@@ -930,7 +1070,29 @@ impl FsdbTrace {
             .unwrap_or_else(|| Rc::new(Column::default())))
     }
 
-    /// 信号初值(t0 快照; 没有条目 → None)
+    /// 取**索引基**变更列(把时间映射到索引空间; 会建时间线)。
+    /// 只有 `find` / 逐拍取值 / 电平条件才需要。
+    fn column_indexed(&self, idx: usize) -> Result<Rc<Vec<(usize, ScalarValue)>>, String> {
+        if let Some(c) = self.idx_cols.borrow().get(&idx) {
+            return Ok(c.clone());
+        }
+        let tl = self.timeline()?;
+        let col = self.column_time(idx)?;
+        let mut pts: Vec<(usize, ScalarValue)> = Vec::with_capacity(col.points.len());
+        for (t, v) in &col.points {
+            if let Ok(i) = tl.binary_search(t) {
+                match pts.last_mut() {
+                    Some((pi, pv)) if *pi == i => *pv = v.clone(),
+                    _ => pts.push((i, v.clone())),
+                }
+            }
+        }
+        let rc = Rc::new(pts);
+        self.idx_cols.borrow_mut().insert(idx, rc.clone());
+        Ok(rc)
+    }
+
+    /// 信号初值(t0 快照; 没有条目 → None)    /// 信号初值(t0 快照; 没有条目 → None)
     fn initial_of(&self, idx: usize) -> Option<ScalarValue> {
         if let Some(v) = self.initials.borrow().get(&idx) {
             return v.clone();
@@ -959,6 +1121,59 @@ impl FsdbTrace {
             other => other,
         }
     }
+
+    /// 全局最早变更时间 = 时间线的第一个时间点。
+    ///
+    /// 只用于一件事: `Changed` 在"首个变更恰好落在索引 0"时要与 VCD 一致。
+    /// 代价刻意压到最低 —— 每块只读**第一条** `t>0` 的条目(块的 add/start 是
+    /// 固定开销, 不必把整块拉完); 时间线已经建好时直接取首元素, 零成本。
+    fn global_first_change_time(&self) -> Result<Option<u64>, String> {
+        if let Some(v) = self.first_change.get() {
+            return Ok(v);
+        }
+        if let Some(tl) = self.timeline.borrow().as_ref() {
+            let v = tl.first().copied();
+            self.first_change.set(Some(v));
+            return Ok(v);
+        }
+        let npi = npi()?;
+        let chunk = chunk_size();
+        let mut best: Option<u64> = None;
+        let mut lo = 0usize;
+        while lo < self.sigs.len() {
+            let hi = (lo + chunk).min(self.sigs.len());
+            let mut it = IterObj::new(npi);
+            for i in lo..hi {
+                unsafe { (npi.iter.add)(it.this(), self.sigs[i].handle) };
+            }
+            unsafe { (npi.iter.start)(it.this(), self.min_t, self.max_t) };
+            loop {
+                let mut t: NpiTime = 0;
+                let mut sig: *mut c_void = ptr::null_mut();
+                let rc = unsafe { (npi.iter.next)(it.this(), &mut t, &mut sig) };
+                if rc <= 0 || sig.is_null() {
+                    break;
+                }
+                if t > 0 {
+                    best = Some(best.map_or(t, |b: u64| b.min(t)));
+                    break;
+                }
+            }
+            drop(it);
+            if unload_each_chunk() {
+                if let Some(f) = npi.unload_vc {
+                    unsafe { f(self.file) };
+                }
+            }
+            lo = hi;
+        }
+        if std::env::var("WAL_DEBUG_FSDB").is_ok() {
+            eprintln!("[fsdb] 全局最早变更时间 = {:?}", best);
+        }
+        self.first_change.set(Some(best));
+        Ok(best)
+    }
+
 }
 
 unsafe fn walk_scope(npi: &'static Npi, scope: *mut c_void, sigs: &mut Vec<Sig>, scopes: &mut Vec<String>) {
@@ -1036,30 +1251,24 @@ impl Trace for FsdbTrace {
     /// 查询前置声明: 记录信号; 首次调用就把时间线和这些信号的变更列一起算出来
     /// (冷启动只遍历一次 FSDB)。
     fn prepare(&self, names: &[String]) {
-        {
-            let mut p = self.prepared.borrow_mut();
-            for n in names {
-                if let Some(i) = self.resolve_idx(n) {
-                    if !p.contains(&i) {
-                        p.push(i);
-                    }
-                }
-            }
-        }
-        if self.timeline.borrow().is_none() {
-            if let Err(e) = self.timeline() {
-                let mut f = self.fatal.borrow_mut();
-                if f.is_none() {
-                    *f = Some(e);
-                }
+        // 只把被查询信号的**时间基变更列**取回来(每个信号一次小扫描)。
+        // **不建时间线** —— 索引空间是"所有信号变更时间的并集", 对流式后端
+        // 就是一次全文件扫描, 只有真正需要索引的查询(find/逐拍/电平)才付。
+        for n in names {
+            if let Some(i) = self.resolve_idx(n) {
+                let _ = self.column_time(i);
             }
         }
     }
 
     fn step(&mut self, steps: usize) -> Result<(), String> {
         let new_index = self.current_index.saturating_add(steps);
-        if new_index > self.max_index() {
-            return Err(format!("Step {} would exceed max index {}", steps, self.max_index()));
+        if new_index > self.highest_valid.get() {
+            let max = self.max_index();
+            if new_index > max {
+                return Err(format!("Step {} would exceed max index {}", steps, max));
+            }
+            self.highest_valid.set(new_index);
         }
         self.current_index = new_index;
         Ok(())
@@ -1076,9 +1285,9 @@ impl Trace for FsdbTrace {
                 offset, max, name
             ));
         }
-        let col = self.column(idx)?;
-        match col.points.binary_search_by(|(i, _)| i.cmp(&offset)) {
-            Ok(k) => Ok(col.points[k].1.clone()),
+        let col = self.column_indexed(idx)?;
+        match col.binary_search_by(|(i, _)| i.cmp(&offset)) {
+            Ok(k) => Ok(col[k].1.clone()),
             Err(0) => {
                 let v = match self.initial_of(idx) {
                     Some(v) => v,
@@ -1086,7 +1295,7 @@ impl Trace for FsdbTrace {
                 };
                 Ok(self.normalize(idx, v))
             }
-            Err(k) => Ok(col.points[k - 1].1.clone()),
+            Err(k) => Ok(col[k - 1].1.clone()),
         }
     }
 
@@ -1165,8 +1374,13 @@ impl Trace for FsdbTrace {
     }
 
     fn set_index(&mut self, index: usize) -> Result<(), String> {
-        if index > self.max_index() {
-            return Err(format!("Index {} exceeds max {}", index, self.max_index()));
+        // 见 `highest_valid`: 恢复游标这类"已知有效"的写入不能去问 max_index()
+        if index > self.highest_valid.get() {
+            let max = self.max_index();
+            if index > max {
+                return Err(format!("Index {} exceeds max {}", index, max));
+            }
+            self.highest_valid.set(index);
         }
         self.current_index = index;
         Ok(())
@@ -1185,8 +1399,8 @@ impl Trace for FsdbTrace {
             return Ok(Vec::new()); // 空时间线(只有头/没有 dump 段)
         }
         let max = tl.len() - 1;
-        let col = self.column(idx)?;
-        Ok(eval_column(max, &col.points, self.initial_of(idx).as_ref(), &cond))
+        let col = self.column_indexed(idx)?;
+        Ok(eval_column(max, &col, self.initial_of(idx).as_ref(), &cond))
     }
 
     fn find_indices_batch(&self, entries: &[BatchEntry]) -> Result<Vec<(String, Vec<usize>)>, String> {
@@ -1238,16 +1452,66 @@ impl Trace for FsdbTrace {
         self.ts_exp
     }
 
+    /// 原生时间基变更点: 直接用时间基列, **不建时间线**(getwave/at/wave 走这里)。
+    fn change_points_time(&self, name: &str) -> Result<Vec<(u64, ScalarValue)>, String> {
+        let idx = self
+            .resolve_idx(name)
+            .ok_or_else(|| format!("Unknown signal: {}", name))?;
+        Ok(self.column_time(idx)?.points.clone())
+    }
+
+    /// 只数个数: 边沿类条件(Rising/Falling/Changed)与全局时间线无关, 可以直接在
+    /// 自己的变更列上数 → 省掉一次全文件扫描(索引空间 = 所有信号变更时间的并集)。
+    /// 判定用同一个 `find_cond_matches`, 前驱口径与 `eval_column` 相同, 所以结果
+    /// 与 `find_indices(..).len()` 逐条一致(差分门/矩阵都在盯这条)。
+    fn count_matches(&self, name: &str, cond: FindCondition) -> Result<usize, String> {
+        let is_edge = matches!(
+            cond,
+            FindCondition::Rising | FindCondition::Falling | FindCondition::Changed
+        );
+        if !is_edge {
+            // 电平/取值条件要按区间长度累加, 那必须落在索引空间里 → 走通用路径
+            return self.find_indices(name, cond).map(|v| v.len());
+        }
+        let idx = self
+            .resolve_idx(name)
+            .ok_or_else(|| format!("Unknown signal: {}", name))?;
+        let col = self.column_time(idx)?;
+        let init = self.initial_of(idx);
+        let init_defined = init.as_ref().map(sv_is_defined).unwrap_or(false);
+        let mut prev = Some(init.unwrap_or(ScalarValue::Bit(b'x')));
+        // 复刻 `eval_column` 的"索引 0 没有前驱"特例: 首个变更恰好是全局最早的
+        // 那次变更、且没有确定初值 → 这次写入不算 Changed(与 VCD 后端一致)。
+        //
+        // 只在**可能真的差**时才去问全局最早变更时间(那要额外扫一遍块头):
+        //  · Rising/Falling 对 x 前驱恒为假 → 两种口径同答;
+        //  · Changed 而首个变更写的是 x/z → x vs x 也不是变化, 同答。
+        let need_index0_check = matches!(cond, FindCondition::Changed)
+            && !init_defined
+            && col.points.first().map(|(_, v)| sv_is_defined(v)).unwrap_or(false);
+        if need_index0_check {
+            if let Some((t_first, _)) = col.points.first() {
+                if self.global_first_change_time()? == Some(*t_first) {
+                    prev = None;
+                }
+            }
+        }
+        let mut n = 0usize;
+        for (_t, v) in &col.points {
+            if find_cond_matches(v, prev.as_ref(), &cond) {
+                n += 1;
+            }
+            prev = Some(v.clone());
+        }
+        Ok(n)
+    }
+
     fn change_points(&self, name: &str) -> Result<Vec<(usize, ScalarValue)>, String> {
         let idx = self
             .resolve_idx(name)
             .ok_or_else(|| format!("Unknown signal: {}", name))?;
-        let col = self.column(idx)?;
-        let mut out: Vec<(usize, ScalarValue)> = Vec::with_capacity(col.points.len());
-        for (i, v) in &col.points {
-            out.push((*i, v.clone()));
-        }
-        Ok(out)
+        let col = self.column_indexed(idx)?;
+        Ok(col.as_ref().clone())
     }
 
     /// Top-k 变更数: 一次遍历数完所有信号(默认实现会对每个信号各扫一遍)。
@@ -1257,9 +1521,10 @@ impl Trace for FsdbTrace {
             Err(_) => return Vec::new(),
         };
         let mut counts = vec![0usize; self.sigs.len()];
+        let chunk = chunk_size();
         let mut chunk_start = 0usize;
         while chunk_start < self.sigs.len() {
-            let chunk_end = (chunk_start + CHUNK).min(self.sigs.len());
+            let chunk_end = (chunk_start + chunk).min(self.sigs.len());
             let mut it = IterObj::new(npi);
             for i in chunk_start..chunk_end {
                 unsafe { (npi.iter.add)(it.this(), self.sigs[i].handle) };
@@ -1280,6 +1545,11 @@ impl Trace for FsdbTrace {
                 }
             }
             drop(it);
+            if unload_each_chunk() {
+                if let Some(f) = npi.unload_vc {
+                    unsafe { f(self.file) };
+                }
+            }
             chunk_start = chunk_end;
         }
         let mut v: Vec<(String, usize)> = self

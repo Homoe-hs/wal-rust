@@ -6,6 +6,20 @@ use wal_rust::wal::ast::{Symbol, Value};
 use wal_rust::trace::{FindCondition, ScalarValue, Trace, VcdTrace};
 use wal_rust::wal::ast::WList;
 
+/// `WAL_CACHE*` / `WAL_COL_CACHE_MB` 是**进程级全局**, 而 cargo test 默认多线程
+/// 并行: 改 env 的测试必须与"正在加载波形"的测试互斥, 否则会出现"同一次运行里
+/// 结果时对时错"的假失败(实测: 别名计数偶发 1 vs 2 —— 别的测试正把
+/// WAL_CACHE_DIR 指到别处/删目录)。
+static ENV_LOCK: std::sync::RwLock<()> = std::sync::RwLock::new(());
+
+fn env_read() -> std::sync::RwLockReadGuard<'static, ()> {
+    ENV_LOCK.read().unwrap_or_else(|e| e.into_inner())
+}
+
+fn env_write() -> std::sync::RwLockWriteGuard<'static, ()> {
+    ENV_LOCK.write().unwrap_or_else(|e| e.into_inner())
+}
+
 fn tmp(name: &str, body: &str) -> std::path::PathBuf {
     let p = std::env::temp_dir().join(format!("wal_reg_{}_{}_{}.vcd", name, std::process::id(), body.len()));
     std::fs::write(&p, body).unwrap();
@@ -13,10 +27,17 @@ fn tmp(name: &str, body: &str) -> std::path::PathBuf {
 }
 
 fn load(vcd: &std::path::Path) -> VcdTrace {
+    let _env = env_read();
     VcdTrace::load(vcd, "t".to_string()).unwrap()
 }
 
 fn eval_with(vcd: &std::path::Path, code: &str) -> Value {
+    let _env = env_read();
+    eval_no_lock(vcd, code)
+}
+
+/// 不带环境锁的版本: 给**已经持有写锁**的 env 测试用(同一线程再拿读锁会死锁)。
+fn eval_no_lock(vcd: &std::path::Path, code: &str) -> Value {
     let mut e = Evaluator::new();
     e.load_trace(&vcd.to_string_lossy(), "t").unwrap();
     e.eval(code).unwrap()
@@ -154,6 +175,7 @@ fn matrix_multi_trace_get() {
 /// 10) 列缓存 == 锚定路径(预算 0 vs 充足),计数一致。
 #[test]
 fn matrix_column_equals_anchored() {
+    let _env = env_write();
     let p = tmp("col", "$timescale 1ns $end\n$scope module t $end\n$var wire 4 ! v $end\n$enddefinitions $end\n\
 #0\nb0000 !\n#10\nb1100 !\nb0011 !\n#20\nb0000 !\n#30\nb1010 !\n");
     let run = |env: &str| -> Value {
@@ -335,6 +357,7 @@ fn matrix_id_suffix_ambiguity() {
 /// 跨进程缓存(§8): 命中与未命中结果一致; 波形改动后失效。
 #[test]
 fn matrix_cache_roundtrip_and_invalidation() {
+    let _env = env_write();
     let dir = std::env::temp_dir().join(format!("wal_reg_cache_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::env::set_var("WAL_CACHE_DIR", &dir);
@@ -342,17 +365,17 @@ fn matrix_cache_roundtrip_and_invalidation() {
 #0\nb00000010 !\n#10\nb00000011 !\n#20\nb00001111 !\n");
     let q = "(count (&& (> (get \"t.d\") 2) (< (get \"t.d\") 200)))";
     // auto 模式对小于阈值的波形**不写**缓存(小文件解析本来就快,避免污染目录)
-    let _ = eval_with(&p, q);
+    let _ = eval_no_lock(&p, q);
     assert!(std::fs::read_dir(&dir).map(|d| d.count() == 0).unwrap_or(true),
         "auto 模式不应为小文件写缓存文件");
     // build 显式写回 → read/auto 命中必须与冷加载一致
     std::env::set_var("WAL_CACHE", "build");
-    let first = eval_with(&p, q);
+    let first = eval_no_lock(&p, q);
     std::env::remove_var("WAL_CACHE");
     assert!(std::fs::read_dir(&dir).map(|d| d.count() > 0).unwrap_or(false),
         "build 模式应写出缓存文件");
     std::env::set_var("WAL_CACHE", "read");
-    let second = eval_with(&p, q);
+    let second = eval_no_lock(&p, q);
     std::env::remove_var("WAL_CACHE");
     assert_eq!(first, second, "cache hit must match the cold result");
     // 波形内容变化 → mtime/指纹变化 → 失效重建, 结果更新
@@ -360,7 +383,7 @@ fn matrix_cache_roundtrip_and_invalidation() {
     std::fs::write(&p, "$timescale 1ns $end\n$scope module t $end\n$var wire 8 ! d $end\n$enddefinitions $end\n\
 #0\nb00000100 !\n#10\nb00000101 !\n#20\nb00000110 !\n").unwrap();
     std::env::set_var("WAL_CACHE", "build");
-    let third = eval_with(&p, q);
+    let third = eval_no_lock(&p, q);
     std::env::remove_var("WAL_CACHE");
     assert_eq!(third, Value::Int(3), "after invalidation the new waveform must be read");
     std::env::remove_var("WAL_CACHE_DIR");

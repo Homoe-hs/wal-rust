@@ -50,6 +50,29 @@ pub trait Trace {
     /// record (unlike `find_indices` with `Changed`, which skips it).
     fn change_points(&self, name: &str) -> Result<Vec<(usize, ScalarValue)>, String>;
 
+    /// 变更点, 但时间是**文件原生单位**(与 `(getwave s)`/`(at s T)` 的输出同单位)。
+    ///
+    /// 为什么单独开一个方法: `change_points` 走索引空间, 而索引空间要求后端先把
+    /// **全局时间线**物化出来 —— 对流式/专有后端(如 FSDB 走 NPI)那是一次全量扫描。
+    /// 而 `getwave`/`at`/边沿计数这些查询只需要"信号自己的变更点 + 原生时间",
+    /// 默认实现(索引→时间回环)对它们是纯浪费。时间优先的后端覆盖本方法即可跳过。
+    fn change_points_time(&self, name: &str) -> Result<Vec<(u64, ScalarValue)>, String> {
+        let mut out = Vec::new();
+        for (idx, sv) in self.change_points(name)? {
+            out.push((self.timestamp_at(idx).unwrap_or(0), sv));
+        }
+        Ok(out)
+    }
+
+    /// 只数"匹配多少个索引", 不要索引本身。
+    ///
+    /// 默认实现就是 `find_indices(..).len()`; 后端若能直接在自己的变更列上数
+    /// (边沿类条件与全局时间线无关), 就省掉一次索引空间物化 —— 对 FSDB 后端
+    /// 意味着省掉一次全文件扫描。语义必须与 `find_indices(..).len()` 完全一致。
+    fn count_matches(&self, name: &str, cond: FindCondition) -> Result<usize, String> {
+        Ok(self.find_indices(name, cond)?.len())
+    }
+
     /// 查询前置声明: 本次查询会碰这些信号(按该 trace 自己的命名规则解析)。
     /// 能"顺手算出来"的后端可把"构建索引"和"提取这些信号的变更列"合并成
     /// 一次遍历(冷启动少读一遍文件); 默认无操作。

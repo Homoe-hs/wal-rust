@@ -1759,9 +1759,18 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
             }
         }
 
-        // Fast path 0: builtins simple-condition fast path (covers (= ...) plus
-        // edge/X conditions: (rising/falling/changes/is-x/is-z "sig"))
+        // Fast path 0: 只数个数。时间优先的后端(FSDB 走 NPI)在这里**不需要物化
+        // 索引空间** —— 索引空间是"所有信号变更时间的并集", 对流式后端就是一次
+        // 全文件扫描; 而 `count` 只要个数。语义与 find_indices(..).len() 一致。
         let resolved_cond = self.resolve_rhs_vars(self.resolve_get_symbols(&args[0]));
+        if let Some(Ok(n)) = crate::wal::builtins::signal::try_count_simple(&resolved_cond, &mut self.env) {
+            if let Ok(mut t) = self.traces.write() {
+                for (tid, idx) in &saved {
+                    let _ = t.set_index(tid, *idx);
+                }
+            }
+            return Ok(Value::Int(n as i64));
+        }
         if let Some(result) = crate::wal::builtins::signal::try_find_indices_simple(&resolved_cond, usize::MAX, &mut self.env) {
             match result {
                 Ok(Value::List(lst)) => {

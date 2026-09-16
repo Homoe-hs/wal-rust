@@ -51,6 +51,11 @@ Flags: `-l <waveform>` (repeatable), `-c <code>` (inline override), `--halt-on-e
   `npi_fsdb_create_vct` 会失效);`npiFsdbValue.format` 是**入参**;库路径来自 `$VERDI_HOME`/
   `$WAL_NPI_LIB`。细节见 `docs/fsdb-npi.md`。差分门 `tests/fsdb_diff.rs` 由
   `WAL_FSDB_TEST_FILE` + `WAL_FSDB_TEST_VCD` 开启(没 Verdi 自动跳过)。
+- **索引空间是"要不要全文件扫描"的分水岭**: `change_points`/`find_indices` 走索引空间,
+  对时间优先后端(FSDB)意味着物化全局时间线 = 全文件扫描; `Trace::change_points_time()`
+  与 `Trace::count_matches()` 让 `getwave`/`at`/边沿计数跳过它。新增/修改这类查询时:
+  ① `count_matches` 必须与 `find_indices(..).len()` **逐条一致**(含 `Changed` 在索引 0 的
+  特例); ② 后端的 `set_index`/`max_index` 不要变成隐藏的全扫(引擎每次查询都会恢复游标)。
 - **Dispatcher pattern** for builtins: (1) handler in `src/wal/builtins/xxx.rs` (2) register in `builtins/mod.rs::register_all()` (3) optional `Operator` variant in `ast/operator.rs`.
 - **Global allocator**: `mimalloc` in `src/main.rs`.
 - **VCD trace loading** (0.13.2 起两段式, 懒索引):

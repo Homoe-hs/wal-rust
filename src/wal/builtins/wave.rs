@@ -156,11 +156,8 @@ fn parse_window(args: &[Value]) -> (Option<u64>, Option<u64>) {
 fn windowed_changes(tr: &dyn Trace, sig: &str, t0: Option<u64>, t1: Option<u64>)
     -> Result<Vec<(u64, ScalarValue)>, String>
 {
-    let points = tr.change_points(sig)?;
-    // (time, value) list
-    let timed: Vec<(u64, ScalarValue)> = points.iter()
-        .map(|(idx, sv)| (tr.timestamp_at(*idx).unwrap_or(0), sv.clone()))
-        .collect();
+    // (time, value) 直接用原生时间, 不必经过索引空间(FSDB 后端据此跳过全量扫描)
+    let timed: Vec<(u64, ScalarValue)> = tr.change_points_time(sig)?;
     let mut out: Vec<(u64, ScalarValue)> = Vec::new();
     // Value held just before t0 (the state entering the window)
     if let Some(t0) = t0 {
@@ -190,10 +187,9 @@ fn op_getwave(args: &[Value], env: &mut Environment, _eval: &mut Evaluator) -> R
     }
     let name = extract_string(&args[0])?;
     with_signal_trace(env, &name, |tr, sig| {
-        let points = tr.change_points(sig)?;
+        let points = tr.change_points_time(sig)?;
         let mut out = Vec::with_capacity(points.len());
-        for (idx, sv) in points {
-            let t = tr.timestamp_at(idx).unwrap_or(0);
+        for (t, sv) in points {
             out.push(tv_pair(t, &sv));
         }
         Ok(Value::List(WList::from_vec(out)))
@@ -223,10 +219,7 @@ fn op_at(args: &[Value], env: &mut Environment, _eval: &mut Evaluator) -> Result
     let name = extract_string(&args[0])?;
     let target = extract_int(&args[1])? as u64;
     with_signal_trace(env, &name, |tr, sig| {
-        let points = tr.change_points(sig)?;
-        let timed: Vec<(u64, ScalarValue)> = points.iter()
-            .map(|(idx, sv)| (tr.timestamp_at(*idx).unwrap_or(0), sv.clone()))
-            .collect();
+        let timed: Vec<(u64, ScalarValue)> = tr.change_points_time(sig)?;
         // last change at or before target time
         match timed.iter().rev().find(|(t, _)| *t <= target) {
             Some((t, sv)) => Ok(Value::List(WList::from_vec(vec![
@@ -277,10 +270,10 @@ fn edge_count(args: &[Value], env: &mut Environment, rising: bool) -> Result<Val
     let (t0, t1) = parse_window(&args[1..]);
     with_first_trace(env, |tr| {
         let sig = resolve_signal(tr, &name)?;
-        let points = tr.change_points(&sig)?;
+        let points = tr.change_points_time(&sig)?;
         let mut count = 0usize;
         let mut prev: Option<u8> = None;
-        for (idx, sv) in &points {
+        for (t, sv) in &points {
             let bit = match sv {
                 ScalarValue::Bit(b) => Some(*b),
                 ScalarValue::Vector(v) if v.len() == 1 => Some(v[0]),
@@ -290,7 +283,7 @@ fn edge_count(args: &[Value], env: &mut Environment, rising: bool) -> Result<Val
                 let is_rise = p == b'0' && c == b'1';
                 let is_fall = p == b'1' && c == b'0';
                 if (rising && is_rise) || (!rising && is_fall) {
-                    let t = tr.timestamp_at(*idx).unwrap_or(0);
+                    let t = *t;
                     let in_window = match (t0, t1) {
                         (Some(a), Some(b)) => t >= a && t <= b,
                         (Some(a), None) => t >= a,
@@ -322,10 +315,10 @@ fn op_edges(args: &[Value], env: &mut Environment, _eval: &mut Evaluator) -> Res
     let (t0, t1) = parse_window(&args[1..]);
     with_first_trace(env, |tr| {
         let sig = resolve_signal(tr, &name)?;
-        let points = tr.change_points(&sig)?;
+        let points = tr.change_points_time(&sig)?;
         let mut out = Vec::new();
-        for (i, (idx, _)) in points.iter().enumerate() {
-            let t = tr.timestamp_at(*idx).unwrap_or(0);
+        for (i, (t, _)) in points.iter().enumerate() {
+            let t = *t;
             // skip the held-state point only when it lies before the window
             if i == 0 && t0.is_some() && t < t0.unwrap() { continue; }
             let in_window = match (t0, t1) {
@@ -416,18 +409,18 @@ fn op_search(args: &[Value], env: &mut Environment, _eval: &mut Evaluator) -> Re
     let (t0, t1) = parse_window(&args[2..]);
     with_first_trace(env, |tr| {
         let sig = resolve_signal(tr, &name)?;
-        let points = tr.change_points(&sig)?;
+        let points = tr.change_points_time(&sig)?;
     let pattern: Vec<char> = pattern.chars().collect();
     let mut out = Vec::new();
     let mut window: Vec<char> = Vec::new();
-    for (idx, sv) in &points {
+    for (t, sv) in &points {
         let bits: Vec<char> = match sv {
             ScalarValue::Vector(v) => v.iter().map(|&b| b as char).collect(),
             ScalarValue::Bit(b) => vec![*b as char],
             _ => vec![],
         };
         if bits.is_empty() { continue; }
-        let t = tr.timestamp_at(*idx).unwrap_or(0);
+        let t = *t;
         let in_window = match (t0, t1) {
             (Some(a), Some(b)) => t >= a && t <= b,
             (Some(a), None) => t >= a,
@@ -468,10 +461,10 @@ fn op_assert_eq(args: &[Value], env: &mut Environment, eval: &mut Evaluator) -> 
     let mut failed = false;
     let out = with_first_trace(env, |tr| {
         let sig = resolve_signal(tr, &name)?;
-        let points = tr.change_points(&sig)?;
+        let points = tr.change_points_time(&sig)?;
         let mut violations = Vec::new();
-        for (idx, sv) in &points {
-            let t = tr.timestamp_at(*idx).unwrap_or(0);
+        for (t, sv) in &points {
+            let t = *t;
             if t < t0 { continue; }
             if t > t1 { break; }
             let actual = match scalar_to_wal(sv) {
@@ -503,18 +496,18 @@ fn op_assert_eq(args: &[Value], env: &mut Environment, eval: &mut Evaluator) -> 
 /// Average rising-edge interval of a clock signal in the waveform's native
 /// time units. Returns None when there are not enough edges.
 fn avg_rise_period_native(tr: &dyn Trace, sig: &str) -> Result<Option<f64>, String> {
-    let points = tr.change_points(sig)?;
+    let points = tr.change_points_time(sig)?;
     let mut prev_rise: Option<u64> = None;
     let mut total = 0u64;
     let mut n = 0u64;
-    for (idx, sv) in &points {
+    for (t, sv) in &points {
         let is_rise = match sv {
             ScalarValue::Bit(b) => *b == b'1',
             ScalarValue::Vector(v) if v.len() == 1 => v[0] == b'1',
             _ => continue,
         };
         if is_rise {
-            let t = tr.timestamp_at(*idx).unwrap_or(0);
+            let t = *t;
             if let Some(p) = prev_rise {
                 total += t - p;
                 n += 1;
@@ -568,9 +561,8 @@ fn op_save(args: &[Value], env: &mut Environment, _eval: &mut Evaluator) -> Resu
         // Union of all change timestamps
         let mut all: Vec<(u64, Vec<Option<ScalarValue>>)> = Vec::new();
         for (ci, sig) in names.iter().enumerate() {
-            if let Ok(points) = tr.change_points(sig) {
-                for (idx, sv) in points {
-                    let t = tr.timestamp_at(idx).unwrap_or(0);
+            if let Ok(points) = tr.change_points_time(sig) {
+                for (t, sv) in points {
                     if let Some(entry) = all.iter_mut().find(|(t0, _)| *t0 == t) {
                         entry.1[ci] = Some(sv);
                     } else {

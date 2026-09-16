@@ -302,6 +302,36 @@ pub(crate) fn try_find_indices_simple(cond: &Value, max_results: usize, env: &mu
     try_find_indices_enum(&sig_name, cond_enum, max_results, env)
 }
 
+/// `count` 专用: 只要匹配个数。默认后端会走 `find_indices(..).len()`; 支持
+/// `count_matches` 的后端(如 FSDB 走 NPI)可以跳过"索引空间物化"。
+pub(crate) fn try_count_simple(cond: &Value, env: &mut Environment) -> Option<Result<usize, String>> {
+    let resolved = resolve_cond_names(cond, env);
+    let (sig_name, cond_enum) = match parse_edge_condition(&resolved) {
+        Some((n, c)) => (n, c),
+        None => {
+            let (n, target) = parse_simple_condition(&resolved)?;
+            let c = if (0..=1).contains(&target) {
+                FindCondition::Value(target as u8)
+            } else {
+                FindCondition::ValueI64(target)
+            };
+            (n, c)
+        }
+    };
+    let traces = env.get_traces()?;
+    let resolved_name = {
+        let t = traces.read().ok()?;
+        let tr = t.first_trace()?;
+        tr.resolve_name(&sig_name).unwrap_or(sig_name)
+    };
+    let n = {
+        let t = traces.read().ok()?;
+        let tr = t.first_trace()?;
+        tr.count_matches(&resolved_name, cond_enum).ok()?
+    };
+    Some(Ok(n))
+}
+
 fn try_find_indices_enum(sig_name: &str, cond_enum: FindCondition, max_results: usize, env: &mut Environment) -> Option<Result<Value, String>> {
 
     let traces = env.get_traces()?;
