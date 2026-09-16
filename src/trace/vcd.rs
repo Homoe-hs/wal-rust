@@ -272,6 +272,13 @@ pub struct VcdTrace {
     id_blob: Vec<u8>,          // concatenated signal ids (allocated once)
     id_offsets: Vec<u32>,      // per-signal start offset into id_blob
     signal_widths: Vec<u32>,               // dense by signal index (declared width)
+
+    /// **别名规范表**(懒构建): VCD 里同一个 idcode 可在多个 scope 里被引用 ——
+    /// 那是同一个 net 的别名(`$var wire 1 = clock` 同时出现在 i_cpu/i_ALUB/i_CCU)。
+    /// 数据列只有一份, 所以所有读取路径都要落到同一个"代表信号"上; 否则会出现
+    /// `(count (changes "别名"))` 与 `(getwave "别名")` 打架、`(initial 别名)` 丢初值、
+    /// topsig 里别名凭空消失。空 Vec = 没有别名(绝大多数文件), `canon_idx` 恒等。
+    alias_canon: std::cell::OnceCell<Vec<u32>>,
     /// $dumpvars 初值: 紧凑存储(每信号 4B 偏移 + 少量 blob;此前是
     /// HashMap<u32, VcdValue> ≈ 40B/信号)。u32::MAX = 无初值(按 VCD 默认 'x')。
     init_off: Vec<u32>,
@@ -602,6 +609,7 @@ impl VcdTrace {
         let trace = VcdTrace {
             id, filename,
             names_blob, name_meta, name_index, signal_ids,
+            alias_canon: std::cell::OnceCell::new(),
             id_blob, id_offsets, signal_widths, init_off, init_blob,
             name_cache: std::cell::RefCell::new(FxHashMap::default()),
             warned_xinit: std::cell::RefCell::new(std::collections::HashSet::new()),
@@ -1049,7 +1057,10 @@ impl VcdTrace {
         let mut want: Vec<u32> = Vec::new();
         for n in names {
             if let Some(i) = self.name_index.find_verified(hash_name(n.as_bytes()), |i| self.name_at(i) == n.as_str()) {
-                want.push(i);
+                let i = self.canon_idx(i); // 别名 → 代表: 融合扫描只需取一次列
+                if !want.contains(&i) {
+                    want.push(i);
+                }
             }
         }
         if !want.is_empty() { let _ = self.ensure_dump_index(&want); }
@@ -1090,8 +1101,48 @@ impl VcdTrace {
     }
 
     /// On-demand: read signal value at a specific timestamp (memchr jump scan + sampled offsets)
-    /// Signal id bytes for a signal index (blob + offsets: one allocation).
+    /// 名字 → 规范信号下标(别名收敛到代表; 无别名时恒等)
     #[inline]
+    fn canon_idx(&self, sig_idx: u32) -> u32 {
+        let canon = self.alias_canon.get_or_init(|| self.build_alias_canon());
+        if canon.is_empty() {
+            return sig_idx;
+        }
+        *canon.get(sig_idx as usize).unwrap_or(&sig_idx)
+    }
+
+    /// 扫描 id 表找出别名组。只读头部(不碰 dump 区), 且**懒执行** ——
+    /// `(SIGNALS)`/`(SCOPES)` 这类只看头的查询不付这个成本。
+    fn build_alias_canon(&self) -> Vec<u32> {
+        let n = self.name_count() as u32;
+        let mut groups: std::collections::HashMap<u64, Vec<u32>> = std::collections::HashMap::new();
+        for i in 0..n {
+            let Some(idb) = self.id_bytes(i) else { continue };
+            if idb.is_empty() {
+                continue;
+            }
+            let h = hash_sig_id(idb);
+            // 必须**字节复核**: 哈希只用来定位槽位
+            let rep = self.signal_ids.find_verified(h, |j| self.id_bytes(j) == Some(idb));
+            if let Some(rep) = rep {
+                if rep != i {
+                    groups.entry(h).or_insert_with(|| vec![rep]).push(i);
+                }
+            }
+        }
+        if groups.is_empty() {
+            return Vec::new();
+        }
+        let mut canon: Vec<u32> = (0..n).collect();
+        for (_h, g) in groups {
+            let rep = g[0];
+            for &i in &g {
+                canon[i as usize] = rep;
+            }
+        }
+        canon
+    }
+
     fn id_bytes(&self, sig_idx: u32) -> Option<&[u8]> {
         let start = *self.id_offsets.get(sig_idx as usize)? as usize;
         let end = self.id_offsets.get(sig_idx as usize + 1).map(|v| *v as usize).unwrap_or(self.id_blob.len());
@@ -1103,6 +1154,7 @@ impl VcdTrace {
     /// (the VCD default for values that never got an explicit write).
     #[inline]
     fn initial_value_at(&self, sig_idx: u32) -> VcdValue {
+        let sig_idx = self.canon_idx(sig_idx);
         match self.init_off.get(sig_idx as usize) {
             Some(&off) if off != u32::MAX => decode_initial(&self.init_blob[off as usize..]),
             _ => VcdValue::Bit(b'x'),
@@ -1122,6 +1174,7 @@ impl VcdTrace {
 
     /// 该信号是否带显式初值(缓存序列化用)
     fn has_initial(&self, sig_idx: u32) -> bool {
+        let sig_idx = self.canon_idx(sig_idx);
         matches!(self.init_off.get(sig_idx as usize), Some(&o) if o != u32::MAX)
     }
 
@@ -1136,6 +1189,7 @@ impl VcdTrace {
     /// Per-index change list for a signal — cached warm or id-anchored
     /// cold scan. Single source for find_indices AND change_points.
     fn anchored_changes(&self, sig_idx: u32) -> Result<Vec<(u32, VcdValue)>, String> {
+        let sig_idx = self.canon_idx(sig_idx);
         // 同进程重复查询(以及 signal_value 已解码过的信号): 直接复用已解码变更列。
         // 此前只有 signal_value 读 signal_cache, find_indices/change_points 每次
         // 都重新做锚定扫描(58.7GB 上第二次同信号查询仍要 ~85s)。
@@ -2201,6 +2255,7 @@ impl VcdTrace {
         Some(VcdTrace {
             id, filename,
             names_blob, name_meta, name_index, signal_ids,
+            alias_canon: std::cell::OnceCell::new(),
             id_blob, id_offsets, signal_widths, init_off, init_blob,
             name_cache: std::cell::RefCell::new(FxHashMap::default()),
             warned_xinit: std::cell::RefCell::new(std::collections::HashSet::new()),
@@ -2326,6 +2381,7 @@ impl Trace for VcdTrace {
     fn signal_width(&self, name: &str) -> Result<usize, String> {
         let sig_idx = self.resolve_idx(name)
             .ok_or_else(|| format!("Unknown signal: {}", name))?;
+        let sig_idx = self.canon_idx(sig_idx);
         Ok(self.signal_widths.get(sig_idx as usize).copied().unwrap_or(1) as usize)
     }
 
@@ -2404,6 +2460,7 @@ impl Trace for VcdTrace {
         }
         let sig_idx = self.resolve_idx(name)
             .ok_or_else(|| format!("Unknown signal: {}", name))?;
+        let sig_idx = self.canon_idx(sig_idx); // 别名 → 代表信号(数据列只有一份)
         // 先声明"我要这个信号的变更列": 索引尚未构建时, 时间戳表与变更列在
         // 同一次遍历里一起算出(冷启动只读一遍文件)。
         if self.ensure_dump_index(&[sig_idx]).timestamps.len() == 0 {
@@ -2479,6 +2536,7 @@ impl Trace for VcdTrace {
                 Some(i) => i,
                 None => continue,
             };
+            let sig_idx = self.canon_idx(sig_idx); // 别名 → 代表
             let id_bytes = match self.id_bytes(sig_idx) {
                 Some(b) => b,
                 None => continue,
@@ -2755,9 +2813,18 @@ impl Trace for VcdTrace {
             }
         }
 
-        let mut v: Vec<(String, usize)> = counts.iter().enumerate()
-            .filter(|(_, c)| **c > 0)
-            .filter_map(|(idx, c)| if idx < self.name_count() { Some((self.name_at(idx as u32).to_string(), *c as usize)) } else { None })
+        // 别名: 计数只记在代表信号上, 但**每个名字都要报同一份数**
+        // (否则 net 复用的别名会从 topsig 里凭空消失)。
+        let canon = self.alias_canon.get_or_init(|| self.build_alias_canon());
+        let count_of = |idx: usize| -> usize {
+            let rep = if canon.is_empty() { idx } else { *canon.get(idx).unwrap_or(&(idx as u32)) as usize };
+            counts.get(rep).copied().unwrap_or(0) as usize
+        };
+        let mut v: Vec<(String, usize)> = (0..self.name_count())
+            .filter_map(|idx| {
+                let c = count_of(idx);
+                if c > 0 { Some((self.name_at(idx as u32).to_string(), c)) } else { None }
+            })
             .collect();
         v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
         v.truncate(k);
@@ -2775,6 +2842,7 @@ impl Trace for VcdTrace {
     fn change_points(&self, name: &str) -> Result<Vec<(usize, ScalarValue)>, String> {
         let sig_idx = self.resolve_idx(name)
             .ok_or_else(|| format!("Unknown signal: {}", name))?;
+        let sig_idx = self.canon_idx(sig_idx);
         // Event signals: change points already recorded during load
         if let Some(points) = self.dump().event_change_points.get(&sig_idx) {
             let mut out = Vec::with_capacity(points.len());

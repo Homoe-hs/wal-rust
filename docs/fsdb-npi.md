@@ -79,7 +79,8 @@ wal-rust -l design.fsdb '(count (rising "clk"))'
 2. **同源差分门** `tests/fsdb_diff.rs`(环境变量开启,没 Verdi 自动跳过):
    `WAL_FSDB_TEST_FILE=x.fsdb WAL_FSDB_TEST_VCD=x.vcd cargo test --release --test fsdb_diff`
    比对:时间线(逐索引原生时间) / 信号集 / 位宽 / 确定初值 / **每个索引的取值** / 变更点。
-   实测 `verilog.fsdb ↔ verilog.vcd`:**179 个信号 × 406 个索引全等**。
+   实测 `verilog.fsdb ↔ verilog.vcd`:**179 个信号 × 406 个索引全等**(仅 2 组位炸开
+   向量按上面说明跳过)。
 3. **对 Verdi 复核**:宿主 `fsdbdebug -vc -vidcode N` 的输出与我们的读数一致
    (例如 t=0 条目 `xtag:(0 0) val:0`)。
 

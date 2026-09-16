@@ -1176,3 +1176,39 @@ fn matrix_cross_chunk_timestamp_attribution() {
     }
     let _ = std::fs::remove_file(&p);
 }
+
+/// VCD 别名: **同一个 idcode 在多个 scope 被引用 = 同一个 net**(VCS 常见)。
+/// 数据列只有一份, 所有读取路径必须一致 —— 修前实测:
+/// `(count (changes 别名))`=1 而 `(getwave 别名)`=2 条、`(initial 别名)` 丢初值
+/// (dumpprobes 只写在代表信号上)、topsig 里别名直接消失。
+#[test]
+fn matrix_vcd_alias_same_idcode() {
+    let p = tmp("alias", "$timescale 1ns $end\n$scope module top $end\n$var wire 1 ! a $end\n\
+$scope module sub $end\n$var wire 1 ! a_alias $end\n$upscope $end\n$upscope $end\n\
+$enddefinitions $end\n#0\n$dumpvars\n1!\n$end\n#5\n0!\n#10\n1!\n");
+    let t = load(&p);
+    for name in ["top.a", "top.sub.a_alias"] {
+        assert_eq!(t.initial_value(name), Some(ScalarValue::Bit(b'1')), "{} 初值", name);
+        assert_eq!(t.defined_initial_value(name), Some(ScalarValue::Bit(b'1')), "{} 确定初值", name);
+        assert_eq!(t.signal_width(name).unwrap(), 1, "{} 位宽", name);
+        let cp = t.change_points(name).unwrap();
+        assert_eq!(cp.len(), 2, "{} 变更点 {:?}", name, cp);
+        assert_eq!(
+            t.find_indices(name, FindCondition::Changed).unwrap().len(),
+            2,
+            "{} find(Changed)",
+            name
+        );
+        assert_eq!(t.signal_value(name, 0).unwrap(), ScalarValue::Bit(b'0'), "{} 索引 0", name);
+        assert_eq!(t.signal_value(name, 1).unwrap(), ScalarValue::Bit(b'1'), "{} 索引 1", name);
+    }
+    // 引擎 == 逐拍 oracle
+    let e = |c: &str| eval_with(&p, c);
+    assert_eq!(e("(count (changes \"a_alias\"))"), Value::Int(2));
+    assert_eq!(e("(count/step (changes \"a_alias\"))"), Value::Int(2));
+    assert_eq!(e("(initial \"a_alias\")"), Value::Int(1));
+    // topsig: 别名与代表都要出现(别名不能凭空消失)
+    let top = t.signal_change_counts_top(5);
+    assert_eq!(top.len(), 2, "topsig 应含两个名字: {:?}", top);
+    assert!(top.iter().all(|(_, c)| *c == 2), "topsig 计数: {:?}", top);
+}

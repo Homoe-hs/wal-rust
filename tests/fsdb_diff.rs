@@ -121,8 +121,6 @@ fn fsdb_matches_vcd_when_available() {
     let mut diffs: Vec<String> = Vec::new();
     let mut checked = 0usize;
     let mut with_init = 0usize;
-    // t=0 采样时机差异(合法, 见文末说明): VCD 侧无确定初值 / FSDB 侧有。
-    let mut t0_writer: Vec<String> = Vec::new();
     for fname in tf.signals() {
         let key = norm(&fname);
         if bitblasted.contains(&key) {
@@ -148,28 +146,14 @@ fn fsdb_matches_vcd_when_available() {
         if iv.is_some() {
             with_init += 1;
         }
-        let mut first_idx = 0usize;
+        // 注: 曾经这里允许一类"VCD 无初值 / FSDB 有初值"的差异, 理由是"两代写者采样
+        // 时机不同"。差分证明那是**VCD 后端的别名 bug**(同一 idcode 在多个 scope 被
+        // 引用时, dumpprobes 初值只写在代表信号上) —— 修掉之后两边初值全等, 这条
+        // 容忍分支随之删除, 恢复严格判据。
         if iv != if_ {
-            if iv.is_none() && if_.is_some() {
-                // 只允许一个方向: VCD 的 `$dumpvars` 是**仿真开始前**抓的快照
-                // (连续赋值/initial 还没结算 → x), 而 FSDB 记的是 t=0 delta
-                // 之后的值。已用 Verdi 自身的 `fsdbdebug -vc -vidcode N` 复核:
-                // FSDB 侧就是 0/1(`xtag:(0 0) val:0`), 我们读得对。
-                // 影响是可见的(如 i_ALUB.clock 的 rising 数 146 vs 147),
-                // 属于两代写者的差异, 不是解析错 → 记录并跳过索引 0。
-                // 差异只可能出现在"首个变更之前"那一段(VCD 一直是 x), 从首个
-                // 变更点到末端的取值必须逐索引一致。
-                t0_writer.push(fname.clone());
-                first_idx = tf
-                    .change_points(&fname)
-                    .ok()
-                    .and_then(|cp| cp.first().map(|(i, _)| *i))
-                    .unwrap_or(1);
-            } else {
-                diffs.push(format!("{}: 确定初值 {:?} vs {:?}", fname, iv, if_));
-            }
+            diffs.push(format!("{}: 确定初值 {:?} vs {:?}", fname, iv, if_));
         }
-        for i in first_idx..=tv.max_index() {
+        for i in 0..=tv.max_index() {
             let (a, b) = (tv.signal_value(&vname, i), tf.signal_value(&fname, i));
             if a != b {
                 diffs.push(format!("{}: 索引 {} 取值 {:?} vs {:?}", fname, i, a, b));
@@ -180,13 +164,6 @@ fn fsdb_matches_vcd_when_available() {
             diffs.push(format!("{}: 变更点不同", fname));
         }
         checked += 1;
-    }
-    if !t0_writer.is_empty() {
-        println!(
-            "t0 采样时机差异 {} 个(VCD `$dumpvars` 抓 x / FSDB 记录 t=0 结算值, Verdi 侧一致): {:?}",
-            t0_writer.len(),
-            t0_writer.iter().take(10).collect::<Vec<_>>()
-        );
     }
     if !diffs.is_empty() {
         eprintln!("共 {} 类差异 (检查 {} 个信号, VCD 侧 {} 个有初值):", diffs.len(), checked, with_init);
