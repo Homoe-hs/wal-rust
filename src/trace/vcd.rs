@@ -1972,9 +1972,9 @@ fn split_value_id(line: &[u8]) -> Option<(&[u8], &[u8])> {
 // 长度/修改时间/格式版本; 头部另有首尾 64KB 指纹。任一不符即视为未命中。
 
 #[derive(PartialEq, Clone, Copy)]
-enum CacheMode { Off, Auto, Build, Read }
+pub(crate) enum CacheMode { Off, Auto, Build, Read }
 
-fn cache_mode() -> CacheMode {
+pub(crate) fn cache_mode() -> CacheMode {
     match std::env::var("WAL_CACHE").unwrap_or_default().to_ascii_lowercase().as_str() {
         "off" | "0" | "none" => CacheMode::Off,
         "build" => CacheMode::Build,
@@ -1985,12 +1985,12 @@ fn cache_mode() -> CacheMode {
 
 /// 缓存目录: 默认 **CWD 相对** `./.wal-rust-cache`(执行命令的目录一定可写;
 /// 波形目录可能是只读挂载/共享盘, 因此绝不写在波形旁边)。`WAL_CACHE_DIR` 可覆盖。
-fn cache_dir() -> std::path::PathBuf {
+pub(crate) fn cache_dir() -> std::path::PathBuf {
     std::env::var_os("WAL_CACHE_DIR").map(std::path::PathBuf::from)
         .unwrap_or_else(|| std::path::PathBuf::from(".wal-rust-cache"))
 }
 
-fn wave_fingerprint(path: &std::path::Path) -> u64 {
+pub(crate) fn wave_fingerprint(path: &std::path::Path) -> u64 {
     use std::io::Read;
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     let mut buf = vec![0u8; 64 * 1024];
@@ -2040,7 +2040,7 @@ fn col_sidecar_file(vcd: &std::path::Path, sig_name: &str) -> Option<std::path::
 }
 
 /// 缓存写回的最小波形大小(默认 8MB; `WAL_CACHE_MIN_MB` 可调, 测试用 0)。
-fn cache_min_bytes() -> u64 {
+pub(crate) fn cache_min_bytes() -> u64 {
     std::env::var("WAL_CACHE_MIN_MB").ok()
         .and_then(|v| v.trim().parse::<u64>().ok())
         .map(|mb| mb.saturating_mul(1024 * 1024))

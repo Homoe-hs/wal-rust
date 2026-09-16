@@ -179,3 +179,57 @@ fn fsdb_matches_vcd_when_available() {
         with_init
     );
 }
+
+/// 时间线落盘缓存的编解码往返(纯函数, 不需要 Verdi)。
+/// 缓存是"索引空间"的唯一跨进程载体, 解错一个字节 = 所有 find/电平查询错位。
+#[test]
+fn timeline_cache_codec_roundtrip() {
+    let cases: Vec<Vec<u64>> = vec![
+        vec![],
+        vec![0],
+        vec![5, 10, 15, 25, 35, 45, 55],
+        (0..5000u64).map(|i| i * 1000).collect(),
+        vec![u64::MAX - 1, u64::MAX],
+    ];
+    for times in cases {
+        let blob = wal_rust::trace::fsdb_test_api::encode(&times, Some(7));
+        let (got, first) = wal_rust::trace::fsdb_test_api::decode(&blob, fp_of(&blob))
+            .expect("decode 应当成功");
+        assert_eq!(got, times, "时间点往返不一致");
+        assert_eq!(first, Some(7));
+    }
+    // 指纹不符 / 截断 / magic 错 → 必须拒绝(不能把别人的时间线读进来)
+    let blob = wal_rust::trace::fsdb_test_api::encode(&[1, 2, 3], None);
+    assert!(wal_rust::trace::fsdb_test_api::decode(&blob, 0xdead_beef).is_none());
+    assert!(wal_rust::trace::fsdb_test_api::decode(&blob[..blob.len() - 1], fp_of(&blob)).is_none());
+    assert!(wal_rust::trace::fsdb_test_api::decode(b"XXXXXXXX", fp_of(&blob)).is_none());
+    let empty_first = wal_rust::trace::fsdb_test_api::encode(&[], None);
+    assert_eq!(wal_rust::trace::fsdb_test_api::decode(&empty_first, fp_of(&empty_first)).unwrap().1, None);
+}
+
+/// 从 blob 里取指纹(测试辅助: 免得再算一遍文件指纹)
+fn fp_of(blob: &[u8]) -> u64 {
+    u64::from_le_bytes(blob[8..16].try_into().unwrap())
+}
+
+/// 名字树缓存的编解码往返(纯函数): 名字/位宽/scope 三者的**顺序与内容**都不能错,
+/// 否则恢复出来的句柄会挂到别的信号上(查询结果整体错位)。
+#[test]
+fn tree_cache_codec_roundtrip() {
+    let names: Vec<String> = vec![
+        "tb.clk".into(),
+        "tb.u_dcache.g_inst[0].u_leaf.cnt".into(),
+        "中文/带空格 名字".into(),
+        String::new(),
+    ];
+    let widths = vec![1usize, 16, 8, 0];
+    let scopes = vec!["tb".into(), "tb.u_dcache".into()];
+    let blob = wal_rust::trace::fsdb_test_api::encode_tree(&names, &widths, &scopes);
+    let got = wal_rust::trace::fsdb_test_api::decode_tree(&blob, fp_of(&blob)).expect("decode");
+    assert_eq!(got.0, names);
+    assert_eq!(got.1, widths);
+    assert_eq!(got.2, scopes);
+    // 指纹不符 / 截断 → 拒绝
+    assert!(wal_rust::trace::fsdb_test_api::decode_tree(&blob, 0x1234).is_none());
+    assert!(wal_rust::trace::fsdb_test_api::decode_tree(&blob[..blob.len() - 1], fp_of(&blob)).is_none());
+}

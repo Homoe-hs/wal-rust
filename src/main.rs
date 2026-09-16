@@ -107,10 +107,16 @@ fn init_eval_with_load(load: &[PathBuf]) -> Result<wal::eval::Evaluator, String>
 }
 
 fn eval_wal_expr(code: &str, load: &[PathBuf]) -> Result<i32, String> {
+    let t0 = std::time::Instant::now();
+    let dbg_t = std::env::var("WAL_DEBUG_FSDB").is_ok();
     let mut eval = init_eval_with_load(load)?;
+    if dbg_t { eprintln!("[time] load {:.0}ms", t0.elapsed().as_millis()); }
     let before = eval.test_failures();
     match eval.eval(code) {
-        Ok(val) => println!("=> {}", val),
+        Ok(val) => {
+            if dbg_t { eprintln!("[time] eval {:.0}ms", t0.elapsed().as_millis()); }
+            println!("=> {}", val)
+        }
         Err(e) => {
             if let Some(c) = parse_exit_code(&e) { return Ok(c); }
             return Err(e);

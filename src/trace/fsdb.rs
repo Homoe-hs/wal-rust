@@ -113,6 +113,8 @@ struct Npi {
     unload_vc: Option<unsafe extern "C" fn(*mut c_void) -> c_int>,
     sig_property: unsafe extern "C" fn(c_int, *mut c_void, *mut c_int) -> c_int,
     sig_property_str: unsafe extern "C" fn(c_int, *mut c_void) -> *const c_char,
+    /// `npi_fsdb_sig_by_name(file, name, scope)`: 按全名取句柄(不遍历树)
+    sig_by_name: unsafe extern "C" fn(*mut c_void, *const c_char, *mut c_void) -> *mut c_void,
     iter_top_scope: unsafe extern "C" fn(*mut c_void) -> *mut c_void,
     iter_child_scope: unsafe extern "C" fn(*mut c_void) -> *mut c_void,
     iter_scope_next: unsafe extern "C" fn(*mut c_void) -> *mut c_void,
@@ -213,14 +215,21 @@ impl Npi {
             let mut handle = ptr::null_mut();
             let mut derr = String::new();
             let mut hit_path = None;
+            let t_dl = std::time::Instant::now();
             for p in &candidates {
                 let c = CString::new(p.as_str()).map_err(|_| format!("库路径含 NUL: {}", p))?;
-                handle = libc::dlopen(c.as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL);
+                // RTLD_LAZY: 123MB 的 libNPI.so 用 RTLD_NOW 会把所有 PLT 重定位在
+                // 加载时做完(实测 ~1s), 而我们用到的符号都是 dlsym 显式取的 →
+                // 懒绑定既省这一秒, 也不影响"符号缺失即报错"。
+                handle = libc::dlopen(c.as_ptr(), libc::RTLD_LAZY | libc::RTLD_LOCAL);
                 if !handle.is_null() {
                     hit_path = Some(p.clone());
                     break;
                 }
                 derr = CStr::from_ptr(libc::dlerror()).to_string_lossy().to_string();
+            }
+            if std::env::var("WAL_DEBUG_FSDB").is_ok() {
+                eprintln!("[fsdb] dlopen {}ms ({})", t_dl.elapsed().as_millis(), candidates.join(", "));
             }
             let Some(hit_path) = hit_path else {
                 return Err(format!(
@@ -273,6 +282,7 @@ impl Npi {
                 unload_vc: sym_opt!("_Z20npi_fsdb_unload_vcPv", unsafe extern "C" fn(*mut c_void) -> c_int),
                 sig_property: sym!("_Z21npi_fsdb_sig_property22npiFsdbSigPropertyTypePvPi", unsafe extern "C" fn(c_int, *mut c_void, *mut c_int) -> c_int),
                 sig_property_str: sym!("_Z25npi_fsdb_sig_property_str22npiFsdbSigPropertyTypePv", unsafe extern "C" fn(c_int, *mut c_void) -> *const c_char),
+                sig_by_name: sym!("_Z20npi_fsdb_sig_by_namePvPKcS_", unsafe extern "C" fn(*mut c_void, *const c_char, *mut c_void) -> *mut c_void),
                 iter_top_scope: sym!("_Z23npi_fsdb_iter_top_scopePv", unsafe extern "C" fn(*mut c_void) -> *mut c_void),
                 iter_child_scope: sym!("_Z25npi_fsdb_iter_child_scopePv", unsafe extern "C" fn(*mut c_void) -> *mut c_void),
                 iter_scope_next: sym!("_Z24npi_fsdb_iter_scope_nextPv", unsafe extern "C" fn(*mut c_void) -> *mut c_void),
@@ -288,16 +298,23 @@ impl Npi {
             // "[NPI ERROR] Please call npi_init() before npi_fsdb_open."
             let init: unsafe extern "C" fn(*mut c_int, *mut *mut *mut c_char) -> c_int =
                 sym!("_Z8npi_initRiRPPc", unsafe extern "C" fn(*mut c_int, *mut *mut *mut c_char) -> c_int);
-            let mut owned: Vec<CString> = std::env::args()
-                .map(|a| CString::new(a).unwrap_or_else(|_| CString::new("wal-rust").unwrap()))
-                .collect();
+            // 只把 argv[0] 交给 NPI: 我们的 CLI 参数(`-l x.fsdb`、表达式…)对它是噪音,
+            // 不同版本的 NPI 还可能去解析它们。
+            let prog = std::env::args().next().unwrap_or_else(|| "wal-rust".to_string());
+            let mut owned: Vec<CString> = vec![
+                CString::new(prog).unwrap_or_else(|_| CString::new("wal-rust").unwrap())
+            ];
             let mut argv: Vec<*mut c_char> =
                 owned.iter_mut().map(|c| c.as_ptr() as *mut c_char).collect();
             argv.push(ptr::null_mut());
             let mut argc = (argv.len() - 1) as c_int;
             let mut argv_p = argv.as_mut_ptr();
+            let t_init = std::time::Instant::now();
             let _box = NpiSandbox::enter(true); // init 的 banner 两个流都要静音
             let rc = init(&mut argc, &mut argv_p);
+            if std::env::var("WAL_DEBUG_FSDB").is_ok() {
+                eprintln!("[fsdb] npi_init {}ms (rc={})", t_init.elapsed().as_millis(), rc);
+            }
             if rc == 0 {
                 return Err(format!(
                     "npi_init 失败(libNPI.so 已加载: {})。常见原因: Verdi 许可不可用、\
@@ -315,6 +332,216 @@ impl Npi {
         } else {
             unsafe { CStr::from_ptr(p) }.to_string_lossy().to_string()
         }
+    }
+}
+
+// ============================ 时间线落盘缓存 ============================
+//
+// 索引空间(全局时间线)对 FSDB 后端就是"把整个 FSDB 的每条变更都过一遍",
+// 而它只跟**波形文件内容**有关 —— 与查询无关。所以第一次算完就落盘:
+// 之后任何进程的 `find`/电平条件查询直接读缓存。
+//
+// 文件布局(全部小端):
+//   magic  8B  "WALFTL01"
+//   fp     8B  波形指纹(首尾 64KB 的 FNV, 与 VCD 旁挂缓存同口径)
+//   first  9B  1B 标志 + 8B "全局最早变更时间"(0 / 1 + 值)
+//   n      8B  时间点个数
+//   body   n 个 delta-varint(时间点升序, 首条为绝对值)
+
+const TL_MAGIC: &[u8; 8] = b"WALFTL01";
+const TREE_MAGIC: &[u8; 8] = b"WALFNM01";
+
+/// 名字树缓存的内容: 全名 + 位宽 + scope 列表。
+/// 句柄**不进缓存**(跨进程无效) —— 恢复后第一次用到再按名字问 NPI。
+pub(crate) struct TreeSnapshot {
+    pub names: Vec<String>,
+    pub widths: Vec<usize>,
+    pub scopes: Vec<String>,
+}
+
+pub(crate) fn encode_tree(t: &TreeSnapshot) -> Vec<u8> {
+    let mut out = Vec::with_capacity(64 + t.names.len() * 24);
+    out.extend_from_slice(TREE_MAGIC);
+    out.extend_from_slice(&[0u8; 8]); // 指纹占位
+    put_varint(&mut out, t.names.len() as u64);
+    for (n, w) in t.names.iter().zip(t.widths.iter()) {
+        put_varint(&mut out, n.len() as u64);
+        out.extend_from_slice(n.as_bytes());
+        put_varint(&mut out, *w as u64);
+    }
+    put_varint(&mut out, t.scopes.len() as u64);
+    for sc in &t.scopes {
+        put_varint(&mut out, sc.len() as u64);
+        out.extend_from_slice(sc.as_bytes());
+    }
+    out
+}
+
+pub(crate) fn decode_tree(buf: &[u8], expect_fp: u64) -> Option<TreeSnapshot> {
+    if buf.len() < 24 || &buf[..8] != TREE_MAGIC {
+        return None;
+    }
+    if u64::from_le_bytes(buf[8..16].try_into().ok()?) != expect_fp {
+        return None;
+    }
+    let mut pos = 16usize;
+    let n = get_varint(buf, &mut pos)? as usize;
+    if n > buf.len() {
+        return None;
+    }
+    let mut names = Vec::with_capacity(n);
+    let mut widths = Vec::with_capacity(n);
+    for _ in 0..n {
+        let l = get_varint(buf, &mut pos)? as usize;
+        let end = pos.checked_add(l)?;
+        names.push(String::from_utf8(buf.get(pos..end)?.to_vec()).ok()?);
+        pos = end;
+        widths.push(get_varint(buf, &mut pos)? as usize);
+    }
+    let ns = get_varint(buf, &mut pos)? as usize;
+    if ns > buf.len() {
+        return None;
+    }
+    let mut scopes = Vec::with_capacity(ns);
+    for _ in 0..ns {
+        let l = get_varint(buf, &mut pos)? as usize;
+        let end = pos.checked_add(l)?;
+        scopes.push(String::from_utf8(buf.get(pos..end)?.to_vec()).ok()?);
+        pos = end;
+    }
+    Some(TreeSnapshot { names, widths, scopes })
+}
+
+fn put_varint(out: &mut Vec<u8>, mut v: u64) {
+    while v >= 0x80 {
+        out.push((v as u8) | 0x80);
+        v >>= 7;
+    }
+    out.push(v as u8);
+}
+
+fn get_varint(buf: &[u8], pos: &mut usize) -> Option<u64> {
+    let mut v: u64 = 0;
+    let mut shift = 0u32;
+    loop {
+        let b = *buf.get(*pos)?;
+        *pos += 1;
+        v |= ((b & 0x7f) as u64) << shift;
+        if b & 0x80 == 0 {
+            return Some(v);
+        }
+        shift += 7;
+        if shift > 63 {
+            return None;
+        }
+    }
+}
+
+/// 时间线 → 字节流(delta 编码: 时间戳单调, 差值多为小数字)
+pub(crate) fn encode_timeline(times: &[u64], first_change: Option<u64>) -> Vec<u8> {
+    let mut out = Vec::with_capacity(times.len() + 32);
+    out.extend_from_slice(TL_MAGIC);
+    // 指纹由调用方写(第 9..17 字节占位), 这里先留 8 字节
+    out.extend_from_slice(&[0u8; 8]);
+    match first_change {
+        Some(t) => {
+            out.push(1);
+            out.extend_from_slice(&t.to_le_bytes());
+        }
+        None => {
+            out.push(0);
+            out.extend_from_slice(&0u64.to_le_bytes());
+        }
+    }
+    out.extend_from_slice(&(times.len() as u64).to_le_bytes());
+    let mut prev = 0u64;
+    for &t in times {
+        put_varint(&mut out, t - prev);
+        prev = t;
+    }
+    out
+}
+
+pub(crate) fn decode_timeline(buf: &[u8], expect_fp: u64) -> Option<(Vec<u64>, Option<u64>)> {
+    if buf.len() < 8 + 8 + 9 + 8 || &buf[..8] != TL_MAGIC {
+        return None;
+    }
+    let fp = u64::from_le_bytes(buf[8..16].try_into().ok()?);
+    if fp != expect_fp {
+        return None;
+    }
+    let mut pos = 16usize;
+    let has_first = buf[pos] != 0;
+    pos += 1;
+    let first_val = u64::from_le_bytes(buf[pos..pos + 8].try_into().ok()?);
+    pos += 8;
+    let n = u64::from_le_bytes(buf[pos..pos + 8].try_into().ok()?) as usize;
+    pos += 8;
+    // 防呆: 每条 varint 至少 1 字节
+    if n > buf.len() - pos {
+        return None;
+    }
+    let mut times = Vec::with_capacity(n);
+    let mut prev = 0u64;
+    for _ in 0..n {
+        let d = get_varint(buf, &mut pos)?;
+        prev = prev.checked_add(d)?;
+        times.push(prev);
+    }
+    Some((times, if has_first { Some(first_val) } else { None }))
+}
+
+/// 通用缓存路径: `<cache>/<basename>-<size>-<mtime>-v1<ext>`
+fn cache_path(filename: &str, ext: &str) -> Option<std::path::PathBuf> {
+    let p = std::path::Path::new(filename);
+    let meta = std::fs::metadata(p).ok()?;
+    let mtime = meta.modified().ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())?;
+    let base = p.file_name()?.to_string_lossy().replace('/', "_");
+    Some(crate::trace::vcd::cache_dir()
+        .join(format!("{}-{}-{}-v1{}", base, meta.len(), mtime, ext)))
+}
+
+fn try_load_tree_cache(filename: &str) -> Option<TreeSnapshot> {
+    if crate::trace::vcd::cache_mode() == crate::trace::vcd::CacheMode::Off {
+        return None;
+    }
+    let f = cache_path(filename, ".fnames")?;
+    let buf = std::fs::read(&f).ok()?;
+    let fp = crate::trace::vcd::wave_fingerprint(std::path::Path::new(filename));
+    let snap = decode_tree(&buf, fp);
+    if snap.is_none() && std::env::var("WAL_DEBUG_FSDB").is_ok() {
+        eprintln!("[fsdb] 名字树缓存未命中/损坏: {}", f.display());
+    }
+    snap
+}
+
+fn save_tree_cache(filename: &str, names: &[String], widths: &[usize], scopes: &[String]) {
+    use crate::trace::vcd::CacheMode;
+    if crate::trace::vcd::cache_mode() == CacheMode::Read {
+        return;
+    }
+    let Some(f) = cache_path(filename, ".fnames") else { return };
+    if let Some(dir) = f.parent() {
+        if std::fs::create_dir_all(dir).is_err() {
+            return;
+        }
+    }
+    let fp = crate::trace::vcd::wave_fingerprint(std::path::Path::new(filename));
+    let snap = TreeSnapshot {
+        names: names.to_vec(),
+        widths: widths.to_vec(),
+        scopes: scopes.to_vec(),
+    };
+    let mut blob = encode_tree(&snap);
+    blob[8..16].copy_from_slice(&fp.to_le_bytes());
+    let tmp = f.with_extension("fnames.tmp");
+    if std::fs::write(&tmp, &blob).is_ok() {
+        let _ = std::fs::rename(&tmp, &f);
+    }
+    if std::env::var("WAL_DEBUG_FSDB").is_ok() {
+        eprintln!("[fsdb] 名字树缓存写入 {} 信号 → {}", names.len(), f.display());
     }
 }
 
@@ -593,12 +820,15 @@ fn eval_column(
 // ============================ Trace 实现 ============================
 
 struct Sig {
-    handle: *mut c_void,
+    /// 句柄。**可能为空** —— 从名字缓存恢复时不知道句柄, 第一次用到才
+    /// `npi_fsdb_sig_by_name(全名)` 解析(实测 2000 次 114ms, 而整棵树遍历
+    /// 60k 信号要 ~800ms)。
+    handle: Cell<*mut c_void>,
     name: String,
     full: String,
     width: usize,
-    is_real: bool,
-    is_string: bool,
+    /// 是否实数/字符串: 懒取(第一次读到这个信号的值时才问 NPI)
+    real_str: Cell<Option<(bool, bool)>>,
 }
 
 /// 每信号变更列: **时间基**(原生时间升序; 不含 t0 初值快照)。
@@ -632,7 +862,7 @@ pub struct FsdbTrace {
     sigs: Vec<Sig>,
     sig_names: Vec<String>,
     name_to_idx: HashMap<String, usize>,
-    handle_to_idx: HashMap<usize, usize>,
+
     scopes: Vec<String>,
     ts_exp: Option<i8>,
     min_t: u64,
@@ -707,20 +937,38 @@ impl FsdbTrace {
             let version = Npi::cstr((npi.file_property_str)(FILE_VERSION, file));
             let ts_exp = crate::vcd::convert::parse_timescale(scale.as_bytes());
             let dbg = std::env::var("WAL_DEBUG_FSDB").is_ok();
-
             let t_walk = std::time::Instant::now();
             let mut sigs: Vec<Sig> = Vec::new();
             let mut scopes: Vec<String> = Vec::new();
-            let top = (npi.iter_top_scope)(file);
-            if !top.is_null() {
-                loop {
-                    let s = (npi.iter_scope_next)(top);
-                    if s.is_null() {
-                        break;
-                    }
-                    walk_scope(npi, s, &mut sigs, &mut scopes);
+            // 名字树缓存: 命中就**完全跳过树遍历**(60k 信号实测 ~800ms)。句柄不进
+            // 缓存, 第一次用到某个信号时按名字解析(`npi_fsdb_sig_by_name`)。
+            let mut quoted_names: Vec<String> = Vec::new();
+            let mut quoted_widths: Vec<usize> = Vec::new();
+            if let Some(snap) = try_load_tree_cache(&filename) {
+                quoted_names = snap.names;
+                quoted_widths = snap.widths;
+                scopes = snap.scopes;
+                for (i, full) in quoted_names.iter().enumerate() {
+                    sigs.push(Sig {
+                        handle: Cell::new(ptr::null_mut()),
+                        name: full.rsplit('.').next().unwrap_or(full).to_string(),
+                        full: full.clone(),
+                        width: quoted_widths.get(i).copied().unwrap_or(1),
+                        real_str: Cell::new(None),
+                    });
                 }
-                (npi.iter_scope_stop)(top);
+            } else {
+                let top = (npi.iter_top_scope)(file);
+                if !top.is_null() {
+                    loop {
+                        let s = (npi.iter_scope_next)(top);
+                        if s.is_null() {
+                            break;
+                        }
+                        walk_scope(npi, s, &mut sigs, &mut scopes);
+                    }
+                    (npi.iter_scope_stop)(top);
+                }
             }
             if dbg {
                 eprintln!(
@@ -737,16 +985,20 @@ impl FsdbTrace {
                     max_t
                 );
             }
+            if quoted_names.is_empty() && !sigs.is_empty() {
+                // 刚走完树 → 落盘, 之后的进程直接跳过遍历
+                let names: Vec<String> = sigs.iter().map(|s| s.full.clone()).collect();
+                let widths: Vec<usize> = sigs.iter().map(|s| s.width).collect();
+                save_tree_cache(&filename, &names, &widths, &scopes);
+            }
             if sigs.is_empty() {
                 (npi.close)(file);
                 return Err(format!("{}: FSDB 里没有任何信号", filename));
             }
             let mut name_to_idx = HashMap::with_capacity(sigs.len());
-            let mut handle_to_idx = HashMap::with_capacity(sigs.len());
             let mut sig_names = Vec::with_capacity(sigs.len());
             for (i, s) in sigs.iter().enumerate() {
                 name_to_idx.entry(s.full.clone()).or_insert(i);
-                handle_to_idx.insert(s.handle as usize, i);
                 sig_names.push(s.full.clone());
             }
             Ok(FsdbTrace {
@@ -756,7 +1008,6 @@ impl FsdbTrace {
                 sigs,
                 sig_names,
                 name_to_idx,
-                handle_to_idx,
                 scopes,
                 ts_exp,
                 min_t,
@@ -805,10 +1056,11 @@ impl FsdbTrace {
     }
 
     /// 读当前迭代位置的值(`get_value` 的字符串缓冲必须立刻拷走)。
-    fn read_value(&self, npi: &Npi, it: &mut IterObj, sig: &Sig) -> ScalarValue {
-        let wanted = if sig.is_real {
+    fn read_value(&self, npi: &Npi, it: &mut IterObj, idx: usize) -> ScalarValue {
+        let (is_real, is_string) = self.real_str_of(idx);
+        let wanted = if is_real {
             VAL_REAL
-        } else if sig.is_string {
+        } else if is_string {
             VAL_STRING
         } else {
             VAL_BINSTR
@@ -887,8 +1139,22 @@ impl FsdbTrace {
                 unsafe { f(it.this(), n) };
             }
             let t_add = std::time::Instant::now();
+            // 局部 handle→下标: 句柄可能刚从名字缓存里懒解析出来, 不能依赖 load
+            // 时建的那张表。每块的信号数有上限(默认 4096), 建表很便宜。
+            let mut local: HashMap<usize, usize> = HashMap::with_capacity(chunk_end - chunk_start);
             for &i in &targets[chunk_start..chunk_end] {
-                unsafe { (npi.iter.add)(it.this(), self.sigs[i].handle) };
+                match self.handle_of(i) {
+                    Ok(h) => {
+                        local.insert(h as usize, i);
+                        unsafe { (npi.iter.add)(it.this(), h) };
+                    }
+                    Err(e) => {
+                        let mut f = self.fatal.borrow_mut();
+                        if f.is_none() {
+                            *f = Some(e);
+                        }
+                    }
+                }
             }
             let ms_add = t_add.elapsed().as_millis();
             let t_start = std::time::Instant::now();
@@ -942,13 +1208,13 @@ impl FsdbTrace {
                 if rc <= 0 || sig.is_null() {
                     break;
                 }
-                let Some(&idx) = self.handle_to_idx.get(&(sig as usize)) else {
+                let Some(&idx) = local.get(&(sig as usize)) else {
                     continue;
                 };
                 entries += 1;
                 if t == 0 {
                     if want.contains(&idx) {
-                        let v = self.read_value(npi, &mut it, &self.sigs[idx]);
+                        let v = self.read_value(npi, &mut it, idx);
                         out.inits.entry(idx).or_insert(v);
                     }
                     continue;
@@ -957,7 +1223,7 @@ impl FsdbTrace {
                     chunk_times.push(t);
                 }
                 if want.contains(&idx) {
-                    let v = self.read_value(npi, &mut it, &self.sigs[idx]);
+                    let v = self.read_value(npi, &mut it, idx);
                     out.raw.entry(idx).or_default().push((t, v));
                 }
             }
@@ -1006,16 +1272,82 @@ impl FsdbTrace {
         Ok(out)
     }
 
+    /// 时间线缓存文件: 与 VCD 旁挂缓存同一套 key(路径 basename+size+mtime)。
+    fn timeline_cache_file(&self) -> Option<std::path::PathBuf> {
+        cache_path(&self.filename, ".ftl")
+    }
+
+    /// 读时间线缓存(命中 → 直接返回, 不再碰 FSDB 数据)
+    fn try_load_timeline_cache(&self) -> Option<(Vec<u64>, Option<u64>)> {
+        if crate::trace::vcd::cache_mode() == crate::trace::vcd::CacheMode::Off {
+            return None;
+        }
+        let f = self.timeline_cache_file()?;
+        let buf = std::fs::read(&f).ok()?;
+        let fp = crate::trace::vcd::wave_fingerprint(std::path::Path::new(&self.filename));
+        let got = decode_timeline(&buf, fp);
+        if got.is_none() && std::env::var("WAL_DEBUG_FSDB").is_ok() {
+            eprintln!("[fsdb] 时间线缓存未命中/损坏, 忽略: {}", f.display());
+        }
+        got
+    }
+
+    /// 写时间线缓存(原子: 先写 .tmp 再 rename, 避免别的进程读到半个文件)
+    fn save_timeline_cache(&self, times: &[u64], first_change: Option<u64>) {
+        use crate::trace::vcd::CacheMode;
+        if crate::trace::vcd::cache_mode() == CacheMode::Read {
+            return;
+        }
+        let Some(f) = self.timeline_cache_file() else { return };
+        if let Some(dir) = f.parent() {
+            if std::fs::create_dir_all(dir).is_err() {
+                return;
+            }
+        }
+        let fp = crate::trace::vcd::wave_fingerprint(std::path::Path::new(&self.filename));
+        let mut blob = encode_timeline(times, first_change);
+        blob[8..16].copy_from_slice(&fp.to_le_bytes());
+        let tmp = f.with_extension("ftl.tmp");
+        if std::fs::write(&tmp, &blob).is_ok() {
+            let _ = std::fs::rename(&tmp, &f);
+        }
+        if std::env::var("WAL_DEBUG_FSDB").is_ok() {
+            eprintln!("[fsdb] 时间线缓存写入 {} 个时间点 → {}", times.len(), f.display());
+        }
+    }
+
     /// 时间线(索引 → 原生时间)。规则 A: 不含 t=0 初值快照。
     fn timeline(&self) -> Result<Rc<Vec<u64>>, String> {
         if let Some(t) = self.timeline.borrow().as_ref() {
             return Ok(t.clone());
         }
-        let prepared: HashSet<usize> = self.prepared.borrow().iter().copied().collect();
-        let out = self.scan(&prepared, true)?;
+        let cached = self.try_load_timeline_cache();
+        if let Some((times, first)) = cached {
+            if std::env::var("WAL_DEBUG_FSDB").is_ok() {
+                eprintln!("[fsdb] 时间线缓存命中: {} 个时间点", times.len());
+            }
+            self.first_change.set(Some(first));
+            let rc = Rc::new(times);
+            *self.timeline.borrow_mut() = Some(rc.clone());
+            return Ok(rc);
+        }
+        let t_begin = std::time::Instant::now();
+        let out = self.scan(&HashSet::new(), true)?;
+        let times = out.times.clone();
         self.apply_scan(out);
         let t = self.timeline.borrow().clone();
-        t.ok_or_else(|| "FSDB 时间线构建失败".to_string())
+        let t = t.ok_or_else(|| "FSDB 时间线构建失败".to_string())?;
+        let elapsed = t_begin.elapsed();
+        // 只缓存"值得缓存"的: 小时间线(<1k 点)重扫也比读文件快, 而且不污染目录。
+        // `WAL_CACHE=build` 时无条件写(测试/预热用)。
+        // 判据: 时间点够多, 或者这次构建确实慢(平台/文件差异都能覆盖到)。
+        if times.len() >= 256
+            || elapsed >= std::time::Duration::from_millis(150)
+            || crate::trace::vcd::cache_mode() == crate::trace::vcd::CacheMode::Build
+        {
+            self.save_timeline_cache(&times, self.first_change.get().flatten());
+        }
+        Ok(t)
     }
 
     /// 把一次扫描结果落进缓存。
@@ -1108,6 +1440,47 @@ impl FsdbTrace {
         None
     }
 
+    /// 取(必要时解析)信号句柄。
+    fn handle_of(&self, idx: usize) -> Result<*mut c_void, String> {
+        let h = self.sigs[idx].handle.get();
+        if !h.is_null() {
+            return Ok(h);
+        }
+        let npi = npi()?;
+        let c = CString::new(self.sigs[idx].full.as_str())
+            .map_err(|_| format!("信号名含 NUL: {}", self.sigs[idx].full))?;
+        let h = unsafe { (npi.sig_by_name)(self.file, c.as_ptr(), ptr::null_mut()) };
+        if h.is_null() {
+            return Err(format!(
+                "npi_fsdb_sig_by_name 取不到信号 '{}'(缓存里的名字与文件不匹配?)",
+                self.sigs[idx].full
+            ));
+        }
+        self.sigs[idx].handle.set(h);
+        Ok(h)
+    }
+
+    /// 是否实数/字符串(懒取一次)
+    fn real_str_of(&self, idx: usize) -> (bool, bool) {
+        if let Some(v) = self.sigs[idx].real_str.get() {
+            return v;
+        }
+        let mut v = (false, false);
+        if let Ok(h) = self.handle_of(idx) {
+            if let Ok(npi) = npi() {
+                unsafe {
+                    let mut is_real: c_int = 0;
+                    let mut is_string: c_int = 0;
+                    (npi.sig_property)(SIG_IS_REAL, h, &mut is_real);
+                    (npi.sig_property)(SIG_IS_STRING, h, &mut is_string);
+                    v = (is_real != 0, is_string != 0);
+                }
+            }
+        }
+        self.sigs[idx].real_str.set(Some(v));
+        v
+    }
+
     fn width_of(&self, idx: usize) -> usize {
         self.sigs[idx].width
     }
@@ -1136,6 +1509,13 @@ impl FsdbTrace {
             self.first_change.set(Some(v));
             return Ok(v);
         }
+        // 落盘缓存里有时间线, 顺带就知道最早变更时间 —— 不必再摸 FSDB
+        if let Some((times, first)) = self.try_load_timeline_cache() {
+            let v = times.first().copied().or(first);
+            self.first_change.set(Some(v));
+            *self.timeline.borrow_mut() = Some(Rc::new(times));
+            return Ok(v);
+        }
         let npi = npi()?;
         let chunk = chunk_size();
         let mut best: Option<u64> = None;
@@ -1144,7 +1524,9 @@ impl FsdbTrace {
             let hi = (lo + chunk).min(self.sigs.len());
             let mut it = IterObj::new(npi);
             for i in lo..hi {
-                unsafe { (npi.iter.add)(it.this(), self.sigs[i].handle) };
+                if let Ok(h) = self.handle_of(i) {
+                    unsafe { (npi.iter.add)(it.this(), h) };
+                }
             }
             unsafe { (npi.iter.start)(it.this(), self.min_t, self.max_t) };
             loop {
@@ -1191,24 +1573,19 @@ unsafe fn walk_scope(npi: &'static Npi, scope: *mut c_void, sigs: &mut Vec<Sig>,
                     break;
                 }
                 let sname = Npi::cstr((npi.sig_property_str)(SIG_NAME, s));
-                let mut size: c_int = 0;
-                let mut is_real: c_int = 0;
-                let mut is_string: c_int = 0;
-                (npi.sig_property)(SIG_SIZE, s, &mut size);
-                (npi.sig_property)(SIG_IS_REAL, s, &mut is_real);
-                (npi.sig_property)(SIG_IS_STRING, s, &mut is_string);
                 let sfull = if full.is_empty() {
                     sname.clone()
                 } else {
                     format!("{}.{}", full, sname)
                 };
+                let mut size: c_int = 0;
+                (npi.sig_property)(SIG_SIZE, s, &mut size);
                 sigs.push(Sig {
-                    handle: s,
+                    handle: Cell::new(s),
                     name: sname,
                     full: sfull,
                     width: if size > 0 { size as usize } else { 1 },
-                    is_real: is_real != 0,
-                    is_string: is_string != 0,
+                    real_str: Cell::new(None),
                 });
             }
             (npi.iter_sig_stop)(sit);
@@ -1251,13 +1628,31 @@ impl Trace for FsdbTrace {
     /// 查询前置声明: 记录信号; 首次调用就把时间线和这些信号的变更列一起算出来
     /// (冷启动只遍历一次 FSDB)。
     fn prepare(&self, names: &[String]) {
-        // 只把被查询信号的**时间基变更列**取回来(每个信号一次小扫描)。
-        // **不建时间线** —— 索引空间是"所有信号变更时间的并集", 对流式后端
-        // 就是一次全文件扫描, 只有真正需要索引的查询(find/逐拍/电平)才付。
+        // 只把被查询信号的**时间基变更列**取回来。**不建时间线** —— 索引空间是
+        // "所有信号变更时间的并集", 对流式后端就是一次全文件扫描, 只有真正需要
+        // 索引的查询(find/逐拍/电平)才付。
+        //
+        // 关键: 一次性把这批信号**合并到一个扫描**里(而不是每个信号各开一次
+        // 归并迭代器)。每次迭代器的 add/start 是固定开销(实测单信号 ~100ms),
+        // 复合条件 `(&& (rising a) (rising b) …)` 少扫 N-1 次。
+        let mut want: HashSet<usize> = HashSet::new();
         for n in names {
             if let Some(i) = self.resolve_idx(n) {
-                let _ = self.column_time(i);
+                want.insert(i);
             }
+        }
+        if want.is_empty() {
+            return;
+        }
+        let missing: HashSet<usize> = want
+            .into_iter()
+            .filter(|i| !self.cols.borrow().contains_key(i))
+            .collect();
+        if missing.is_empty() {
+            return;
+        }
+        if let Ok(out) = self.scan(&missing, false) {
+            self.apply_scan(out);
         }
     }
 
@@ -1520,6 +1915,18 @@ impl Trace for FsdbTrace {
             Ok(n) => n,
             Err(_) => return Vec::new(),
         };
+        // 句柄可能还没解析(名字缓存路径) → 先解析再喂给迭代器
+        let mut local: HashMap<usize, usize> = HashMap::with_capacity(self.sigs.len());
+        let mut handles: Vec<*mut c_void> = Vec::with_capacity(self.sigs.len());
+        for i in 0..self.sigs.len() {
+            match self.handle_of(i) {
+                Ok(h) => {
+                    local.insert(h as usize, i);
+                    handles.push(h);
+                }
+                Err(_) => handles.push(ptr::null_mut()),
+            }
+        }
         let mut counts = vec![0usize; self.sigs.len()];
         let chunk = chunk_size();
         let mut chunk_start = 0usize;
@@ -1527,7 +1934,9 @@ impl Trace for FsdbTrace {
             let chunk_end = (chunk_start + chunk).min(self.sigs.len());
             let mut it = IterObj::new(npi);
             for i in chunk_start..chunk_end {
-                unsafe { (npi.iter.add)(it.this(), self.sigs[i].handle) };
+                if !handles[i].is_null() {
+                    unsafe { (npi.iter.add)(it.this(), handles[i]) };
+                }
             }
             unsafe { (npi.iter.start)(it.this(), self.min_t, self.max_t) };
             loop {
@@ -1540,7 +1949,7 @@ impl Trace for FsdbTrace {
                 if t == 0 {
                     continue;
                 }
-                if let Some(&idx) = self.handle_to_idx.get(&(sig as usize)) {
+                if let Some(&idx) = local.get(&(sig as usize)) {
                     counts[idx] += 1;
                 }
             }
