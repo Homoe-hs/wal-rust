@@ -30,6 +30,11 @@ pub mod fsdb_test_api {
         decode_timeline(buf, expect_fp)
     }
 
+    /// 轮转分片(测试用): 并行构建时间线时每个 worker 负责的信号下标
+    pub fn round_robin_slice(n: usize, offset: usize, stride: usize) -> Vec<usize> {
+        super::fsdb::round_robin_slice(n, offset, stride)
+    }
+
     /// 编码名字树(测试用)
     pub fn encode_tree(names: &[String], widths: &[usize], scopes: &[String]) -> Vec<u8> {
         raw_encode_tree(&super::fsdb::TreeSnapshot {

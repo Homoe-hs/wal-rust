@@ -127,9 +127,9 @@ wal-rust count <wave> <signal> [value]")]
 pub struct FsdbTlWorkerArgs {
     /// 波形文件
     pub file: PathBuf,
-    /// 信号区间起点(按名字树顺序的下标)
+    /// 轮转分片: 起始下标
     pub lo: usize,
-    /// 信号区间终点(不含)
+    /// 轮转分片: 步长(worker 数)
     pub hi: usize,
     /// 输出: 该区间内所有变更时间(升序去重, delta-varint)
     pub out: PathBuf,

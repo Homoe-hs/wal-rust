@@ -565,6 +565,15 @@ fn save_tree_cache(
     }
 }
 
+/// 轮转分片: worker `offset`(0..stride) 负责的信号下标。
+/// 纯函数, 有单测盯着"无重叠、无遗漏"(并行构建的底座)。
+pub(crate) fn round_robin_slice(n: usize, offset: usize, stride: usize) -> Vec<usize> {
+    if stride == 0 {
+        return (0..n).collect();
+    }
+    (offset..n).step_by(stride).collect()
+}
+
 /// 时间线"值得落盘缓存"的判据(点数够多, 或这次构建确实慢 —— 由调用方补时长判断)
 fn times_len_ok(n: usize) -> bool {
     n >= 256
@@ -649,17 +658,24 @@ fn read_times(path: &std::path::Path) -> Option<Vec<u64>> {
 /// worker 入口: 只算 [lo, hi) 这些信号的变更时间并落盘。
 pub fn run_timeline_worker(
     file: &std::path::Path,
-    lo: usize,
-    hi: usize,
+    offset: usize,
+    stride: usize,
     out: &std::path::Path,
 ) -> Result<(), String> {
     let trace = FsdbTrace::load(file, "w".to_string())?;
     let n = trace.sigs.len();
-    let hi = hi.min(n);
-    if lo >= hi {
+    let stride = stride.max(1);
+    // **轮转分片**: 热点信号的代价比冷信号高几个数量级, 连续切片会让一个 worker
+    // 独自扛下整条时钟树; `idx % stride == offset` 把冷热混在一起, 且**不需要**
+    // 增加 worker 数(每个 worker 一次 NPI 初始化就要 ~2s, 细分成池子反而更慢)。
+    let mine: Vec<usize> = round_robin_slice(n, offset, stride);
+    if mine.is_empty() {
         return write_times(out, &[]).map_err(|e| e.to_string());
     }
-    let times = trace.scan_times(&(lo..hi).collect::<Vec<usize>>())?;
+    if std::env::var("WAL_DEBUG_FSDB").is_ok() {
+        eprintln!("[fsdb] worker offset={} stride={}: {} 个信号", offset, stride, mine.len());
+    }
+    let times = trace.scan_times(&mine)?;
     trace.close_now();
     write_times(out, &times).map_err(|e| e.to_string())
 }
@@ -1272,55 +1288,52 @@ impl FsdbTrace {
     /// 所以默认关闭。
     fn parallel_timeline(&self, jobs: usize) -> Result<Vec<u64>, String> {
         let exe = std::env::current_exe().map_err(|e| format!("current_exe: {}", e))?;
-        let n = self.sigs.len();
-        let per = n.div_ceil(jobs.max(1));
+        let jobs = jobs.clamp(1, self.sigs.len());
+        // 只开 `jobs` 个 worker(每个都是一次 NPI 会话, 初始化 ~2s + 一个 Verdi 许可),
+        // 负载均衡靠 worker 内部的**轮转分片**而不是加进程。
         let tag = std::process::id();
-        let mut kids: Vec<(std::process::Child, std::path::PathBuf)> = Vec::new();
-        let mut lo = 0usize;
+        let mut running: Vec<(std::process::Child, std::path::PathBuf)> = Vec::new();
         for k in 0..jobs {
-            let hi = ((k + 1) * per).min(n);
-            if lo >= hi {
-                break;
-            }
             let out = self.cache_root.join(format!(".tl-{}-{}.part", tag, k));
             let _ = std::fs::remove_file(&out);
-            let child = std::process::Command::new(&exe)
+            match std::process::Command::new(&exe)
                 .arg("fsdb-tl-worker")
                 .arg(&self.filename)
-                .arg(lo.to_string())
-                .arg(hi.to_string())
+                .arg(k.to_string())
+                .arg(jobs.to_string())
                 .arg(&out)
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
                 .spawn()
-                .map_err(|e| format!("spawn worker: {}", e))?;
-            kids.push((child, out));
-            lo = hi;
-        }
-        let mut parts: Vec<Vec<u64>> = Vec::new();
-        let mut failed = None;
-        for (mut c, out) in kids {
-            let st = c.wait().map_err(|e| format!("wait worker: {}", e))?;
-            if !st.success() {
-                failed = Some(format!("worker 退出码 {:?}", st.code()));
-                let _ = std::fs::remove_file(&out);
-                break;
-            }
-            match read_times(&out) {
-                Some(t) => parts.push(t),
-                None => {
-                    failed = Some(format!("worker 输出无法读取: {}", out.display()));
-                    let _ = std::fs::remove_file(&out);
-                    break;
+            {
+                Ok(c) => running.push((c, out)),
+                Err(e) => {
+                    for (mut c, o) in running {
+                        let _ = c.kill();
+                        let _ = c.wait();
+                        let _ = std::fs::remove_file(&o);
+                    }
+                    return Err(format!("spawn worker: {}", e));
                 }
             }
+        }
+        let mut parts: Vec<Vec<u64>> = Vec::new();
+        let mut failed: Option<String> = None;
+        for (mut c, out) in running {
+            match c.wait() {
+                Ok(st) if st.success() => match read_times(&out) {
+                    Some(t) => parts.push(t),
+                    None => failed = Some(format!("worker 输出无法读取: {}", out.display())),
+                },
+                Ok(st) => failed = Some(format!("worker 退出码 {:?}", st.code())),
+                Err(e) => failed = Some(format!("wait worker: {}", e)),
+            }
             let _ = std::fs::remove_file(&out);
+            if failed.is_some() {
+                break;
+            }
         }
         if let Some(e) = failed {
-            for (mut c, out) in Vec::<(std::process::Child, std::path::PathBuf)>::new() {
-                let _ = c.wait();
-                let _ = std::fs::remove_file(&out);
-            }
             return Err(e);
         }
         let mut all: Vec<u64> = Vec::new();

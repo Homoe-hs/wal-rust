@@ -233,3 +233,21 @@ fn tree_cache_codec_roundtrip() {
     assert!(wal_rust::trace::fsdb_test_api::decode_tree(&blob, 0x1234).is_none());
     assert!(wal_rust::trace::fsdb_test_api::decode_tree(&blob[..blob.len() - 1], fp_of(&blob)).is_none());
 }
+
+/// 并行构建时间线的**分片正确性**(纯函数, 不需要 Verdi):
+/// 每个 worker 拿到的信号必须两两不重叠、合起来正好覆盖全部 —— 漏一个信号就会
+/// 少一段时间点(索引空间整体错位), 重一个则白算。
+#[test]
+fn timeline_round_robin_partition_covers_all() {
+    for n in [0usize, 1, 2, 3, 7, 8, 1000, 60005] {
+        for k in [1usize, 2, 3, 4, 8, 16, 64] {
+            let mut all: Vec<usize> = Vec::new();
+            for off in 0..k {
+                all.extend(wal_rust::trace::fsdb_test_api::round_robin_slice(n, off, k));
+            }
+            all.sort_unstable();
+            let expect: Vec<usize> = (0..n).collect();
+            assert_eq!(all, expect, "n={} k={} 分片不覆盖/有重复", n, k);
+        }
+    }
+}
