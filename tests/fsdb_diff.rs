@@ -32,6 +32,54 @@ fn norm(name: &str) -> String {
     name.split(" [").next().unwrap_or(name).to_string()
 }
 
+/// **相对路径**加载 FSDB 也必须落缓存。
+///
+/// NPI 沙箱会把 CWD 切到缓存目录下的 `npi/`, 而缓存 key 要 stat 波形文件 ——
+/// 若 trace 里存的是用户给的相对路径, 沙箱里 stat 不到 → `cache_path()` 返回
+/// None → **一个缓存都不写**: 用户用 `-l design.fsdb`(最常见的写法)时, 每次查询
+/// 都要重付一遍全文件扫描(时间线)。本测试在临时目录里 chdir + 相对路径加载,
+/// 断言缓存目录非空。(VM 实测: 修复前 files= 空, 修复后 .fnames 落盘。)
+#[test]
+fn fsdb_cache_written_for_relative_path() {
+    use std::sync::Mutex;
+    static CWD_LOCK: Mutex<()> = Mutex::new(());
+    let fsdb = match env_or_skip("WAL_FSDB_TEST_FILE") {
+        Some(v) => v,
+        None => return,
+    };
+    if !std::path::Path::new(&fsdb).exists() {
+        eprintln!("skip: {} 不存在", fsdb);
+        return;
+    }
+    let _guard = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = std::env::temp_dir().join(format!("wal_fsdb_rel_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let cache = dir.join("cache");
+    std::fs::create_dir_all(&cache).unwrap();
+    std::fs::copy(&fsdb, dir.join("rel.fsdb")).unwrap();
+
+    let prev_cwd = std::env::current_dir().unwrap();
+    std::env::set_current_dir(&dir).unwrap();
+    std::env::set_var("WAL_CACHE", "build");
+    std::env::set_var("WAL_CACHE_DIR", &cache);
+    std::env::set_var("WAL_CACHE_MIN_MB", "0");
+    let res = wal_rust::trace::FsdbTrace::load(std::path::Path::new("rel.fsdb"), "rel".to_string());
+    let n = match res {
+        Ok(tr) => {
+            let _ = tr.max_index(); // 触发全文件扫描(时间线)
+            std::fs::read_dir(&cache).map(|d| d.count()).unwrap_or(0)
+        }
+        Err(e) => {
+            std::env::set_current_dir(prev_cwd).unwrap();
+            panic!("相对路径加载 FSDB 失败: {}", e);
+        }
+    };
+    std::env::set_current_dir(prev_cwd).unwrap();
+    assert!(n > 0, "相对路径加载 FSDB 也必须落缓存(否则每次查询重扫全文件): {:?} 为空", cache);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn fsdb_matches_vcd_when_available() {
     let fsdb = match env_or_skip("WAL_FSDB_TEST_FILE") {

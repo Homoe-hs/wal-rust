@@ -1075,11 +1075,17 @@ fn unload_each_chunk() -> bool {
 impl FsdbTrace {
     pub fn load(path: &Path, id: TraceId) -> Result<Self, String> {
         let npi = npi()?;
-        let filename = path.to_string_lossy().to_string();
-        // 沙箱会把 CWD 切走, 所以必须给 NPI 绝对路径(用户可能传相对路径)
+        // 用户可能传**相对路径**, 而 NPI 沙箱会把 CWD 切到缓存目录下 npi/ 里:
+        // ① NPI open 必须给绝对路径; ② 之后每次算缓存 key 都要 stat 这个文件 ——
+        // 相对路径在沙箱里 stat 不到 → cache_path() 返回 None → **缓存永远写不出来**,
+        // 每次都重付一遍全文件扫描(实测 VM 上相对路径一个缓存文件都不落)。
+        // 所以这里统一记成绝对路径(解析失败才退回原样)。
+        let filename = std::fs::canonicalize(path)
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|_| path.to_string_lossy().to_string());
         // 缓存根必须在进 NPI 沙箱**之前**算成绝对路径(沙箱里 CWD 已经变了)
         let cache_root = abs_cache_root();
-        let abs = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        let abs = std::path::PathBuf::from(&filename);
         let cpath = CString::new(abs.to_string_lossy().as_bytes())
             .map_err(|_| format!("路径含 NUL 字节: {}", filename))?;
         let _box = NpiSandbox::enter(false); // open 的版本警告留在 stderr
