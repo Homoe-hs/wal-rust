@@ -51,6 +51,21 @@ Flags: `-l <waveform>` (repeatable), `-c <code>` (inline override), `--halt-on-e
   `npi_fsdb_create_vct` 会失效);`npiFsdbValue.format` 是**入参**;库路径来自 `$VERDI_HOME`/
   `$WAL_NPI_LIB`。细节见 `docs/fsdb-npi.md`。差分门 `tests/fsdb_diff.rs` 由
   `WAL_FSDB_TEST_FILE` + `WAL_FSDB_TEST_VCD` 开启(没 Verdi 自动跳过)。
+- **多文件语义(0.14.8 起)**: ①`TraceContainer` 按**加载顺序**迭代(`order: Vec<TraceId>`)
+  —— 两条波形都有同名信号时**先 `-l` 的先算**, 不许退化成 HashMap 迭代顺序(跨进程随机,
+  实测同一条命令 6 次里 5 次答 30000、1 次答 40); ②查询的**索引空间 = 实际会读值的波形**
+  (first-match: 第一条 `-l` 里能解析出该名字的那条)的 `max_index`,
+  不引用信号的查询(常量条件/INDEX-only)取**主波形**(第一条 `-l`)。未参与查询的波形绝不进
+  索引空间 —— 否则 `-l vcd -l fsdb` 查一个两条都有的信号会先物化 FSDB 全局时间线
+  (内网 >900s, 单加载秒级)。③**禁止跨波形合并索引集合**: 索引是各自的变更排名,
+  合并出来的既不是这条也不是那条(实测 `-l s1 -l s2` 同名信号答出 s2 的数);
+  所有取值/取索引路径统一 first-match。逐拍(`step_scan`)与统一引擎必须用同一规则;
+  `INDEX`/`TS` 读"正在被推进的那条 trace"(`Evaluator::scan_trace`)。
+- **缓存 key 必须含 ctime+inode**: `trace::vcd::file_identity`(basename+len+mtime+ctime+inode)
+  —— 只按 size+mtime 会漏掉"同一秒内等长改写"(脚本反复生成同名波形是常态), 而首尾 64KB
+  指纹拦不住中段改动; ctime 用户改不回去。`.wcol`/`.cols`/`.fnames`/`.ftl` 统一用它。
+  缓存写失败只提示一次、绝不影响结果与退出码; `main` 启动就忽略 **SIGXFSZ**(否则
+  `ulimit -f`/磁盘满 → rc=153 + core)。
 - **索引空间是"要不要全文件扫描"的分水岭**: `change_points`/`find_indices` 走索引空间,
   对时间优先后端(FSDB)意味着物化全局时间线 = 全文件扫描; `Trace::change_points_time()`
   与 `Trace::count_matches()` 让 `getwave`/`at`/边沿计数跳过它。新增/修改这类查询时:
@@ -85,7 +100,8 @@ Flags: `-l <waveform>` (repeatable), `-c <code>` (inline override), `--halt-on-e
 | `whenever` do decomposition | → independent `count` calls |
 | **懒索引 + 变更列融合** | `(load)` 只读头; 首次查询声明信号(`Trace::prepare`)→ 索引与变更列同一次遍历; 58.7GB 冷查询 216s→73s, `(load)` 63s→1s |
 | **统一区间扫描引擎** | `interval_scan`(变更点并集边界 + 解释器值覆盖): count/find/whenever/count/step 同一实现;含边沿谓词时"边界真值 + 区间内部真值(边沿强制 false)"两段计入 |
-| **旁挂列缓存(跨进程)** | 冷扫描后按信号落盘 `<cache>/<wave>-<len>-<mtime>-v1.cols/<fnv(name)>.col`;下一个进程 `anchored_changes` 直接命中(58.7GB 同查询 113.8s → 3.35s) |
+| **多文件选源与索引空间收口** | 加载顺序决定选源(first-match), 且 `interval_scan`/`step_scan`/`find_indices` 只对**会读值的**波形取 `max_index`; 禁止跨波形合并索引集合(内网 #32: `-l vcd -l fsdb` 查同名信号 >900s → 秒级) |
+| **旁挂列缓存(跨进程)** | 冷扫描后按信号落盘 `<cache>/<file_identity>-v1.cols/<fnv(name)>.col`(key 含 ctime+inode);下一个进程 `anchored_changes` 直接命中(58.7GB 同查询 113.8s → 3.35s) |
 | **纯逐拍 oracle** | `WAL_NO_ENGINE=1` 让引擎直接返回 None → 全部走逐拍;矩阵在子进程里用它做独立对拍 |
 
 > 统一查询引擎(变更点并集区间扫描)已落地(docs/query-engine-design.md §IntervalSweep):

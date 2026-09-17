@@ -236,3 +236,84 @@ worker 数**(每个 worker 一次 NPI 初始化 ~2s + 一个 Verdi 许可, 细�
   样本验证。
 * FSDB 版本比本机 reader 新时无法读取(实测 25A 写的 5.7,2018 的 reader 是 5.6 →
   `npi_fsdb_open` 直接失败),错误信息里已给出这个提示。
+
+## 9 多文件语义与缓存一致性(2026-09-17 内网反馈三连)
+
+### 9.1 谁回答: 加载顺序, 不是 HashMap 顺序(#32 的真凶之一)
+
+`TraceContainer` 存 trace 用 `HashMap<TraceId, _>`, 而 Rust 的 `HashMap` 每个进程
+的迭代顺序都不同 —— 于是**两条波形都含同名信号**时(内网场景正是"同一设计导出
+FSDB + VCD"), 同一条命令会在两条波形之间**随机**挑一条:
+
+```
+$ wal-rust '(count (rising "top.clk"))' -l wal.fsdb -l big.vcd   # VM 实测 6 次
+=> 40      # 命中 FSDB(短时间线)
+=> 30000   # 命中 VCD
+=> 30000  ...
+```
+
+结果、耗时都不可复现。修法: `TraceContainer` 增加 `order: Vec<TraceId>` 维护**加载
+顺序**, 所有"要挑一条"的读取(`trace_ids`/`first_trace`/`traces_iter`/`prepare`/
+`source_ids`/`indices`)都按它迭代 → **先 `-l` 的先算**, 后加载的同名波形不参与回答
+(`traces_iter_mut` 这类批量写操作顺序无关, 保持原样)。
+
+同时**禁止跨波形合并索引集合**: `find_indices` 原本把"能解析出该名字的所有波形"的
+索引并起来(`decompose_and_count`/`find_indices_all_traces` 亦然)。索引是各自变更时间的
+**排名**, 两条波形的索引空间不是一回事 —— 实测 `-l s1 -l s2`(同名信号)会答出 s2 的数字。
+现在所有取值/取索引路径都统一为 **first-match 选源**(第一条 `-l` 里能解析出该名字的
+波形), 与解释器逐拍一致。
+
+### 9.2 索引空间: 只由"查询引用到的波形"决定(#32 的性能真凶)
+
+时间优先后端(FSDB)的 `max_index` = 索引空间长度 = **全文件所有信号变更时间的并集**,
+只能全文件扫描得到。而统一引擎原先对**所有已加载 trace** 取 `max_index` 的最大值 ——
+于是 `-l fsdb -l vcd` 查 VCD 信号 = 先物化一遍 FSDB 全局时间线(内网 174MB 样本冷建
+400s+), 用户看到 >900s; 只加载 VCD 则是秒级。
+
+现在的规则(逐拍回退与统一引擎**一致**):
+
+| 查询形态 | 索引空间 |
+|---|---|
+| 引用了某信号 | **实际会读值的那条波形**(first-match: 第一条 `-l` 里能解析出该名字的波形)的 `max_index` |
+| 不引用信号(常量条件 / `INDEX`/`TS`-only) | **主波形**(第一条 `-l`) |
+
+注意是"**会读值**"而不是"**能解析**": `-l vcd -l fsdb` 查一个两条都有的信号(同一设计
+导出两份是常态)时, 值只从 VCD 读 —— 若把"能解析"的 FSDB 也算进索引空间, 就会为了一个
+VCD 查询先扫一遍 FSDB 全局时间线(内网 >900s 的另一半原因)。
+
+**没出现在查询里的波形不该改变查询的索引空间** —— 既省掉无关的全文件扫描, 语义上
+也更可解释。逐拍扫描同时收口(`step_scan` 只推进参与集合; `INDEX`/`TS` 改为读"正在
+被推进的那条 trace", 否则多文件时会读到原地不动的波形而恒为 0)。
+
+### 9.3 缓存 key 必须含 `ctime` + `inode`(#8 陈旧命中)
+
+缓存 key 原为 `basename + size + mtime`, 内容指纹只覆盖首尾 64KB。脚本反复生成同名
+波形时"**同一秒内等长改写**"会让 size/mtime 都不变, 中段(>64KB 以外的)改写又躲过
+指纹 → 热查询直接返回**旧列**(内网实测: 174MB 波形改 10 处后仍答旧值 40473)。
+
+修法: key 增加 `ctime`(+纳秒)与 `inode` —— `ctime` 在内容或元数据任何改动时都会变,
+且普通用户**改不回去**(改 `mtime` 容易, 改 `ctime` 不行); `inode` 挡住"删了重建"。
+`.wcol`/`.cols`(VCD)与 `.fnames`/`.ftl`(FSDB)统一走 `trace::vcd::file_identity`。
+首尾 64KB 指纹保留作第二道防线(`WALCOL02` 格式)。
+
+### 9.4 缓存写不下的降级(#50)
+
+`ulimit -f` / 磁盘满时, 写缓存超限会收到 **SIGXFSZ** —— 默认处置是直接杀进程
+(`rc=153` + core), 用户看到的是"查个波形崩了"。现在:
+
+* `main` 一开始就把 `SIGXFSZ` 设为 `SIG_IGN` → `write()` 返回 `EFBIG`, 进程继续;
+* 缓存写失败**只提示一次**(`wal-rust: 缓存写入失败, 本次会话不再尝试写缓存…`),
+  查询结果与退出码不受影响。
+
+回归: `tests/regression_matrix.rs` 的 `matrix_cache_write_over_limit_degrades`
+(用 python3/perl 垫一层把 `SIGXFSZ` 复位成 `SIG_DFL`, 否则父进程若已忽略它, 测试会
+在"永远通过"的假象里)。
+
+### 9.5 这三个修复对应的回归测试
+
+| 测试 | 保证 |
+|---|---|
+| `matrix_multitrace_source_is_load_order` | 同一条命令跨进程可复现; 第一条 `-l` 优先 |
+| `matrix_multitrace_index_space_follows_query` | 多加载无关(long)波形不改变结果(引擎与逐拍两条路都对拍) |
+| `matrix_sidecar_stale_content_same_size_mtime` | 等长中段改写 + mtime 装回去 → 必须重算(去掉 ctime/inode 即失败) |
+| `matrix_cache_write_over_limit_degrades` | `ulimit -f` 下 rc=0 + 正确结果 + 一次提示(不忽略 SIGXFSZ 即失败) |

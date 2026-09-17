@@ -20,6 +20,14 @@ use std::path::{Path, PathBuf};
 use std::process;
 
 fn main() {
+    // 缓存落盘可能撞上 `ulimit -f`(RLIMIT_FSIZE)或磁盘配额: 默认处置是发 SIGXFSZ
+    // **直接杀进程**(rc=153, 还留 core), 用户看到的是"A 波形查 B 波形崩了"。
+    // 缓存只是加速手段 —— 忽略该信号, 让 write() 返回 EFBIG, 走"缓存写失败"降级路径。
+    #[cfg(unix)]
+    unsafe {
+        libc::signal(libc::SIGXFSZ, libc::SIG_IGN);
+    }
+
     // ---version: print build version plus install path (helps reconcile
     // package-manager module versions with the binary's own version).
     let argv: Vec<String> = std::env::args().collect();

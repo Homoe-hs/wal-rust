@@ -17,6 +17,13 @@ pub struct Evaluator {
     /// 断言失败次数(assert-eq)。builtin 不抛错(脚本可以分支判断它的布尔返回值),
     /// 由 CLI 读这个计数决定进程退出码 —— 否则 CI 只能靠解析输出。
     test_failures: usize,
+    /// 逐拍扫描的"索引基准"trace。
+    ///
+    /// 逐拍只推进**参与查询**的波形(见 `step_scan`: 多加载一个时间优先后端不该
+    /// 让每条查询都去物化它的全局时间线, #32), 而 INDEX/TS 读的是"当前索引" ——
+    /// 必须读那条正在被推进的 trace, 否则多文件时会读到一条原地不动的波形,
+    /// 索引恒为 0。嵌套扫描(条件里又出现 count)按栈保存恢复。
+    scan_trace: Option<String>,
 }
 
 impl Evaluator {
@@ -37,6 +44,7 @@ impl Evaluator {
             disp,
             traces,
             test_failures: 0,
+            scan_trace: None,
         }
     }
 
@@ -188,7 +196,12 @@ pub fn eval_value(&mut self, value: Value) -> Result<Value, String> {
             "INDEX" => {
                 if let Some(traces) = self.env.get_traces() {
                     let traces = traces.read().unwrap_or_else(|e| e.into_inner());
-                    if let Some(t) = traces.first_trace() {
+                    let cur = self
+                        .scan_trace
+                        .as_ref()
+                        .and_then(|tid| traces.get(tid))
+                        .or_else(|| traces.first_trace());
+                    if let Some(t) = cur {
                         return Ok(Value::Int(t.index() as i64));
                     }
                 }
@@ -197,9 +210,8 @@ pub fn eval_value(&mut self, value: Value) -> Result<Value, String> {
             "MAX-INDEX" => {
                 if let Some(traces) = self.env.get_traces() {
                     let traces = traces.read().unwrap_or_else(|e| e.into_inner());
-                    if let Some(t) = traces.first_trace() {
-                        return Ok(Value::Int(t.max_index() as i64));
-                    }
+                    // 不引用信号 → 取主波形(第一条 -l); 确定性, 且不必物化无关波形
+                    return Ok(Value::Int(traces.index_space_max(&[]) as i64));
                 }
                 return Ok(Value::Int(0));
             }
@@ -221,7 +233,12 @@ pub fn eval_value(&mut self, value: Value) -> Result<Value, String> {
             "TS" => {
                 if let Some(traces) = self.env.get_traces() {
                     let traces = traces.read().unwrap_or_else(|e| e.into_inner());
-                    if let Some(t) = traces.first_trace() {
+                    let cur = self
+                        .scan_trace
+                        .as_ref()
+                        .and_then(|tid| traces.get(tid))
+                        .or_else(|| traces.first_trace());
+                    if let Some(t) = cur {
                         return Ok(Value::Int(t.index() as i64));
                     }
                 }
@@ -1217,8 +1234,9 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
                 } else {
                     return Ok(None); // unknown sub → fallback step scan
                 };
-            // 多 trace: 信号只存在于其中一条 → 该信号的结果是"各含它的 trace 的并集";
-            // 不含它的 trace 必须**跳过**(曾用原始名去查 → 报错 → 塞空集 → && 被清空)。
+            // 多 trace: 取**第一条能解析出该信号的波形**(加载顺序, 与解释器/引擎选源
+            // 一致)。不能跨波形合并索引集合 —— 索引空间是各自的, 合出来既不是这条
+            // 也不是那条的结果(实测 `-l s1 -l s2` 同名信号答出 s2 的数)。
             let mut set: Vec<usize> = Vec::new();
             let mut found_any = false;
             if let Ok(t) = self.traces.read() {
@@ -1234,7 +1252,7 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
                                 if std::env::var("WAL_DEBUG_FIND").is_ok() {
                                     eprintln!("decompose: sig={} cond={:?} n={}", resolved, cond, idxs.len());
                                 }
-                                set.extend(idxs);
+                                set = idxs;
                             }
                             Err(e) => {
                                 if std::env::var("WAL_DEBUG_FIND").is_ok() {
@@ -1243,6 +1261,7 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
                                 return Ok(None); // 解码/解析失败 → 回退逐拍(不伪造空集)
                             }
                         }
+                        break; // 只认第一条
                     }
                 }
             }
@@ -1528,7 +1547,10 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
             // 常量条件: 全索引或空集 → O(1)
             if let Some(v) = self.const_cond_value(&resolved_cond) {
                 let out: Vec<i64> = if v {
-                    let max = { self.traces.read().ok().and_then(|t| t.first_trace().map(|tr| tr.max_index())).unwrap_or(0) };
+                    // 常量条件不引用任何信号 → 索引空间 = 主波形(第一条 -l)。
+                    // 不再用 first_trace() 的 HashMap 顺序: 那个顺序不确定, 多文件
+                    // 时同一条命令会飘; 现在是"先 -l 的先算", 可复现。
+                    let max = { self.traces.read().map(|t| t.index_space_max(&[])).unwrap_or(0) };
                     (0..=max as i64).take(max_results).collect()
                 } else { Vec::new() };
                 return Ok(Value::List(WList::from_vec(out.into_iter().map(Value::Int).collect())));
@@ -1809,7 +1831,7 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
         if let Some(v) = self.const_cond_value(&resolved_cond) {
             let total = if v {
                 let t = self.traces.read().unwrap_or_else(|e| e.into_inner());
-                t.first_trace().map(|tr| tr.max_index() + 1).unwrap_or(0)
+                t.index_space_max(&[]) + 1
             } else { 0 };
             if let Ok(mut t) = self.traces.write() {
                 for (tid, idx) in &saved {
@@ -1888,25 +1910,17 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
         traces_ids: &[String],
     ) -> Result<Vec<usize>, String> {
         let t = self.traces.read().unwrap_or_else(|e| e.into_inner());
-        let mut found_any = false;
-        let mut out: Vec<usize> = Vec::new();
-        let mut first_err: Option<String> = None;
+        // 只认第一条能解析出该名字的波形: 索引集合不能跨波形合并(索引空间不同),
+        // 合并出来的数字既不是第一条的也不是第二条的。
         for tid in traces_ids {
             let tr = match t.get(tid) { Some(tr) => tr, None => continue };
             let resolved = match tr.resolve_name(name) { Some(r) => r, None => continue };
-            found_any = true;
-            match tr.find_indices(&resolved, cond.clone()) {
-                Ok(idxs) => out.extend(idxs),
-                Err(e) => { if first_err.is_none() { first_err = Some(e); } }
-            }
+            let mut idxs = tr.find_indices(&resolved, cond.clone())?;
+            idxs.sort_unstable();
+            idxs.dedup();
+            return Ok(idxs);
         }
-        if let Some(e) = first_err { return Err(e); }
-        if !found_any {
-            return Err(format!("signal '{}' not found in any loaded trace.", name));
-        }
-        out.sort_unstable();
-        out.dedup();
-        Ok(out)
+        Err(format!("signal '{}' not found in any loaded trace.", name))
     }
 
     /// 常量条件折叠: 返回 Some(truthy) 表示该条件不依赖信号/索引,
@@ -1954,11 +1968,13 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
             let saved: Vec<(String, usize)> = ids.iter()
                 .filter_map(|tid| t.get(tid).map(|tr| (tid.clone(), tr.index())))
                 .collect();
-            // 时间线长度 = 各 trace max_index 的最大值(与逐拍"任一还能步进就继续"一致)
-            let max_index = ids.iter()
-                .filter_map(|tid| t.get(tid).map(|tr| tr.max_index()))
-                .max()
-                .unwrap_or(0);
+            // 索引空间 = **本次查询实际读值的波形**(first-match 选源)的 max_index 最大值。
+            // 不能对"所有已加载 trace"取 max: 时间优先后端(FSDB)的 max_index 需要全文件
+            // 扫描(全局时间线), 于是多加载一个无关波形会让每条查询都付一次全文件扫描 ——
+            // 内网实测 `-l fsdb -l vcd` 查 VCD 信号 >900s, 只加载 VCD 是秒级(#32)。
+            // 也不能用"能解析出该名字的波形"(那会把只读 VCD 值的查询拖去扫 FSDB 时间线)。
+            // 逐拍回退路径(step_scan)用同一规则, 两者保持一致。
+            let max_index = t.index_space_max(&names);
             // (别名键, 变更点, 索引0的值, $dumpvars 确定初值)
             let mut per_sig: Vec<(Vec<String>, Vec<(usize, ScalarValue)>, ScalarValue, Option<ScalarValue>)> = Vec::new();
             for n in &names {
@@ -2101,11 +2117,22 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
     fn step_scan(&mut self, cond: &Value) -> Result<(Vec<usize>, usize), String> {
         let (ids, saved): (Vec<String>, Vec<(String, usize)>) = {
             if let Ok(t) = self.traces.read() {
-                let ids = t.trace_ids();
-                let saved = ids
+                let all = t.trace_ids();
+                let saved = all
                     .iter()
                     .filter_map(|tid| t.get(tid).map(|tr| (tid.clone(), tr.index())))
                     .collect();
+                // 与 interval_scan 同一规则: 索引空间只由**实际读值的**波形决定
+                // (first-match 选源)。否则 `-l vcd -l fsdb` 查两条都有的信号时, 逐拍
+                // 回退会按 FSDB 的时间线一直步进(既物化 FSDB 全局时间线, 又扫出多余索引)。
+                let mut names = Vec::new();
+                let (mut has_edge, mut idx_dep) = (false, false);
+                collect_cond_signals(cond, &mut names, &mut has_edge, &mut idx_dep);
+                // 没有任何波形能解析出引用名 → 回落全部, 让条件求值照常报"找不到信号"
+                let ids = match t.source_ids(&names) {
+                    v if v.is_empty() => all,
+                    v => v,
+                };
                 (ids, saved)
             } else {
                 return Err("no traces loaded".to_string());
@@ -2114,11 +2141,13 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
         if ids.is_empty() {
             return Ok((Vec::new(), 0));
         }
+        // INDEX/TS 的基准 = 正在被推进的这条 trace(嵌套扫描按栈恢复)
+        let prev_scan = self.scan_trace.replace(ids[0].clone());
         // 常量条件: 全索引或空集 → O(1)
         if let Some(v) = self.const_cond_value(cond) {
             let max = {
                 let t = self.traces.read().unwrap_or_else(|e| e.into_inner());
-                t.first_trace().map(|tr| tr.max_index()).unwrap_or(0)
+                t.index_space_max(&[])
             };
             return Ok(if v { ((0..=max).collect(), max + 1) } else { (Vec::new(), 0) });
         }
@@ -2163,6 +2192,7 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
                 let _ = t.set_index(tid, *idx);
             }
         }
+        self.scan_trace = prev_scan;
         Ok((found, count))
     }
 

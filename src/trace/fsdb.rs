@@ -508,13 +508,10 @@ fn abs_cache_root() -> std::path::PathBuf {
 
 /// 通用缓存路径: `<cache>/<basename>-<size>-<mtime>-v1<ext>`
 fn cache_path(cache_root: &std::path::Path, filename: &str, ext: &str) -> Option<std::path::PathBuf> {
-    let p = std::path::Path::new(filename);
-    let meta = std::fs::metadata(p).ok()?;
-    let mtime = meta.modified().ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_secs())?;
-    let base = p.file_name()?.to_string_lossy().replace('/', "_");
-    Some(cache_root.join(format!("{}-{}-{}-v1{}", base, meta.len(), mtime, ext)))
+    // key 用 `file_identity`(含 ctime/inode): 只按 size+mtime 会漏掉"同秒等长改写",
+    // 而那正是波形脚本反复重生成的常态(内网 #8)。
+    let id = crate::trace::vcd::file_identity(std::path::Path::new(filename))?;
+    Some(cache_root.join(format!("{}-v1{}", id, ext)))
 }
 
 fn try_load_tree_cache(cache_root: &std::path::Path, filename: &str) -> Option<TreeSnapshot> {
@@ -557,8 +554,13 @@ fn save_tree_cache(
     let mut blob = encode_tree(&snap);
     blob[8..16].copy_from_slice(&fp.to_le_bytes());
     let tmp = f.with_extension("fnames.tmp");
-    if std::fs::write(&tmp, &blob).is_ok() {
-        let _ = std::fs::rename(&tmp, &f);
+    match std::fs::write(&tmp, &blob) {
+        Ok(()) => {
+            if let Err(e) = std::fs::rename(&tmp, &f) {
+                crate::trace::warn_cache_write(&f, &e);
+            }
+        }
+        Err(e) => crate::trace::warn_cache_write(&tmp, &e),
     }
     if std::env::var("WAL_DEBUG_FSDB").is_ok() {
         eprintln!("[fsdb] 名字树缓存写入 {} 信号 → {}", names.len(), f.display());
@@ -1585,8 +1587,13 @@ impl FsdbTrace {
         let mut blob = encode_timeline(times, first_change);
         blob[8..16].copy_from_slice(&fp.to_le_bytes());
         let tmp = f.with_extension("ftl.tmp");
-        if std::fs::write(&tmp, &blob).is_ok() {
-            let _ = std::fs::rename(&tmp, &f);
+        match std::fs::write(&tmp, &blob) {
+            Ok(()) => {
+                if let Err(e) = std::fs::rename(&tmp, &f) {
+                    crate::trace::warn_cache_write(&f, &e);
+                }
+            }
+            Err(e) => crate::trace::warn_cache_write(&tmp, &e),
         }
         if std::env::var("WAL_DEBUG_FSDB").is_ok() {
             eprintln!("[fsdb] 时间线缓存写入 {} 个时间点 → {}", times.len(), f.display());

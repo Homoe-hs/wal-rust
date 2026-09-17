@@ -1235,3 +1235,308 @@ $enddefinitions $end\n#0\n$dumpvars\n1!\n$end\n#5\n0!\n#10\n1!\n");
     assert_eq!(top.len(), 2, "topsig 应含两个名字: {:?}", top);
     assert!(top.iter().all(|(_, c)| *c == 2), "topsig 计数: {:?}", top);
 }
+
+/// 缓存陈旧(#8): 旁挂列缓存的目录 key 只有 **basename+size+mtime** —— 同一秒内
+/// 等长改写内容(脚本反复生成同名波形是常态)时 key 不变, 若不校验**内容指纹**,
+/// 热查询会拿旧列给出"看似正常"的错答案。
+/// 本测试: 写 A → 查询(落缓存) → 等长改写为 B 并把 mtime 改回去 → 再查必须反映 B。
+/// 多文件同一条命令必须**可复现**: 两条波形都有同名信号时, 谁回答由**加载顺序**
+/// 决定(第一条 `-l` 优先), 不能由 HashMap 迭代顺序决定。
+///
+/// 曾经的 bug: TraceContainer 用 `HashMap<TraceId, _>`, 每个进程的迭代顺序不同 ——
+/// 实测 `-l fsdb -l vcd`(同一设计两条波形)同一条 `(count (rising "top.clk"))`
+/// 6 次里 5 次答 30000、1 次答 40(在 VM 上复现)。
+#[test]
+fn matrix_multitrace_source_is_load_order() {
+    let bin = env!("CARGO_BIN_EXE_wal-rust");
+    let dir = std::env::temp_dir().join(format!("wal_reg_ord_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // 两条波形**同名信号** `top.s`, 但时间线与取值完全不同 → 谁回答一眼可辨
+    let mk = |ts: u32, one_every: u32| -> String {
+        let mut s = String::from(
+            "$timescale 1ns $end\n$scope module top $end\n$var wire 1 ! s $end\n$enddefinitions $end\n",
+        );
+        for i in 0..ts {
+            s.push_str(&format!("#{}\n{}!\n", i * 10, if i % one_every == 0 { 1 } else { 0 }));
+        }
+        s
+    };
+    let first = dir.join("first.vcd");    // 短: 100 个索引, 每 4 个一个 1 → 25 个 1
+    let second = dir.join("second.vcd");  // 长: 2000 个索引, 每 2 个一个 1
+    std::fs::write(&first, mk(100, 4)).unwrap();
+    std::fs::write(&second, mk(2000, 2)).unwrap();
+    let cdir = dir.join("cache");
+
+    let run = |q: &str, order: [&std::path::Path; 2]| -> String {
+        let out = std::process::Command::new(bin)
+            .arg(q).arg("-l").arg(order[0]).arg("-l").arg(order[1])
+            .env("WAL_CACHE", "auto").env("WAL_CACHE_DIR", &cdir).env("WAL_CACHE_MIN_MB", "0")
+            .output().expect("spawn wal-rust");
+        assert!(out.status.success(), "cli 失败: {}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+
+    // (查询, 第一条 -l=first 时应答, 第一条 -l=second 时应答)
+    // rising 少 1: 索引 0 的 x→1 按 WAL 语义是 Changed, 不算 rising。
+    let cases = [
+        ("(count (= (get \"top.s\") 1))", 25, 1000),
+        ("(count (rising \"top.s\"))", 24, 999),
+    ];
+    for (q, want_first, want_second) in cases {
+        // 每个进程的 HashMap 种子都不同 → 多跑几次才抓得住"随机挑一条"
+        let a: Vec<String> = (0..8).map(|_| run(q, [&first, &second])).collect();
+        let b: Vec<String> = (0..8).map(|_| run(q, [&second, &first])).collect();
+        assert!(a.iter().all(|x| x == &a[0]), "同一条命令结果飘了: {:?} | {}", a, q);
+        assert!(b.iter().all(|x| x == &b[0]), "同一条命令结果飘了: {:?} | {}", b, q);
+        // 第一条 -l 优先: first(25 个 1) vs second(1000 个 1)
+        assert_eq!(a[0], format!("=> {}", want_first), "应先答第一条 -l 的波形: {} | {}", a[0], q);
+        assert_eq!(b[0], format!("=> {}", want_second), "应先答第一条 -l 的波形: {} | {}", b[0], q);
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 多文件: **没被查询引用的波形不该改变查询的索引空间**。
+///
+/// 时间优先后端(FSDB 走 NPI)的 `max_index` = 索引空间长度, 只能全文件扫描得到;
+/// 如果每条查询都去问所有已加载波形的 max_index, 那么 `-l fsdb -l vcd` 里查 VCD
+/// 信号会退化成"先物化 FSDB 全局时间线"(内网实测 >900s, 单加载 VCD 是秒级, #32)。
+/// 语义上也应如此: 长尾巴波形不该凭空拉长短波形查询的结果。
+#[test]
+fn matrix_multitrace_index_space_follows_query() {
+    let bin = env!("CARGO_BIN_EXE_wal-rust");
+    let dir = std::env::temp_dir().join(format!("wal_reg_mt_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // a: 20 个索引, a_sig 前 10 个 0, 后 10 个 1
+    let mut a = String::from(
+        "$timescale 1ns $end\n$scope module ta $end\n$var wire 1 ! a_sig $end\n$enddefinitions $end\n",
+    );
+    for i in 0..20 {
+        a.push_str(&format!("#{}\nb{} !\n", i * 10, if i < 10 { 0 } else { 1 }));
+    }
+    // b: 4000 个索引, b_sig 恒 0 —— 与查询无关的长波形
+    let mut b = String::from(
+        "$timescale 1ns $end\n$scope module tb $end\n$var wire 1 # b_sig $end\n$enddefinitions $end\n",
+    );
+    for i in 0..4000 {
+        b.push_str(&format!("#{}\nb0 #\n", i * 10));
+    }
+    let av = dir.join("a.vcd");
+    let bv = dir.join("b.vcd");
+    std::fs::write(&av, &a).unwrap();
+    std::fs::write(&bv, &b).unwrap();
+    let cdir = dir.join("cache");
+
+    let run = |q: &str, only_a: bool, no_engine: bool| -> String {
+        let mut c = std::process::Command::new(bin);
+        c.arg(q).arg("-l").arg(&av);
+        if !only_a { c.arg("-l").arg(&bv); }
+        c.env("WAL_CACHE", "auto").env("WAL_CACHE_DIR", &cdir).env("WAL_CACHE_MIN_MB", "0");
+        if no_engine { c.env("WAL_NO_ENGINE", "1"); }
+        let out = c.output().expect("spawn wal-rust");
+        assert!(out.status.success(), "cli 失败: {}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+
+    // 引用 a_sig 的查询: 索引空间应由 a 决定(20 个索引), b 的长尾巴不得参与
+    for q in [
+        "(count/step (&& (> INDEX 15) (= (get \"a_sig\") 1)))",
+        "(count (&& (rising \"a_sig\") (= (get \"a_sig\") 1)))",
+        "(count (= (get \"a_sig\") 1))",
+    ] {
+        let single = run(q, true, false);            // 只加载 a(基准)
+        let dual_engine = run(q, false, false);      // a + b, 统一引擎
+        let dual_step = run(q, false, true);         // a + b, 纯逐拍
+        assert_eq!(dual_engine, single, "多加载无关波形改变了结果(引擎): {} | {}", q, dual_engine);
+        assert_eq!(dual_step, single, "多加载无关波形改变了结果(逐拍): {} | {}", q, dual_step);
+    }
+
+    // ---- 两条波形**同名**信号(内网常态: 同一设计导出 FSDB + VCD)----
+    // 值只从第一条 -l 读, 索引空间也必须只由它决定; 长的那条不得拉长结果。
+    let s1 = dir.join("s1.vcd");
+    let s2 = dir.join("s2.vcd");
+    let mk_s = |ts: u32, one_every: u32| -> String {
+        let mut x = String::from(
+            "$timescale 1ns $end\n$scope module top $end\n$var wire 1 ! s $end\n$enddefinitions $end\n",
+        );
+        for i in 0..ts {
+            x.push_str(&format!("#{}\n{}!\n", i * 10, if i % one_every == 0 { 1 } else { 0 }));
+        }
+        x
+    };
+    std::fs::write(&s1, mk_s(100, 4)).unwrap();     // 25 个 1
+    std::fs::write(&s2, mk_s(2000, 2)).unwrap();    // 1000 个 1(长 20 倍)
+    let run_named = |q: &str, files: &[&std::path::Path], no_engine: bool| -> String {
+        let mut c = std::process::Command::new(bin);
+        c.arg(q);
+        for f in files { c.arg("-l").arg(f); }
+        c.env("WAL_CACHE", "off").env("WAL_NO_ENGINE", if no_engine { "1" } else { "0" });
+        let out = c.output().expect("spawn wal-rust");
+        assert!(out.status.success(), "cli 失败: {}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    for q in [
+        "(count (&& (rising \"top.s\") (= (get \"top.s\") 1)))",
+        "(count (&& (rising \"top.s\") (>= INDEX 0)))",
+        "(count (|| (rising \"top.s\") (falling \"top.s\")))",
+    ] {
+        let only_first = run_named(q, &[&s1], false);
+        let only_second = run_named(q, &[&s2], false);
+        for no_engine in [false, true] {
+            let fwd = run_named(q, &[&s1, &s2], no_engine);
+            let rev = run_named(q, &[&s2, &s1], no_engine);
+            assert_eq!(fwd, only_first,
+                "同名信号时应答第一条 -l 且索引空间也只由它决定(engine={}): {} | {}", !no_engine, fwd, q);
+            assert_eq!(rev, only_second,
+                "反序应答第二条 -l: {} | {}", rev, q);
+        }
+    }
+
+    // 不引用信号的 MAX-INDEX = **主波形**(第一条 -l = a, 20 个索引 → 19), 而不是
+    // 并集: 确定(按加载顺序)、且不必为一个不引用信号的查询去物化 b 的时间线。
+    assert_eq!(run("(MAX-INDEX)", false, false), "=> 19");
+    // 反序则应答 b(b 更长, 主波形变了 → 结果跟着变, 但每次都确定)
+    assert_eq!(run("(MAX-INDEX)", true, false), "=> 19");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 缓存落盘撞上 `ulimit -f`(或磁盘满)时, **不能**被杀进程: SIGXFSZ 默认处置是
+/// terminate+core, 用户看到的是 "查个波形 rc=153, 还掉了个 core"。缓存只是加速
+/// 手段 —— 必须降级为"不写缓存", 结果照出, 退出码 0, stderr 提示一次(内网 #50)。
+#[test]
+fn matrix_cache_write_over_limit_degrades() {
+    let bin = env!("CARGO_BIN_EXE_wal-rust");
+    let dir = std::env::temp_dir().join(format!("wal_reg_xfsz_{}", std::process::id()));
+    let cdir = dir.join("cache");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&cdir).unwrap();
+    let vcd = dir.join("w.vcd");
+    let mut body = String::from(
+        "$timescale 1ns $end\n$scope module t $end\n$var wire 1 ! d $end\n$enddefinitions $end\n",
+    );
+    for i in 0..2000u32 {
+        body.push_str(&format!("#{}\n{}!\n", i * 10, i % 2));
+    }
+    std::fs::write(&vcd, &body).unwrap();
+
+    // 子 shell 里把 RLIMIT_FSIZE 压到 1 块, 任何缓存文件都写不下。
+    //
+    // 注意: SIGXFSZ 的**处置会被继承** —— 本测试的父进程(CI/dsh shell)很可能已经
+    // 把它设成 SIG_IGN, 那就永远看不到"被杀"。所以这里用 python3/perl 垫一层, 显式
+    // 把处置改回 SIG_DFL, 否则这个测试会在错误的乐观状态下一直"通过"。
+    let launcher = if std::process::Command::new("python3").arg("-c").arg("pass").output().is_ok() {
+        "exec python3 -c 'import signal,os,sys; signal.signal(signal.SIGXFSZ, signal.SIG_DFL); os.execv(sys.argv[1], sys.argv[1:])' \"$WAL_BIN\" \"$WAL_Q\" -l \"$WAL_VCD\""
+    } else if std::process::Command::new("perl").arg("-e").arg("0").output().is_ok() {
+        "exec perl -e '$SIG{XFSZ}=\"DEFAULT\"; exec @ARGV or die' \"$WAL_BIN\" \"$WAL_Q\" -l \"$WAL_VCD\""
+    } else {
+        eprintln!("跳过: 需要 python3 或 perl 复位 SIGXFSZ 处置");
+        let _ = std::fs::remove_dir_all(&dir);
+        return;
+    };
+    let out = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(format!("ulimit -f 1 || exit 99; {}", launcher))
+        .env("WAL_BIN", bin)
+        .env("WAL_Q", "(count (= (get \"t.d\") 1))")
+        .env("WAL_VCD", &vcd)
+        .env("WAL_CACHE", "auto")
+        .env("WAL_CACHE_DIR", &cdir)
+        .env("WAL_CACHE_MIN_MB", "0")
+        .current_dir(&dir)     // 万一还是被杀, core 落在临时目录里
+        .output().expect("spawn sh");
+    let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    assert_eq!(out.status.code(), Some(0),
+        "缓存写失败不能改变退出码(信号: {:?}): stderr={}", out.status, stderr);
+    assert_eq!(stdout, "=> 1000", "查询结果必须照常给出: stderr={}", stderr);
+    assert!(stderr.contains("缓存写入失败"), "应提示一次缓存降级: {}", stderr);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn matrix_sidecar_stale_content_same_size_mtime() {
+    let bin = env!("CARGO_BIN_EXE_wal-rust");
+    let dir = std::env::temp_dir().join(format!("wal_reg_stale_{}", std::process::id()));
+    let cdir = dir.join("cache");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&cdir).unwrap();
+    let vcd = dir.join("w.vcd");
+
+    // 夹具必须**够大(>192KB)且改动点落在中段**: 缓存 key 里的内容指纹只覆盖
+    // 首尾各 64KB, 中段改写绕得过去 —— 只有这种改写才能暴露 "size+mtime 当 key"
+    // 的漏洞(内网 #8: 174MB 波形被改 10 处仍命中旧列 40473)。
+    const N: usize = 30_000;
+    let build = |flip: bool| -> String {
+        let mut s = String::from(
+            "$timescale 1ns $end\n$scope module t $end\n$var wire 1 ! d $end\n$enddefinitions $end\n",
+        );
+        for i in 0..N {
+            let v = if i % 2 == 0 { 1 } else { 0 };
+            // 把中段一个 0 改成 1(等长), count(=1) 就从 N/2 变成 N/2+1
+            let v = if flip && i == N / 2 + 1 { 1 } else { v };
+            s.push_str(&format!("#{}\n{}!\n", i * 10, v));
+        }
+        s
+    };
+    let src_a = build(false);
+    let src_b = build(true);
+    assert_eq!(src_a.len(), src_b.len(), "夹具必须等长才算 '同尺寸'");
+    assert!(src_a.len() > 192 * 1024, "夹具必须大于 192KB, 否则指纹覆盖全文件");
+    // 改动点必须落在首尾 64KB 之外 —— 否则指纹会拦住, 测不到 key 本身
+    let mid = src_a.find("\n#150010\n").expect("找得到中段改动点");
+    assert!(mid > 64 * 1024, "改动点必须在首 64KB 之外: {}", mid);
+    assert!(src_a.len() - (mid + 10) > 64 * 1024, "改动点必须在尾 64KB 之外");
+    std::fs::write(&vcd, &src_a).unwrap();
+
+    let meta = std::fs::metadata(&vcd).unwrap();
+    let mt = meta.modified().unwrap();
+    let st = {
+        use std::os::unix::fs::MetadataExt;
+        (meta.atime(), meta.atime_nsec(),
+         mt.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64,
+         mt.duration_since(std::time::UNIX_EPOCH).unwrap().subsec_nanos() as i64)
+    };
+
+    let run = |q: &str| -> (String, String) {
+        let out = std::process::Command::new(bin)
+            .arg(q).arg("-l").arg(&vcd)
+            .env("WAL_CACHE", "auto")
+            .env("WAL_CACHE_DIR", &cdir)
+            .env("WAL_CACHE_MIN_MB", "0")
+            .env("WAL_DEBUG_FIND", "1")
+            .output().expect("spawn wal-rust");
+        assert!(out.status.success(), "cli 失败: {}", String::from_utf8_lossy(&out.stderr));
+        (String::from_utf8_lossy(&out.stdout).trim().to_string(),
+         String::from_utf8_lossy(&out.stderr).to_string())
+    };
+
+    // 第一次: 冷扫 + 落盘; 第二次: .wcol 命中 + 列旁挂命中
+    let (a1, _) = run("(count (= (get \"t.d\") 1))");
+    assert_eq!(a1, format!("=> {}", N / 2));
+    let (a2, err2) = run("(count (= (get \"t.d\") 1))");
+    assert!(err2.contains("col-sidecar hit"), "第二次应命中列缓存: {}", err2);
+    assert_eq!(a2, format!("=> {}", N / 2));
+
+    // ---- 等长中段改写 + mtime 装回去(模拟脚本反复生成同名波形) ----
+    std::fs::write(&vcd, &src_b).unwrap();
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let c = std::ffi::CString::new(vcd.as_os_str().as_bytes()).unwrap();
+        let times = [libc::timeval { tv_sec: st.0 as _, tv_usec: st.1 / 1000 },
+                     libc::timeval { tv_sec: st.2 as _, tv_usec: st.3 / 1000 }];
+        unsafe { libc::utimes(c.as_ptr(), times.as_ptr()); }
+    }
+    let meta2 = std::fs::metadata(&vcd).unwrap();
+    assert_eq!(meta2.len(), src_a.len() as u64, "必须保持同尺寸");
+    use std::os::unix::fs::MetadataExt;
+    assert_eq!(meta2.mtime(), mt.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64,
+        "必须保持同 mtime");
+
+    let (b1, eb1) = run("(count (= (get \"t.d\") 1))");
+    assert_eq!(b1, format!("=> {}", N / 2 + 1),
+        "内容变了就必须重算 —— 中段改动指纹拦不住, 只能靠 ctime/inode; stderr={}", eb1);
+    let _ = std::fs::remove_dir_all(&dir);
+}

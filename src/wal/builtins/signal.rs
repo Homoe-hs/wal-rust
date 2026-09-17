@@ -319,15 +319,13 @@ pub(crate) fn try_count_simple(cond: &Value, env: &mut Environment) -> Option<Re
         }
     };
     let traces = env.get_traces()?;
-    let resolved_name = {
-        let t = traces.read().ok()?;
-        let tr = t.first_trace()?;
-        tr.resolve_name(&sig_name).unwrap_or(sig_name)
-    };
+    // 选源: 第一条能解析出该名字的波形(第一条 -l 优先), 而不是无脑 first_trace()
     let n = {
         let t = traces.read().ok()?;
-        let tr = t.first_trace()?;
-        tr.count_matches(&resolved_name, cond_enum).ok()?
+        let tid = t.source_ids(&[sig_name.clone()]).into_iter().next()?;
+        let tr = t.get(&tid)?;
+        let resolved = tr.resolve_name(&sig_name)?;
+        tr.count_matches(&resolved, cond_enum).ok()?
     };
     Some(Ok(n))
 }
@@ -335,18 +333,18 @@ pub(crate) fn try_count_simple(cond: &Value, env: &mut Environment) -> Option<Re
 fn try_find_indices_enum(sig_name: &str, cond_enum: FindCondition, max_results: usize, env: &mut Environment) -> Option<Result<Value, String>> {
 
     let traces = env.get_traces()?;
-    let first_trace_info = {
+    // 选源: 第一条能解析出该名字的波形(见 TraceContainer::find_indices)
+    let (tid, resolved) = {
         let t = traces.read().ok()?;
-        let tr = t.first_trace()?;
-        let resolved = tr.resolve_name(sig_name)
-            .unwrap_or_else(|| sig_name.to_string());
-        (tr.id().clone(), resolved)
+        let tid = t.source_ids(&[sig_name.to_string()]).into_iter().next()?;
+        let tr = t.get(&tid)?;
+        let resolved = tr.resolve_name(sig_name)?;
+        (tid, resolved)
     };
-    let (_tid, resolved) = first_trace_info;
 
     let indices = {
         let t = traces.read().ok()?;
-        t.find_indices(&resolved, cond_enum).ok()?
+        t.get(&tid)?.find_indices(&resolved, cond_enum).ok()?
     };
 
     let limited: Vec<Value> = indices.into_iter()

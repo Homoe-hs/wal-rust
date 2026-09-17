@@ -13,6 +13,23 @@ pub use container::{TraceContainer, SharedTraceContainer, new_shared};
 pub use vcd::VcdTrace;
 pub use fst::FstTrace;
 pub use fsdb::FsdbTrace;
+
+/// 缓存写失败的**一次性**提示。
+///
+/// 缓存只是加速手段: 磁盘满(`ENOSPC`)、配额、只读目录、`ulimit -f`(`EFBIG`)
+/// 都不该影响查询结果, 也不该影响退出码。这里只提示一次, 免得大循环里刷屏。
+pub(crate) fn warn_cache_write(path: &std::path::Path, err: &std::io::Error) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    if WARNED.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    eprintln!(
+        "wal-rust: 缓存写入失败, 本次会话不再尝试写缓存(不影响查询结果): {}: {}",
+        path.display(),
+        err
+    );
+}
 /// 测试可见的 FSDB 内部编解码(仅供单测; 产品 API 不暴露)。
 pub mod fsdb_test_api {
     use super::fsdb::{

@@ -293,6 +293,8 @@ pub struct VcdTrace {
     event_signals: HashSet<u32>,
     /// dump 区索引(懒构建;见 DumpIndex 注释)
     dump_index: std::cell::OnceCell<DumpIndex>,
+    /// 波形内容指纹缓存(见 `wave_fp`)
+    wave_fp_cache: std::cell::Cell<Option<u64>>,
     /// 头解析时的时间戳数估计(仅用于预分配容量)
     est_ts: usize,
 
@@ -615,6 +617,7 @@ impl VcdTrace {
             warned_xinit: std::cell::RefCell::new(std::collections::HashSet::new()),
             event_signals,
             dump_index: std::cell::OnceCell::new(),
+            wave_fp_cache: std::cell::Cell::new(None),
             est_ts,
             lru_cache: RefCell::new(lru::LruCache::new(lru_cap)),
             signal_cache: Mutex::new(HashMap::new()),
@@ -1143,6 +1146,17 @@ impl VcdTrace {
         canon
     }
 
+    /// 波形内容指纹(首尾 64KB FNV) —— 与 `.wcol`/旁挂缓存同一口径。
+    /// 按 trace 缓存一次: 旁挂缓存每条都要复核, 不能每条都去读 128KB。
+    fn wave_fp(&self) -> u64 {
+        if let Some(v) = self.wave_fp_cache.get() {
+            return v;
+        }
+        let v = wave_fingerprint(std::path::Path::new(&self.filename));
+        self.wave_fp_cache.set(Some(v));
+        v
+    }
+
     fn id_bytes(&self, sig_idx: u32) -> Option<&[u8]> {
         let start = *self.id_offsets.get(sig_idx as usize)? as usize;
         let end = self.id_offsets.get(sig_idx as usize + 1).map(|v| *v as usize).unwrap_or(self.id_blob.len());
@@ -1592,7 +1606,19 @@ impl VcdTrace {
         let path = col_sidecar_file(std::path::Path::new(&self.filename), &name)?;
         let data = std::fs::read(&path).ok()?;
         let mut r = BufR::new(&data);
-        if r.bytes()? != b"WALCOL01".to_vec() {
+        if r.bytes()? != b"WALCOL02".to_vec() {
+            return None;
+        }
+        // **内容指纹**: 目录 key 只有 basename+size+mtime, 同一秒内等长改写内容
+        // (脚本反复生成同名波形是常态) 会让 key 不变而内容是旧的 —— 这里必须
+        // 用首尾 64KB 指纹复核, 否则热查询会拿旧列给出"看似正常"的错答案。
+        // (旧格式 WALCOL01 没有指纹 → 直接视为未命中并重建。)
+        let fp = r.u64()?;
+        if fp != self.wave_fp() {
+            // 首尾 64KB 指纹变了 → 直接未命中并重建。
+            if std::env::var("WAL_DEBUG_FIND").is_ok() {
+                eprintln!("col-sidecar REJECT(fp): sig={}", name);
+            }
             return None;
         }
         let n = r.u32()? as usize;
@@ -1624,15 +1650,21 @@ impl VcdTrace {
             let _ = std::fs::create_dir_all(dir);
         }
         let mut w = BufW::new();
-        w.bytes(b"WALCOL01");
+        w.bytes(b"WALCOL02");
+        w.u64(self.wave_fp());
         w.u32(changes.len() as u32);
         for (i, v) in changes {
             w.u32(*i);
             w.val(v);
         }
         let tmp = path.with_extension("tmp");
-        if std::fs::write(&tmp, &w.b).is_ok() {
-            let _ = std::fs::rename(&tmp, &path);
+        match std::fs::write(&tmp, &w.b) {
+            Ok(()) => {
+                if let Err(e) = std::fs::rename(&tmp, &path) {
+                    crate::trace::warn_cache_write(&path, &e);
+                }
+            }
+            Err(e) => crate::trace::warn_cache_write(&tmp, &e),
         }
     }
 
@@ -2010,16 +2042,36 @@ pub(crate) fn wave_fingerprint(path: &std::path::Path) -> u64 {
     h
 }
 
-fn cache_file_for(vcd: &std::path::Path) -> Option<std::path::PathBuf> {
+/// 缓存 key 里的"文件身份": basename + 长度 + mtime + **ctime** + **inode**。
+///
+/// 为什么不能只看 size+mtime: 脚本反复生成同名波形时, **同一秒内等长改写**会让
+/// size/mtime 都不变, 于是缓存 key 不变而内容已经换了 —— 热查询会拿旧数据给出
+/// "看似正常"的错答案(内网 #8)。ctime 在内容或元数据任何改动时都会变, 且普通
+/// 用户**改不回去**(改 mtime 容易, 改 ctime 不行); inode 则能挡住"删了重建"。
+/// 头部另有首尾 64KB 指纹兜底, 但指纹只覆盖首尾 —— 中段改动只能靠 ctime 拦。
+pub(crate) fn file_identity(vcd: &std::path::Path) -> Option<String> {
+    use std::os::unix::fs::MetadataExt;
     let meta = std::fs::metadata(vcd).ok()?;
-    let mtime = meta.modified().ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_secs())?;
     let base = vcd.file_name()?.to_string_lossy().replace('/', "_");
-    Some(cache_dir().join(format!("{}-{}-{}-v1.wcol", base, meta.len(), mtime)))
+    Some(format!(
+        "{}-{}-{}-{}-{}-{}-{}",
+        base,
+        meta.len(),
+        meta.mtime(),
+        meta.mtime_nsec(),
+        meta.ctime(),
+        meta.ctime_nsec(),
+        meta.ino()
+    ))
 }
 
-/// 列缓存旁挂目录: 与 .wcol 同 key(波形 basename+size+mtime), 后缀换 .cols。
+fn cache_file_for(vcd: &std::path::Path) -> Option<std::path::PathBuf> {
+    let id = file_identity(vcd)?;
+    Some(cache_dir().join(format!("{}-v1.wcol", id)))
+}
+
+/// 列缓存旁挂目录: 与 .wcol 同 key(`file_identity`: basename+size+mtime+ctime+inode),
+/// 后缀换 .cols。
 /// 每个信号一个文件, 首次冷扫描后落盘 → 下一个进程直接命中, 不再扫全文件。
 fn col_sidecar_dir(vcd: &std::path::Path) -> Option<std::path::PathBuf> {
     let f = cache_file_for(vcd)?;
@@ -2155,8 +2207,13 @@ impl VcdTrace {
         }
         let _ = std::fs::create_dir_all(cache_dir());
         let tmp = path.with_extension("tmp");
-        if std::fs::write(&tmp, &w.b).is_ok() {
-            let _ = std::fs::rename(&tmp, path);
+        match std::fs::write(&tmp, &w.b) {
+            Ok(()) => {
+                if let Err(e) = std::fs::rename(&tmp, path) {
+                    crate::trace::warn_cache_write(path, &e);
+                }
+            }
+            Err(e) => crate::trace::warn_cache_write(&tmp, &e),
         }
     }
 
@@ -2253,6 +2310,7 @@ impl VcdTrace {
         };
         let est_ts = dump.timestamps.len();
         Some(VcdTrace {
+            wave_fp_cache: std::cell::Cell::new(None),
             id, filename,
             names_blob, name_meta, name_index, signal_ids,
             alias_canon: std::cell::OnceCell::new(),
