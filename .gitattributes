@@ -1,0 +1,16 @@
+# git 属性: 统一换行, 标注生成物, 让 diff/review 更干净。
+* text=auto eol=lf
+
+*.rs            text
+*.toml          text
+*.md            text
+*.sh            text eol=lf
+*.yml           text
+Makefile        text
+Cargo.lock      text
+
+# tree-sitter 生成的 C 解析器(由 grammar.js 生成): 在 GitHub 上折叠展示, 但 diff 仍然可见
+tree-sitter-wal/src/parser.c linguist-generated=true
+
+# 波形样本按文本处理(diff 慢但可读); 若将来大样本入库, 改成 binary
+*.vcd           text diff

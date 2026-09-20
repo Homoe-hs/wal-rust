@@ -1,0 +1,10 @@
+# 工具链固定: CI 与本机用同一个 Rust 版本, 避免"我这儿能编, CI 编不过"。
+#
+# 项目自身的 MSRV 写在 Cargo.toml 的 `rust-version`(当前 1.90), 那是**下限**;
+# 这里固定的是**构建用的版本**, 保证 rustfmt/clippy 的行为一致(两者的输出随版本变化)。
+#
+# 升级流程: 改 channel → 本机 `rustup update` → 跑 `make ci` → 单独一个 commit。
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

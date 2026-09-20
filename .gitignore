@@ -1,22 +1,49 @@
+# ---- 构建产物 ----
 /target/
-/Cargo.lock
+/wal-rust
+
+# ---- 仓库内自包含的工具链与缓存 ----
+.cargo-home/
+.tools/
+
+# ---- 波形样本/夹具(体积大、与设计强相关, 本地生成) ----
 *.vcd
 *.fst
+*.fsdb
 test_data/
 stress_tests/
+vcd-samples/
+bench/data/
+
+# ---- 运行期缓存(WAL_CACHE=auto, 见 docs/fsdb-npi.md §9) ----
+.wal-rust-cache/
+
+# ---- 本地实验/调试产物 ----
+_dbg/
+_logs/
+exp/
+scratch_mt/
+_*_sim.log
+*Log/
+
+# ---- 生成器产物(源码在 bench/gen_vcd.rs) ----
+/tools/gen_vcd
+bench/gen_vcd
+
+# ---- 旧脚本产物 ----
 bench_results.csv
 perf_test.sh
 generate_*.py
 gen_*.py
+generate_vcd.sh
+generate_5000.py
 regression.py
 requirements.txt
 rustup_install.sh
-generate_vcd.sh
-generate_5000.py
-vcd-samples/
 .memsearch/
-test_*.wal
-wal-rust
+/test_*.wal
+
+# 注意: Cargo.lock **必须入库** —— 二进制项目锁定依赖才能复现发布构建
 
 # local cargo home (read-only ~/.cargo workaround)
 .cargo-home/
@@ -33,13 +60,3 @@ _logs/
 exp/
 scratch_mt/
 _*_sim.log
-
-# FSDB 垫片构建产物(见 src/trace/fsdb_shim/build_shim.sh)
-src/trace/fsdb_shim/*.so
-src/trace/fsdb_shim/shim_smoke
-
-# Verdi fsdbdebug 在工作目录留下的日志目录
-fsdbdebugLog/
-npi_probeLog/
-# NPI 日志目录常落在 CWD(我们的 FSDB 后端会把它挪进 .wal-rust-cache/npi/)
-*Log/

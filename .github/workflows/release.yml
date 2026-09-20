@@ -1,0 +1,76 @@
+# 打 tag 即发版: 与本地 `make release` 等价, 但跑在 GitHub 上(不需要本地 Verdi/zig 环境)。
+#
+# 幂等: release 已存在 → 覆盖上传二进制; 不存在 → 创建。说明文字取 CHANGELOG.md
+# 里该版本的条目(所以**发版前必须先在 main 上提交 CHANGELOG**)。
+name: release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '要发布的 tag(如 v0.15.0, 必须已存在)'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - run: rustup toolchain install stable --profile minimal
+      - uses: Swatinem/rust-cache@v2
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.13.0
+      - run: cargo install cargo-zigbuild --locked
+
+      - name: 版本一致性(代码里的版本 vs tag)
+        run: |
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          VER="$(sed -n 's/^version = "\([0-9.]*\)"/\1/p' Cargo.toml | head -1)"
+          echo "TAG=$TAG VER=$VER" >> "$GITHUB_ENV"
+          if [ "$TAG" != "v$VER" ]; then
+            echo "::error::tag($TAG) 与 Cargo.toml($VER) 不一致; 请先改版本号再打 tag"
+            exit 1
+          fi
+          grep -qE "^##\s*\[?$VER\]?" CHANGELOG.md || {
+            echo "::error::CHANGELOG.md 缺少 v$VER 的条目"
+            exit 1
+          }
+
+      - name: 构建 glibc 2.17 二进制
+        run: |
+          echo "CARGO_HOME=$HOME/.cargo" >> "$GITHUB_ENV"
+          echo "XDG_CACHE_HOME=$HOME/.cache" >> "$GITHUB_ENV"
+          ./scripts/ci.sh --only package
+          cp target/x86_64-unknown-linux-gnu/release/wal-rust wal-rust-linux-x86_64
+          sha256sum wal-rust-linux-x86_64 > wal-rust-linux-x86_64.sha256
+
+      - name: 提取 CHANGELOG 该版本说明
+        run: |
+          awk -v v="$VER" '
+            $0 ~ "^##[[:space:]]*\\[?"v"\\]?" {found=1; next}
+            found && /^##[[:space:]]/ {exit}
+            found {print}
+          ' CHANGELOG.md > notes.md
+          [ -s notes.md ] || { echo "::error::CHANGELOG 里 v$VER 一节为空"; exit 1; }
+          cat notes.md
+
+      - name: 创建或更新 release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" wal-rust-linux-x86_64 wal-rust-linux-x86_64.sha256 --clobber
+          else
+            gh release create "$TAG" --title "$TAG" --notes-file notes.md \
+              wal-rust-linux-x86_64 wal-rust-linux-x86_64.sha256
+          fi

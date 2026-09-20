@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: 📖 使用手册 / 文档总览
+    url: https://github.com/Homoe-hs/wal-rust/blob/main/docs/README.md
+    about: WAL 语言用法、语义口径、性能与设计文档都在这里
+  - name: 🔐 报告安全漏洞
+    url: https://github.com/Homoe-hs/wal-rust/security/advisories/new
+    about: 请走私密通道, 不要开公开 issue

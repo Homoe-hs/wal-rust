@@ -1,6 +1,6 @@
 [package]
 name = "wal-rust"
-version = "0.14.11"
+version = "0.14.12"
 authors = ["He Sheng"]
 edition = "2021"
 rust-version = "1.90"

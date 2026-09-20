@@ -1,0 +1,30 @@
+# 编辑器统一配置 —— 减少"缩进/换行/编码"这类无意义 diff。
+# 支持者: VS Code(需插件)、JetBrains 全家桶、Vim/Neovim(editorconfig 插件)、Emacs(editorconfig-mode)。
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+indent_style = space
+indent_size = 4
+
+[*.{md,markdown}]
+# Markdown 里行尾两个空格是"硬换行", 不能被自动删掉
+trim_trailing_whitespace = false
+indent_size = 2
+
+[*.{yml,yaml,toml,json}]
+indent_size = 2
+
+[Makefile]
+indent_style = tab
+
+[*.sh]
+indent_size = 4
+
+[*.{vcd,fst,fsdb}]
+# 波形样本是测试夹具, 不要被编辑器改写
+insert_final_newline = false
+trim_trailing_whitespace = false

@@ -1,0 +1,63 @@
+# 远端 CI —— 与本地 `make ci` 跑**同一份** scripts/ci.sh, 避免"本地过、CI 挂"。
+#
+# 注意(诚实说明): 因历史原因仓库还没做过全仓 rustfmt, 也有存量 clippy 告警,
+# 所以这两个阶段目前是**提示级**(见 rustfmt.toml 的注释与 CONTRIBUTING 的收敛计划)。
+# 收敛完成后把 WAL_CI_FMT_STRICT / WAL_CI_CLIPPY_STRICT 改成 1 即可变硬门。
+name: ci
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  WAL_CI_FMT_STRICT: "0"
+  WAL_CI_CLIPPY_STRICT: "0"
+
+jobs:
+  # 主门: 结构自检 / 文档一致性 / 构建 / 全部测试 / 语义冻结闸
+  gate:
+    name: gate (build+test+gates)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: 安装 Rust(版本跟随 rust-toolchain.toml)
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt,clippy
+          rustup default stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+      - name: 把本地 CI 脚本的仓库内工具链路径改成 runner 默认
+        run: |
+          echo "CARGO_HOME=$HOME/.cargo" >> "$GITHUB_ENV"
+          echo "XDG_CACHE_HOME=$HOME/.cache" >> "$GITHUB_ENV"
+      # 说明: scripts/ci.sh 默认用仓库内 .cargo-home/; CI 上改用 runner 的 cargo home
+      - run: ./scripts/ci.sh --only preflight,docs,fmt,clippy,build,test,gates
+
+  # 打包门: glibc 2.17 交叉构建 + 冒烟(VCS 无关, 只需要 zig)
+  package:
+    name: package (glibc 2.17)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install stable --profile minimal
+      - uses: Swatinem/rust-cache@v2
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.13.0
+      - name: 安装 cargo-zigbuild
+        run: cargo install cargo-zigbuild --locked
+      - run: |
+          echo "CARGO_HOME=$HOME/.cargo" >> "$GITHUB_ENV"
+          echo "XDG_CACHE_HOME=$HOME/.cache" >> "$GITHUB_ENV"
+      - run: ./scripts/ci.sh --only package

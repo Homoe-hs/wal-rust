@@ -1,0 +1,11 @@
+# rustfmt 配置 —— 刻意只用 stable 支持的选项(nightly-only 选项会让 `cargo fmt` 直接失败)。
+#
+# 现状与计划: 全仓尚未做过一次 `cargo fmt`(2026-09-17 时 `cargo fmt --check` 有约 2000 处
+# 差异)。因此 CI 的 fmt 门**默认是提示级**(`WAL_CI_FMT_STRICT=1` 才失败):
+#   - 新增/修改的文件必须 `cargo fmt`(评审要求, 见 CONTRIBUTING.md);
+#   - 全仓一次性收敛安排在下一次大版本(0.15), 用单独一个纯格式化 commit, 不混在功能改动里。
+edition = "2021"
+max_width = 100
+newline_style = "Unix"
+use_field_init_shorthand = true
+use_try_shorthand = true

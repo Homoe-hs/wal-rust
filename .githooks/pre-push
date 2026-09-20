@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# pre-push: 只做**秒级**检查, 不跑编译/测试(那是 `make ci` 的事, 别拖慢 push)。
+#
+# 目的: 挡住"文档断了/格式漂了"这类本来 CI 才发现的小问题。
+# 逃生口: WAL_SKIP_PREPUSH=1 git push
+set -uo pipefail
+
+[ "${WAL_SKIP_PREPUSH:-0}" = "1" ] && { echo "pre-push: 已跳过(WAL_SKIP_PREPUSH=1)"; exit 0; }
+cd "$(git rev-parse --show-toplevel)"
+
+rc=0
+if command -v python3 >/dev/null; then
+    python3 scripts/check_docs.py || rc=1
+fi
+
+# 只对本次推送涉及的文件做格式检查(避免全仓 2000 处历史差异刷屏)
+base=$(git merge-base HEAD @{u} 2>/dev/null || echo "")
+if [ -n "$base" ]; then
+    changed=$(git diff --name-only "$base"..HEAD -- '*.rs' | head -20)
+    if [ -n "$changed" ]; then
+        # shellcheck disable=SC2086
+        if ! cargo fmt --check -- $changed >/dev/null 2>&1; then
+            echo "pre-push: 以下文件格式不合规(请 cargo fmt -- <file>):"
+            echo "$changed" | while read -r f; do
+                cargo fmt --check -- "$f" >/dev/null 2>&1 || echo "  $f"
+            done
+            rc=1
+        fi
+    fi
+fi
+
+if [ $rc -ne 0 ]; then
+    echo "pre-push: 检查未通过。完整门: make ci   跳过本次: WAL_SKIP_PREPUSH=1 git push"
+    exit 1
+fi
+echo "pre-push: OK(完整检查请跑 make ci)"

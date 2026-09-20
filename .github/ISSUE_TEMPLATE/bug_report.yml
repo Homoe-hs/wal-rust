@@ -1,0 +1,61 @@
+name: 🐛 Bug 报告
+description: 结果不对、崩溃、或行为与文档不符
+title: "[bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感谢反馈! 波形工具的问题**十有八九靠最小复现就能定位** —— 请尽量给能重现的输入。
+        涉及内部环境的信息(主机名/路径/许可服务器)请脱敏后再贴。
+  - type: textarea
+    id: what
+    attributes:
+      label: 发生了什么
+      description: 实际结果 vs 期望结果(贴命令与输出)
+      placeholder: |
+        命令: wal-rust '(count (rising "top.clk"))' -l design.vcd
+        实际: => 40
+        期望: => 820965(与 (count (changes "top.clk")) 的口径对不上)
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: 最小复现
+      description: |
+        优先给"能生成问题波形的最小脚本"; 直接贴波形片段也可以(几十行足够)。
+        大文件请给生成脚本而不是附件。
+      render: shell
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: 版本
+      description: 输出 `wal-rust --version`
+    validations:
+      required: true
+  - type: dropdown
+    id: format
+    attributes:
+      label: 波形格式
+      options: ["VCD", "FST", "FSDB", "多个格式混用(-l 多次)", "其他/不确定"]
+    validations:
+      required: true
+  - type: textarea
+    id: env
+    attributes:
+      label: 环境
+      description: "`uname -m`、`ldd --version | head -1`;FSDB 问题请附 Verdi 版本与许可方式"
+      render: shell
+    validations:
+      required: false
+  - type: dropdown
+    id: cache
+    attributes:
+      label: 是否与缓存有关
+      description: 试试 `WAL_CACHE=off` 是否还复现
+      options: ["WAL_CACHE=off 仍复现", "只有开着缓存才复现", "没试过"]
+    validations:
+      required: false
