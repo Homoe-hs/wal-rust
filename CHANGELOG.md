@@ -14,7 +14,7 @@
 ### Added
 - (下一次发版前在这里写;分类见文件头)
 
-## [0.14.16] - 2026-09-20
+## [0.14.17] - 2026-09-20
 
 ### Added
 - **工程外壳**: LICENSE(MIT/Apache-2.0)、CHANGELOG、CONTRIBUTING、SECURITY、issue/PR 模板、
