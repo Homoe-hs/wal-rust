@@ -12,6 +12,11 @@
 ## [未发布]
 
 ### Added
+- (下一次发版前在这里写;分类见文件头)
+
+## [0.14.13] - 2026-09-20
+
+### Added
 - **工程外壳**: LICENSE(MIT/Apache-2.0)、CHANGELOG、CONTRIBUTING、SECURITY、issue/PR 模板、
   `rust-toolchain.toml`、`.editorconfig`、`.gitattributes`。
 - **本地 CI**: `make ci`(`scripts/ci.sh`)—— 环境自检 / 文档一致性 / fmt / clippy / build / test /

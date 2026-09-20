@@ -117,7 +117,17 @@ fi
 
 # --- 5. 推送 + 建 release ----------------------------------------------------
 say "推送 main"
-git push origin main
+if ! git push origin main 2>.tools/push.err; then
+    # 有些环境(容器/受限 ssh 配置)下 ssh 推不上去;此时用 gh 的 HTTPS 凭据重试。
+    if command -v gh >/dev/null && gh auth status >/dev/null 2>&1; then
+        say "ssh 推送失败, 改用 gh 的 HTTPS 凭据重试"
+        slug="$(gh repo view --json nameWithOwner -q .nameWithOwner)"
+        git -c credential.helper='!gh auth git-credential' push "https://github.com/$slug.git" main
+    else
+        cat .tools/push.err >&2
+        die "推送失败: 见上面的错误(可手动 git push 后重新执行本脚本)"
+    fi
+fi
 
 say "创建 GitHub release $TAG"
 printf '%s\n' "$NOTES" > .tools/release-notes.md
