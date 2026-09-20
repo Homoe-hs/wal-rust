@@ -34,4 +34,11 @@ NEW="$MAJOR.$MINOR.$((PATCH + 1))"
 
 sed -i "s/^version = \"$VER\"/version = \"$NEW\"/" "$TOML"
 git add "$TOML"
+
+# Cargo.lock 记录了本包的版本号, 必须跟着走 —— 否则工作区永远"脏", 发版脚本
+# (scripts/release.sh)会以"工作区有未提交改动"为由拒绝发布。
+if [ -f "$(git rev-parse --show-toplevel)/Cargo.lock" ] && command -v cargo >/dev/null; then
+    ( cd "$(git rev-parse --show-toplevel)" && cargo metadata --format-version 1 >/dev/null 2>&1 || true )
+    git add Cargo.lock 2>/dev/null || true
+fi
 echo "auto-bump: wal-rust $VER -> $NEW"
