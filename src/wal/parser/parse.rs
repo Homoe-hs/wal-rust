@@ -53,30 +53,37 @@ impl WalParser {
 
 /// 把字符串字面量之外的独立 `%` token 换成 `mod `(两边保持空格分隔)。
 /// 返回 Cow: 没有 `%` 时零拷贝。
+///
+/// ⚠️ 实现注意: **必须按字节下标切片拷贝**, 不能 `out.push(b as char)` ——
+/// 后者会把 UTF-8 的多字节序列逐字节映射成 Latin-1 字符, 于是任何含 `%` 的源码里
+/// 的中文都会被双重编码(实测 `(printf "信号: %s\n" "x")` 打印出 `ä¿¡å·: x`)。
+/// 原因: 本函数只在源码含 `%` 时触发, 所以以前只有"带格式串的中文"会乱码,
+/// 不带 `%` 的中文正常 —— 这也是它长期没被发现的原因。
 fn expand_percent_operator(src: &str) -> std::borrow::Cow<'_, str> {
     if !src.contains('%') {
         return std::borrow::Cow::Borrowed(src);
     }
     let bytes = src.as_bytes();
     let mut out = String::with_capacity(src.len() + 8);
+    let mut seg = 0usize; // 当前未输出片段的字节起点
     let mut i = 0usize;
     let mut in_str = false;
     while i < bytes.len() {
         let b = bytes[i];
         if in_str {
-            out.push(b as char);
+            // 字符串内部原样保留(含 \" 转义): 只扫描状态, 不拷贝
             if b == b'\\' && i + 1 < bytes.len() {
-                out.push(bytes[i + 1] as char);
                 i += 2;
                 continue;
             }
-            if b == b'"' { in_str = false; }
+            if b == b'"' {
+                in_str = false;
+            }
             i += 1;
             continue;
         }
         if b == b'"' {
             in_str = true;
-            out.push('"');
             i += 1;
             continue;
         }
@@ -86,14 +93,16 @@ fn expand_percent_operator(src: &str) -> std::borrow::Cow<'_, str> {
             let next_ok = i + 1 >= bytes.len()
                 || matches!(bytes[i + 1], b' ' | b'\t' | b'\n' | b')' | b']');
             if prev_ok && next_ok {
+                out.push_str(&src[seg..i]); // 按字符边界切片(seg/i 都在 ASCII 位置)
                 out.push_str("mod ");
                 i += 1;
+                seg = i;
                 continue;
             }
         }
-        out.push(b as char);
         i += 1;
     }
+    out.push_str(&src[seg..]);
     std::borrow::Cow::Owned(out)
 }
 
