@@ -1,11 +1,13 @@
 # WAL 编程手册
 
+> ✅ **现行使用手册(面向使用者)** —— 语言与算子的完整用法;文档地图见 `docs/README.md`。
+
 > Waveform Analysis Language — 波形分析语言
 > 基于 wal-rust 实现
 
 ## WAL 是什么
 
-WAL (Waveform Analysis Language) 是面向**硬件波形分析**的领域特定语言。它不是通用的日志分析或软件 trace 工具——它专门处理**数字电路仿真产生的 VCD/FST 波形文件**。
+WAL (Waveform Analysis Language) 是面向**硬件波形分析**的领域特定语言。它不是通用的日志分析或软件 trace 工具——它专门处理**数字电路仿真产生的 VCD/FST/FSDB 波形文件**(FSDB 借 Verdi 的 NPI 读库, 见 `docs/fsdb-npi.md`)。
 
 ### 硬件波形分析 vs 软件 Trace 分析
 
@@ -121,9 +123,10 @@ WAL 将硬件分析中最常用的概念直接作为语言一等公民：
 ### 8. wal-rust 差异
 - [扩展操作符](#81-扩展操作符golden-无): `abs` `string-append` `third` `null?` `empty?`
 - [已移除的非核心操作符](#82-已移除的非核心操作符): TileLink 分析、VCD→FST 转换
-- [内置特殊形式](#83-内置特殊形式golden-中为-stdlib-宏): `when` `unless` `cond` `count` `timeframe` `sum`
-- [行为差异](#84-行为差异): wal-rust 与 golden 行为对照表
-- [特殊变量](#85-特殊变量): wal-rust 特殊变量列表
+- [信号变量作为函数](#83-信号变量作为函数): `(sig idx)` 取值形式
+- [内置特殊形式](#84-内置特殊形式golden-中为-stdlib-宏): `when` `unless` `cond` `count` `timeframe` `sum`
+- [行为差异](#85-行为差异): wal-rust 与 golden 行为对照表
+- [特殊变量](#86-特殊变量): wal-rust 特殊变量列表
 
 ---
 
@@ -563,10 +566,10 @@ WAL 将硬件分析中最常用的概念直接作为语言一等公民：
 **签名**: `(&& expr+ ...)`  
 **参数**:
 - `expr+ ...` (`any?`, 至少 1 个) — 表达式
-**返回值**: `bool?`（`1` 或 `0`）
+**返回值**: `bool`（`true` / `false`;回归测试 `test_and_or_return_bool` 冻结此口径）
 **说明**: 
 - wal-rust 中为非短路求值：所有参数均被求值后再判断
-- 所有参数均为真值时返回 `1`，否则返回 `0`
+- 所有参数均为真值时返回 `true`，否则返回 `false`
 - 真值规则同 `!`
 **示例**:
 ```wal
@@ -581,10 +584,10 @@ WAL 将硬件分析中最常用的概念直接作为语言一等公民：
 **签名**: `(|| expr+ ...)`  
 **参数**:
 - `expr+ ...` (`any?`, 至少 1 个) — 表达式
-**返回值**: `bool?`（`1` 或 `0`）
+**返回值**: `bool`（`true` / `false`;同 `&&`）
 **说明**: 
 - wal-rust 中为非短路求值：所有参数均被求值后再判断
-- 任一参数为真值时返回 `1`，否则返回 `0`
+- 任一参数为真值时返回 `true`，否则返回 `false`
 **示例**:
 ```wal
 (|| #f #f #t)
@@ -1148,7 +1151,15 @@ hi
 
 ### 1.10 标准库宏
 
-以下宏定义在标准库 `std/std.wal` 中或在 wal-rust 中直接内置：
+> ⚠️ **关于"标准库宏"与本节**: 这是**上游 WAL 发行版**的标准库形式, wal-rust 只发布解释器本体,
+> **没有** std 目录(仓库里没有那个 std.wal 文件)。本节表格中: 
+> * **可用**(wal-rust 内置): `rising` `falling` `unless` `timeframe` `sum` `first` `rest` `set!` `defunm` `defmacro` `count` `whenever` `if` `when` `cond`;
+> * **未内置**(调用报 `Unknown operator or function`): `for` `dowhile` `until` `step-until` `step-while` `always` `inc` `dec` `stable` `unstable` `signed` `car` `cdr` `cadr` `append` `reverse` `filter` `sort` `partition` `symbol-add` `groups-excluding` `inc-define`。
+> 需要等价能力时用内置形式改写: 列表遍历用 `(map f lst)`、条件循环用 `(while c …)`、计数用 `(count cond)`。
+> (本节标题里的"标准库宏"是上游历史命名, 不要理解成"随 wal-rust 一起可用"。)
+
+
+下表汇总**上游 WAL 标准库宏**与 wal-rust 的内置形式 —— 每个宏能否在 wal-rust 里直接用, 看"说明"列的标注(wal-rust 只发布解释器本体, 没有 `std/` 目录)。
 
 | 宏 | 签名 | 说明 |
 |------|------|------|
@@ -1158,35 +1169,35 @@ hi
 | `cond` | `(cond [guard expr+]+)` | 多分支条件（wal-rust 内置） |
 | `case` | 见上文 | 值匹配分支（特殊形式） |
 | `for/list` | `(for/list [sym data] body+)` | 列表推导，展开为 `map`（wal-rust 内置） |
-| `for` | `(for [sym data] body+)` | 列表遍历（无返回值，副作用，标准库宏） |
-| `dowhile` | `(dowhile body... cond)` | 至少执行一次 body 后检查 cond（标准库宏） |
-| `until` | `(until cond body+)` | 循环直至 cond 为真（标准库宏） |
-| `step-until` | `(step-until condition)` | 步进直到 condition 满足（标准库宏） |
-| `step-while` | `(step-while condition)` | 步进直到 condition 不满足（标准库宏） |
-| `always` | `(always body+)` | 等价于 `(whenever #t body...)`（标准库宏） |
-| `inc` | `(inc sym ...)` | 变量自增 1，支持多个变量（标准库宏） |
-| `dec` | `(dec sym ...)` | 变量自减 1（标准库宏） |
-| `rising` | `(rising expr)` | 上升沿检测：expr 从 0→1（标准库宏） |
-| `falling` | `(falling expr)` | 下降沿检测：expr 从 1→0（标准库宏） |
-| `stable` | `(stable expr)` | 信号稳定检测（标准库宏） |
-| `unstable` | `(unstable expr)` | 信号不稳定检测（标准库宏） |
-| `signed` | `(signed signal)` | 将有符号整数转为补码形式（标准库宏） |
+| `for` | `(for [sym data] body+)` | 列表遍历 ⚠️**wal-rust 未内置**(上游标准库宏) |
+| `dowhile` | `(dowhile body... cond)` | 至少执行一次 body 后检查 cond ⚠️**wal-rust 未内置**(上游标准库宏) |
+| `until` | `(until cond body+)` | 循环直至 cond 为真 ⚠️**wal-rust 未内置**(上游标准库宏) |
+| `step-until` | `(step-until condition)` | 步进直到 condition 满足 ⚠️**wal-rust 未内置**(上游标准库宏) |
+| `step-while` | `(step-while condition)` | 步进直到 condition 不满足 ⚠️**wal-rust 未内置**(上游标准库宏) |
+| `always` | `(always body+)` | 等价于 `(whenever #t body...)` ⚠️**wal-rust 未内置**(上游标准库宏) |
+| `inc` | `(inc sym ...)` | 变量自增 1，支持多个变量 ⚠️**wal-rust 未内置**(上游标准库宏) |
+| `dec` | `(dec sym ...)` | 变量自减 1 ⚠️**wal-rust 未内置**(上游标准库宏) |
+| `rising` | `(rising expr)` | 上升沿检测：expr 从 0→1（**wal-rust 内置**） |
+| `falling` | `(falling expr)` | 下降沿检测：expr 从 1→0（**wal-rust 内置**） |
+| `stable` | `(stable expr)` | 信号稳定检测 ⚠️**wal-rust 未内置**(上游标准库宏) |
+| `unstable` | `(unstable expr)` | 信号不稳定检测 ⚠️**wal-rust 未内置**(上游标准库宏) |
+| `signed` | `(signed signal)` | 将有符号整数转为补码形式 ⚠️**wal-rust 未内置**(上游标准库宏) |
 | `timeframe` | `(timeframe body+)` | 保存/恢复 INDEX（wal-rust 内置） |
 | `count` | `(count cond)` | 计算条件为真的次数（wal-rust 内置） |
 | `sum` | `(sum xs)` | 列表求和（wal-rust 内置） |
-| `car` | `(car xs)` | 等价于 `first`（标准库宏） |
-| `cdr` | `(cdr xs)` | 等价于 `rest`（标准库宏） |
-| `cadr` | `(cadr xs)` | 等价于 `(car (cdr xs))`（标准库宏） |
-| `append` | `(append xs x)` | 列表末尾追加（标准库宏） |
-| `reverse` | `(reverse xs)` | 反转列表（标准库宏定义函数） |
-| `filter` | `(filter p xs)` | 列表过滤（标准库宏定义函数） |
-| `sort` | `(sort xs)` | 数字列表排序（标准库宏定义函数） |
-| `partition` | `(partition p xs)` | 列表分区（标准库宏） |
+| `car` | `(car xs)` | 等价于 `first`;⚠️**wal-rust 未内置**(上游标准库宏), 调用会报未知算子 ⚠️**wal-rust 未内置**(上游标准库宏) |
+| `cdr` | `(cdr xs)` | 等价于 `rest`;⚠️**未内置** ⚠️**wal-rust 未内置**(上游标准库宏) |
+| `cadr` | `(cadr xs)` | 等价于 `(car (cdr xs))`;⚠️**未内置** ⚠️**wal-rust 未内置**(上游标准库宏) |
+| `append` | `(append xs x)` | 列表末尾追加;⚠️**未内置** ⚠️**wal-rust 未内置**(上游标准库宏) |
+| `reverse` | `(reverse xs)` | 反转列表;⚠️**未内置** ⚠️**wal-rust 未内置**(上游标准库宏) |
+| `filter` | `(filter p xs)` | 列表过滤;⚠️**未内置**(可用 `map` + 条件表达式替代) ⚠️**wal-rust 未内置**(上游标准库宏) |
+| `sort` | `(sort xs)` | 数字列表排序;⚠️**未内置** ⚠️**wal-rust 未内置**(上游标准库宏) |
+| `partition` | `(partition p xs)` | 列表分区;⚠️**未内置** ⚠️**wal-rust 未内置**(上游标准库宏) |
 | `set!` | `(set! key value)` | 展开为 `(set key value)`（wal-rust 内置） |
 | `defunm` | `(defunm name [args] body)` | 定义可变参数宏（wal-rust 内置） |
-| `symbol-add` | `(symbol-add args...)` | 符号名拼接（标准库宏定义函数） |
-| `groups-excluding` | `(groups-excluding (including ...) (excluding ...))` | 过滤组（标准库宏） |
-| `inc-define` | `(inc-define sym ...)` | 不存在则初始化为 1 再自增（标准库宏） |
+| `symbol-add` | `(symbol-add args...)` | 符号名拼接;⚠️**未内置** ⚠️**wal-rust 未内置**(上游标准库宏) |
+| `groups-excluding` | `(groups-excluding (including ...) (excluding ...))` | 过滤组;⚠️**未内置** ⚠️**wal-rust 未内置**(上游标准库宏) |
+| `inc-define` | `(inc-define sym ...)` | 不存在则初始化为 1 再自增;⚠️**未内置** ⚠️**wal-rust 未内置**(上游标准库宏) |
 
 ---
 
@@ -1542,7 +1553,7 @@ clk
 **签名**: `(get name)`  
 **参数**:
 - `name` (`symbol?` | `string?`) — 信号名
-**返回值**: `int?` | `float?`
+**返回值**: `int?` | `float?` | `string?`（含 x/z 的向量返回位串, 如 `"00x1"`）
 **说明**: 
 - 返回指定信号在当前 INDEX 的值
 - 信号名首先精确匹配，然后添加作用域前缀 (`CS + name`)，再添加组前缀 (`CG + name`)
@@ -1620,7 +1631,7 @@ INDEX@-1
 |------|------|------|
 | `INDEX` | `int?` | 当前时间索引（0-based）|
 | `MAX-INDEX` | `int?` | 最大有效 INDEX 值 |
-| `TS` | `int?` | 当前仿真时间戳（同 INDEX）|
+| `TS` | `int?` | ⚠️ **实现返回的是当前 INDEX**(不是原生时间戳) —— 要按时间过滤请用 `(at s T)`/`(getwave s)` |
 | `SIGNALS` | `list?` | 所有信号名称列表 |
 | `SIGNALS-NO-ALIAS` | `list?` | 无别名的信号列表 |
 | `CS` | `string?` | 当前作用域 (Current Scope) |
@@ -2122,18 +2133,18 @@ INDEX@-1
 
 ### 5.9 宏定义列表函数
 
-以下函数通过标准库宏定义（在 `std/std.wal` 中）：
+以下函数是内置宏(随解释器发布, 不需要额外加载库文件):
 
 | 函数 | 签名 | 说明 |
 |------|------|------|
-| `car` | `(car xs)` | 等价于 `first` |
-| `cdr` | `(cdr xs)` | 等价于 `rest` |
-| `cadr` | `(cadr xs)` | 等价于 `(car (cdr xs))` |
-| `append` | `(append xs x)` | 在列表末尾追加元素 x |
-| `reverse` | `(reverse xs)` | 反转列表 |
-| `filter` | `(filter p xs)` | 过滤列表，保留满足谓词 p 的元素 |
-| `sort` | `(sort xs)` | 对数字列表排序 |
-| `partition` | `(partition p xs)` | 将列表分为满足和不满足谓词 p 的两部分 |
+| `car` | `(car xs)` | 等价于 `first` ⚠️**wal-rust 未内置**(上游标准库宏) |
+| `cdr` | `(cdr xs)` | 等价于 `rest` ⚠️**wal-rust 未内置**(上游标准库宏) |
+| `cadr` | `(cadr xs)` | 等价于 `(car (cdr xs))` ⚠️**wal-rust 未内置**(上游标准库宏) |
+| `append` | `(append xs x)` | 在列表末尾追加元素 x ⚠️**wal-rust 未内置**(上游标准库宏) |
+| `reverse` | `(reverse xs)` | 反转列表 ⚠️**wal-rust 未内置**(上游标准库宏) |
+| `filter` | `(filter p xs)` | 过滤列表，保留满足谓词 p 的元素 ⚠️**wal-rust 未内置**(上游标准库宏) |
+| `sort` | `(sort xs)` | 对数字列表排序 ⚠️**wal-rust 未内置**(上游标准库宏) |
+| `partition` | `(partition p xs)` | 将列表分为满足和不满足谓词 p 的两部分 ⚠️**wal-rust 未内置**(上游标准库宏) |
 
 ---
 
@@ -2549,7 +2560,6 @@ wal-rust 新增了以下操作符（golden 中无对应实现）：
 | `third` | `(third xs)` | 返回列表第三个元素，不足 3 个元素时报错 |
 | `null?` | `(null? x)` | 检查是否为 `nil` 或空列表 |
 | `empty?` | `(empty? x)` | `null?` 的别名 |
-| `convert` | `(convert input output compression?)` | VCD 转 FST 格式 |
 
 ### 8.2 已移除的非核心操作符
 
@@ -2598,12 +2608,12 @@ wal-rust 新增了以下操作符（golden 中无对应实现）：
 wal-rust 中以下特殊变量可作为**无参数函数**调用：
 
 ```wal
-(signals)       ↦ 所有信号列表
-(index)         ↦ 当前时间索引
-(max-index)     ↦ 最大索引
-(ts)            ↦ 当前时间戳
-(trace-name)    ↦ 当前波形名称
-(trace-file)    ↦ 当前波形路径
+(SIGNALS)       ↦ 所有信号列表
+(INDEX)         ↦ 当前时间索引
+(MAX-INDEX)     ↦ 最大索引
+(TS)            ↦ 当前时间索引(实现如此; 不是原生时间戳)
+(TRACE-NAME)    ↦ 当前波形名称
+(TRACE-FILE)    ↦ 当前波形路径
 ```
 
 （在 golden 中这些是大写变量名 `INDEX`、`SIGNALS` 等，不通过函数调用）

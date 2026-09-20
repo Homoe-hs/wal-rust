@@ -1,6 +1,11 @@
-;; FST signal name verification
-(load "test_data/grp1_mpu7_timeout.fst")
+;; FST 信号名/取值自检 —— 波形用 -l 预先加载(旧版硬编码的 test_data/*.fst 已不在仓库)。
+;;
+;;   wal-rust run -l design.fst test_samples/fst_check.wal
 
-(printf "total signals: %d\n" (length SIGNALS))
-(printf "signal 0: %s\n" (list (get SIGNALS 0) 0))
-(printf "signal 1: %s\n" (list (list (get SIGNALS 0) (get SIGNALS 1)) 0))
+(printf "波形: %s\n" (TRACE-FILE))
+(printf "信号总数: %d\n" (length (SIGNALS)))
+(printf "前 3 个信号: %s\n" (take 3 (SIGNALS)))
+(define s0 (first (SIGNALS)))
+(printf "信号 %s 宽度: %s\n" s0 (signal-width s0))
+(printf "信号 %s 初值: %s\n" s0 (get s0))
+(printf "信号 %s 前 2 个变更点: %s\n" s0 (take 2 (getwave s0)))

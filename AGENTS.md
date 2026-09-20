@@ -3,7 +3,7 @@
 ## Quick commands
 
 ```bash
-cargo test                          # all Rust tests (~232)
+cargo test                          # all Rust tests (~290)
 cargo test --test wal_integration_test  # integration tests only
 cargo test test_vcd_pyvcd_verify_strobe -- --nocapture  # single test + stdout
 cargo build --release               # release build
@@ -11,7 +11,8 @@ cargo zigbuild --release --target x86_64-unknown-linux-gnu.2.17  # glibc 2.17+ c
 target/release/wal-rust '(expr)' -l trace.vcd   # eval expression
 target/release/wal-rust run script.wal -l file  # run script
 target/release/wal-rust repl        # interactive REPL
-test_samples/run_tests.sh           # WAL script test runner
+make ci                             # 本地 CI(与 GitHub Actions 同一份 scripts/ci.sh)
+WAVE=x.vcd test_samples/run_tests.sh  # WAL 脚本层冒烟(自包含脚本无需波形)
 bash scripts/diff_find.sh .tools/wal-rust.old target/release/wal-rust   # find semantic diff gate
 WAL_NO_ENGINE=1 target/release/wal-rust '(count (&& (rising "c") (= (get "d") 3)))' -l x.vcd  # 禁用统一引擎(纯逐拍)= 独立 oracle
 cargo test --test fuzz_vcd_fst_diff   # 随机波形差分: VCD↔FST 等价 + 引擎↔逐拍(可调 WAL_FUZZ_N/WAL_FUZZ_SEED)
@@ -33,18 +34,18 @@ Flags: `-l <waveform>` (repeatable), `-c <code>` (inline override), `--halt-on-e
 
 | Dir | Content | ~Lines |
 |-----|---------|--------|
-| `src/wal/` | AST, tree-sitter parser, Evaluator, builtins (11 modules) | 5,300 |
-| `src/vcd/` | VCD parser (mmap + memchr + two-pass) | 2,100 |
-| `src/fst/` | FST writer (wellen reads via `src/trace/fst.rs`; legacy reader retired) | 2,700 |
-| `src/trace/` | `Trace` trait, `VcdTrace`, `FstTrace`, `FsdbTrace`, `TraceContainer` | 3,200 |
-| `tests/` | Rust integration & correctness tests (6 files, ~900 lines) | 900 |
-| `test_data/` | VCD/FST test files (counter.vcd 11K, pyvcd_100M 107MB, edge cases) | — |
-| `tree-sitter-wal/` | WAL grammar (`grammar.js`), compiled to `parser.c` via `build.rs` | — |
-| `docs/` | 设计/复盘: `query-engine-design.md`(统一引擎), `waveform-io-plan.md`(IO-1..6), `152gb-round.md`(P0 轮), `internal-feedback-review.md` | — |
+| `src/wal/` | AST, tree-sitter parser, Evaluator, builtins (11 modules) | 10,300 |
+| `src/vcd/` | VCD parser (mmap + memchr + two-pass) | 2,200 |
+| `src/fst/` | FST writer (wellen reads via `src/trace/fst.rs`; legacy reader retired) | 2,900 |
+| `src/trace/` | `Trace` trait, `VcdTrace`, `FstTrace`, `FsdbTrace`, `TraceContainer` | 6,800 |
+| `tests/` | Rust integration & correctness tests(11 个文件) | 4,200 |
+| `src/tests_fixtures.rs` | **测试夹具的来源**: 内嵌合成波形, 测试不依赖 `test_data/`(该目录不存在, 也不该存在) | — |
+| `tree-sitter-wal/` | WAL 语法(`grammar.js`), 构建时生成解析器 C 代码并编译 | — |
+| `docs/` | 文档(10+ 篇): **入口是 [`docs/README.md`](docs/README.md)** —— 有索引、状态与权威性标注, 不要在这里枚举 | — |
 
 ## Architecture notes
 
-- **tree-sitter parser**: `build.rs` compiles `tree-sitter-wal/src/parser.c`. First build compiles C code.
+- **tree-sitter parser**: `tree-sitter-wal/build.rs` 调 tree-sitter CLI 生成 `src/parser.c` 再用 `cc` 编译(该文件是**构建产物, 不入库**;仓库根目录下没有同名脚本)。首次构建会编 C。
 - **FST read backend**: wellen (`wellen::simple::read` in `src/trace/fst.rs`); legacy hand-rolled reader retired (writer stays: `src/fst/writer.rs`).
 - **FSDB read backend**: `src/trace/fsdb.rs` —— 运行期 `dlopen` Synopsys NPI(`libNPI.so`)+
   Itanium mangled 符号,纯 Rust FFI,无 C++ 垫片。只用 `npiFsdbTimeBasedVcIter`(用过后
@@ -71,7 +72,7 @@ Flags: `-l <waveform>` (repeatable), `-c <code>` (inline override), `--halt-on-e
   与 `Trace::count_matches()` 让 `getwave`/`at`/边沿计数跳过它。新增/修改这类查询时:
   ① `count_matches` 必须与 `find_indices(..).len()` **逐条一致**(含 `Changed` 在索引 0 的
   特例); ② 后端的 `set_index`/`max_index` 不要变成隐藏的全扫(引擎每次查询都会恢复游标)。
-- **Dispatcher pattern** for builtins: (1) handler in `src/wal/builtins/xxx.rs` (2) register in `builtins/mod.rs::register_all()` (3) optional `Operator` variant in `ast/operator.rs`.
+- **Dispatcher pattern** for builtins: (1) handler in `src/wal/builtins/<module>.rs` (2) register in `src/wal/builtins/mod.rs::register_all()` (3) 可选 `Operator` variant in `src/wal/ast/operator.rs`。
 - **Global allocator**: `mimalloc` in `src/main.rs`.
 - **VCD trace loading** (0.13.2 起两段式, 懒索引):
   - **load** = 只读文件头 PASS-1a($scope/$var/$dumpvars 初值快照)。58.7GB 的 `(SIGNALS)` 现在 1s 级。
@@ -116,18 +117,23 @@ Flags: `-l <waveform>` (repeatable), `-c <code>` (inline override), `--halt-on-e
 
 ## Test data notes
 
-- `test_data/test_pyvcd_150G.vcd` (155GB) may not exist on all clones (LFS-managed). Tests skip gracefully.
-- `test_data/test_pyvcd_100M.vcd` (107MB) required for strobe/counter pyvcd tests.
-- `test_data/counter.vcd` (11KB): primary small fixture (6 signals, 523 timestamps).
-- `.tools/` (gitignored): handwritten fixtures (x/z、glitch、dumpvars、alias、45-bit), vcd2fst binaries, old binaries for the diff gate.
-- `bench/data/` (gitignored): synthetic large waveforms (76MB / 11.5GB / 58.7GB), `bench/RESULTS.md` has the numbers.
+- **仓库里不放波形夹具**: 单元/集成测试用 `src/tests_fixtures.rs` 现场生成的合成波形;
+  需要真实大波形的门(FSDB↔VCD、性能)由环境变量开启, 没有样本时自动跳过。
+- `test_data/`、`bench/data/`、`.tools/` 都是 **gitignored** 的本地产物:
+  `test_data/` 已不存在(别引用), `bench/data/` 需要时用 `scripts/gen_big_vcd.py` 生成,
+  `.tools/` 放手工夹具(x/z、glitch、dumpvars、alias、45-bit)、vcd2fst 二进制与旧版二进制(语义门)。
+- 历史大样本(11.5GB / 58.7GB)已清理;数字与复现方法见 `bench/README.md` 与 `bench/RESULTS.md`。
 
 ## GitHub Release
 
+**不要再手敲发布命令** —— 用脚本(它会检查工作区/tag/CHANGELOG 并跑本地 CI):
+
 ```bash
-cargo zigbuild --release --target x86_64-unknown-linux-gnu.2.17
-gh release create <tag> --title "v0.x.x" target/x86_64-unknown-linux-gnu/release/wal-rust
+make release-dry VERSION=0.15.0   # 演练
+make release     VERSION=0.15.0   # 正式(改版本号 → CI → zigbuild → push → gh release)
+make dist                         # 只构建 glibc2.17 二进制, 不发布
 ```
 
 Binary requires glibc ≥ 2.17 (CentOS 7 / RHEL 7 / Ubuntu 16.04+ compatible).
-版本线: 0.13.x(0.13.0 已发布);pre-commit 钩子自动 bump 补丁号(**Cargo.toml 已暂存时不 bump**——版本变更与代码同 commit 提交)。
+版本线: 0.14.x —— **`Cargo.toml` 是唯一版本来源**, 发版走 `make release VERSION=x.y.z`(见 `CONTRIBUTING.md` §4);
+`.githooks/pre-commit` 自动 bump 补丁号(**Cargo.toml 已暂存时不 bump** —— 版本变更与代码同 commit 提交)。

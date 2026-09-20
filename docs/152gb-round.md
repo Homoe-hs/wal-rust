@@ -1,5 +1,8 @@
 # 152GB 大波形内测轮 — P0 修复记录
 
+> 📦 **复盘文档** —— 记录 152GB 大波形内测轮当时的问题与修法, 其中的路径/数字为当时状态, 不随代码更新。
+> 当前行为以 `query-engine-design.md` §1 与 `4-state-semantics.md` 为准。
+
 > 触发: 内测 152GB VCD + 对应 FST(585MB VCD 转换)。
 > 版本: P0-a 随 v0.11.14 发布;P0-b 分两次落地 — v0.11.15(读值语义统一)与 v0.11.16(扫描起点统一)。
 
@@ -163,7 +166,7 @@ error: FST 信号 t.d 的数据: Unexpected signal value: 0!defi。该 FST 值�
 | B14 | dumpvars 初值 → 首条变化 的跨界边丢失 | 新增 `Trace::defined_initial_value`:索引 0 的前驱 = **确定的** $dumpvars 初值(初值含 x/z 或后端无初值概念 → 仍无前驱)。变更列/逐拍/区间引擎三条路径统一。**修复** |
 | B6 | 未知信号静默退 0 | count/find/whenever 快路径与 `rising/falling/changes/is-x/is-z` 全部改为报错(`signal '…' not found`);顺带让这些谓词支持多 trace。**修复** |
 | B11 | .gz/.bz2 静默退化 | 加载前按 magic(1f 8b / BZh)明确报错"请先解压"。**修复** |
-| B8 | FSDB 直接 panic / 错误信息误导 | 按扩展名与 magic 识别 FSDB,给出"FSDB 暂不支持,请转 VCD/FST"的明确错误。**修复** |
+| B8 | FSDB 直接 panic / 错误信息误导 | 按扩展名与 magic 识别 FSDB,给出"FSDB 暂不支持,请转 VCD/FST"的明确错误。**当时已修复** ——⚠️ **本条与下面"FSDB 被拒绝"只适用于 ≤0.12.38;0.14.x 起 FSDB 已支持**(借 Verdi NPI 直读, 见 `docs/fsdb-npi.md`) |
 | 截断 VCD | 静默接受 | 缺少 `$enddefinitions` 时打印截断告警。**修复** |
 | B3 | `dump-trace` 写 `.fst` 名不副实 / 字符串值当位串写 / 时标用索引号 | `.fst` 路径明确拒绝;非波形值(字符串/闭包)跳过并告警;输出改用源波形真实时间戳。**修复** |
 | B4 | `(doc <符号>)` 报错、核心算子无文档 | `(doc sym)` 接受符号;补齐 get/at/rising/falling/changes/is-x/is-z/count/find/whenever/=/==/!=/&&/\|\|/not/div/help 等条目。**修复** |
@@ -192,7 +195,7 @@ x/z、dumpoff 窗口、`is-x`/`is-z`。
 **B. 深层宽信号**(30 层层次、每层 1024b 寄存器):`-c` 内联与脚本模式均为 0.01s
 (B9"脚本模式挂起"未复现;需要现场最小复现)。
 
-**FSDB**:VCS 直接产出的 `.fsdb` 被明确拒绝并提示转换(不再 panic)。
+**FSDB**(⚠️ **≤0.12.38 的现场**):VCS 直接产出的 `.fsdb` 被明确拒绝并提示转换(不再 panic)。**0.14.x 起 FSDB 已支持**。
 
 **注意**:VCS 的 `$dumpvars` 块写在 `#0` 之后且内容是 t=0 的**最终**值,因此
 "dumpvars 初值 ≠ #0 值"这种跨界边在 VCS 输出里不出现;B14 的修复仍按语义生效,

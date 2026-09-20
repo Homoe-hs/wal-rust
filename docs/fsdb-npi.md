@@ -1,5 +1,8 @@
 # FSDB 读取:借 Verdi 的 NPI,纯 Rust FFI
 
+> ✅ **现行设计 + 实测记录** —— FSDB 后端(借 Verdi NPI, 纯 Rust FFI)的设计、缓存策略与实测数字;
+> 多文件/缓存一致性规则见 §9。
+
 > 一句话:**FSDB 我们不猜格式,直接调用 Synopsys 正版 Verdi 的 NPI 读库**(`libNPI.so`);
 > 而调用方式是 `dlopen` + `dlsym` 手写 FFI —— **不需要 C++ 编译器,也不需要 fsdb2vcd 转换**。
 > 没有 Verdi 的机器上,FSDB 依旧是"明确报错 + 提示",VCD/FST 通路完全不受影响。
@@ -10,7 +13,7 @@
 |---|---|
 | **自己逆向 FSDB 二进制** | 不做。写者(FSDB 版本)一直在变,单变量差分成本极高,收益不确定 |
 | **fsdb2vcd 转换后再读** | 不做(用户明确否掉):多一次落盘、丢掉 FSDB 独有信息、还要外部工具 |
-| **FFR(`libnffr.so` + C++ 垫片)** | 做过并跑通(见 `src/trace/fsdb_shim/`),但要 C++ 编译链;产品通路改走 NPI |
+| **FFR(`libnffr.so` + C++ 垫片)** | 做过并跑通, 但要拖一条 C++ 编译链(垫片源码见历史提交 `b993d8c`);产品通路改走 NPI 纯 Rust FFI |
 | **NPI + 纯 Rust FFI** ✅ | 只需要目标机已装 Verdi;二进制里没有 C++ 依赖,运行期发现库、缺库优雅退化 |
 
 ## 2 纯 Rust 调 C++ 库:三个实测结论
@@ -214,8 +217,8 @@ worker 数**(每个 worker 一次 NPI 初始化 ~2s + 一个 Verdi 许可, 细�
 
 **实践建议**(与内网实测结论一致): FSDB 后端适合**中小波形、边沿/时间类查询、
 一次性全扫**; 大波形的高频随机 `find`/电平查询仍建议用 VCD/FST。
-下一步可做的是把时间线落盘缓存(对齐 VCD 的旁挂列缓存), 让"需要索引空间"的
-查询在第二次以后也变成毫秒级。
+> 注: 时间线/名字树落盘缓存**已在 0.14.3 落地**(见 §6.1), 上面这句是当时的状态描述。
+> 仍需付全文件扫描的只有"第一次冷查" —— 之后所有进程直接读 `.ftl`。
 
 ## 7 内网实测环境(2026-09-16)
 
@@ -229,9 +232,9 @@ worker 数**(每个 worker 一次 NPI 初始化 ~2s + 一个 Verdi 许可, 细�
 
 ## 8 已知限制 / 后续
 
-* 首次按索引查询要扫一遍**全文件**(算时间线),大 FSDB 上是主要成本;后续可落盘缓存
-  (对齐 VCD 的旁挂列缓存),或用 `npiFsdbSigdbCollector` + `npi_waveform_sigdb_open`
-  建列式索引库。
+* 首次按索引查询要扫一遍**全文件**(算时间线),大 FSDB 上是主要成本 —— **已有落盘缓存**
+  (`.ftl`/`.fnames`, 0.14.3 起, 见 §6.1),冷建可用 `WAL_FSDB_TL_JOBS` 并行;
+  更彻底的做法是 `npiFsdbSigdbCollector` + `npi_waveform_sigdb_open` 建列式索引库(未做)。
 * `FSDB_BT_VCD_REAL` 之类的 analog/real 值走 `format=RealVal` 兜底,尚未用真实 analog
   样本验证。
 * FSDB 版本比本机 reader 新时无法读取(实测 25A 写的 5.7,2018 的 reader 是 5.6 →

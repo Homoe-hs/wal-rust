@@ -1,11 +1,13 @@
-;; Simple WAL script to test waveform loading
-;; This script demonstrates basic WAL operations
+;; 最小冒烟脚本: 确认解释器能跑、算得对、退出码正常。
+;;
+;;   wal-rust test_samples/test_load.wal
+;;
+;; 说明(历史纠正): 加载波形早已实现 —— 命令行用 -l, 脚本里用 (load "x.vcd");
+;; 旧版注释里说的 'convert' 命令(VCD→FST)已经从核心移除, wal-rust 不做格式转换。
 
-(define test-name "test_10G")
-(print "Loading VCD file: " test-name)
-
-;; Load the waveform (this is a stub in current implementation)
-;; The actual VCD loading is done via the 'convert' command
-
-(print "Script loaded successfully")
-(print "Result: " (+ 1 2 3 4 5))
+(define test-name "smoke")
+(printf "test: %s\n" test-name)
+(printf "expr ok: %d\n" (+ 1 2 3 4 5))
+(printf "list ok: %s\n" (map (fn (x) (* x x)) (list 1 2 3)))
+(printf "string ok: %s\n" (string-append "a" "b"))
+(printf "Script loaded successfully\n")

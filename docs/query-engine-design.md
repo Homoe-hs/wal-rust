@@ -1,5 +1,8 @@
 # wal-rust 查询引擎设计(初版方案)
 
+> ✅ **现行设计** —— §1 的查询语义是**权威定义**(与 `4-state-semantics.md` 的四值口径配套);
+> 后续章节保留当初的方案与阶段表, 落地状态在文内标注。
+
 > 目标: **消灭"快路径/慢路径"分裂**,用一个统一引擎服务 count/find/whenever/
 > count-rise/at/change_points,并把任意表达式的查询性能做到与 `(= (get "sig") N)`
 > 同一量级(150GB 单表达式 ≤ 60s)。
@@ -39,7 +42,7 @@ fixtures ∈ {小(≤1k 拍), 大(≥300k 拍), 标量, 向量, x/z, 毛刺(delt
 
 ```
                ┌──────────────────────────────────────────────┐
-               │        QueryEngine  (src/query/)              │
+               │     QueryEngine (src/wal/eval/, interval_scan) │
                │  Expr(编译后表达式树) · IntervalSweep(区间扫描) │
                │  count/find/whenever/edge/at  — 全部入口        │
                └───────▲─────────────────────┬───────────────┘
@@ -186,12 +189,13 @@ pub enum Node {
 | `change_points`/`getwave`/`wave` | Column 变更列表 + 初值 |
 | `save/CSV` | 列 + 区间展开(现状保留,输出层) |
 
-## 4. 4-state 比较语义(明确写入文档)
+## 4. 4-state 比较语义
 
-- `=`/`!=`:两侧都纯 bit 字符串(无 x/z)→ 按整数比;含 x/z → 位串比,任何 x/z 位
-  相异即不等(`x` ≠ `0` ≠ `1` ≠ `z` 的全序按位串 lexical)。
-- 真值: `0`/`x`/`z` → false;`1`/非零 → true(与 0.11.x 现状一致)。
-- Rising/Falling 只认 0↔1;Changed = 语义相等比较(全 x = x)。
+**权威定义在 [`4-state-semantics.md`](4-state-semantics.md)**(本节不再重复, 避免两处不一致)。
+摘要: `=`/`!=` 在含 x/z 时按位串比(任一 x/z 位相异即不等);真值为假的是 `#f`/`0`/`()`(注意 **`x` 不是假值**,
+它是"未知", 与 0 的关系是不相等);Rising/Falling 只认 0↔1, Changed 按语义相等(全 x = x)。
+> 历史注: 本文早期版本写的"`0`/`x`/`z` → false"与实现不符(实现在 `src/wal/ast/value.rs::is_truthy`),
+> 已按权威文档改正。
 
 ## 5. 落地阶段
 
@@ -202,14 +206,17 @@ pub enum Node {
 | P3 | Expr 编译 + IntervalSweep;`count`/`find` 切换到引擎 | diff gate(scripts/diff_find.sh)ALL MATCH + 矩阵全绿 |
 | **P3 ✅ 已落地(0.12.x)** | **实现变体**: 不另写表达式编译器,而是"同一解释器 + 信号值覆盖"——`interval_scan` 收集引用信号,取变更点并集为边界,在边界处给 `op_get`/边沿谓词安装值覆盖后调用**现有解释器**求值;无边缘谓词按区间长度计入,含边缘谓词只计边界。`count`/`find` 回退前先试引擎。矩阵用例 `matrix_interval_engine_equals_oracle` 全绿 |
 | **P4 ✅ 已落地(0.12.x)** | whenever/`count/step`/`find/step`/`at` 收敛到引擎(count/find/whenever/step 四个入口同一实现) | 矩阵 20/20 全绿(含子进程独立 oracle) |
-| P5 | 批量向量化 + SIMD 行解析 + 并行 | 150GB 任意表达式 ≤60s;RSS ≤3GB |
-| P6 | 删除旧 FindCondition 匹配路径(仅保留 CLI/导出视图) | 无死代码;矩阵绿 |
+| P5 ⏳ **未落地** | 批量向量化 + SIMD 行解析 | 部分达成: 并行分块/`memchr` 已有, 绝对秒数见 README「性能」;SIMD 未做 |
+| P6 ⏳ **未落地** | 删除旧 `FindCondition` 匹配路径(仅保留 CLI/导出视图) | `FindCondition` 仍在 `src/trace/trace.rs`;`Trace::columns()` 也没引入(`grep -rn 'fn columns' src/trace/` 为空) |
 
 每阶段独立可发布;P1-P3 是主体(正确性),P5 是性能冲刺。
 
 ## 6. 风险与对策
 
-- **初值快照($dumpvars)** 现 VCD 读器未捕获(B11: 初值 0 丢) → P2 在
+- ~~**初值快照($dumpvars)** 现 VCD 读器未捕获(B11: 初值 0 丢)~~ → **已解决**(0.13.x: load 只读文件头时抓
+  `$dumpvars` 初值快照, 矩阵用例 `matrix_dumpvars_initial`/`matrix_dumpvars_first_edge_at_index_zero` 冻结)。
+  原始条目保留在下方仅作记录:
+- **初值快照($dumpvars)** 当时 VCD 读器未捕获(B11: 初值 0 丢) → P2 在
   头解析时读取 dumpvars 块,存 per-signal initial。
 - **索引域偏移**:FST 时间表可能与 VCD 的 #T 列表差 1 位(§8.4 内测现象,
   取决于转换器)→ P1 明确"以 VCD #T 顺序为准"的索引定义;FST 列按时间值对齐

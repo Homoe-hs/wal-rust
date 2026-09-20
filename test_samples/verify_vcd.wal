@@ -1,33 +1,25 @@
-;; VCD format validation script
-;; Usage: wal-rust run verify_vcd.wal -l <vcd_file>
+;; VCD/FST/FSDB 加载自检 —— 波形用 -l 预先加载, 脚本不假设文件路径。
+;;
+;;   wal-rust run -l design.vcd test_samples/verify_vcd.wal
+;;
+;; 用途: 确认波形能读到、名字/索引/取值口径正常(无 error 即通过)。
+;; 口径提醒: 特殊变量只认大写形式;按索引取值用 (sample-at s i),
+;;           取列表元素用 (first l) / (take n l)(没有 (get l i) 这种形式)。
 
-(define fname (trace-name 0))
-(print "Loaded: " fname)
+(printf "波形: %s\n" (TRACE-FILE))
+(printf "信号数: %d\n" (length (SIGNALS)))
+(printf "最大索引: %d\n" (MAX-INDEX))
+(printf "当前索引: %d\n" (INDEX))
+(printf "前 10 个信号: %s\n" (take 10 (SIGNALS)))
 
-;; Check signal count
-(let ((sigs (signals)))
-  (print "Signals: " (length sigs))
-  (print "First 10 signals:"))
-(dotimes (i (min 10 (length (signals))))
-  (print "  " (index (signals) i)))
+(define mid (/ (MAX-INDEX) 2))
+(printf "\n抽样(索引 0 / %d / %d):\n" mid (MAX-INDEX))
+(define (sample-line s)
+  (printf "  %s: [0]=%s [mid]=%s [max]=%s\n"
+          s (sample-at s 0) (sample-at s mid) (sample-at s (MAX-INDEX))))
+(map sample-line (take 5 (SIGNALS)))
 
-;; Check timestamp range
-(print "Max index: " (max-index))
-(print "Index 0 timestamp: " (ts 0))
-(print "Index " (max-index) " timestamp: " (ts (max-index)))
-
-;; Sample a few signals at random timestamps
-(let ((mid (/ (max-index) 2)))
-  (print "")
-  (print "=== Sampling signal values ===")
-  (print "counter at 0: " (get counter 0))
-  (print "counter at " mid ": " (get counter mid))
-  (print "counter at " (max-index) ": " (get counter (max-index)))
-  (print "strobe at 0: " (get strobe 0))
-  (print "strobe at 999: " (get strobe 999))
-  (print "strobe at 1000: " (get strobe 1000))
-  (print "sig0 at 0: " (get sig0 0))
-  (print "sig0 at 1: " (get sig0 1)))
-
-(print "")
-(print "=== VCD validation PASSED ===")
+(define s0 (first (SIGNALS)))
+(printf "\n信号 %s 的前 3 个变更点: %s\n" s0 (take 3 (getwave s0)))
+(printf "信号 %s 的初值: %s\n" s0 (get s0))
+(printf "\n=== 自检完成(无 error 即正常) ===\n")
