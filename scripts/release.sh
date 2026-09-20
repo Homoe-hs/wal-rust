@@ -38,6 +38,8 @@ done
 say() { printf '\033[1m==> %s\033[0m\n' "$*"; }
 die() { printf '\033[31m!! %s\033[0m\n' "$*" >&2; exit 1; }
 
+# 发布流程自己已经跑过完整 CI, 没必要再让 pre-push 钩子重复检查/拦人
+export WAL_SKIP_PREPUSH=1
 export CARGO_HOME="${CARGO_HOME:-$REPO_ROOT/.cargo-home}"
 export XDG_CACHE_HOME="${XDG_CACHE_HOME:-$REPO_ROOT/.tools/cache}"
 ZIG_DIR="$REPO_ROOT/.tools/zig-linux-x86_64-0.13.0"

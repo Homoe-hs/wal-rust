@@ -13,18 +13,23 @@ if command -v python3 >/dev/null; then
     python3 scripts/check_docs.py || rc=1
 fi
 
+# 格式检查是**提示级**: 本仓库还没做过全仓 rustfmt(约 2000 处历史差异),
+# 只要改了老文件就会被点名 —— 硬拦会挡住正常提交。收敛计划见 rustfmt.toml。
+# 想让它变成硬门: WAL_PREPUSH_FMT_STRICT=1 git push
+
 # 只对本次推送涉及的文件做格式检查(避免全仓 2000 处历史差异刷屏)
 base=$(git merge-base HEAD @{u} 2>/dev/null || echo "")
 if [ -n "$base" ]; then
     changed=$(git diff --name-only "$base"..HEAD -- '*.rs' | head -20)
     if [ -n "$changed" ]; then
         # shellcheck disable=SC2086
-        if ! cargo fmt --check -- $changed >/dev/null 2>&1; then
-            echo "pre-push: 以下文件格式不合规(请 cargo fmt -- <file>):"
-            echo "$changed" | while read -r f; do
-                cargo fmt --check -- "$f" >/dev/null 2>&1 || echo "  $f"
-            done
-            rc=1
+        bad=$(echo "$changed" | while read -r f; do
+                  cargo fmt --check -- "$f" >/dev/null 2>&1 || echo "$f"
+              done)
+        if [ -n "$bad" ]; then
+            echo "pre-push: 以下文件格式与 rustfmt 不一致(建议 cargo fmt -- <file>):"
+            echo "$bad" | sed 's/^/  /'
+            [ "${WAL_PREPUSH_FMT_STRICT:-0}" = "1" ] && rc=1
         fi
     fi
 fi
