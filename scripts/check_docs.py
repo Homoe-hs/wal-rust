@@ -45,6 +45,9 @@ ALLOW_PATTERNS = [
     r"^[A-Za-z]:[/\\]",      # Windows 路径
 ]
 
+# 这些文档天然会提到"已经不存在的路径"(变更日志/迁移说明), 不做路径存在性检查
+SKIP_PATH_CHECK = {"CHANGELOG.md"}
+
 # 面向"当前用户"的文档: 这里出现旧版本号 = 会误导使用者
 CURRENT_FACING = ["README.md", "AGENTS.md", "CONTRIBUTING.md", "docs/README.md"]
 # 历史复盘类文档: 允许出现旧版本号
@@ -98,6 +101,8 @@ def is_historical(doc: Path) -> bool:
 def check_paths(docs: list[Path]) -> None:
     """A. 反引号路径 + 相对链接必须存在(跳过围栏代码块与行内代码里的命令)。"""
     for doc in docs:
+        if doc.name in SKIP_PATH_CHECK:
+            continue
         lines = doc.read_text(encoding="utf-8").splitlines()
         stale_only = is_historical(doc)
         in_fence = False
