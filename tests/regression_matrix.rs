@@ -1403,6 +1403,73 @@ fn matrix_multitrace_index_space_follows_query() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// 源码里带 `%` 时不能把非 ASCII 字符搞乱 —— `%` 归一化(`%` → `mod `)曾经逐字节
+/// `push(b as char)`, 把 UTF-8 中文双重编码成 Latin-1。
+///
+/// 真实症状: `(printf "信号: %s\n" "x")` 打印 `ä¿¡å·: x`;而**不带 `%` 的中文正常**,
+/// 所以只有"中文 + 格式串"才会踩到。同源问题: `(length "信号 %s")` 应 9 却给 15。
+#[test]
+fn matrix_percent_normalize_keeps_utf8() {
+    let bin = env!("CARGO_BIN_EXE_wal-rust");
+    let run = |e: &str| -> (bool, String) {
+        let out = std::process::Command::new(bin)
+            .arg(e).env("WAL_CACHE", "off").output().expect("spawn wal-rust");
+        (out.status.success(), String::from_utf8_lossy(&out.stdout).to_string())
+    };
+    // 字节数: "信号" 6 + " " 1 + "%s" 2 = 9;曾经是 15(6 字节被拉丁化后变 12)
+    let (ok, got) = run("(length \"信号 %s\")");
+    assert!(ok && got.trim() == "=> 9", "带 % 的中文字面量被重编码了: {}", got.trim());
+    // 格式化输出里中文必须原样
+    let (ok, got) = run("(printf \"信号: %s\\n\" 42)");
+    // 注意: printf 的 %s 会把字符串值带上引号, 所以这里用数字参数
+    assert!(ok && got.starts_with("信号: 42"), "printf 中文乱码: {:?}", got);
+    // `%` 作为取模仍然归一化, 且与 (mod ...) 等价
+    let (_, a) = run("(% 7 3)");
+    let (_, b) = run("(mod 7 3)");
+    assert_eq!(a.trim(), "=> 1");
+    assert_eq!(a, b);
+    // 字符串里的 % 不被当成取模; %% 仍是字面 %
+    let (ok, got) = run("(printf \"进度 100%% 完成\\n\")");
+    assert!(ok && got.contains("进度 100% 完成"), "%% 处理不对: {:?}", got);
+}
+
+/// `(slice x start end)` 在 `start >= end` 时必须给空结果 —— 不能 panic、也不能取错值。
+///
+/// 真实 crash: `(slice (list 0 1 2 3 4 5 6 7) 3 0)` → `src/wal/builtins/special.rs` 里
+/// `lst.0[3..0]` 直接 panic(slice index starts at 3 but ends at 0);字符串分支则错取
+/// 了 `skip(3).take(0-3 下溢的巨数)` → "lo"。这类"参数顺序写反"是使用者最容易犯的错,
+/// 工具必须给空结果或明确报错, 不能崩。
+#[test]
+fn matrix_slice_reversed_range_is_empty() {
+    let bin = env!("CARGO_BIN_EXE_wal-rust");
+    let eval = |e: &str| -> (bool, String) {
+        let out = std::process::Command::new(bin)
+            .arg(e).env("WAL_CACHE", "off").output().expect("spawn wal-rust");
+        (out.status.success(), String::from_utf8_lossy(&out.stdout).trim().to_string())
+    };
+    // 空区间 → 空
+    for (expr, want) in [
+        ("(slice (list 0 1 2 3 4 5 6 7) 3 0)", "=> ()"),
+        ("(slice (list 0 1 2 3) 2 2)", "=> ()"),
+        ("(slice \"hello\" 3 1)", "=> \"\""),
+        ("(slice (list 0 1 2 3) 9 12)", "=> ()"),
+    ] {
+        let (ok, got) = eval(expr);
+        assert!(ok, "不该失败/崩溃: {}", expr);
+        assert_eq!(got, want, "{}", expr);
+    }
+    // 正常区间不受影响
+    for (expr, want) in [
+        ("(slice (list 0 1 2 3) 1 3)", "=> (1 2)"),
+        ("(slice \"hello\" 1 3)", "=> \"el\""),
+        ("(slice \"hello\" 1)", "=> \"e\""),
+    ] {
+        let (ok, got) = eval(expr);
+        assert!(ok, "不该失败: {}", expr);
+        assert_eq!(got, want, "{}", expr);
+    }
+}
+
 /// 缓存落盘撞上 `ulimit -f`(或磁盘满)时, **不能**被杀进程: SIGXFSZ 默认处置是
 /// terminate+core, 用户看到的是 "查个波形 rc=153, 还掉了个 core"。缓存只是加速
 /// 手段 —— 必须降级为"不写缓存", 结果照出, 退出码 0, stderr 提示一次(内网 #50)。

@@ -215,7 +215,11 @@ fn op_slice(args: &[Value], _env: &mut Environment, eval: &mut Evaluator) -> Res
             Value::String(s) => {
                 let start = idx1.max(0) as usize;
                 let end = idx2.max(0) as usize;
-                if start >= s.len() {
+                // 空区间(start >= end)与越界一样返回空 —— 曾经漏了 `end <= start`,
+                // 于是 `(slice "hello" 3 1)` 取到 "lo"(错), 列表分支更会直接
+                // panic(`lst.0[3..0]`, 见 tests/regression_matrix.rs 的
+                // matrix_slice_reversed_range_is_empty)。
+                if start >= s.len() || end <= start {
                     return Ok(Value::String(String::new()));
                 }
                 let end = end.min(s.len());
@@ -224,7 +228,7 @@ fn op_slice(args: &[Value], _env: &mut Environment, eval: &mut Evaluator) -> Res
             Value::List(lst) => {
                 let start = idx1.max(0) as usize;
                 let end = idx2.max(0) as usize;
-                if start >= lst.len() {
+                if start >= lst.len() || end <= start {
                     return Ok(Value::List(WList::new()));
                 }
                 let end = end.min(lst.len());

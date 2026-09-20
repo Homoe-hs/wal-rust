@@ -1,14 +1,21 @@
 [package]
 name = "wal-rust"
-version = "0.14.9"
-authors = ["He Sheng && Deepseek"]
+version = "0.14.10"
+authors = ["He Sheng"]
 edition = "2021"
 rust-version = "1.90"
-description = "WAL: Waveform Analysis Language - High-performance parser, REPL, and waveform tools"
+description = "WAL: Waveform Analysis Language — high-performance CLI/REPL for querying VCD/FST/FSDB waveforms"
 license = "MIT OR Apache-2.0"
-repository = ""
-keywords = ["wal", "vcd", "fst", "waveform", "verilog", "eda"]
+readme = "README.md"
+repository = "https://github.com/Homoe-hs/wal-rust"
+homepage = "https://github.com/Homoe-hs/wal-rust"
+documentation = "https://github.com/Homoe-hs/wal-rust/tree/main/docs"
+keywords = ["wal", "vcd", "fst", "fsdb", "waveform", "verilog", "eda"]
 categories = ["command-line-utilities", "hardware"]
+# 默认 run 的目标(有 lib 时 cargo run 需要它)
+default-run = "wal-rust"
+# 打包上 crates.io 时排除本地/历史资产(体积与隐私)
+exclude = ["docs/history/", "test_samples/", "bench/"]
 
 [dependencies]
 # CLI
