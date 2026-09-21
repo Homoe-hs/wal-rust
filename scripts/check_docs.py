@@ -187,10 +187,12 @@ def check_versions(docs: list[Path], cur: tuple[int, int, int]) -> None:
                 continue
             for m in VERSION_RE.finditer(line):
                 v = (int(m.group(1)), int(m.group(2)), int(m.group(3)))
-                if v < cur[:2] + (0,):
-                                    warnings.append(
-                        f"{rel(doc)}:{i}: 提到版本 {'.'.join(map(str, v))}"
-                        f"(当前 {'.'.join(map(str, cur))})—— 历史说明可以留, 但别写成「当前版本」"
+                # 「当前版本」这类声明必须与 Cargo.toml **完全一致**(patch 级也要)。
+                # 曾只比到 minor → README 首页的 0.14.9 在 Cargo 到 0.14.17 之后还挂着。
+                if v != cur:
+                    errors.append(
+                        f"{rel(doc)}:{i}: 「当前版本」写着 {'.'.join(map(str, v))}"
+                        f", 但 Cargo.toml 是 {'.'.join(map(str, cur))}"
                     )
 
 

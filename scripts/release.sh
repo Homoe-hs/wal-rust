@@ -52,6 +52,11 @@ if [ -n "$VERSION" ] && [ "$VERSION" != "$CFG_VERSION" ]; then
     say "把 Cargo.toml 版本改为 $VERSION(原 $CFG_VERSION)"
     if [ $DRY -eq 0 ]; then
         sed -i "s/^version = \"$CFG_VERSION\"/version = \"$VERSION\"/" Cargo.toml
+        # README 首页的"当前版本"是同一条事实的另一处表述, 必须一起改
+        if [ -f README.md ] && grep -q '| 当前版本 |' README.md; then
+            sed -i "s/| 当前版本 | \*\*[0-9][0-9.]*\*\* /| 当前版本 | **$VERSION** /" README.md
+            git add README.md
+        fi
         git add Cargo.toml
         git commit -q -m "chore(release): v$VERSION" || die "提交版本号失败"
     fi

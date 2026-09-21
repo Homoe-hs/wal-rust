@@ -41,4 +41,11 @@ if [ -f "$(git rev-parse --show-toplevel)/Cargo.lock" ] && command -v cargo >/de
     ( cd "$(git rev-parse --show-toplevel)" && cargo metadata --format-version 1 >/dev/null 2>&1 || true )
     git add Cargo.lock 2>/dev/null || true
 fi
+# README 首页写着"当前版本" —— 它也必须在同一次提交里跟着走, 否则
+# scripts/check_docs.py 的版本一致性检查会立刻失败(而且很容易被忽略)。
+README="$(git rev-parse --show-toplevel)/README.md"
+if [ -f "$README" ] && grep -q '| 当前版本 |' "$README"; then
+    sed -i "s/| 当前版本 | \*\*[0-9][0-9.]*\*\* /| 当前版本 | **$NEW** /" "$README"
+    git add README.md
+fi
 echo "auto-bump: wal-rust $VER -> $NEW"

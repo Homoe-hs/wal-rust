@@ -154,14 +154,17 @@ stage_gates() {
     else
         echo "跳过旧版语义门(无 .tools/wal-rust.old)"
     fi
-    # 4) FSDB↔VCD 同源差分门: 需要 Verdi/NPI + 一对同源波形, 否则跳过
+    # 4) FSDB↔VCD 同源差分门: 需要 Verdi/NPI + 一对同源波形。
+    #    这两个测试标了 #[ignore], 所以"没 Verdi"时在测试统计里如实显示为 ignored
+    #    (以前是静默 return → 报 5 passed, 造成"门禁跑过"的假象)。
+    cargo test --release --test fsdb_diff 2>&1 | tail -2 || rc=1
     if [ -n "${WAL_FSDB_TEST_FILE:-}" ] && [ -n "${WAL_FSDB_TEST_VCD:-}" ]; then
-        cargo test --release --test fsdb_diff -- --nocapture 2>&1 | tail -4 || rc=1
+        echo "Verdi 样本已提供 → 跑被 ignore 的 FSDB↔VCD 差分门"
+        cargo test --release --test fsdb_diff -- --include-ignored --nocapture 2>&1 | tail -6 || rc=1
     else
-        echo "跳过 FSDB↔VCD 差分门(未设 WAL_FSDB_TEST_FILE/WAL_FSDB_TEST_VCD)"
-        echo "  Verdi 环境: export VERDI_HOME=... SNPSLMD_LICENSE_FILE=... ;"
-        echo "              WAL_FSDB_TEST_FILE=design.fsdb WAL_FSDB_TEST_VCD=design.vcd make gates"
-        bash scripts/ci.sh --only docs >/dev/null 2>&1 || true
+        echo "FSDB↔VCD 差分门未跑(未设 WAL_FSDB_TEST_FILE/WAL_FSDB_TEST_VCD): 上面应显示 ignored, 不是 passed"
+        echo "  跑法: export VERDI_HOME=... SNPSLMD_LICENSE_FILE=... ;"
+        echo "        WAL_FSDB_TEST_FILE=design.fsdb WAL_FSDB_TEST_VCD=design.vcd make gates"
     fi
     return $rc
 }

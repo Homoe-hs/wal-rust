@@ -1,25 +1,34 @@
-;; VCD/FST/FSDB 加载自检 —— 波形用 -l 预先加载, 脚本不假设文件路径。
+;; 波形加载**断言式**自检 —— 任何一条不成立就退出码 1(不是"打印了事")。
 ;;
-;;   wal-rust run -l design.vcd test_samples/verify_vcd.wal
+;;   wal-rust run -l design.vcd test_samples/verify_vcd.wal ; echo "rc=$?"
 ;;
-;; 用途: 确认波形能读到、名字/索引/取值口径正常(无 error 即通过)。
-;; 口径提醒: 特殊变量只认大写形式;按索引取值用 (sample-at s i),
-;;           取列表元素用 (first l) / (take n l)(没有 (get l i) 这种形式)。
+;; 与之前版本的区别: 之前只 printf 结果、不看对错, 于是 `(nil nil nil)`、浮点索引
+;; 被静默截断这类问题都能"通过"。现在每条检查都会判定, 失败即 `exit 1`。
+;; 口径提醒: 特殊变量只认大写;取列表元素用 (first l);整数除法用 (div a b)。
+
+(define sigs (SIGNALS))
+(define n (length sigs))
+(define mx (MAX-INDEX))
+(define s0 (first sigs))
+(define mid (div mx 2))
 
 (printf "波形: %s\n" (TRACE-FILE))
-(printf "信号数: %d\n" (length (SIGNALS)))
-(printf "最大索引: %d\n" (MAX-INDEX))
-(printf "当前索引: %d\n" (INDEX))
-(printf "前 10 个信号: %s\n" (take 10 (SIGNALS)))
+(printf "信号数: %d, 最大索引: %d, 中途索引: %d\n" n mx mid)
 
-(define mid (/ (MAX-INDEX) 2))
-(printf "\n抽样(索引 0 / %d / %d):\n" mid (MAX-INDEX))
-(define (sample-line s)
-  (printf "  %s: [0]=%s [mid]=%s [max]=%s\n"
-          s (sample-at s 0) (sample-at s mid) (sample-at s (MAX-INDEX))))
-(map sample-line (take 5 (SIGNALS)))
+;; check: 条件为假 → 打印 FAIL 并以 1 退出
+(defmacro check (name cond)
+  `(if ,cond
+       (printf "  ok   %s\n" ,name)
+       (do (printf "  FAIL %s\n" ,name) (exit 1))))
 
-(define s0 (first (SIGNALS)))
-(printf "\n信号 %s 的前 3 个变更点: %s\n" s0 (take 3 (getwave s0)))
-(printf "信号 %s 的初值: %s\n" s0 (get s0))
-(printf "\n=== 自检完成(无 error 即正常) ===\n")
+(check "至少有一个信号"          (> n 0))
+(check "波形名非空"              (> (length (TRACE-FILE)) 0))
+(check "最大索引 >= 0"           (>= mx 0))
+(check "信号宽度 >= 1"           (>= (signal-width s0) 1))
+(check "索引 0 的 (get) == (sample-at 0)" (= (sample-at s0 0) (get s0)))
+(check "(sample-at mid) 有值"    (not (null? (sample-at s0 mid))))
+(check "(sample-at MAX) 有值"    (not (null? (sample-at s0 mx))))
+(check "变更点列表是列表"        (list? (getwave s0)))
+(check "索引越界返回 nil"        (null? (sample-at s0 (+ mx 1000000))))
+
+(printf "== 自检通过: %d 项 ==\n" 9)

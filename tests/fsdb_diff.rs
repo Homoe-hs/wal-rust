@@ -19,7 +19,12 @@ fn env_or_skip(k: &str) -> Option<String> {
     match std::env::var(k) {
         Ok(v) if !v.is_empty() => Some(v),
         _ => {
-            eprintln!("skip: 未设置 {} (本测试需要 Verdi/NPI + 同源波形对)", k);
+            eprintln!(
+                "ignored: 未设置 {} —— 本测试需要 Verdi/NPI + 同源波形对;\n  \
+                 要真正跑它: WAL_FSDB_TEST_FILE=x.fsdb WAL_FSDB_TEST_VCD=x.vcd \\\n  \
+                 cargo test --release --test fsdb_diff -- --include-ignored",
+                k
+            );
             None
         }
     }
@@ -40,6 +45,7 @@ fn norm(name: &str) -> String {
 /// 都要重付一遍全文件扫描(时间线)。本测试在临时目录里 chdir + 相对路径加载,
 /// 断言缓存目录非空。(VM 实测: 修复前 files= 空, 修复后 .fnames 落盘。)
 #[test]
+#[ignore = "需要 Verdi/NPI(libNPI.so)+ 同源 FSDB: 用 --include-ignored 跑(见 scripts/ci.sh gates)"]
 fn fsdb_cache_written_for_relative_path() {
     use std::sync::Mutex;
     static CWD_LOCK: Mutex<()> = Mutex::new(());
@@ -81,6 +87,7 @@ fn fsdb_cache_written_for_relative_path() {
 }
 
 #[test]
+#[ignore = "需要 Verdi/NPI + 同源 FSDB/VCD 对: 用 --include-ignored 跑(见 scripts/ci.sh gates)"]
 fn fsdb_matches_vcd_when_available() {
     let fsdb = match env_or_skip("WAL_FSDB_TEST_FILE") {
         Some(v) => v,
