@@ -45,7 +45,10 @@ Flags: `-l <waveform>` (repeatable), `-c <code>` (inline override), `--halt-on-e
 
 ## Architecture notes
 
-- **tree-sitter parser**: `tree-sitter-wal/build.rs` 调 tree-sitter CLI 生成 `src/parser.c` 再用 `cc` 编译(该文件是**构建产物, 不入库**;仓库根目录下没有同名脚本)。首次构建会编 C。
+- **tree-sitter parser**: `tree-sitter-wal/build.rs` 用 `cc` 编译 `tree-sitter-wal/src/parser.c`;
+  该文件**入库**(与 `grammar.js` 一起提交, 否则干净 clone/build.rs 直接失败)。
+  **改语法必须重新生成**: 见 `tree-sitter-wal/README.md`(`tree-sitter generate` + CLI 版本固定 + 提交生成物)。
+  ⚠️ `token(...)` 里不能引用规则(`$.base_symbol`), 只能内联正则 —— 所以字符类提取成 `BASE_SYMBOL_RE` 共用。
 - **FST read backend**: wellen (`wellen::simple::read` in `src/trace/fst.rs`); legacy hand-rolled reader retired (writer stays: `src/fst/writer.rs`).
 - **FSDB read backend**: `src/trace/fsdb.rs` —— 运行期 `dlopen` Synopsys NPI(`libNPI.so`)+
   Itanium mangled 符号,纯 Rust FFI,无 C++ 垫片。只用 `npiFsdbTimeBasedVcIter`(用过后
@@ -62,6 +65,16 @@ Flags: `-l <waveform>` (repeatable), `-c <code>` (inline override), `--halt-on-e
   合并出来的既不是这条也不是那条(实测 `-l s1 -l s2` 同名信号答出 s2 的数);
   所有取值/取索引路径统一 first-match。逐拍(`step_scan`)与统一引擎必须用同一规则;
   `INDEX`/`TS` 读"正在被推进的那条 trace"(`Evaluator::scan_trace`)。
+- **CLI 多顶层形式 = `(list ...)`**: `parse_expr` 把"一个参数里写多个顶层形式"包成 `(list form1 form2 ...)`
+  (求值顺序 = 书写顺序, 结果回显各形式的值)。**绝不能**让它以裸列表进 `eval_list` —— 那里的 IIFE 分支
+  会在首元素求值成 Closure/Macro 时把其余顶层形式当成它的实参, 于是
+  `(define add5 ((fn (n) (fn (x) (+ x n))) 5)) (add5 3)` 静默答 13、`defun` 返回闭包报 Arity error、
+  `(twice (print …))` 打印 4 次。回归: `matrix_cli_multiform_program_forms`。
+- **词法边界不能靠"最长前缀"**: `#t`/`#f` 是关键字, 但 `#name` 是合法的分组符号 ——
+  若 `grouped_symbol` 写成 `seq("#", $.base_symbol)`(两个 token), 词法器先匹配到 `#` 就输给 `#t`,
+  于是 `#timeout` 被拆成 `#t` + `imeout`(报错指到 `imeout`)。现在 `grouped_symbol` 是**单 token**,
+  按最长匹配赢过 `#t`;`#t` 单独出现时仍是布尔。回归: `matrix_lexer_scientific_and_sharp_symbols`。
+- **索引参数不许静默截断**: `(sample-at s 4.5)` 曾经取索引 4 的值(静默错值), 现在明确报"必须是整数"。
 - **缓存 key 必须含 ctime+inode**: `trace::vcd::file_identity`(basename+len+mtime+ctime+inode)
   —— 只按 size+mtime 会漏掉"同一秒内等长改写"(脚本反复生成同名波形是常态), 而首尾 64KB
   指纹拦不住中段改动; ctime 用户改不回去。`.wcol`/`.cols`/`.fnames`/`.ftl` 统一用它。

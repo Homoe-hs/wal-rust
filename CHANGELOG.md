@@ -11,6 +11,27 @@
 
 ## [未发布]
 
+### Fixed
+- **CLI 一次性表达式里"多顶层形式"被当成函数调用(静默错值)**: `parse_expr` 把程序交给
+  `eval_list` 时, 若首元素求值成 Closure/Macro 就走 IIFE 分支、把其余顶层形式当作实参 ——
+  `(define add5 ((fn (n) (fn (x) (+ x n))) 5)) (add5 3)` 答 **13**(应为 8);
+  `defun` 返回闭包报 Arity error;`(twice (print "hi"))` 打印 **4** 次(应 2 次);
+  `macroexpand` 会连带求值。现在多顶层形式显式包成 `(list ...)`, 按书写顺序求值。
+  (脚本模式与 `--stdin` 逐条求值本来就不受影响, 所以只在"命令行一把梭"时踩到。)
+  回归: `matrix_cli_multiform_program_forms`。
+- **词法**: `1e3` / `1.5e3` / `1.5E-3` 等科学计数法现在被识别(此前拆成 `1` + 符号 `e3`,
+  报 "Undefined symbol: e3");`#timeout`(合法分组符号 `#name`)不再被拆成 `#t` + `imeout`
+  (此前报 "Undefined symbol: imeout"), 找不到组时给明确语义错误。
+  回归: `matrix_lexer_scientific_and_sharp_symbols`。
+- **`(sample-at s idx)` 浮点索引不再静默截断**: `(sample-at s 4.5)` 曾取索引 4 的值, 现在明确报错
+  (整数除法用 `(div a b)`)。回归: `matrix_sample_at_rejects_float_index`。
+
+### Changed
+- `test_samples/verify_vcd.wal` 从"只打印不断言"改为**断言式**自检: 9 项检查, 任一不成立即退出码 1。
+- `tests/fsdb_diff.rs` 的两个 Verdi 门改为 `#[ignore = "需要 Verdi/NPI…"]`: 没 Verdi 时如实显示
+  `ignored` 而不是"5 passed"(以前是静默 return, 造成门禁跑过的假象);有样本时
+  `make gates` 会自动 `--include-ignored` 真跑。
+
 ### Added
 - (下一次发版前在这里写;分类见文件头)
 
