@@ -131,7 +131,7 @@ fn op_print(args: &[Value], _env: &mut Environment, _eval: &mut Evaluator) -> Re
     Ok(Value::Nil)
 }
 
-fn op_printf(args: &[Value], _env: &mut Environment, eval: &mut Evaluator) -> Result<Value, String> {
+fn op_printf(args: &[Value], _env: &mut Environment, _eval: &mut Evaluator) -> Result<Value, String> {
     ensure_arity_atleast(args, 1)?;
     let fmt = extract_string(&args[0])?;
     let mut evaluated = Vec::new();

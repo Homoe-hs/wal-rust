@@ -922,6 +922,7 @@ fn op_trim_trace(args: &[Value], _env: &mut Environment, _eval: &mut Evaluator) 
 // (rising "sig") (falling "sig") (is-x "sig") (is-z "sig") (changes "sig")
 // Used inside count/find/whenever conditions; evaluate at the current INDEX.
 
+#[allow(dead_code)] // 参考实现: 逐拍风格的单信号边沿取值(现走 parse_edge_condition)
 fn edge_value(name: &str, env: &mut Environment) -> Result<Option<(Option<u8>, Option<u8>)>, String> {
     if let Some(traces) = env.get_traces() {
         let traces = traces.read().unwrap_or_else(|e| e.into_inner());

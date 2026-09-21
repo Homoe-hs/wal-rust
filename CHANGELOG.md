@@ -27,6 +27,9 @@
 - `--help` 里 "125 named operators" 更正为 146(实际注册数), 并加单元测试守门:
   帮助文案与注册表不一致就红。
 - 文档门禁的测试数口径改为 cargo 口径(`2×单元 + 集成`), 不再把 295 误报成 223。
+- `cargo build --release` **零告警**(此前 37 条): 清掉未用 import/赋值与死代码,
+  旧的手写 FST 读器(`src/fst/reader.rs`, 查询路径已改用 wellen)整体标注 `#![allow(dead_code)]`
+  并说明保留原因, 不再淹没真实告警。
 
 ### Changed
 - **CLI 一次性表达式里"多顶层形式"被当成函数调用(静默错值)**: `parse_expr` 把程序交给

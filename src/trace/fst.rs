@@ -239,7 +239,7 @@ impl FstTrace {
             .map_err(|e| format!("Failed to read FST file {}: {}", filename, e))?;
 
         let timestamps: Vec<u64> = wf.time_table().to_vec();
-        let max_index = if timestamps.is_empty() { 0 } else { timestamps.len() - 1 };
+        let _max_index = if timestamps.is_empty() { 0 } else { timestamps.len() - 1 };
 
         let mut name_to_ref: HashMap<String, SignalRef> = HashMap::new();
         for var in wf.hierarchy().iter_vars() {

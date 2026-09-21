@@ -222,7 +222,7 @@ impl<W: Write> FstWriter<W> {
             .get(handle.saturating_sub(1) as usize)
             .map(|s| s.width as usize)
             .unwrap_or_else(|| value.len());
-        let mut v = if matches!(var_type, VarType::Real) {
+        let v = if matches!(var_type, VarType::Real) {
             let mut b = vec![0u8; 8];
             for (i, x) in value.iter().take(8).enumerate() { b[i] = *x; }
             b

@@ -593,7 +593,7 @@ fn merge_sorted_unique(a: &[u64], b: &[u64]) -> Vec<u64> {
     }
     let mut out: Vec<u64> = Vec::with_capacity(a.len() + b.len());
     let (mut i, mut j) = (0usize, 0usize);
-    let mut push = |v: u64, out: &mut Vec<u64>| {
+    let push = |v: u64, out: &mut Vec<u64>| {
         if out.last() != Some(&v) {
             out.push(v);
         }
@@ -991,6 +991,8 @@ struct Sig {
     /// `npi_fsdb_sig_by_name(全名)` 解析(实测 2000 次 114ms, 而整棵树遍历
     /// 60k 信号要 ~800ms)。
     handle: Cell<*mut c_void>,
+    /// 短名(诊断/调试用; 查询走 `full`)
+    #[allow(dead_code)]
     name: String,
     full: String,
     width: usize,
@@ -1043,6 +1045,7 @@ pub struct FsdbTrace {
     idx_cols: RefCell<HashMap<usize, Rc<Vec<(usize, ScalarValue)>>>>,
     initials: RefCell<HashMap<usize, Option<ScalarValue>>>,
     /// `Trace::prepare` 声明的信号: 建时间线时顺带取它们的变更列
+    #[allow(dead_code)]
     prepared: RefCell<Vec<usize>>,
     name_cache: RefCell<HashMap<String, Option<usize>>>,
     current_index: usize,
@@ -1057,6 +1060,8 @@ pub struct FsdbTrace {
     highest_valid: Cell<usize>,
     fatal: RefCell<Option<String>>,
     /// 扫描进行中: 防止 `column()` 递归触发第二次扫描
+    /// 扫描重入保护(当前扫描路径已串行化; 保留字段以便将来做并发扫描)
+    #[allow(dead_code)]
     scanning: Cell<bool>,
 }
 
@@ -1120,6 +1125,7 @@ impl FsdbTrace {
             // 名字树缓存: 命中就**完全跳过树遍历**(60k 信号实测 ~800ms)。句柄不进
             // 缓存, 第一次用到某个信号时按名字解析(`npi_fsdb_sig_by_name`)。
             let mut quoted_names: Vec<String> = Vec::new();
+            #[allow(unused_assignments)]
             let mut quoted_widths: Vec<usize> = Vec::new();
             if let Some(snap) = try_load_tree_cache(&cache_root, &filename) {
                 quoted_names = snap.names;
@@ -1888,7 +1894,7 @@ impl FsdbTrace {
 unsafe fn walk_scope(npi: &'static Npi, scope: *mut c_void, sigs: &mut Vec<Sig>, scopes: &mut Vec<String>) {
     unsafe {
         let full = Npi::cstr((npi.scope_property_str)(SCOPE_FULLNAME, scope));
-        let name = Npi::cstr((npi.scope_property_str)(SCOPE_NAME, scope));
+        let _name = Npi::cstr((npi.scope_property_str)(SCOPE_NAME, scope));
         if !full.is_empty() {
             scopes.push(full.clone());
         }

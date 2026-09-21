@@ -1,6 +1,5 @@
 //! Trace trait for waveform access
 
-use std::collections::HashMap;
 
 pub type TraceId = String;
 

@@ -15,6 +15,10 @@
 //!   entries with full names, types, widths, alias handles) appended after GEOM.
 //!   Signal names and hierarchy are correctly extracted.
 
+// 旧的手写 FST 读器: **查询路径已改用 wellen**(见 src/trace/fst.rs)。
+// 这里保留作为参考实现与往返测试工具, 因此允许存在未被引用的辅助函数/字段。
+#![allow(dead_code)]
+
 use super::types::{FstHeader, ScopeType, SignalDecl, VarType};
 use super::varint::decode_varint;
 use std::fs::File;
@@ -629,7 +633,7 @@ impl<R: Read + Seek> FstReader<R> {
     }
 
     fn read_header_block(&mut self, _len: u64) -> io::Result<()> {
-        let start_pos = self.reader.stream_position()?;
+        let _start_pos = self.reader.stream_position()?;
         // NOTE: the header's section_length field doubles as the block length,
         // already consumed by read_file — read the fields directly.
         self.file.header.start_time = self.read_u64()?;

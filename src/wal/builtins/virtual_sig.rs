@@ -4,7 +4,6 @@
 
 use crate::wal::ast::{Value, Operator};
 use crate::wal::eval::{Environment, Dispatcher, Evaluator};
-use crate::trace::Trace;
 use std::fs::File;
 use std::io::Write;
 use std::path::Path;

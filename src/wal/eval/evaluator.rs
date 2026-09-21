@@ -1735,7 +1735,7 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
                 }
             }
             if batch_entries.len() >= 2 {
-                let mut result_counts: Vec<Value> = Vec::new();
+                let _result_counts: Vec<Value> = Vec::new();
                 let mut batch_counts: Option<Vec<Value>> = None;
                 {
                     let t = self.traces.read().unwrap_or_else(|e| e.into_inner());

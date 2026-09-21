@@ -14,7 +14,6 @@ pub mod wal;
 pub mod trace;
 
 use crate::cli::{Args, ExecMode};
-use crate::trace::Trace;
 use clap::Parser;
 use std::path::{Path, PathBuf};
 use std::process;

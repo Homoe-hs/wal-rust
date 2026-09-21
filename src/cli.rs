@@ -1,6 +1,6 @@
 //! CLI argument parsing and logging
 
-use clap::{Parser, Subcommand};
+use clap::Parser;
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]

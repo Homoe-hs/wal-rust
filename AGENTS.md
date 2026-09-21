@@ -82,7 +82,7 @@ Flags: `-l <waveform>`(可重复), `--halt-on-error`(遇错即停)。
   `(count (= clk 1))` 给 20/0, 真值 10)。现在用 `collect_cond_signals_with_bare`: 符号既不是
   变量、又能被某条波形解析 → 算信号引用(变量优先, 不影响常量折叠)。回归: `matrix_bare_signal_symbols_count_correctly`。
 - **帮助文案里的数字要有测试守门**: `--help` 曾写 "125 named operators" 而实际 146
-  (`check_docs.py` 不扫 help 文本)。现在 `src/cli.rs` 有单元测试比对
+  (`scripts/check_docs.py` 不扫 help 文本)。现在 `src/cli.rs` 有单元测试比对
   `builtins::registered_operator_count()`, 改注册表不同步改文案就会红。
 - **索引参数不许静默截断**: `(sample-at s 4.5)` 曾经取索引 4 的值(静默错值), 现在明确报"必须是整数"。
 - **缓存 key 必须含 ctime+inode**: `trace::vcd::file_identity`(basename+len+mtime+ctime+inode)

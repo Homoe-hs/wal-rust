@@ -14,6 +14,8 @@ const MAX_DECODED_SIGNALS: usize = 256;
 #[derive(Clone, Copy)]
 enum CacheType {
     FullScan,
+    // 保留分支: 记录"部分扫描"的旧语义, 便于将来做增量索引时区分缓存来源
+    #[allow(dead_code)]
     PartialScan(u32),
 }
 
@@ -393,7 +395,6 @@ impl VcdTrace {
         hit
     }
     pub fn load(path: &Path, id: TraceId) -> Result<Self, String> {
-        use rayon::prelude::*;
 
         let filename = path.to_string_lossy().to_string();
         let mut reader = crate::vcd::reader::MmapReader::new(path)
@@ -534,6 +535,7 @@ impl VcdTrace {
         // FST/VCD is-x (and get/at) initial semantics diverge (152GB §8.4 #1).
         let mut init_off: Vec<u32> = Vec::new();
         let mut init_blob: Vec<u8> = Vec::new();
+        #[allow(unused_assignments)]
         let mut pos = dump_start;
         {
             let mut line_start = dump_start;
@@ -712,6 +714,7 @@ impl VcdTrace {
         let mut col_cache: HashMap<u32, Col> = self.col_cache.take();
         let mut off_cache: HashMap<u32, OffCol> = self.off_cache.take();
         let mut col_ts_base: usize = 0;
+        #[allow(unused_assignments)]
         let mut col_ts_next: usize = 0;
 
         const COL_BATCH: usize = 8;
@@ -726,7 +729,7 @@ impl VcdTrace {
                 let chunk = &data[chunk_start..chunk_end];
                 let sid = sid_all;
                 let evt = event_all;
-                let widths = widths_all;
+                let _widths = widths_all;
                 let col_on = col_enabled;
                 // 冷文件: 先让内核按大块预读本 chunk(逐页 4KB 缺页在 58.7GB 上
                 // 会比 1MB 顺序读多花一倍 sys 时间)。分窗口调用, 避免一次排队过多。
@@ -936,7 +939,7 @@ impl VcdTrace {
                     } else if col_bytes < col_budget {
                         let w = chunk_cols[i].4 as usize;
                         let mut col = Col { width: w, idxs: Vec::with_capacity(j - i), states: Vec::with_capacity(j - i) };
-                        for (_, local_ts, st, off, _vw) in &chunk_cols[i..j] {
+                        for (_, local_ts, st, _off, _vw) in &chunk_cols[i..j] {
                             let gts = (col_ts_base as i64 + local_ts) as u32;
                             col.idxs.push(gts);
                             col.states.push(*st);
@@ -1710,7 +1713,6 @@ impl std::hash::Hasher for FxHasher {
 }
 type FxBuild = std::hash::BuildHasherDefault<FxHasher>;
 type FxHashMap<K, V> = std::collections::HashMap<K, V, FxBuild>;
-type FxHashSet<T> = std::collections::HashSet<T, FxBuild>;
 
 /// 名字 → 索引用的哈希(与 id 哈希同族, 64 位 FNV-1a)
 #[inline]
@@ -3073,6 +3075,7 @@ fn vcd_semantic_eq(a: &VcdValue, b: &VcdValue) -> bool {
     normalize(a) == normalize(b)
 }
 
+#[allow(dead_code)] // 参考实现: 位值 → 0/1(当前读取路径直接比较 VcdValue)
 fn val_to_bit(val: &VcdValue) -> Option<u8> {
     match val {
         VcdValue::Bit(b) => Some(*b),
@@ -3089,7 +3092,7 @@ fn value_to_scalar(val: &VcdValue) -> ScalarValue {
     }
 }
 
-fn find_signal_in_block(block: &[u8], target_id: &[u8], id_len: usize) -> Option<VcdValue> {
+fn find_signal_in_block(block: &[u8], target_id: &[u8], _id_len: usize) -> Option<VcdValue> {
     // A timestamp may contain several value lines for the same id (delta
     // cycles/glitches). VCD semantics: the value at the timestamp is the LAST
     // one written — keep scanning and return the last occurrence. Parsing via
