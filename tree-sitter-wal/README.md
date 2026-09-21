@@ -23,6 +23,8 @@ cd .. && cargo build --release && make gates
   `HOME=$PWD/.tools/home XDG_CONFIG_HOME=$PWD/.tools/config <ts> generate`
 * `package.json` 的 `tree-sitter` 字段必须是**数组**形式(`[{"scope": "source.wal", ...}]`),
   写成对象会让 CLI 直接报 "invalid type: map, expected a sequence"。
+* `ts generate` 还会顺手生成 `binding.gyp`/`bindings/`/`Makefile`/`.gitignore` 等 Node 包脚手架 ——
+  本仓库是"内嵌 grammar 的 Rust crate", 这些都不需要, 生成后删掉即可(根 `.gitignore` 已忽略 `node_modules/`)。
 * `token(...)` 里**不能引用规则**(如 `$.base_symbol`), 只能内联正则 —— 所以
   `base_symbol` 的字符类提取成了顶部的 `BASE_SYMBOL_RE` 常量, 两处共用。
 
