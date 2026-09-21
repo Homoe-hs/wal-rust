@@ -130,8 +130,10 @@ if ! git push origin main 2>.tools/push.err; then
         say "ssh 推送失败, 改用 gh 的 HTTPS 凭据重试"
         slug="$(gh repo view --json nameWithOwner -q .nameWithOwner)"
         git -c credential.helper='!gh auth git-credential' push "https://github.com/$slug.git" main
-        # 显式 URL 推送不会更新 refs/remotes/origin/*, 会让本地一直显示"领先 N 个提交"
-        git fetch origin --quiet || true
+        # 显式 URL 推送不会更新 refs/remotes/origin/*, 会让本地一直显示"领先 N 个提交";
+        # 用同一个 HTTPS 端点取回引用(ssh 在这种环境本来就通不了)
+        git -c credential.helper='!gh auth git-credential' \
+            fetch "https://github.com/$slug.git" "main:refs/remotes/origin/main" --quiet || true
     else
         cat .tools/push.err >&2
         die "推送失败: 见上面的错误(可手动 git push 后重新执行本脚本)"
