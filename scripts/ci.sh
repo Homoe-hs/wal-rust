@@ -45,6 +45,7 @@ STAGES_ALL=(
     "clippy|1|0|cargo clippy(默认提示级, WAL_CI_CLIPPY_STRICT=1 才失败)"
     "build|1|0|cargo build --release"
     "test|1|0|cargo test --release(全部单元/集成测试)"
+    "samples|1|0|脚本层冒烟: test_samples/ 自包含 + 依赖波形的自检脚本(断言式)"
     "gates|1|0|语义冻结闸: 矩阵 / VCD↔FST 差分 / 引擎↔逐拍 oracle"
     "perf|0|0|性能冒烟(可选: 有 bench/data 大样本才跑)"
     "package|1|0|打包冒烟: glibc2.17 交叉构建 + --version/基本查询"
@@ -140,6 +141,20 @@ stage_build() {
 stage_test() {
     cargo test --release 2>&1 | tee "$LOG_DIR/test.raw" | grep -E '^(running|test result|error|FAILED)' | tail -40
     ! grep -qE 'FAILED|test result: FAILED' "$LOG_DIR/test.raw"
+}
+
+stage_samples() {
+    # 生成一条最小波形, 让"需要波形"的自检脚本真的跑起来(否则它们永远是跳过)
+    local smoke="$LOG_DIR/smoke.vcd"
+    {
+        printf '$timescale 1ns $end\n$scope module t $end\n'
+        printf '$var wire 1 ! clk $end\n$var wire 8 " data [7:0] $end\n'
+        printf '$enddefinitions $end\n$dumpvars\n0!\nb00000000 "\n$end\n'
+        for i in $(seq 0 20); do
+            printf '#%d\n%d!\nb0000000%d "\n' "$((i * 5))" "$((i % 2))" "$((i % 8))"
+        done
+    } > "$smoke"
+    WAL_BIN=target/release/wal-rust WAVE="$smoke" bash test_samples/run_tests.sh
 }
 
 stage_gates() {

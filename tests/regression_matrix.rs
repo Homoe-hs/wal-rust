@@ -1514,6 +1514,35 @@ fn matrix_lexer_scientific_and_sharp_symbols() {
     assert!(ok && got.contains("true") && got.contains("false"), "#t/#f 不再是布尔: {:?}", got);
 }
 
+/// **变参宏**必须把全部实参绑成一个列表。
+///
+/// 真实 bug: `defmacro` 遇到"单个符号作参数表"时忘了置 `variadic` 标志, 于是
+/// `(defunm m args (length args)) (m 1 2 3)` 里 `args` 只绑到第一个实参(整数 1)
+/// → 宏体 `(length args)` 报 "length expects list or string"(使用者看到的"defunm 类型错")。
+#[test]
+fn matrix_variadic_macros_bind_all_args() {
+    let bin = env!("CARGO_BIN_EXE_wal-rust");
+    let run = |code: &str| -> (bool, String) {
+        let out = std::process::Command::new(bin)
+            .arg(code).env("WAL_CACHE", "off").output().expect("spawn wal-rust");
+        let mut s = String::from_utf8_lossy(&out.stdout).to_string();
+        s.push_str(&String::from_utf8_lossy(&out.stderr));
+        (out.status.success(), s)
+    };
+    for (code, want) in [
+        ("(defunm m args (length args)) (m 1 2 3)", "(<macro m> 3)"),
+        ("(defmacro m args (length args)) (m 1 2 3)", "(<macro m> 3)"),
+        // 宏体里构造 AST 要用反引号(直接调用 list 走的是"体被求值"的老路径, 结果语义怪;
+        // 手册的示例统一用反引号)。
+        ("(defmacro m xs `(list ,@xs)) (m 1 2 3)", "(<macro m> (1 2 3))"),
+        ("(defunm m (a b) (list a b)) (m 1 2)", "(<macro m> (1 2))"),
+    ] {
+        let (ok, got) = run(code);
+        assert!(ok, "变参宏用例失败: {} → {:?}", code, got);
+        assert!(got.contains(want), "变参宏结果不对: {} → {:?}(期望含 {})", code, got, want);
+    }
+}
+
 /// `sample-at` 的浮点索引不能静默截断(曾经取到索引 4 的值而不是报错)。
 #[test]
 fn matrix_sample_at_rejects_float_index() {

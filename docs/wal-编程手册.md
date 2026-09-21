@@ -1016,6 +1016,12 @@ hi
 (defmacro twice (x) `(do ,x ,x))
 (macroexpand '(twice (print "hi")))   ;; => (do (print "hi") (print "hi"))
 ```
+
+> **写法建议**: 宏体里构造 AST 用**反引号/逗号**(`` `(do ,x ,x) ``) —— 这是"宏接收原始 AST"
+> 的用法, 参数不会被提前求值。直接调用 `list`/`cons` 之类的构造函数属于"宏体被求值"的老路径,
+> 参数会被当值处理, 结果常常不是你要的(例如 `(defmacro m args (list args))` 会多套一层括号)。
+> 变参宏: 参数表写单个符号(`(defmacro m xs ...)`, 或 `(defunm m xs ...)`), 宏体里 `xs` 是全部
+> 实参组成的列表, 配合 `,@` 展开(`` `(print ,@xs) ``)。
 > 注: 旧版示例用的 `when` 是内建特殊形式、不是宏, 展开会报 `Undefined macro: when`;
 > 现在请用自己定义的宏(或 `(doc "defmacro")` 里列出的标准库宏)。
 

@@ -2486,12 +2486,16 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
             Value::Symbol(s) => s.name.clone(),
             _ => return Err("defunm: first argument must be a symbol".to_string()),
         };
-        let defmacro_expr = Value::List(WList::from_vec(vec![
+        // body 要**平铺**传给 defmacro(与 defun 一致), 不能把多个 body 形式包成一个列表:
+        // 包一层会让"求值结果为值"的宏多套一个列表 ——
+        // `(defunm m args (length args)) (m 1 2 3)` 得到 `(3)` 而不是 `3`。
+        let mut parts = vec![
             Value::Symbol(Symbol::new("defmacro")),
             Value::Symbol(Symbol::new(&name)),
             args[1].clone(),
-            Value::List(WList::from_vec(args[2..].to_vec())),
-        ]));
+        ];
+        parts.extend(args[2..].iter().cloned());
+        let defmacro_expr = Value::List(WList::from_vec(parts));
         self.eval_value(defmacro_expr)
     }
 
@@ -2506,26 +2510,34 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
             Value::Symbol(s) => s.name.clone(),
             _ => return Err("defmacro expects symbol name".to_string()),
         };
-        let args_list = match &args[1] {
-            Value::List(lst) => lst.0.iter().filter_map(|v| {
-                if let Value::Symbol(s) = v {
-                    Some(s.clone())
-                } else {
-                    None
-                }
-            }).collect(),
-            Value::Symbol(s) => vec![s.clone()],
+        // 参数表: 列表 → 定参;单个符号 → **变参**(宏体里收到全部实参组成的列表)。
+        // 曾经漏置 `variadic` 标志, 于是 `(defunm m args (length args))` 把 args 绑成
+        // 第一个实参(整数) → 宏体里 `(length args)` 报 "length expects list or string"
+        // (即使用者看到的"defunm 类型错")。
+        let (args_list, variadic) = match &args[1] {
+            Value::List(lst) => (
+                lst.0.iter().filter_map(|v| {
+                    if let Value::Symbol(s) = v {
+                        Some(s.clone())
+                    } else {
+                        None
+                    }
+                }).collect(),
+                false,
+            ),
+            Value::Symbol(s) => (vec![s.clone()], true),
             _ => return Err("defmacro expects argument list".to_string()),
         };
         let mut body = args[2].clone();
         for arg in &args[3..] {
             body = Value::List(WList::from_vec(vec![body, arg.clone()]));
         }
-        let macro_obj = crate::wal::ast::Macro::new(
+        let mut macro_obj = crate::wal::ast::Macro::new(
             Rc::new(RefCell::new(self.env.clone())),
             args_list,
             body,
         ).with_name(&name);
+        macro_obj.variadic = variadic;
         let value = Value::Macro(macro_obj);
         self.env.define(name, value.clone());
         Ok(value)

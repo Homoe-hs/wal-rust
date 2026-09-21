@@ -23,6 +23,11 @@
   报 "Undefined symbol: e3");`#timeout`(合法分组符号 `#name`)不再被拆成 `#t` + `imeout`
   (此前报 "Undefined symbol: imeout"), 找不到组时给明确语义错误。
   回归: `matrix_lexer_scientific_and_sharp_symbols`。
+- **变参宏(`defmacro`/`defunm` 单个符号作参数表)只绑到第一个实参**: 例如
+  `(defunm m args (length args)) (m 1 2 3)` 报 `length expects list or string`(应为 3)。
+  根因是构造宏对象时漏置 `variadic` 标志;顺带修掉 `defunm` 把 body 多包一层列表的问题
+  (`(defunm m args (length args))` 曾返回 `(3)` 而不是 `3`)。
+  回归: `matrix_variadic_macros_bind_all_args`。
 - **`(sample-at s idx)` 浮点索引不再静默截断**: `(sample-at s 4.5)` 曾取索引 4 的值, 现在明确报错
   (整数除法用 `(div a b)`)。回归: `matrix_sample_at_rejects_float_index`。
 
