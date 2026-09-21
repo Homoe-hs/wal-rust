@@ -88,6 +88,27 @@ def allowed(ref: str) -> bool:
     return any(re.search(pat, ref) for pat in ALLOW_PATTERNS)
 
 
+def is_gitignored(doc: Path, ref: str) -> bool:
+    """引用的路径是否被 .gitignore 忽略(本地产物/样本/实验目录)。
+
+    这类引用**不能**让 CI 在"干净 clone"上变红 —— 真实踩过: `docs/agent-cli.md` 引用
+    `exp/README.md`(本机实验目录, 已 gitignore), 本机有 `exp/` 所以检查通过, 别人
+    clone 下来 docs 阶段直接红。判定交给 git 自己, 就不必维护一份路径白名单。
+    """
+    try:
+        rel_path = os.path.relpath((doc.parent / ref).resolve(), ROOT)
+    except (ValueError, OSError):
+        return False
+    if rel_path.startswith(".."):
+        return False
+    try:
+        r = subprocess.run(["git", "check-ignore", "-q", "--", rel_path],
+                           cwd=ROOT, capture_output=True)
+    except OSError:
+        return False
+    return r.returncode == 0
+
+
 def is_historical(doc: Path) -> bool:
     """文档开头 20 行里声明了「历史文档 / 归档」→ 其中的旧路径只警告不报错。
 
@@ -119,6 +140,8 @@ def check_paths(docs: list[Path]) -> None:
                 cands = [(doc.parent / ref), (ROOT / ref)]
                 if any(c.exists() for c in cands):
                     continue
+                if is_gitignored(doc, ref):
+                    continue  # 本地产物: 干净 clone 上不存在是正常的
                 msg = f"{rel(doc)}:{i}: 引用了不存在的路径 `{ref}`"
                 (warnings if stale_only else errors).append(
                     msg + ("  [历史文档, 仅提示]" if stale_only else "")
