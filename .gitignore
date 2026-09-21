@@ -2,6 +2,15 @@
 /target/
 /wal-rust
 
+# ---- tree-sitter CLI 的脚手架(仅改语法时临时用, 见 tree-sitter-wal/README.md) ----
+node_modules/
+tree-sitter-wal/binding.gyp
+tree-sitter-wal/bindings/
+tree-sitter-wal/Makefile
+tree-sitter-wal/Package.swift
+tree-sitter-wal/pyproject.toml
+tree-sitter-wal/setup.py
+
 # ---- 仓库内自包含的工具链与缓存 ----
 .cargo-home/
 .tools/
