@@ -1925,11 +1925,43 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
 
     /// 常量条件折叠: 返回 Some(truthy) 表示该条件不依赖信号/索引,
     /// 每个索引取值相同(调用方据此直接得出结果, O(1))。
+    /// 收集条件里引用的信号名, **包含裸符号形式**(`(= clk 1)` / `(! rst)` / `(rising clk)`)。
+    ///
+    /// 为什么不能直接用自由函数 `collect_cond_signals`: 它只认 `(get s)`/`(rising s)` 这类
+    /// 显式形式, 于是 `(= clk 1)` 被判成"不引用信号" → 被常量折叠 → `count` 在索引 0 求值
+    /// 一次就把结果套用到全部索引, 静默给出 0 或总数(实测 `(count (= clk 1))` 返回 20/0,
+    /// 应为 10)。裸符号在 WAL 里是"当前 INDEX 的值", 必须算作信号引用。
+    ///
+    /// 判定"这个符号是不是信号"用两条: ① 不是当前环境里的变量/闭包/宏(变量优先);
+    /// ② 至少一条已加载波形能解析出它。两者都不满足就当作普通符号, 不影响常量折叠。
+    fn collect_cond_signals_with_bare(&self, cond: &Value, out: &mut Vec<String>, has_edge: &mut bool, idx_dep: &mut bool) {
+        collect_cond_signals(cond, out, has_edge, idx_dep);
+        let mut syms: Vec<String> = Vec::new();
+        collect_bare_symbols(cond, &mut syms);
+        let traces = match self.env.get_traces() {
+            Some(t) => t,
+            None => return,
+        };
+        let guard = traces.read().unwrap_or_else(|e| e.into_inner());
+        for name in syms {
+            if self.env.lookup(&name).is_some() {
+                continue; // 变量/闭包/宏优先, 不是信号
+            }
+            if out.iter().any(|n| n == &name) {
+                continue;
+            }
+            let resolvable = guard.traces_iter().any(|tr| tr.resolve_name(&name).is_some());
+            if resolvable {
+                out.push(name);
+            }
+        }
+    }
+
     fn const_cond_value(&mut self, cond: &Value) -> Option<bool> {
         let mut names: Vec<String> = Vec::new();
         let mut has_edge = false;
         let mut idx_dep = false;
-        collect_cond_signals(cond, &mut names, &mut has_edge, &mut idx_dep);
+        self.collect_cond_signals_with_bare(cond, &mut names, &mut has_edge, &mut idx_dep);
         if !names.is_empty() || idx_dep || !cond_is_foldable(cond, &self.env) {
             return None;
         }
@@ -1944,7 +1976,7 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
         let mut names: Vec<String> = Vec::new();
         let mut has_edge = false;
         let mut idx_dep = false;
-        collect_cond_signals(cond, &mut names, &mut has_edge, &mut idx_dep);
+        self.collect_cond_signals_with_bare(cond, &mut names, &mut has_edge, &mut idx_dep);
         // INDEX/TS 在区间内部会变化 → 引擎的"边界求值 + 区间常量"假设不成立,
         // 交给逐拍路径(此类条件本身就必须 O(索引数))。
         if names.is_empty() || idx_dep {
@@ -2127,7 +2159,7 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
                 // 回退会按 FSDB 的时间线一直步进(既物化 FSDB 全局时间线, 又扫出多余索引)。
                 let mut names = Vec::new();
                 let (mut has_edge, mut idx_dep) = (false, false);
-                collect_cond_signals(cond, &mut names, &mut has_edge, &mut idx_dep);
+                self.collect_cond_signals_with_bare(cond, &mut names, &mut has_edge, &mut idx_dep);
                 // 没有任何波形能解析出引用名 → 回落全部, 让条件求值照常报"找不到信号"
                 let ids = match t.source_ids(&names) {
                     v if v.is_empty() => all,
@@ -2727,6 +2759,33 @@ fn cond_is_foldable(expr: &Value, env: &Environment) -> bool {
             Some(Value::Closure(_)) | Some(Value::Macro(_))
         ),
         _ => true,
+    }
+}
+
+/// 收集表达式里出现的**裸符号**(作为值被引用的符号), 用于判断"这是不是信号"。
+///
+/// 只收集"值位置"的符号: 列表头(`(op a b)` 里的 `op`)是算子/函数名, 不算值引用;
+/// `(quote ...)` 里的符号是数据, 也不算。`INDEX`/`TS` 这类伪信号由调用方另行处理。
+fn collect_bare_symbols(expr: &Value, out: &mut Vec<String>) {
+    match expr {
+        Value::Symbol(s) => out.push(s.name.clone()),
+        Value::List(lst) => {
+            let mut iter = lst.0.iter();
+            let head = iter.next();
+            if let Some(Value::Symbol(op)) = head {
+                if op.name == "quote" {
+                    return; // 引号里的符号是数据
+                }
+                for item in iter {
+                    collect_bare_symbols(item, out);
+                }
+            } else {
+                for item in lst.0.iter() {
+                    collect_bare_symbols(item, out);
+                }
+            }
+        }
+        _ => {}
     }
 }
 

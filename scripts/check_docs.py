@@ -178,24 +178,29 @@ def check_docs_index(docs: list[Path]) -> None:
 
 def check_claims(docs: list[Path]) -> None:
     """C. 可核对的数字(测试数)与仓库实际一致。"""
-    n = 0
-    for pat in ("src/**/*.rs", "tests/**/*.rs"):
-        for f in ROOT.glob(pat):
-            n += len(re.findall(r"^\s*#\[(?:tokio::)?test\]", f.read_text(encoding="utf-8"), re.M))
-    # `cargo test` 实际跑的条数会包含被 `#[ignore]` 的;这里用静态计数做近似,
-    # 偏差阈值放宽到 30%(见报告里的两个数)。
+    # `cargo test` 的统计口径: 单元测试(src/**)会在 lib 与 bin 两个 target 各跑一遍
+    # (main.rs 与 lib.rs 都声明了同样的 mod), 集成测试(tests/*.rs)只跑一遍。
+    # 所以"实跑条数 ≈ 2×单元测试 + 集成测试"。用静态计数直接比会误报
+    # (本项目静态 223, 实跑 295) —— 这正是门禁指标口径太粗导致的噪声。
+    unit = 0
+    integ = 0
+    for f in ROOT.glob("src/**/*.rs"):
+        unit += len(re.findall(r"^\s*#\[(?:tokio::)?test\]", f.read_text(encoding="utf-8"), re.M))
+    for f in ROOT.glob("tests/**/*.rs"):
+        integ += len(re.findall(r"^\s*#\[(?:tokio::)?test\]", f.read_text(encoding="utf-8"), re.M))
+    n = 2 * unit + integ
+    if unit == 0:
+        n = unit + integ  # 没有 bin/lib 双跑的情况, 退回单倍
     for doc in docs:
         for i, line in enumerate(doc.read_text(encoding="utf-8").splitlines(), 1):
             m = TEST_COUNT_RE.search(line)
             if not m:
                 continue
             claimed = int(m.group(1))
-            if claimed and abs(claimed - n) / max(n, 1) > 0.3:
-                # 提示级: `cargo test` 会把 lib 的单元测试在 bin target 里再跑一遍,
-                # 所以"实际跑了几条"与静态计数天然有差距(本项目 219 静态 → 293 实跑)。
+            if claimed and abs(claimed - n) / max(n, 1) > 0.2:
                 warnings.append(
-                    f"{rel(doc)}:{i}: 声称约 {claimed} 个测试, 静态计数 #{n}"
-                    f"(cargo 实跑会更多; 偏差 >30% 请更新)"
+                    f"{rel(doc)}:{i}: 声称约 {claimed} 个测试, 按 cargo 口径估算 #{n}"
+                    f"(= 2×单元 {unit} + 集成 {integ}); 偏差 >20% 请更新"
                 )
 
 

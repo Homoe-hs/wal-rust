@@ -1514,6 +1514,60 @@ fn matrix_lexer_scientific_and_sharp_symbols() {
     assert!(ok && got.contains("true") && got.contains("false"), "#t/#f 不再是布尔: {:?}", got);
 }
 
+/// **裸信号符号**(`clk`)算不算"引用了信号" —— 算错就会静默错值。
+///
+/// 真实 bug: `collect_cond_signals` 只认 `(get s)`/`(rising s)` 这类显式形式, 于是
+/// `(= clk 1)` 被判成"不引用信号" → 常量折叠在索引 0 求值一次套用到所有索引:
+///     (count (= clk 1))  → 20(真值 10)   (count (= clk 0)) → 0(真值 10)
+///     (count (< clk 1))  → 0(真值 10)
+/// 手册里有 4 处教裸符号写法, 所以这是"照文档写就拿到静默错值"。现在裸符号(既不是
+/// 变量、又能被某条波形解析出来)一律算作信号引用, 引擎与逐拍必须一致。
+#[test]
+fn matrix_bare_signal_symbols_count_correctly() {
+    let bin = env!("CARGO_BIN_EXE_wal-rust");
+    let dir = std::env::temp_dir().join(format!("wal_reg_bare_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let vcd = dir.join("bare.vcd");
+    let mut body = String::from(
+        "$timescale 1ns $end\n$scope module tb $end\n$var wire 1 ! clk $end\n$var wire 1 \" rst $end\n$enddefinitions $end\n$dumpvars\n0!\n1\"\n$end\n",
+    );
+    // 20 个索引: clk 前 10 个为 0、后 10 个为 1;rst 恒 1
+    for i in 0..20 {
+        body.push_str(&format!("#{}\n{}!\n", i * 5, if i < 10 { 0 } else { 1 }));
+    }
+    std::fs::write(&vcd, &body).unwrap();
+    let run = |code: &str, no_engine: bool| -> String {
+        let mut c = std::process::Command::new(bin);
+        c.arg(code).arg("-l").arg(&vcd).env("WAL_CACHE", "off");
+        if no_engine {
+            c.env("WAL_NO_ENGINE", "1");
+        }
+        let out = c.output().expect("spawn wal-rust");
+        assert!(out.status.success(), "cli 失败: {:?}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    let cases = [
+        ("(count (= clk 1))", "=> 10"),
+        ("(count (= clk 0))", "=> 10"),
+        ("(count (< clk 1))", "=> 10"),
+        ("(count (> clk 0))", "=> 10"),
+        ("(count (! rst))", "=> 0"),
+        ("(count (&& (= clk 1) (= rst 1)))", "=> 10"),
+        ("(count (|| (= clk 1) (= clk 0)))", "=> 20"),
+        // 变量不受影响: `(= x 1)` 仍然可以常量折叠
+        ("(define x 1) (count (= x 1))", "=> (1 20)"),
+        ("(define y 0) (count (= y 1))", "=> (0 0)"),
+    ];
+    for (code, want) in cases {
+        let engine = run(code, false);
+        let oracle = run(code, true);
+        assert_eq!(engine, want, "引擎结果不对: {}", code);
+        assert_eq!(oracle, want, "逐拍结果不对: {}", code);
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// **变参宏**必须把全部实参绑成一个列表。
 ///
 /// 真实 bug: `defmacro` 遇到"单个符号作参数表"时忘了置 `variadic` 标志, 于是

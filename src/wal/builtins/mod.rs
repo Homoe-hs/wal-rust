@@ -39,3 +39,11 @@ pub fn register_all(disp: &mut Dispatcher) {
     register_wave(disp);
     register_special(disp);
 }
+
+/// 已注册的算子个数(去重) —— 用于 CLI 帮助文案, 保证"帮助里写的数字"不会和实现漂移。
+/// `scripts/check_docs.py` 不扫 help 文本, 所以这里配一个单元测试(见 src/cli.rs)。
+pub fn registered_operator_count() -> usize {
+    let mut d = crate::wal::eval::Dispatcher::new();
+    register_all(&mut d);
+    d.operators.len()
+}

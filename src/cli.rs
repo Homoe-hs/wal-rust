@@ -14,7 +14,7 @@ use std::path::PathBuf;
                   input is an existing file → executed as WAL script\n  \
                   no input → shows help\n\n\
                   Features:\n  \
-                  - WAL language: 125 named operators, macros, @/#/~ syntax, scripts + REPL\n  \
+                  - WAL language: 146 named operators, macros, @/#/~ syntax, scripts + REPL\n  \
                   - mmap-based on-demand VCD loading (two-pass scan + sparse index + LRU cache)\n  \
                   - Handles 150GB+ dumps; process HEAP is O(signals + queried columns)\n  \
                     (RSS additionally counts mmap'd file pages — see docs/waveform-io-plan.md)\n  \
@@ -168,9 +168,9 @@ pub struct TopsigArgs {
 
 #[derive(Parser, Debug)]
 pub struct RunArgs {
-    /// WAL script file to execute
-    #[arg(help = "Path to the WAL script file (.wal)")]
-    pub file: PathBuf,
+    /// WAL script file to execute (省略时用 --code)
+    #[arg(help = "Path to the WAL script file (.wal).\n可省略 —— 配合 --code 直接求值一段 WAL;两者都给时只跑 --code。")]
+    pub file: Option<PathBuf>,
 
     /// Pre-load waveform file(s) before script execution
     #[arg(
@@ -240,11 +240,19 @@ impl Args {
         // If a subcommand was given explicitly, use it
         if let Some(cmd) = self.command {
             return match cmd {
-                Command::Run(r) => ExecMode::RunScript {
-                    path: r.file,
-                    load: r.load,
-                    code: r.code,
-                    halt_on_error: self.halt_on_error,
+                Command::Run(r) => match (r.file, r.code) {
+                    // `-c <code>`: 只求值代码, 不需要 FILE
+                    (_, Some(code)) => ExecMode::EvalExpr { code, load: r.load },
+                    (Some(path), None) => ExecMode::RunScript {
+                        path,
+                        load: r.load,
+                        code: None,
+                        halt_on_error: self.halt_on_error,
+                    },
+                    (None, None) => {
+                        eprintln!("error: `run` 需要 <FILE>, 或者用 `-c/--code '<表达式>'`");
+                        std::process::exit(2);
+                    }
                 },
                 Command::Repl => ExecMode::Repl,
                 Command::Count(c) => ExecMode::Count { wave: c.wave, sig: c.sig, value: c.value },
@@ -306,5 +314,31 @@ impl Args {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    /// 帮助文案里的"146 named operators"必须与**实际注册表**一致。
+    /// 这条数字曾经长期停在 125(README 写 146), 而 check_docs.py 不扫 help 文本,
+    /// 所以在这里守一道。
+    #[test]
+    fn help_operator_count_matches_registry() {
+        let cmd = Args::command();
+        let text = cmd
+            .get_long_about()
+            .map(|s| s.to_string())
+            .or_else(|| cmd.get_about().map(|s| s.to_string()))
+            .unwrap_or_default();
+        let n = crate::wal::builtins::registered_operator_count();
+        assert!(
+            text.contains(&format!("{} named operators", n)),
+            "帮助文案里的算子数应写成 `{} named operators`(当前文案: {:?})",
+            n,
+            text.lines().find(|l| l.contains("named operators")).unwrap_or("<未找到>")
+        );
     }
 }

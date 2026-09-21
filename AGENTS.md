@@ -28,7 +28,9 @@ No subcommand needed for common cases:
 - no input → REPL
 
 Subcommands: `run`, `repl`, `count <wave> <sig> [v]`, `sigs <wave> <pat> [n]`, `topsig <wave> [n]`.
-Flags: `-l <waveform>` (repeatable), `-c <code>` (inline override), `--halt-on-error` (stop at first script error).
+Flags: `-l <waveform>`(可重复), `--halt-on-error`(遇错即停)。
+`-c/--code <表达式>` 是 **`run` 子命令**的选项(`wal-rust run -c '(+ 1 2)'`, 可省略 FILE);
+顶层 `wal-rust '(...)'` 的表达式靠"以 `(` 开头"自动识别, 没有全局 `-c`。
 
 ## Source layout
 
@@ -74,6 +76,14 @@ Flags: `-l <waveform>` (repeatable), `-c <code>` (inline override), `--halt-on-e
   若 `grouped_symbol` 写成 `seq("#", $.base_symbol)`(两个 token), 词法器先匹配到 `#` 就输给 `#t`,
   于是 `#timeout` 被拆成 `#t` + `imeout`(报错指到 `imeout`)。现在 `grouped_symbol` 是**单 token**,
   按最长匹配赢过 `#t`;`#t` 单独出现时仍是布尔。回归: `matrix_lexer_scientific_and_sharp_symbols`。
+- **裸信号符号必须算作信号引用**: `(= clk 1)` / `(! rst)` 里的裸符号在 WAL 里是"当前 INDEX 的值"。
+  判定"是否引用信号"的 `collect_cond_signals` 只认 `(get s)`/`(rising s)` 这类显式形式 ——
+  裸符号漏判会被**常量折叠**吃掉, `count` 只在索引 0 求值一次就套用到全部索引(实测
+  `(count (= clk 1))` 给 20/0, 真值 10)。现在用 `collect_cond_signals_with_bare`: 符号既不是
+  变量、又能被某条波形解析 → 算信号引用(变量优先, 不影响常量折叠)。回归: `matrix_bare_signal_symbols_count_correctly`。
+- **帮助文案里的数字要有测试守门**: `--help` 曾写 "125 named operators" 而实际 146
+  (`check_docs.py` 不扫 help 文本)。现在 `src/cli.rs` 有单元测试比对
+  `builtins::registered_operator_count()`, 改注册表不同步改文案就会红。
 - **索引参数不许静默截断**: `(sample-at s 4.5)` 曾经取索引 4 的值(静默错值), 现在明确报"必须是整数"。
 - **缓存 key 必须含 ctime+inode**: `trace::vcd::file_identity`(basename+len+mtime+ctime+inode)
   —— 只按 size+mtime 会漏掉"同一秒内等长改写"(脚本反复生成同名波形是常态), 而首尾 64KB
