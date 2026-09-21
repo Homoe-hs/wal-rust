@@ -188,7 +188,8 @@ impl TraceContainer {
     }
 
     pub fn contains(&self, name: &str) -> bool {
-        self.ordered_values().any(|t| t.signals().contains(&name.to_string()))
+        // 用后端自己的解析器(索引式), 不要 `signals().contains(..)` —— 那会克隆整张名字表
+        self.ordered_values().any(|t| t.resolve_name(name).is_some())
     }
 
     /// 已加载的 trace id, **按加载顺序**(多文件选源必须确定, 见 `order`)。

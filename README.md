@@ -19,7 +19,7 @@ $ wal-rust '(count (&& (= (get "awvalid") 1) (= (get "awready") 1)))' -l design.
 
 | | |
 |---|---|
-| 当前版本 | **0.14.25**(发版记录见 [`CHANGELOG.md`](CHANGELOG.md)) |
+| 当前版本 | **0.14.26**(发版记录见 [`CHANGELOG.md`](CHANGELOG.md)) |
 | 输入格式 | VCD、FST([wellen](https://crates.io/crates/wellen))、**FSDB**(借 Verdi NPI, 纯 Rust FFI) |
 | 平台 | Linux x86_64;发布二进制要求 **glibc ≥ 2.17**(CentOS 7 / RHEL 7 / Ubuntu 16.04+) |
 | 规模 | 已在 **152GB / 58.7GB** 合成波形与 **5.86GB** 真实波形上验证(冷查询单遍读文件, 见[性能](#性能)) |

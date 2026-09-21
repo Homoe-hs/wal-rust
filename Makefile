@@ -53,6 +53,14 @@ docs-check: ## 文档一致性: 断链、索引完整性、声称的数字
 	python3 scripts/check_docs.py
 
 # --- 性能 -------------------------------------------------------------------
+bench-names: ## 名字解析/裸符号求值基准(默认 200k 信号 × 2000 时间戳)
+	./scripts/bench_name_resolution.sh $(N) $(T)
+
+quickcheck: ## FSDB↔VCD 一分钟一致性诊断: make quickcheck FSDB=a.fsdb VCD=a.vcd [SIG=tb.clk]
+	@: $${FSDB:?用法: make quickcheck FSDB=a.fsdb VCD=a.vcd}
+	@: $${VCD:?用法: make quickcheck FSDB=a.fsdb VCD=a.vcd}
+	./scripts/fsdb_vcd_quickcheck.sh "$$FSDB" "$$VCD" $(SIG)
+
 perf: ## 性能冒烟(需要 bench/data 里有大样本)
 	./scripts/ci.sh --only perf
 

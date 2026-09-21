@@ -342,9 +342,15 @@ pub fn eval_value(&mut self, value: Value) -> Result<Value, String> {
             return Ok(Value::Symbol(Symbol::new(op.as_str())));
         }
 
-        // Try signal name auto-lookup from loaded traces
-        // WAL spec: bare signal names return their waveform value at current INDEX
-        // Try name as-is, then prepend scope, then prepend group
+        // 裸信号名自动解析: WAL 规定裸符号 = "当前 INDEX 的该信号值"。
+        // 解析顺序: 原样 → 加当前 scope → 加当前 group。
+        //
+        // ⚠️ 性能要点(188 万信号 FSDB 上的实锤): 这里**绝不能**调用
+        // `traces.signals(&id)` —— 它返回 `Vec<String>`(FSDB 是 `sig_names.clone()`),
+        // 每次求值都克隆整张名字表;统一引擎在每个边界都要重新求值条件, 于是
+        // O(N) × 边界数, 表现为"`get` 名字解析慢到 3 分钟不出结果"。
+        // 现在改调用各后端的 `resolve_name`(FSDB/VCD 都是索引式并有缓存),
+        // 叶子名/子串匹配由后端自己的解析器负责(语义一致)。
         if let Some(traces) = self.env.get_traces() {
             let traces = traces.read().unwrap_or_else(|e| e.into_inner());
             let candidates = [
@@ -354,30 +360,11 @@ pub fn eval_value(&mut self, value: Value) -> Result<Value, String> {
             ];
             for candidate in &candidates {
                 for id in traces.trace_ids() {
-                    if let Some(sigs) = traces.signals(&id) {
-                        if sigs.contains(candidate) {
-                            let get_expr = Value::List(WList::from_vec(vec![
-                                Value::Symbol(Symbol::new("get")),
-                                Value::String(candidate.clone()),
-                            ]));
-                            return self.eval_value(get_expr);
-                        }
-                    }
-                }
-            }
-            // Fuzzy fallback: try suffix / substring match
-            for id in traces.trace_ids() {
-                if let Some(sigs) = traces.signals(&id) {
-                    let (matched, candidates) = fuzzy_match_signal(&name, &sigs);
-                    if candidates.len() > 1 {
-                        log::warn!("signal '{}' is ambiguous: matches {:?}, using '{}'",
-                            name, &candidates[..candidates.len().min(5)],
-                            matched.map(|s| s.as_str()).unwrap_or("?"));
-                    }
-                    if let Some(matched) = matched {
+                    let Some(tr) = traces.get(&id) else { continue };
+                    if let Some(resolved) = tr.resolve_name(candidate) {
                         let get_expr = Value::List(WList::from_vec(vec![
                             Value::Symbol(Symbol::new("get")),
-                            Value::String(matched.clone()),
+                            Value::String(resolved),
                         ]));
                         return self.eval_value(get_expr);
                     }
@@ -2828,30 +2815,6 @@ fn collect_cond_signals(expr: &Value, out: &mut Vec<String>, has_edge: &mut bool
             collect_cond_signals(item, out, has_edge, idx_dep);
         }
     }
-}
-
-fn fuzzy_match_signal<'a>(name: &str, signals: &'a [String]) -> (Option<&'a String>, Vec<&'a String>) {
-    let dot_name = format!(".{}", name);
-    // 1. Exact or suffix match
-    let suffix: Vec<&'a String> = signals.iter().filter(|s| s.as_str() == name || s.ends_with(&dot_name)).collect();
-    if suffix.len() == 1 { return (Some(suffix[0]), vec![]); }
-    if suffix.len() > 1 { return (Some(suffix[0]), suffix); }
-
-    // 2. Last component match for short names
-    if name.len() <= 8 || !name.contains('.') {
-        let last_comp: Vec<&'a String> = signals.iter()
-            .filter(|s| s.rsplitn(2, '.').next().unwrap_or("") == name)
-            .collect();
-        if last_comp.len() == 1 { return (Some(last_comp[0]), vec![]); }
-        if last_comp.len() > 1 { return (Some(last_comp[0]), last_comp); }
-    }
-
-    // 3. Substring match
-    let sub: Vec<&'a String> = signals.iter().filter(|s| s.contains(name)).collect();
-    if sub.len() == 1 { return (Some(sub[0]), vec![]); }
-    if sub.len() > 1 { return (Some(sub[0]), sub); }
-
-    (None, vec![])
 }
 
 /// Helper to extract a name from either a Symbol or String value

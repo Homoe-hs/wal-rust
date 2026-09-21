@@ -47,7 +47,7 @@ STAGES_ALL=(
     "test|1|0|cargo test --release(全部单元/集成测试)"
     "samples|1|0|脚本层冒烟: test_samples/ 自包含 + 依赖波形的自检脚本(断言式)"
     "gates|1|0|语义冻结闸: 矩阵 / VCD↔FST 差分 / 引擎↔逐拍 oracle"
-    "perf|0|0|性能冒烟(可选: 有 bench/data 大样本才跑)"
+    "perf|0|0|性能冒烟: 名字解析基准(防 O(N) 求值回归) + 有 bench/data 时的冷加载"
     "package|1|0|打包冒烟: glibc2.17 交叉构建 + --version/基本查询"
     "fuzz|0|1|大规模随机差分(WAL_CI_FUZZ_N 控制规模)"
 )
@@ -185,17 +185,39 @@ stage_gates() {
 }
 
 stage_perf() {
+    # ① 名字解析/裸符号求值基准(自带合成样本, 不需要 bench/data):
+    #    这条专门防"每次求值克隆整张名字表"回归 —— 188 万信号 FSDB 上它就是分钟级卡死。
+    #    预算放得很宽(60k 信号 × 800 时间戳的逐拍路径, 正常 <5s), 只抓数量级退化。
+    local n="${WAL_CI_NAMES_N:-60000}" t="${WAL_CI_NAMES_T:-800}"
+    local log="$LOG_DIR/bench_names.log"
+    local t0 t1 step_s
+    t0=$(date +%s)
+    ./scripts/bench_name_resolution.sh "$n" "$t" >"$log" 2>&1 || { echo "基准脚本失败(见 $log)"; return 1; }
+    t1=$(date +%s)
+    step_s=$((t1 - t0))
+    grep -E "引擎|逐拍|字符串" "$log" | sed 's/^/  /'
+    echo "  基准总耗时: ${step_s}s"
+    if [ "$step_s" -gt 240 ]; then
+        echo "名字解析疑似退化(超过 240s 预算) —— 检查热路径是否又在调用 traces.signals()"
+        return 1
+    fi
+
+    # ② 大样本冒烟(有 bench/data 才跑)
     if [ ! -d bench/data ] || [ -z "$(ls -A bench/data 2>/dev/null | grep -E '\.(vcd|fst|fsdb)$')" ]; then
-        echo "跳过: bench/data 里没有大样本(见 bench/RESULTS.md 的生成方法)"; return 77
+        echo "跳过: bench/data 里没有大样本(见 bench/README.md 的生成方法)"; return 0
     fi
     local w
     w=$(ls -S bench/data/*.vcd 2>/dev/null | head -1)
     echo "样本: $w ($(du -h "$w" | cut -f1))"
-    local t0 t1
+    local t0 t1 out
     t0=$(date +%s%N)
-    target/release/wal-rust '(load)' -l "$w" >/dev/null 2>&1 || { echo "load 失败"; return 1; }
+    # `-l` 已是加载入口;这里读一次信号表(冷加载 = 头解析 + $dumpvars 快照)
+    out=$(target/release/wal-rust '(length (SIGNALS))' -l "$w" 2>&1 | tail -1) || true
     t1=$(date +%s%N)
-    echo "冷加载: $(( (t1 - t0) / 1000000 ))ms"
+    case "$out" in
+        "=> "*|"("*) echo "冷加载(信号表): $(( (t1 - t0) / 1000000 ))ms  $out" ;;
+        *) echo "加载/查询失败: $out"; return 1 ;;
+    esac
     echo "对照历史: bench/RESULTS.md(超过 1.5 倍即视为回归, 需要人工确认)"
 }
 

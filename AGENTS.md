@@ -81,6 +81,14 @@ Flags: `-l <waveform>`(可重复), `--halt-on-error`(遇错即停)。
   裸符号漏判会被**常量折叠**吃掉, `count` 只在索引 0 求值一次就套用到全部索引(实测
   `(count (= clk 1))` 给 20/0, 真值 10)。现在用 `collect_cond_signals_with_bare`: 符号既不是
   变量、又能被某条波形解析 → 算信号引用(变量优先, 不影响常量折叠)。回归: `matrix_bare_signal_symbols_count_correctly`。
+- **求值热路径禁止 `signals()`**: `Trace::signals()` 返回 `Vec<String>`(FSDB 是
+  `sig_names.clone()`, 188 万信号 = 每次克隆一整张表)。裸符号自动解析曾经这么干, 而统一引擎
+  **在每个边界都重新求值条件** → O(N)×边界数, 实测 200k 信号 VCD 的逐拍路径 117s → 修复后 8.2s
+  (引擎路径 0.27s → 0.06s; 188 万信号 FSDB 上就是"3 分钟不出结果")。
+  规则: 热路径一律用 `resolve_name`/`contains`(后端索引式);需要整表的地方只有
+  `(SIGNALS)`/`sigs`/`find-sig` 这类**显式**请求。
+  FSDB 短名解析另有懒建的叶子名排序索引(`leaf_order`, 只存 u32, O(log N)), 不再线性扫全表。
+  基准: `./scripts/bench_name_resolution.sh [信号数] [时间戳数]`。
 - **帮助文案里的数字要有测试守门**: `--help` 曾写 "125 named operators" 而实际 146
   (`scripts/check_docs.py` 不扫 help 文本)。现在 `src/cli.rs` 有单元测试比对
   `builtins::registered_operator_count()`, 改注册表不同步改文案就会红。

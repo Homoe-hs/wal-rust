@@ -1048,6 +1048,13 @@ pub struct FsdbTrace {
     #[allow(dead_code)]
     prepared: RefCell<Vec<usize>>,
     name_cache: RefCell<HashMap<String, Option<usize>>>,
+    /// 叶子名(短名)索引: 按叶子名排序的 `sig_names` 下标, 懒建一次。
+    ///
+    /// 为什么需要: 短名(`clk`)不是 `name_to_idx` 的键, 旧实现在这里**线性扫 188 万个名字**
+    /// (首个不同拼写各付一次)。188 万信号的 FSDB 上, 一次解析要几十~几百毫秒;
+    /// 而查询里每次 `get` 解析一次 → 直接卡死。排序索引只存 u32(约 7.5MB @188万),
+    /// 查找 O(log N), 且不复制名字字符串。
+    leaf_order: std::cell::OnceCell<Vec<u32>>,
     current_index: usize,
     /// 全局最早变更时间(时间线第一个时间点)的懒缓存:
     /// `Cell<Option<Option<u64>>>` = 外层"算过没", 内层"有没有变更"。
@@ -1202,6 +1209,7 @@ impl FsdbTrace {
                 initials: RefCell::new(HashMap::new()),
                 prepared: RefCell::new(Vec::new()),
                 name_cache: RefCell::new(HashMap::new()),
+                leaf_order: std::cell::OnceCell::new(),
                 first_change: Cell::new(None),
                 current_index: 0,
                 highest_valid: Cell::new(0),
@@ -1212,6 +1220,52 @@ impl FsdbTrace {
     }
 
     /// 名字解析: 精确 → 叶子名(短名/无点) → 子串(与 VCD/FST 同口径), 结果缓存。
+    /// 叶子名(最后一个 `.` 之后)在 `sig_names` 里的下标, 按 (叶子名, 下标) 排序。
+    /// 相同叶子名时取**下标最小**的, 与旧的线性扫描语义一致。
+    fn leaf_order_index(&self) -> &Vec<u32> {
+        self.leaf_order.get_or_init(|| {
+            fn leaf(s: &str) -> &str {
+                s.rsplitn(2, '.').next().unwrap_or("")
+            }
+            let mut v: Vec<u32> = (0..self.sig_names.len() as u32).collect();
+            v.sort_unstable_by(|a, b| {
+                let (sa, sb) = (&self.sig_names[*a as usize], &self.sig_names[*b as usize]);
+                leaf(sa).cmp(leaf(sb)).then(a.cmp(b))
+            });
+            v
+        })
+    }
+
+    /// 按叶子名查(O(log N));重复叶子名返回下标最小的那个。
+    fn lookup_leaf(&self, want: &str) -> Option<usize> {
+        fn leaf(s: &str) -> &str {
+            s.rsplitn(2, '.').next().unwrap_or("")
+        }
+        let order = self.leaf_order_index();
+        let lo = order.partition_point(|&i| leaf(&self.sig_names[i as usize]) < want);
+        let first = *order.get(lo)?;
+        if leaf(&self.sig_names[first as usize]) == want {
+            Some(first as usize)
+        } else {
+            None
+        }
+    }
+
+    /// 叶子名是否**唯一**(用于严格解析的歧义判定)。
+    fn leaf_is_unique(&self, want: &str) -> Option<bool> {
+        fn leaf(s: &str) -> &str {
+            s.rsplitn(2, '.').next().unwrap_or("")
+        }
+        let order = self.leaf_order_index();
+        let lo = order.partition_point(|&i| leaf(&self.sig_names[i as usize]) < want);
+        let first = *order.get(lo)?;
+        if leaf(&self.sig_names[first as usize]) != want {
+            return None;
+        }
+        let hi = lo + order[lo..].iter().take_while(|&&i| leaf(&self.sig_names[i as usize]) == want).count();
+        Some(hi - lo == 1)
+    }
+
     fn resolve_idx(&self, name: &str) -> Option<usize> {
         if let Some(i) = self.name_to_idx.get(name) {
             return Some(*i);
@@ -1219,22 +1273,20 @@ impl FsdbTrace {
         if let Some(c) = self.name_cache.borrow().get(name) {
             return *c;
         }
-        fn leaf(s: &str) -> &str {
-            s.rsplitn(2, '.').next().unwrap_or("")
-        }
         let allow_leaf = name.len() <= 8 || !name.contains('.');
-        let mut hit = None;
-        let mut sub = None;
-        for (i, s) in self.sig_names.iter().enumerate() {
-            if allow_leaf && leaf(s) == name {
-                hit = Some(i);
-                break;
-            }
-            if sub.is_none() && s.contains(name) {
-                sub = Some(i);
+        // 短名走懒建的排序索引(O(log N)), 不再线性扫全表
+        let hit = if allow_leaf { self.lookup_leaf(name) } else { None };
+        if hit.is_none() {
+            // 子串匹配仍然只能线性扫(这类写法本身代价高);结果同样进 name_cache。
+            for (i, s) in self.sig_names.iter().enumerate() {
+                if s.contains(name) {
+                    let found = Some(i);
+                    self.name_cache.borrow_mut().insert(name.to_string(), found);
+                    return found;
+                }
             }
         }
-        let found = hit.or(sub);
+        let found = hit;
         self.name_cache.borrow_mut().insert(name.to_string(), found);
         found
     }
@@ -2046,6 +2098,24 @@ impl Trace for FsdbTrace {
             s.rsplitn(2, '.').next().unwrap_or("")
         }
         let allow_leaf = name.len() <= 8 || !name.contains('.');
+        // 叶子名唯一 → 直接命中(免去 188 万次线性扫描);有重名则按原语义报歧义错误。
+        if allow_leaf {
+            match self.leaf_is_unique(name) {
+                Some(true) => {
+                    let i = self.lookup_leaf(name).ok_or_else(|| {
+                        format!("signal '{}' not found in any loaded trace.", name)
+                    })?;
+                    return Ok(self.sig_names[i].clone());
+                }
+                Some(false) => {
+                    return Err(format!(
+                        "signal '{}' is ambiguous (多个同名叶子信号) — 请用完整名字",
+                        name
+                    ));
+                }
+                None => {}
+            }
+        }
         let mut hits: Vec<&String> = Vec::new();
         for s in &self.sig_names {
             if (allow_leaf && leaf(s) == name) || s.contains(name) {
