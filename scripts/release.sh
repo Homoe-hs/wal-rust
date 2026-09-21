@@ -95,6 +95,19 @@ NOTES="$(awk -v v="$VERSION" '
 ' CHANGELOG.md)"
 [ -n "$(printf '%s' "$NOTES" | tr -d '[:space:]')" ] || die "CHANGELOG 里 $VERSION 一节是空的"
 
+# 拒绝"只有模板占位"的版本节 —— 真实事故: v0.14.25/v0.14.26 的 release notes
+# 发出去只有 `### Added - (下一次发版前在这里写…)`。这里比 check_docs 更靠前地拦一次。
+if printf '%s' "$NOTES" | grep -q "下一次发版前在这里写"; then
+    die "CHANGELOG 里 $VERSION 一节还是模板占位。发版前必须:
+  1) 在「未发布」里写清本轮变更;
+  2) 把「## [未发布]」标题改成「## [$VERSION] - $(date +%F)」;
+  3) 在文件顶部新开一个「## [未发布]」小节(只留注释, 不要留占位条目)。"
+fi
+bullets=$(printf '%s' "$NOTES" | grep -c '^- ')
+[ "$bullets" -ge 2 ] || die "CHANGELOG 里 $VERSION 一节只有 $bullets 条变更 —— release notes 至少写清 2 条"
+say "release notes 预览($bullets 条):"
+printf '%s\n' "$NOTES" | sed 's/^/    /' | head -12
+
 # --- 3. 本地 CI --------------------------------------------------------------
 if [ $SKIP_CI -eq 1 ]; then
     say "跳过本地 CI(--skip-ci)"

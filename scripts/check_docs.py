@@ -224,6 +224,56 @@ def check_versions(docs: list[Path], cur: tuple[int, int, int]) -> None:
                     )
 
 
+PLACEHOLDER = "下一次发版前在这里写"
+
+
+def check_changelog() -> None:
+    """F. CHANGELOG 的版本节不许是空模板。
+
+    真实事故: v0.14.25 / v0.14.26 的 release notes 发出去的只有
+    `### Added - (下一次发版前在这里写;分类见文件头)` —— 因为发版把
+    「未发布」标题改名成版本号时, 那一节里只有占位条目, 而 release.sh 只检查了"非空"。
+    这里在提交/CI 阶段就拦住: 占位文本 + 变更条数太少两条都报错。
+    """
+    p = ROOT / "CHANGELOG.md"
+    if not p.exists():
+        errors.append("CHANGELOG.md 不存在")
+        return
+    text = p.read_text(encoding="utf-8")
+    heads = list(re.finditer(r"^## \[([^\]]+)\]", text, re.M))
+    if not heads:
+        errors.append("CHANGELOG.md 里没有任何 `## [版本]` 小节")
+        return
+    names = [m.group(1) for m in heads]
+    if "未发布" not in names:
+        errors.append("CHANGELOG.md 缺少 `## [未发布]` 小节(新一轮变更写在那里)")
+    unreleased = names.index("未发布") if "未发布" in names else None
+    if unreleased is not None and unreleased != 0:
+        errors.append("CHANGELOG.md 的 `## [未发布]` 不在最上面(新的在上面)")
+    first_version_idx = next((i for i, m in enumerate(heads) if m.group(1) != "未发布"), None)
+    for i, m in enumerate(heads):
+        end = heads[i + 1].start() if i + 1 < len(heads) else len(text)
+        body = text[m.end():end]
+        name = m.group(1)
+        if name == "未发布":
+            continue
+        if PLACEHOLDER in body:
+            errors.append(
+                f"CHANGELOG.md: [{name}] 一节只有模板占位 —— 发版说明会照抄这一节, "
+                f"必须写清实际变更"
+            )
+            continue
+        # "至少 2 条"只对**最新**版本节要求(它就是要发的 release notes);
+        # 历史版本允许只有一条变更(0.14.9 就是单条修复), 不做无意义的历史改写。
+        if i == first_version_idx:
+            bullets = len(re.findall(r"^- ", body, re.M))
+            if bullets < 2:
+                errors.append(
+                    f"CHANGELOG.md: [{name}] 是最新一节却只有 {bullets} 条变更 —— "
+                    f"release notes 至少写清 2 条(或把它并进上一节)"
+                )
+
+
 def check_workflows() -> None:
     """E. 声明存在的 workflow 文件必须真的存在(README 里的 CI 徽章依赖它)。"""
     wf = ROOT / ".github" / "workflows"
@@ -243,6 +293,7 @@ def main() -> int:
     check_docs_index(docs)
     check_claims(docs)
     check_versions(docs, cur)
+    check_changelog()
     check_workflows()
 
     for w in warnings:

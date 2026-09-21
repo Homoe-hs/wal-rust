@@ -11,20 +11,12 @@
 
 ## [未发布]
 
-### Added
-- (下一次发版前在这里写;分类见文件头)
+<!-- 新一轮变更写在这里(下面直接写 ### Added / ### Fixed / ...)。
+     发版时把本标题改成 `## [x.y.z] - YYYY-MM-DD`, 并在文件顶部新开一个「未发布」小节 ——
+     只留本注释, 不要留占位条目:`scripts/check_docs.py` 与 `scripts/release.sh` 都会拒绝
+     只有模板的版本节(曾发生: v0.14.25/v0.14.26 的 release notes 发成了空模板)。 -->
 
 ## [0.14.26] - 2026-09-21
-
-### Added
-- (下一次发版前在这里写;分类见文件头)
-
-## [0.14.25] - 2026-09-21
-
-### Added
-- (下一次发版前在这里写;分类见文件头)
-
-## [0.14.21] - 2026-09-21
 
 ### Performance
 - **名字解析不再每次求值克隆整张名字表(188 万信号 FSDB 上的致命项)**。裸符号求值走
@@ -36,12 +28,16 @@
 - FSDB 短名解析加**叶子名排序索引**(`leaf_order`, 只存 u32, O(log N) 查找, 首次用时懒建):
   此前每个不同拼写的短名都要线性扫全部信号名(188 万 → 几十~几百毫秒/次)。
 
-### Added
 - `scripts/fsdb_vcd_quickcheck.sh <fsdb> <vcd> [sig…]`: 一分钟内回答"两份波形是不是同一份仿真"
   —— ① 信号集(数量/同名交集/各自独有) ② 索引空间长度 ③ 典型信号的边沿/电平/变更计数,
   逐项 ✅/❌ 并给出"是不是 fsdb2vcd 匹配问题"的结论。
 - `scripts/bench_name_resolution.sh [信号数] [时间戳数]`: 名字解析/裸符号求值的可复跑基准
   (引擎 / 逐拍 / 字符串对照三条路径), 专门盯"O(N) 每次求值"回归。
+
+### Internal
+- CI 的 `perf` 阶段接入名字解析基准(>240s 判退化);`AGENTS.md` 增加硬约束"求值热路径禁止 `signals()`"。
+
+## [0.14.25] - 2026-09-21
 
 ### Fixed
 - **裸信号符号做电平比较会静默错值**: `(= clk 1)` / `(! rst)` 这类**手册在教**的写法被判成
@@ -57,6 +53,11 @@
 - `cargo build --release` **零告警**(此前 37 条): 清掉未用 import/赋值与死代码,
   旧的手写 FST 读器(`src/fst/reader.rs`, 查询路径已改用 wellen)整体标注 `#![allow(dead_code)]`
   并说明保留原因, 不再淹没真实告警。
+
+### Internal
+- `scripts/release.sh`: ssh 推送失败时回退到 gh 的 HTTPS 凭据, 并刷新 `origin/main` 跟踪引用。
+
+## [0.14.21] - 2026-09-21
 
 ### Changed
 - **CLI 一次性表达式里"多顶层形式"被当成函数调用(静默错值)**: `parse_expr` 把程序交给
@@ -77,15 +78,10 @@
   回归: `matrix_variadic_macros_bind_all_args`。
 - **`(sample-at s idx)` 浮点索引不再静默截断**: `(sample-at s 4.5)` 曾取索引 4 的值, 现在明确报错
   (整数除法用 `(div a b)`)。回归: `matrix_sample_at_rejects_float_index`。
-
-### Changed
 - `test_samples/verify_vcd.wal` 从"只打印不断言"改为**断言式**自检: 9 项检查, 任一不成立即退出码 1。
 - `tests/fsdb_diff.rs` 的两个 Verdi 门改为 `#[ignore = "需要 Verdi/NPI…"]`: 没 Verdi 时如实显示
   `ignored` 而不是"5 passed"(以前是静默 return, 造成门禁跑过的假象);有样本时
   `make gates` 会自动 `--include-ignored` 真跑。
-
-### Added
-- (下一次发版前在这里写;分类见文件头)
 
 ## [0.14.17] - 2026-09-20
 

@@ -99,12 +99,19 @@ git config core.hooksPath .githooks
 ## 4. 发版流程
 
 ```bash
-# 1) 写 CHANGELOG: 把「未发布」内容整理到 ## [x.y.z] - YYYY-MM-DD(scripts/release.sh 会检查)
+# 1) 写 CHANGELOG —— 三步, 少一步 release.sh 会直接拒绝(它照抄该版本节当 release notes):
+#    a) 在「未发布」里写清本轮变更(至少 2 条);
+#    b) 把「## [未发布]」标题改成「## [x.y.z] - YYYY-MM-DD」;
+#    c) 在文件顶部新开一个「## [未发布]」小节 —— 只留注释, 不要留占位条目。
+#    (历史事故: v0.14.25/v0.14.26 的 release notes 发出去只有模板占位。)
 # 2) 演练(检查工作区/tag/CHANGELOG, 跑 CI 与交叉构建, 但不推送)
 make release-dry VERSION=0.15.0
 # 3) 正式发版: 改版本号 → 提交 → 跑 CI → zigbuild → 推送 → 创建 GitHub release
 make release VERSION=0.15.0
 ```
+
+> CI 的 `docs` 阶段同样会校验 CHANGELOG: 版本节里有模板占位、或最新一节少于 2 条变更、
+> 或缺少/位置不对的「未发布」小节, 都会让 CI 变红 —— 别等到发版才发现。
 
 * 发布物: `target/x86_64-unknown-linux-gnu.2.17/release/wal-rust`(**要求 glibc ≥ 2.17**,
   兼容 CentOS 7 / Ubuntu 16.04+)。`make dist` 只构建不发布。
