@@ -873,8 +873,16 @@ fn op_sample_at(args: &[Value], env: &mut Environment, _eval: &mut Evaluator) ->
     let signal_name = resolve_signal_name(&name, &[]).unwrap_or(name);
     let _ = &signal_name;
     let index = match &args[1] {
-        Value::Int(i) => *i as usize,
-        Value::Float(f) => *f as usize,
+        Value::Int(i) if *i >= 0 => *i as usize,
+        Value::Int(i) => return Err(format!("sample-at: 索引不能为负: {}", i)),
+        // 浮点索引**不能静默截断**: `(sample-at s 4.5)` 曾经取到索引 4 的值,
+        // 于是"按时间/按拍取值"写错的人会拿到一个看起来正常的数(静默错值)。
+        Value::Float(f) => {
+            return Err(format!(
+                "sample-at: 索引必须是整数, 收到 {}。要按索引取整可用 (div n 2)",
+                f
+            ))
+        }
         _ => return Err("sample-at: second argument must be an integer index".to_string()),
     };
     if let Some(traces) = env.get_traces() {

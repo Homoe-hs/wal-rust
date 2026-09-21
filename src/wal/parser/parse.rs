@@ -39,12 +39,24 @@ impl WalParser {
         // 词法把 `==`/`===` 拆成多个 `=`: 归一化 (= = a b) → (= a b), 否则
         // `(== x 1)` 会静默得到 false(而不是报错)。
         normalize_eq_aliases(&mut result);
-        // Unwrap single-expression program: return the child, not the wrapping list
+        // 多顶层形式 → 显式包成 `(list form1 form2 ...)`:
+        // ① 求值顺序 = 书写顺序(dispatcher 的实参按序求值);
+        // ② 结果与之前一致(各形式的值组成列表), 所以 CLI 一次性表达式仍会回显所有值;
+        // ③ **关键**: 不再让"程序"以裸列表的形式进入 eval_list —— 那里的 IIFE 分支
+        //    会把首元素求值成 Closure/Macro 时, 把**其余顶层形式当成它的实参**!
+        //    真实症状: `(define add5 ((fn (n) (fn (x) (+ x n))) 5)) (add5 3)` 因为
+        //    define 返回闭包 → 整段被当成闭包调用 → 静默答 13(应为 8);
+        //    `(defmacro twice (x) `(do ,x ,x)) (twice (print "hi"))` → 打印 4 次(应 2 次)。
         if root.kind() == "program" {
-            if let Value::List(ref lst) = result {
-                if lst.len() == 1 {
-                    return Ok(lst[0].clone());
+            match result {
+                Value::List(ref lst) if lst.len() == 1 => return Ok(lst[0].clone()),
+                Value::List(lst) if !lst.is_empty() => {
+                    let mut wrapped = Vec::with_capacity(lst.len() + 1);
+                    wrapped.push(Value::Symbol(crate::wal::ast::Symbol::new("list")));
+                    wrapped.extend(lst.0.into_iter());
+                    return Ok(Value::List(crate::wal::ast::WList::from_vec(wrapped)));
                 }
+                _ => {}
             }
         }
         Ok(result)
@@ -284,26 +296,21 @@ pub fn expr_from_node(node: tree_sitter::Node, source: &str) -> Result<Value, St
             }
         }
         "grouped_symbol" => {
-            let mut values = Vec::new();
-            let mut cursor = node.walk();
-            for child in node.children(&mut cursor) {
-                if should_skip_node(child) {
-                    continue;
-                }
-                values.push(expr_from_node(child, source)?);
+            // 语法里 `#name` 是**单个 token**(见 grammar.js: 拆成两个 token 时
+            // `#t`/`#f` 关键字会抢先匹配), 所以这里直接取节点文本、剥掉 `#`。
+            let text = get_node_text(node, source);
+            let name = text.trim().strip_prefix('#').unwrap_or(text.trim()).to_string();
+            if name.is_empty() {
+                return Err("Invalid grouped_symbol".to_string());
             }
-            if values.is_empty() {
-                Err("Invalid grouped_symbol".to_string())
-            } else {
-                // #signal -> (resolve-group 'signal)
-                Ok(Value::List(WList::from_vec(vec![
-                    Value::Symbol(Symbol::new("resolve-group")),
-                    Value::List(WList::from_vec(vec![
-                        Value::Symbol(Symbol::new("quote")),
-                        values[0].clone(),
-                    ])),
-                ])))
-            }
+            // #signal -> (resolve-group 'signal)
+            Ok(Value::List(WList::from_vec(vec![
+                Value::Symbol(Symbol::new("resolve-group")),
+                Value::List(WList::from_vec(vec![
+                    Value::Symbol(Symbol::new("quote")),
+                    Value::Symbol(Symbol::new(&name)),
+                ])),
+            ])))
         }
         "scoped_symbol" => {
             let mut values = Vec::new();

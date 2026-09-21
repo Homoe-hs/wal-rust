@@ -1433,6 +1433,116 @@ fn matrix_percent_normalize_keeps_utf8() {
     assert!(ok && got.contains("进度 100% 完成"), "%% 处理不对: {:?}", got);
 }
 
+/// **CLI 一次性表达式里"多顶层形式"必须按顺序求值, 不能当成函数调用**。
+///
+/// 真实 bug: `parse_expr` 把多形式程序交给 `eval_list` 时, 后者看到首元素求值成
+/// Closure/Macro 就走 IIFE 分支, 把**其余顶层形式当成它的实参** ——
+///   * `(define add5 ((fn (n) (fn (x) (+ x n))) 5)) (add5 3)` → 13(应为 8);
+///   * `(defun make-adder (n) (fn (x) (+ x n))) (define add5 (make-adder 5)) (add5 3)`
+///     → Arity error(应为 8);
+///   * `(defmacro twice (x) `(do ,x ,x)) (twice (print "hi"))` → 打印 4 次(应为 2 次);
+///   * `macroexpand` 会连带求值展开结果(应只展开)。
+/// 脚本模式/`--stdin` 逐条求值不受影响, 所以只在"命令行一把梭"时出现。
+#[test]
+fn matrix_cli_multiform_program_forms() {
+    let bin = env!("CARGO_BIN_EXE_wal-rust");
+    let run = |code: &str| -> (bool, String) {
+        let out = std::process::Command::new(bin)
+            .arg(code).env("WAL_CACHE", "off").output().expect("spawn wal-rust");
+        (out.status.success(), String::from_utf8_lossy(&out.stdout).to_string())
+    };
+    // 1) 闭包捕获: 必须 8
+    let (ok, got) = run("(define add5 ((fn (n) (fn (x) (+ x n))) 5)) (add5 3)");
+    assert!(ok, "闭包用例失败: {}", got);
+    assert!(got.contains("8") && !got.contains("13"), "闭包捕获算错: {}", got);
+    // 2) defun 返回闭包: 必须 8(曾经 Arity error)
+    let (ok, got) = run("(defun make-adder (n) (fn (x) (+ x n))) (define add5 (make-adder 5)) (add5 3)");
+    assert!(ok, "defun 返回闭包失败: {}", got);
+    assert!(got.contains("8") && !got.contains("13"), "defun 闭包算错: {}", got);
+    // 3) 宏参数求值次数 = 展开里的出现次数(2), 不能是 4
+    let (ok, got) = run("(defmacro twice (x) `(do ,x ,x)) (twice (print \"hi\"))");
+    assert!(ok);
+    assert_eq!(got.matches("hi").count(), 2, "宏参数被求值多次: {:?}", got);
+    // 4) macroexpand 只展开不求值
+    let (ok, got) = run("(defmacro twice (x) `(do ,x ,x)) (macroexpand '(twice (print \"hi\")))");
+    assert!(ok);
+    assert!(!got.contains("hi\n") || got.contains("(do (print \"hi\") (print \"hi\"))"),
+        "macroexpand 不该求值展开结果: {:?}", got);
+    assert!(got.contains("(do (print \"hi\") (print \"hi\"))"), "macroexpand 结果不对: {:?}", got);
+    // 5) 多形式程序仍按书写顺序求值, 并回显各形式的值
+    let (ok, got) = run("(define n 100) (define add5 ((fn (n) (fn (x) (+ x n))) 5)) (add5 3)");
+    assert!(ok && got.contains("(100 <closure <anonymous>> 8)"), "多形式回显变了: {}", got);
+    // 6) 立即调用 lambda 不受影响
+    let (ok, got) = run("((fn (x) (* x 2)) 21)");
+    assert!(ok && got.trim() == "=> 42", "IIFE 坏了: {}", got);
+}
+
+/// 字面量: 科学计数法必须被识别; `#t`/`#f` 前缀不能被"吞掉"。
+///
+/// 真实 bug: `1e3` 被拆成 int(1)+symbol(e3) → `Undefined symbol: e3`;
+/// `#timeout`(合法的分组符号 `#name`)被拆成 bool `#t` + symbol `imeout`
+/// → `Undefined symbol: imeout`。两者都是"报错指错了地方", 使用者完全看不出来。
+#[test]
+fn matrix_lexer_scientific_and_sharp_symbols() {
+    let bin = env!("CARGO_BIN_EXE_wal-rust");
+    let run = |code: &str| -> (bool, String) {
+        let out = std::process::Command::new(bin)
+            .arg(code).env("WAL_CACHE", "off").output().expect("spawn wal-rust");
+        let mut s = String::from_utf8_lossy(&out.stdout).to_string();
+        s.push_str(&String::from_utf8_lossy(&out.stderr));
+        (out.status.success(), s)
+    };
+    // 注意: 命令行裸参数 `1e3` 会被当成"脚本文件路径" —— 这是 CLI 的输入自动识别,
+    // 不是词法问题。所以字面量要放进表达式里测(`(#t)` 那类也一样)。
+    for (expr, want) in [
+        ("(list 1e3 1.5e3 1.5E-3)", "(1000 1500 0.0015)"),
+        ("(+ 1e3 0.5)", "1000.5"),
+        ("(* 1.5e3 2)", "3000"),
+        ("(list 1.5 3.14)", "(1.5 3.14)"),
+    ] {
+        let (ok, got) = run(expr);
+        assert!(ok && got.contains(want), "科学计数法 {} → {:?}(期望含 {})", expr, got, want);
+    }
+    // `#timeout` 是分组符号: 找不到组是运行期语义错误, 但**绝不该**是 "Undefined symbol: imeout"
+    let (ok, got) = run("(list #timeout)");
+    assert!(!ok, "#timeout 不该成功(没有加载波形/组)");
+    // 注意别写 `!contains("imeout")` —— "timeout" 本身就含这个子串。
+    assert!(!got.contains("Undefined symbol: imeout"), "#timeout 仍被拆成 #t + imeout: {:?}", got);
+    assert!(got.contains("group signal: timeout"), "错误信息应把 #timeout 当成分组符号: {:?}", got);
+    // `#t`/`#f` 仍然是布尔
+    let (ok, got) = run("(list #t #f)");
+    assert!(ok && got.contains("true") && got.contains("false"), "#t/#f 不再是布尔: {:?}", got);
+}
+
+/// `sample-at` 的浮点索引不能静默截断(曾经取到索引 4 的值而不是报错)。
+#[test]
+fn matrix_sample_at_rejects_float_index() {
+    let bin = env!("CARGO_BIN_EXE_wal-rust");
+    let dir = std::env::temp_dir().join(format!("wal_reg_idx_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let vcd = dir.join("i.vcd");
+    let mut body = String::from(
+        "$timescale 1ns $end\n$scope module t $end\n$var wire 1 ! clk $end\n$enddefinitions $end\n",
+    );
+    for i in 0..10 {
+        body.push_str(&format!("#{}\n{}!\n", i * 5, i % 2));
+    }
+    std::fs::write(&vcd, &body).unwrap();
+    let run = |code: &str| -> (bool, String) {
+        let out = std::process::Command::new(bin)
+            .arg(code).arg("-l").arg(&vcd).env("WAL_CACHE", "off")
+            .output().expect("spawn wal-rust");
+        (out.status.success(), String::from_utf8_lossy(&out.stderr).to_string())
+    };
+    let (ok, err) = run("(sample-at \"t.clk\" 4.5)");
+    assert!(!ok, "浮点索引应当报错, 不能静默截断");
+    assert!(err.contains("整数"), "报错应说明要整数: {}", err);
+    // 整数索引照常
+    let (ok, _) = run("(sample-at \"t.clk\" 4)");
+    assert!(ok, "整数索引不该失败");
+}
+
 /// `(slice x start end)` 在 `start >= end` 时必须给空结果 —— 不能 panic、也不能取错值。
 ///
 /// 真实 crash: `(slice (list 0 1 2 3 4 5 6 7) 3 0)` → `src/wal/builtins/special.rs` 里
