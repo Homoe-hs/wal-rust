@@ -100,6 +100,13 @@ Flags: `-l <waveform>`(可重复), `--halt-on-error`(遇错即停)。
 - **时间线冷建别逐块拷主表**: `FsdbTrace::scan` 每 4096 信号一块, 曾把已累积的时间线
   每块整份拷贝一次 → O(块数 × 主表长)(1.88M 信号 = 459 块 × 上千万时间点 = 几十 GB memcpy)。
   现在分片收齐后一次归并(收完再平衡归并)。
+- **并行冷建 = 分片 map/reduce, 产物必须逐字节一致**: 冷建时间线是唯一还在"整文件过一遍"
+  的操作, 且是纯并集。单机: `WAL_FSDB_TL_JOBS=N|auto`;集群: `make fsdb-prewarm FSDB=x.fsdb
+  SHARDS=16 [QUEUE=q]`(=`bsub -n 1` × N 跑 `fsdb-timeline-map`, 再 `fsdb-timeline-merge`)。
+  **归并走 `write_timeline_cache()` 同一份实现**, 与单进程产物逐字节相同(闸:
+  `timeline_map_reduce_matches_single_process_encoding`)。分片判据是"每个 worker 至少一个
+  信号"(曾错写 `sigs >= 2048`, 于是"信号少但时间戳几千万"的波形永远不并行)。
+  ⚠️ 每个 worker 一次 NPI 会话 = 一个 Verdi 许可;集群各节点要能看到 FSDB/二进制/缓存目录。
 - **帮助文案里的数字要有测试守门**: `--help` 曾写 "125 named operators" 而实际 146
   (`scripts/check_docs.py` 不扫 help 文本)。现在 `src/cli.rs` 有单元测试比对
   `builtins::registered_operator_count()`, 改注册表不同步改文案就会红。

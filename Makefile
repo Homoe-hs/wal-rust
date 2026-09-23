@@ -10,7 +10,7 @@ CARGO_HOME ?= $(CURDIR)/.cargo-home
 XDG_CACHE_HOME ?= $(CURDIR)/.tools/cache
 export CARGO_HOME XDG_CACHE_HOME
 
-.PHONY: help ci ci-fast ci-full fmt fmt-check lint build test gates test-fsdb docs-check docs-serve perf bench-names bench-fsdb quickcheck release release-dry clean dist clean-logs
+.PHONY: help ci ci-fast ci-full fmt fmt-check lint build test gates test-fsdb docs-check docs-serve perf bench-names bench-fsdb fsdb-prewarm quickcheck release release-dry clean dist clean-logs
 
 help: ## 显示所有可用任务
 	@grep -hE '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN{FS=":.*?## "}{printf "  \033[1m%-16s\033[0m %s\n", $$1, $$2}'
@@ -59,6 +59,10 @@ bench-names: ## 名字解析/裸符号求值基准(默认 200k 信号 × 2000 �
 bench-fsdb: ## FSDB 查询基准(冷建时间线/暖查询): make bench-fsdb FSDB=a.fsdb [SIG=tb.clk]
 	@: $${FSDB:?用法: make bench-fsdb FSDB=a.fsdb [SIG=tb.clk]}
 	./scripts/bench_fsdb.sh "$$FSDB" "$(SIG)"
+
+fsdb-prewarm: ## 并行预计算 FSDB 时间线缓存: make fsdb-prewarm FSDB=a.fsdb [SHARDS=8] [QUEUE=q] [LOCAL=1]
+	@: $${FSDB:?用法: make fsdb-prewarm FSDB=a.fsdb [SHARDS=8] [QUEUE=队列] [LOCAL=1]}
+	./scripts/lsf_fsdb_prewarm.sh "$$FSDB" $(or $(SHARDS),8) $(if $(QUEUE),--queue $(QUEUE)) $(if $(LOCAL),--local)
 
 quickcheck: ## FSDB↔VCD 一分钟一致性诊断: make quickcheck FSDB=a.fsdb VCD=a.vcd [SIG=tb.clk]
 	@: $${FSDB:?用法: make quickcheck FSDB=a.fsdb VCD=a.vcd}

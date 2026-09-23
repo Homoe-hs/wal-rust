@@ -191,7 +191,7 @@ mtime 变了(仿真还在写盘)或换名字 → 自动失效重建。
 
 实现选**多进程 exec**(不是 fork/线程): NPI 的线程/fork 安全性没有保证, exec 出来的
 worker 是全新进程, 走正常的 `npi_init/open`, 每个 worker 只算一段信号的变更时间并
-落盘, 父进程线性归并。CLI 里是隐藏子命令 `fsdb-tl-worker`。
+落盘, 父进程线性归并。worker 入口就是正式子命令 `fsdb-timeline-map`(见 §6.6)。
 
 | 60k 信号 FSDB 冷建 | 墙钟 | 说明 |
 |---|---|---|
@@ -259,6 +259,63 @@ NPI 变更流**(`npiFsdbTimeBasedVcIter`), 每次进程启动都要为这次查�
 回归闸: `tests/fsdb_diff.rs::fsdb_col_cache_hit_matches_cold`(需 Verdi)—— 同一查询在
 "不用缓存 / 建缓存 / 命中缓存"三次运行下必须同答, 且 `.fcol` 确实落盘;
 `src/trace/fsdb.rs::col_cache_tests` 覆盖编解码往返(4-state / 初值缺失 / 指纹失效 / 损坏)。
+
+### 6.6 并行冷建: 单机多进程 + 集群(LSF)
+
+冷建时间线是**唯一**还在"整文件过一遍"量级的操作(§6.5 之后查询侧已经压到"只加载"),
+而它是纯并集 —— 天然可并行, 且**分片方式不影响结果**。三条路径:
+
+**① 单机多进程**: `WAL_FSDB_TL_JOBS=N`(或 `auto` = min(核数, 8))。
+每个 worker 是独立进程(一次 NPI 初始化 ~2s + 一个 Verdi 许可), 扫 `idx % N == k`
+那批信号的变更时间, 父进程归并。
+
+**② LSF(集群)**: `scripts/lsf_fsdb_prewarm.sh <file.fsdb> [shards] [--queue Q] [--wall HH:MM]`
+
+```bash
+# 在共享文件系统上(FSDB、二进制、--work、--cache-dir 都要所有节点可见)
+./scripts/lsf_fsdb_prewarm.sh /shared/wave/design.fsdb 16 --queue normal --cache-dir /shared/wave/.wal-rust-cache
+# 内部 = bsub -n 1 跑 N 个 `wal-rust fsdb-timeline-map design.fsdb $k N tl.$k.part`
+#        → 等全部结束 → `wal-rust fsdb-timeline-merge design.fsdb tl.*.part`
+```
+
+之后普通查询把 `WAL_CACHE_DIR` 指向同一个共享目录即可直接命中。
+没有 LSF 时 `--local` 等价于 ①;`--dry-run` 只打印将要提交的 bsub 命令。
+
+**③ 手动两步**(批处理系统自己调度的场合):
+
+```bash
+wal-rust fsdb-timeline-map   design.fsdb 0 16 tl.0.part    # 每片一个 job
+wal-rust fsdb-timeline-merge design.fsdb tl.*.part         # 归并 → .ftl
+```
+
+**正确性契约**(有闸盯着):
+
+| 不变量 | 闸 |
+|---|---|
+| `.ftl` 与单进程产出的缓存**逐字节一致** | `timeline_map_reduce_matches_single_process_encoding`(还验了归并顺序无关) + 真机 `cmp` 实测 |
+| 轮转分片无重叠、无遗漏 | `timeline_round_robin_partition_covers_all` |
+| 分片失败/截断/空分片 → 报错, 不写半份缓存 | 同上单测 |
+| `WAL_FSDB_TL_JOBS` 默认 1(不能偷偷并行吃许可) | `timeline_jobs_parsing_is_conservative` |
+
+**实测**(200 万时间戳夹具, 客机 TCG 8 vCPU —— 比真机保守得多):
+
+| 分片 | 冷建墙钟 |
+|---|---|
+| 1(默认) | 40.1s |
+| 4 | 24.8s(1.6×) |
+| 8 | 21.6s(1.9×) |
+| LSF `--local 4` + reduce | 17s(参照单进程含取列共 40.7s) |
+
+内网 174MB 样本(真机, 4 进程): 400.5s → **175.1s**。
+
+⚠️ 两个**必然踩**的坑:
+* **许可**: 每个 worker 各占一个 Verdi 许可。shards 要看许可池余量, 不确定先 4;
+* **共享文件系统**: 集群 job 在别的节点上跑, FSDB / 二进制 / `--work` / `--cache-dir`
+  必须都是共享路径, 否则 job 直接找不到文件。
+
+另外: 计数用的"每个 worker 至少一个信号"判据曾经写成 `信号数 ≥ 2048`, 于是
+"信号很少但时间戳几千万"的波形(一组计数器打满时间轴)永远不会并行 —— 现在放开了,
+轮转分片对任何信号数都成立。
 
 ## 7 内网实测环境(2026-09-16)
 

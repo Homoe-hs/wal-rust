@@ -117,22 +117,53 @@ wal-rust count <wave> <signal> [value]")]
     #[command(about = "Most-active signals (by change count):\nwal-rust topsig <wave> [limit]")]
     Topsig(TopsigArgs),
 
-    /// (internal) FSDB 时间线并行构建 worker
-    #[command(hide = true)]
-    FsdbTlWorker(FsdbTlWorkerArgs),
+    /// FSDB 全局时间线: 集群/多进程分片预计算(第 shard 片)
+    #[command(
+        about = "Precompute a shard of the FSDB global timeline (index space).\n\
+Use it to fan the one unavoidable full-file pass out over many cores / LSF nodes,\n\
+then merge the shards with `fsdb-timeline-merge`:\n\
+  wal-rust fsdb-timeline-map design.fsdb 0 8 tl.0.part\n\
+  wal-rust fsdb-timeline-merge design.fsdb tl.*.part\n\
+Shards are round-robin over the signal list (hot/cold mixed evenly).\n\
+Each worker is a separate NPI session and takes one Verdi license."
+    )]
+    FsdbTimelineMap(FsdbTimelineMapArgs),
+
+    /// FSDB 全局时间线: 归并分片 → 安装 .ftl 缓存
+    #[command(
+        about = "Merge shards from `fsdb-timeline-map` and install the .ftl timeline cache\n\
+(byte-identical to the single-process cache):\n\
+  wal-rust fsdb-timeline-merge design.fsdb tl.*.part\n\
+Cache goes to $WAL_CACHE_DIR (default: ./.wal-rust-cache); run it from the directory\n\
+you query from, or point WAL_CACHE_DIR at a shared one."
+    )]
+    FsdbTimelineMerge(FsdbTimelineMergeArgs),
 }
 
-/// FSDB 时间线并行构建的内部 worker(用户不会直接调用)。
+/// 时间线分片预计算(集群/多进程)。
 #[derive(clap::Args, Debug)]
-pub struct FsdbTlWorkerArgs {
-    /// 波形文件
+pub struct FsdbTimelineMapArgs {
+    /// 波形文件(FSDB)
     pub file: PathBuf,
-    /// 轮转分片: 起始下标
-    pub lo: usize,
-    /// 轮转分片: 步长(worker 数)
-    pub hi: usize,
-    /// 输出: 该区间内所有变更时间(升序去重, delta-varint)
+    /// 本片编号(0 ≤ shard < shards)
+    pub shard: usize,
+    /// 分片总数(通常 = 并发 worker 数)
+    pub shards: usize,
+    /// 输出分片文件(该片内所有变更时间, 升序去重, delta-varint)
     pub out: PathBuf,
+}
+
+/// 归并分片并安装 `.ftl` 缓存。
+#[derive(clap::Args, Debug)]
+pub struct FsdbTimelineMergeArgs {
+    /// 波形文件(必须与 map 阶段同一个文件)
+    pub file: PathBuf,
+    /// 分片文件(可多个)
+    #[arg(required = true)]
+    pub parts: Vec<PathBuf>,
+    /// 缓存根目录(默认: $WAL_CACHE_DIR 或 ./.wal-rust-cache)
+    #[arg(long)]
+    pub cache_dir: Option<PathBuf>,
 }
 
 #[derive(Parser, Debug)]
@@ -209,12 +240,18 @@ pub enum ExecMode {
     },
     /// Start the interactive REPL
     Repl,
-    /// (internal) FSDB 时间线并行构建 worker
-    FsdbTlWorker {
+    /// FSDB 时间线分片预计算
+    FsdbTimelineMap {
         file: PathBuf,
-        lo: usize,
-        hi: usize,
+        shard: usize,
+        shards: usize,
         out: PathBuf,
+    },
+    /// FSDB 时间线分片归并 → 安装 .ftl
+    FsdbTimelineMerge {
+        file: PathBuf,
+        parts: Vec<PathBuf>,
+        cache_dir: Option<PathBuf>,
     },
     /// count <wave> <sig> [value]
     Count {
@@ -258,11 +295,16 @@ impl Args {
                 Command::Count(c) => ExecMode::Count { wave: c.wave, sig: c.sig, value: c.value },
                 Command::Sigs(s) => ExecMode::Sigs { wave: s.wave, pattern: s.pattern, limit: s.limit },
                 Command::Topsig(t) => ExecMode::Topsig { wave: t.wave, limit: t.limit },
-                Command::FsdbTlWorker(w) => ExecMode::FsdbTlWorker {
-                    file: w.file,
-                    lo: w.lo,
-                    hi: w.hi,
-                    out: w.out,
+                Command::FsdbTimelineMap(m) => ExecMode::FsdbTimelineMap {
+                    file: m.file,
+                    shard: m.shard,
+                    shards: m.shards,
+                    out: m.out,
+                },
+                Command::FsdbTimelineMerge(m) => ExecMode::FsdbTimelineMerge {
+                    file: m.file,
+                    parts: m.parts,
+                    cache_dir: m.cache_dir,
                 },
             };
         }

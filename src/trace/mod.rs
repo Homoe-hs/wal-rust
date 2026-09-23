@@ -52,6 +52,35 @@ pub mod fsdb_test_api {
         super::fsdb::round_robin_slice(n, offset, stride)
     }
 
+    /// 写时间线分片文件(map 阶段产物格式; 测试用)
+    pub fn write_times_file(path: &std::path::Path, times: &[u64]) -> std::io::Result<()> {
+        super::fsdb::write_times(path, times)
+    }
+
+    /// 归并分片 → 安装 `.ftl`(reduce 阶段入口; 测试用) → (时间点数, 缓存文件)
+    pub fn merge_timeline_parts(
+        file: &std::path::Path,
+        parts: &[std::path::PathBuf],
+        cache_root: Option<&std::path::Path>,
+    ) -> Result<(usize, std::path::PathBuf), String> {
+        super::fsdb::merge_timeline_parts(file, parts, cache_root)
+    }
+
+    /// `WAL_FSDB_TL_JOBS` 解析(含 `auto`; 测试用)
+    pub fn timeline_jobs() -> usize {
+        super::fsdb::timeline_jobs()
+    }
+
+    /// 纯解析(测试用): raw 值 × 核数 → 分片数
+    pub fn parse_timeline_jobs(raw: &str, cores: usize) -> usize {
+        super::fsdb::parse_timeline_jobs(raw, cores)
+    }
+
+    /// 波形指纹(测试用): 旁挂缓存的失效判据
+    pub fn wave_fingerprint(path: &std::path::Path) -> u64 {
+        super::vcd::wave_fingerprint(path)
+    }
+
     /// 编码名字树(测试用)
     pub fn encode_tree(names: &[String], widths: &[usize], scopes: &[String]) -> Vec<u8> {
         raw_encode_tree(&super::fsdb::TreeSnapshot {

@@ -11,6 +11,19 @@
 
 ## [未发布]
 
+### Added
+- **FSDB 时间线的并行/集群预计算**: 新增两个正式子命令 ——
+  `wal-rust fsdb-timeline-map <file> <shard> <shards> <out.part>`(算一片)与
+  `wal-rust fsdb-timeline-merge <file> <part>...`(归并 → 安装 `.ftl`)。
+  集群上用 `scripts/lsf_fsdb_prewarm.sh <file.fsdb> [shards]` 一条命令提交/等待/归并
+  (`bsub -n 1` × N, 无 LSF 时 `--local` 本机并发, `--dry-run` 只打印提交命令)。
+  `WAL_FSDB_TL_JOBS` 支持 `auto`(= min(核数, 8))。
+  **归并产物与单进程写出的 `.ftl` 逐字节一致**(单测 + 真机 `cmp` 双重验证), 分片怎么切、
+  归并顺序如何都不影响结果。
+- `scripts/bench_fsdb.sh`(`make bench-fsdb FSDB=x.fsdb [SIG=tb.clk]`): FSDB 查询基准,
+  冷建/暖查询/只加载分开计时并追加到 `bench/perf-history.csv`; CI `perf` 阶段在设了
+  `WAL_FSDB_BENCH=<file.fsdb>` 时自动跑(判据: 暖查询应接近"只加载")。
+
 ### Performance
 - **FSDB 逐信号变更列有了跨进程缓存(`.fcol`)**: FSDB 取某信号的变更列只能重走一遍
   NPI 变更流(`npiFsdbTimeBasedVcIter`), 以前**每个新进程都要为该查询用到的信号重扫一遍**,
@@ -19,19 +32,21 @@
   实测(客机, 200 万时间戳 / 100 万沿夹具, TCG 模拟下偏保守):
   电平计数暖查询 8.6s → **4.1s**(2.1×)、沿计数 8.0s → **3.6s**(2.2×), 冷查询 48.5s → **36.6s**;
   暖查询已逼近"只加载"的 3.2s 底线。
+- **单机并行冷建对"信号少、时间戳多"的波形也生效了**: 并行判据曾是"信号数 ≥ 2048",
+  于是"一组计数器打满时间轴"(几百毫秒级别的信号数、几千万时间戳)这类波形永远走单进程。
+  改成"每个 worker 至少分到一个信号"。实测冷建 40.1s → 24.8s(`TL_JOBS=4`)/ 21.6s(`TL_JOBS=8`)。
 - **时间线冷建不再逐块拷贝主表**: 每 4096 信号一块, 以前每块结束都把已累积的时间线整份
   拷贝一遍(O(块数 × 主表长) —— 1.88M 信号 = 459 块 × 上千万时间点 = 几十 GB memcpy),
   现在收齐分片后一次归并。
 
-### Added
-- `scripts/bench_fsdb.sh`(`make bench-fsdb FSDB=x.fsdb [SIG=tb.clk]`): FSDB 查询基准,
-  冷建/暖查询/只加载分开计时并追加到 `bench/perf-history.csv`; CI `perf` 阶段在设了
-  `WAL_FSDB_BENCH=<file.fsdb>` 时自动跑(判据: 暖查询应接近"只加载")。
-
 ### Internal
-- `tests/fsdb_diff.rs` 新增 `fsdb_col_cache_hit_matches_cold`(需 Verdi): 同一查询在
-  "不用缓存 / 建缓存 / 命中缓存"三次运行下必须同答, 且 `.fcol` 确实落盘;
+- `tests/fsdb_diff.rs` 新增三个闸: `fsdb_col_cache_hit_matches_cold`(需 Verdi, 同一查询在
+  "不用缓存 / 建缓存 / 命中缓存"三次运行下必须同答且 `.fcol` 落盘)、
+  `timeline_map_reduce_matches_single_process_encoding`(map/reduce 的 `.ftl` 与单进程
+  逐字节一致 + 归并顺序无关 + 坏分片报错)、`timeline_jobs_parsing_is_conservative`;
   `src/trace/fsdb.rs` 增加列缓存编解码往返单测(含 4-state、初值缺失、指纹失效、损坏)。
+- 并行写的缓存临时文件带 PID 后缀: N 个 worker 同时走 `FsdbTrace::load` 会写同一份
+  `.fnames`, 固定 tmp 名会互相 rename 走半份文件。
 
 <!-- 新一轮变更写在这里(下面直接写 ### Added / ### Fixed / ...)。
      发版时把本标题改成 `## [x.y.z] - YYYY-MM-DD`, 并在文件顶部新开一个「未发布」小节 ——

@@ -388,3 +388,78 @@ fn fsdb_col_cache_hit_matches_cold() {
     let _ = std::fs::remove_dir_all(&base);
     assert!(n_col > 0, "没有写出任何 .fcol 列缓存 —— 缓存路径或写入门槛有问题");
 }
+
+/// map/reduce 预计算的时间线缓存必须与"单进程自己写出来的 `.ftl`"**逐字节一致**,
+/// 且与分片顺序/切法无关 —— 这是集群(LSF)与多进程并行的正确性契约:
+/// 分片阶段只产"升序去重的时间序列", 汇合阶段走与单进程完全相同的编码 + 指纹。
+///
+/// (不需要 Verdi: 这里只碰分片文件的编解码与缓存落盘。)
+#[test]
+fn timeline_map_reduce_matches_single_process_encoding() {
+    use std::path::PathBuf;
+    let base = std::env::temp_dir().join(format!("wal-tl-mr-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).unwrap();
+    // 假波形: merge 只读它的身份(stat)与首尾 64KB 指纹, 不需要是真 FSDB
+    let wave = base.join("fake.fsdb");
+    std::fs::write(&wave, vec![7u8; 4096]).unwrap();
+
+    // 三个分片: 片内升序去重, 片间有重叠(轮转分片的真实形态)
+    let sets: [&[u64]; 3] = [&[3, 9, 40], &[9, 11], &[1, 40, 41]];
+    let mut parts: Vec<PathBuf> = Vec::new();
+    for (k, s) in sets.iter().enumerate() {
+        let p = base.join(format!("tl.{}.part", k));
+        wal_rust::trace::fsdb_test_api::write_times_file(&p, s).unwrap();
+        parts.push(p);
+    }
+    let cache = base.join("cache");
+    let (n, ftl) =
+        wal_rust::trace::fsdb_test_api::merge_timeline_parts(&wave, &parts, Some(&cache)).unwrap();
+    assert_eq!(n, 6, "1,3,9,11,40,41 去重后应有 6 个时间点");
+
+    let want: Vec<u64> = vec![1, 3, 9, 11, 40, 41];
+    let fp = wal_rust::trace::fsdb_test_api::wave_fingerprint(&wave);
+    let bytes = std::fs::read(&ftl).unwrap();
+    let (got, first) = wal_rust::trace::fsdb_test_api::decode(&bytes, fp).expect("缓存可解码");
+    assert_eq!(got, want);
+    assert_eq!(first, Some(1), "first_change = 时间线首点");
+    // 与单进程编码逐字节一致(只有指纹不同来源, 值必须相同)
+    let expect = wal_rust::trace::fsdb_test_api::encode(&want, Some(1));
+    assert_eq!(bytes[0..8], expect[0..8], "magic 必须一致");
+    assert_eq!(bytes[16..], expect[16..], "除指纹外整段字节必须一致");
+
+    // 分片顺序无关: 倒序归并 → 同一份缓存内容
+    let mut rev = parts.clone();
+    rev.reverse();
+    let cache2 = base.join("cache2");
+    let (n2, ftl2) =
+        wal_rust::trace::fsdb_test_api::merge_timeline_parts(&wave, &rev, Some(&cache2)).unwrap();
+    assert_eq!(n2, 6);
+    assert_eq!(std::fs::read(&ftl2).unwrap(), bytes, "归并顺序不得影响缓存字节");
+
+    // 坏输入必须报错而不是写出半份缓存
+    assert!(wal_rust::trace::fsdb_test_api::merge_timeline_parts(&wave, &[], Some(&cache)).is_err());
+    let bad = base.join("tl.bad.part");
+    std::fs::write(&bad, [0x80u8, 0x80]).unwrap(); // 截断的 varint
+    assert!(wal_rust::trace::fsdb_test_api::merge_timeline_parts(&wave, &[bad], Some(&cache)).is_err());
+    let empty = base.join("tl.empty.part");
+    wal_rust::trace::fsdb_test_api::write_times_file(&empty, &[]).unwrap();
+    assert!(wal_rust::trace::fsdb_test_api::merge_timeline_parts(&wave, &[empty], Some(&cache)).is_err());
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// `WAL_FSDB_TL_JOBS` 解析: 默认 1(每 worker 一个 Verdi 许可, 不能偷偷并行),
+/// `auto` = min(核数, 8), 非法值退回 1。
+#[test]
+fn timeline_jobs_parsing_is_conservative() {
+    use wal_rust::trace::fsdb_test_api::parse_timeline_jobs as p;
+    assert_eq!(p("", 32), 1, "未设置 → 不并行");
+    assert_eq!(p("1", 32), 1);
+    assert_eq!(p("4", 32), 4);
+    assert_eq!(p(" 4 ", 32), 4);
+    assert_eq!(p("auto", 32), 8, "auto 上限 8(许可与内存都有限)");
+    assert_eq!(p("auto", 4), 4);
+    assert_eq!(p("auto", 1), 1);
+    assert_eq!(p("nonsense", 32), 1, "非法值不能变成 0 或 panic");
+    assert_eq!(p("0", 32), 0, "0 表示显式关闭并行(由调用方 clamp)");
+}

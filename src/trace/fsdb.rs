@@ -679,7 +679,7 @@ fn save_tree_cache(
     };
     let mut blob = encode_tree(&snap);
     blob[8..16].copy_from_slice(&fp.to_le_bytes());
-    let tmp = f.with_extension("fnames.tmp");
+    let tmp = tmp_path(&f);
     match std::fs::write(&tmp, &blob) {
         Ok(()) => {
             if let Err(e) = std::fs::rename(&tmp, &f) {
@@ -757,15 +757,27 @@ fn merge_sorted_unique(a: &[u64], b: &[u64]) -> Vec<u64> {
 // 开关: `WAL_FSDB_TL_JOBS=N`(默认 1 = 关闭, 保持旧行为)。分片按名字树顺序切成
 // N 段连续区间, 每段一个 worker, 各自输出"升序去重的变更时间", 父进程线性归并。
 
+/// 同目录临时文件名带 PID 后缀。
+///
+/// 并行/集群场景里 **N 个进程可能同时写同一份缓存**(比如 N 个 worker 各自走
+/// `FsdbTrace::load` 写 `.fnames`)。若临时文件名固定, 两个进程会写同一个文件,
+/// 一个进程 rename 走的可能是另一个进程刚写了一半的内容。带上 pid 后各写各的,
+/// `rename` 本身仍是原子的。(读侧本来就校验 magic/指纹/长度, 坏文件只会被当缓存未命中。)
+fn tmp_path(p: &Path) -> PathBuf {
+    let mut s = p.as_os_str().to_owned();
+    s.push(format!(".{}.tmp", std::process::id()));
+    PathBuf::from(s)
+}
+
 /// 该区间内所有变更时间(升序去重) —— worker 的输出格式: delta-varint
-fn write_times(path: &std::path::Path, times: &[u64]) -> std::io::Result<()> {
+pub(crate) fn write_times(path: &std::path::Path, times: &[u64]) -> std::io::Result<()> {
     let mut out = Vec::with_capacity(times.len() * 2 + 8);
     let mut prev = 0u64;
     for &t in times {
         put_varint(&mut out, t - prev);
         prev = t;
     }
-    let tmp = path.with_extension("tmp");
+    let tmp = tmp_path(path);
     std::fs::write(&tmp, &out)?;
     std::fs::rename(&tmp, path)
 }
@@ -781,6 +793,113 @@ fn read_times(path: &std::path::Path) -> Option<Vec<u64>> {
         out.push(prev);
     }
     Some(out)
+}
+
+/// `WAL_FSDB_TL_JOBS` 的解析规则(纯函数, 便于测试):
+/// * 空 / 非法 / `1` → 1(默认不并行: 每个 worker 是一次独立 NPI 会话, 各占一个 Verdi 许可);
+/// * `auto` → min(核数, 8);
+/// * 数字 N → N。
+pub(crate) fn parse_timeline_jobs(raw: &str, cores: usize) -> usize {
+    let v = raw.trim().to_ascii_lowercase();
+    if v == "auto" {
+        return cores.clamp(1, 8);
+    }
+    v.parse::<usize>().ok().unwrap_or(1)
+}
+
+/// 时间线分片数: `WAL_FSDB_TL_JOBS` 见 `parse_timeline_jobs`。
+pub fn timeline_jobs() -> usize {
+    let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+    parse_timeline_jobs(&std::env::var("WAL_FSDB_TL_JOBS").unwrap_or_default(), cores)
+}
+
+/// 写 `<cache>/<file_identity>-v1.ftl`(原子: 先写 .tmp 再 rename)。
+/// 单进程路径与 `fsdb-timeline-merge` **共用这一份实现** —— 保证两条路径产出的
+/// 缓存逐字节一致(已有 A/B 校验: 串行与并行产物相同)。
+pub(crate) fn write_timeline_cache(
+    cache_root: &Path,
+    filename: &str,
+    times: &[u64],
+    first_change: Option<u64>,
+) -> Option<PathBuf> {
+    let f = cache_path(cache_root, filename, ".ftl")?;
+    if let Some(dir) = f.parent() {
+        if std::fs::create_dir_all(dir).is_err() {
+            return None;
+        }
+    }
+    let fp = crate::trace::vcd::wave_fingerprint(Path::new(filename));
+    let mut blob = encode_timeline(times, first_change);
+    blob[8..16].copy_from_slice(&fp.to_le_bytes());
+    let tmp = tmp_path(&f);
+    match std::fs::write(&tmp, &blob) {
+        Ok(()) => {
+            if let Err(e) = std::fs::rename(&tmp, &f) {
+                crate::trace::warn_cache_write(&f, &e);
+                return None;
+            }
+        }
+        Err(e) => {
+            crate::trace::warn_cache_write(&tmp, &e);
+            return None;
+        }
+    }
+    if std::env::var("WAL_DEBUG_FSDB").is_ok() {
+        eprintln!("[fsdb] 时间线缓存写入 {} 个时间点 → {}", times.len(), f.display());
+    }
+    Some(f)
+}
+
+/// 把若干"升序去重的时间序列"归并成一个(平衡两两归并, 避免反复拷贝大表)
+pub(crate) fn merge_time_sets(mut parts: Vec<Vec<u64>>) -> Vec<u64> {
+    if parts.is_empty() {
+        return Vec::new();
+    }
+    while parts.len() > 1 {
+        let mut next: Vec<Vec<u64>> = Vec::with_capacity(parts.len().div_ceil(2));
+        let mut it = parts.into_iter();
+        while let Some(a) = it.next() {
+            match it.next() {
+                Some(b) => next.push(merge_sorted_unique(&a, &b)),
+                None => next.push(a),
+            }
+        }
+        parts = next;
+    }
+    parts.pop().unwrap_or_default()
+}
+
+/// `fsdb-timeline-merge`: 归并分片(每个都是 delta-varint 的升序去重时间序列)
+/// 并安装 `.ftl` 缓存 —— 集群(map/reduce)与单机多进程共用同一条收尾路径。
+///
+/// `cache_root`: None → 用默认缓存目录(`WAL_CACHE_DIR` / CWD 下 `.wal-rust-cache`);
+/// 显式传入便于测试与集群里统一指定共享目录。
+pub fn merge_timeline_parts(
+    file: &Path,
+    parts: &[PathBuf],
+    cache_root: Option<&Path>,
+) -> Result<(usize, PathBuf), String> {
+    if parts.is_empty() {
+        return Err("没有输入分片(用法: wal-rust fsdb-timeline-merge <file.fsdb> <part>...)".to_string());
+    }
+    let mut sets: Vec<Vec<u64>> = Vec::with_capacity(parts.len());
+    for p in parts {
+        let t = read_times(p).ok_or_else(|| format!("分片读不出(截断/格式不对): {}", p.display()))?;
+        sets.push(t);
+    }
+    let times = merge_time_sets(sets);
+    if times.is_empty() {
+        return Err("归并结果为空: 分片里一个时间点都没有(波形没有 dump 段?)".to_string());
+    }
+    // 与 `FsdbTrace::load` 同一套文件名规范化(相对路径在 NPI 沙箱里 stat 不到)
+    let filename = std::fs::canonicalize(file)
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|_| file.to_string_lossy().to_string());
+    let root = cache_root.map(|p| p.to_path_buf()).unwrap_or_else(abs_cache_root);
+    let first = times.first().copied();
+    let out = write_timeline_cache(&root, &filename, &times, first)
+        .ok_or_else(|| format!("写时间线缓存失败: {} (检查目录权限/WAL_CACHE_DIR)", root.display()))?;
+    Ok((times.len(), out))
 }
 
 /// worker 入口: 只算 [lo, hi) 这些信号的变更时间并落盘。
@@ -1489,7 +1608,7 @@ impl FsdbTrace {
             let out = self.cache_root.join(format!(".tl-{}-{}.part", tag, k));
             let _ = std::fs::remove_file(&out);
             match std::process::Command::new(&exe)
-                .arg("fsdb-tl-worker")
+                .arg("fsdb-timeline-map")
                 .arg(&self.filename)
                 .arg(k.to_string())
                 .arg(jobs.to_string())
@@ -1528,10 +1647,9 @@ impl FsdbTrace {
         if let Some(e) = failed {
             return Err(e);
         }
-        let mut all: Vec<u64> = Vec::new();
-        for p in parts {
-            all = merge_sorted_unique(&all, &p);
-        }
+        let mut all: Vec<u64> = merge_time_sets(parts);
+        all.sort_unstable();
+        all.dedup();
         Ok(all)
     }
 
@@ -1729,19 +1847,7 @@ impl FsdbTrace {
             // 收齐所有分片再一次归并。**不能边扫边并进主表**: 每块都会把已累积的
             // 主表整份拷贝一遍, 总拷贝量 = O(块数 × 主表长) —— 1.88M 信号(4096/块
             // = 459 块)× 上千万时间点 = 几十 GB memcpy, 纯浪费。
-            let mut parts = tl_parts;
-            while parts.len() > 1 {
-                let mut next: Vec<Vec<u64>> = Vec::with_capacity(parts.len().div_ceil(2));
-                let mut it = parts.into_iter();
-                while let Some(a) = it.next() {
-                    match it.next() {
-                        Some(b) => next.push(merge_sorted_unique(&a, &b)),
-                        None => next.push(a),
-                    }
-                }
-                parts = next;
-            }
-            let mut times = parts.pop().unwrap_or_default();
+            let mut times = merge_time_sets(tl_parts);
             times.sort_unstable();
             times.dedup();
             out.times = times;
@@ -1785,27 +1891,7 @@ impl FsdbTrace {
         if crate::trace::vcd::cache_mode() == CacheMode::Read {
             return;
         }
-        let Some(f) = self.timeline_cache_file() else { return };
-        if let Some(dir) = f.parent() {
-            if std::fs::create_dir_all(dir).is_err() {
-                return;
-            }
-        }
-        let fp = crate::trace::vcd::wave_fingerprint(std::path::Path::new(&self.filename));
-        let mut blob = encode_timeline(times, first_change);
-        blob[8..16].copy_from_slice(&fp.to_le_bytes());
-        let tmp = f.with_extension("ftl.tmp");
-        match std::fs::write(&tmp, &blob) {
-            Ok(()) => {
-                if let Err(e) = std::fs::rename(&tmp, &f) {
-                    crate::trace::warn_cache_write(&f, &e);
-                }
-            }
-            Err(e) => crate::trace::warn_cache_write(&tmp, &e),
-        }
-        if std::env::var("WAL_DEBUG_FSDB").is_ok() {
-            eprintln!("[fsdb] 时间线缓存写入 {} 个时间点 → {}", times.len(), f.display());
-        }
+        write_timeline_cache(&self.cache_root, &self.filename, times, first_change);
     }
 
     // ============ 逐信号变更列的旁挂缓存(跨进程) ============
@@ -1914,7 +2000,7 @@ impl FsdbTrace {
         let init = self.initials.borrow().get(&idx).cloned().flatten();
         let fp = crate::trace::vcd::wave_fingerprint(Path::new(&self.filename));
         let out = encode_col_cache(fp, self.sigs[idx].width, init.as_ref(), pts);
-        let tmp = f.with_extension("tmp");
+        let tmp = tmp_path(&f);
         match std::fs::write(&tmp, &out) {
             Ok(()) => {
                 if let Err(e) = std::fs::rename(&tmp, &f) {
@@ -1944,12 +2030,12 @@ impl FsdbTrace {
             return Ok(rc);
         }
         let t_begin = std::time::Instant::now();
-        // 并行构建(可选): 冷启动的时间线是全文件扫描, 是唯一还在几百秒量级的操作。
-        let jobs = std::env::var("WAL_FSDB_TL_JOBS")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(1);
-        if jobs > 1 && self.sigs.len() >= 2048 {
+        // 并行构建: 冷启动的时间线是"把全文件每条变更过一遍", 与信号数无关、只与
+        // 变更条数有关 —— 所以判据是"每个 worker 至少分到一个信号", 不是"信号数够多"。
+        // 曾经写成 `sigs >= 2048`, 于是"信号少但时间戳几千万"的波形(一组计数器打满
+        // 时间轴)永远走单进程, 明明可以并行。(轮转分片对任何 n 都成立。)
+        let jobs = timeline_jobs();
+        if jobs > 1 && self.sigs.len() >= jobs {
             match self.parallel_timeline(jobs) {
                 Ok(times) if !times.is_empty() => {
                     if std::env::var("WAL_DEBUG_FSDB").is_ok() {
@@ -1987,6 +2073,17 @@ impl FsdbTrace {
             self.first_change.set(Some(t.first().copied()));
         }
         let elapsed = t_begin.elapsed();
+        // 冷建慢的时候给一条可执行的提示(时间线只能靠"把全文件变更过一遍", 能压的
+        // 只有并行 —— 单机多进程或 LSF)。只在真的慢(≥30s)且没开并行时说一次。
+        if jobs <= 1 && elapsed >= std::time::Duration::from_secs(30) {
+            eprintln!(
+                "[fsdb] 时间线冷建 {:.1}s({} 个时间点): 可并行加速 —— \
+                 WAL_FSDB_TL_JOBS=auto(每 worker 各占一个 NPI 许可), \
+                 集群上用 `wal-rust fsdb-timeline-map`/`fsdb-timeline-merge`(见 docs/fsdb-npi.md §6.6)",
+                elapsed.as_secs_f64(),
+                times.len()
+            );
+        }
         // 只缓存"值得缓存"的: 小时间线(<1k 点)重扫也比读文件快, 而且不污染目录。
         // `WAL_CACHE=build` 时无条件写(测试/预热用)。
         // 判据: 时间点够多, 或者这次构建确实慢(平台/文件差异都能覆盖到)。

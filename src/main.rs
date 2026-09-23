@@ -41,13 +41,29 @@ fn main() {
     let args = Args::parse();
 
     match args.resolve() {
-        ExecMode::FsdbTlWorker { file, lo, hi, out } => {
-            // 内部 worker: 只为并行构建全局时间线用(见 src/trace/fsdb.rs)。
-            // 不算入口, 不进 CLI 文档。
-            match wal_rust::trace::fsdb::run_timeline_worker(&file, lo, hi, &out) {
+        ExecMode::FsdbTimelineMap { file, shard, shards, out } => {
+            // 并行/集群预计算全局时间线的一"片"(见 docs/fsdb-npi.md §6.6)。
+            // 单机多进程(`WAL_FSDB_TL_JOBS`)与 LSF 多 job 都走这个入口。
+            if shards == 0 || shard >= shards {
+                eprintln!(
+                    "fsdb-timeline-map: 需要 0 ≤ shard < shards(收到 shard={}, shards={})",
+                    shard, shards
+                );
+                std::process::exit(2);
+            }
+            match wal_rust::trace::fsdb::run_timeline_worker(&file, shard, shards, &out) {
                 Ok(()) => std::process::exit(0),
                 Err(e) => {
-                    eprintln!("fsdb-tl-worker: {}", e);
+                    eprintln!("fsdb-timeline-map: {}", e);
+                    std::process::exit(2);
+                }
+            }
+        }
+        ExecMode::FsdbTimelineMerge { file, parts, cache_dir } => {
+            match wal_rust::trace::fsdb::merge_timeline_parts(&file, &parts, cache_dir.as_deref()) {
+                Ok((n, out)) => println!("=> {} 个时间点 → {}", n, out.display()),
+                Err(e) => {
+                    eprintln!("fsdb-timeline-merge: {}", e);
                     std::process::exit(2);
                 }
             }
