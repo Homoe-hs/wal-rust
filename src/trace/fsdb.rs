@@ -22,7 +22,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int, c_void};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::ptr;
 use std::rc::Rc;
 use std::sync::OnceLock;
@@ -435,6 +435,132 @@ fn get_varint(buf: &[u8], pos: &mut usize) -> Option<u64> {
             return None;
         }
     }
+}
+
+/// 值 → 字节(旁挂列缓存用; 4-state 原样保留: Bit 存原始字节, 0/1/x/z 不丢)
+fn put_scalar(out: &mut Vec<u8>, v: &ScalarValue) {
+    match v {
+        ScalarValue::Bit(b) => {
+            out.push(0);
+            out.push(*b);
+        }
+        ScalarValue::Vector(bytes) => {
+            out.push(1);
+            put_varint(out, bytes.len() as u64);
+            out.extend_from_slice(bytes);
+        }
+        ScalarValue::Real(x) => {
+            out.push(2);
+            out.extend_from_slice(&x.to_le_bytes());
+        }
+    }
+}
+
+fn get_scalar(buf: &[u8], pos: &mut usize) -> Option<ScalarValue> {
+    let tag = *buf.get(*pos)?;
+    *pos += 1;
+    match tag {
+        0 => {
+            let b = *buf.get(*pos)?;
+            *pos += 1;
+            Some(ScalarValue::Bit(b))
+        }
+        1 => {
+            let n = get_varint(buf, pos)? as usize;
+            if *pos + n > buf.len() {
+                return None;
+            }
+            let v = buf[*pos..*pos + n].to_vec();
+            *pos += n;
+            Some(ScalarValue::Vector(v))
+        }
+        2 => {
+            if *pos + 8 > buf.len() {
+                return None;
+            }
+            let mut a = [0u8; 8];
+            a.copy_from_slice(&buf[*pos..*pos + 8]);
+            *pos += 8;
+            Some(ScalarValue::Real(f64::from_le_bytes(a)))
+        }
+        _ => None,
+    }
+}
+
+/// 旁挂列缓存的编码(纯函数, 便于单元测试往返): `WALFCOL2` + 指纹 + 位宽 +
+/// init 编码 + 条数 + [delta 时间 varint, 值]*。
+/// init 放在头部, `initial_of()` 读前 64KB 就能拿到(不必解整列)。
+fn encode_col_cache(fp: u64, width: usize, init: Option<&ScalarValue>, pts: &[(u64, ScalarValue)]) -> Vec<u8> {
+    let mut out: Vec<u8> = Vec::with_capacity(32 + pts.len() * 6);
+    out.extend_from_slice(b"WALFCOL2");
+    out.extend_from_slice(&fp.to_le_bytes());
+    out.extend_from_slice(&(width as u32).to_le_bytes());
+    match init {
+        None => out.push(0),
+        Some(ScalarValue::Bit(b)) => {
+            out.push(1);
+            out.push(*b);
+        }
+        Some(ScalarValue::Vector(v)) => {
+            out.push(2);
+            put_varint(&mut out, v.len() as u64);
+            out.extend_from_slice(v);
+        }
+        Some(ScalarValue::Real(x)) => {
+            out.push(3);
+            out.extend_from_slice(&x.to_le_bytes());
+        }
+    }
+    out.extend_from_slice(&(pts.len() as u32).to_le_bytes());
+    let mut prev = 0u64;
+    for (t, v) in pts {
+        put_varint(&mut out, t.wrapping_sub(prev));
+        prev = *t;
+        put_scalar(&mut out, v);
+    }
+    out
+}
+
+/// 解析旁挂列缓存头部 → (位宽, t0 初值, 变更点起始偏移)。指纹不符/损坏 → None。
+fn parse_col_header(buf: &[u8], fp: u64) -> Option<(usize, Option<ScalarValue>, usize)> {
+    if buf.len() < 25 || &buf[0..8] != b"WALFCOL2" {
+        return None;
+    }
+    if u64::from_le_bytes(buf[8..16].try_into().ok()?) != fp {
+        return None;
+    }
+    let width = u32::from_le_bytes(buf[16..20].try_into().ok()?) as usize;
+    let mut pos = 20usize;
+    let kind = *buf.get(pos)?;
+    pos += 1;
+    let init: Option<ScalarValue> = match kind {
+        0 => None,
+        1 => {
+            let b = *buf.get(pos)?;
+            pos += 1;
+            Some(ScalarValue::Bit(b))
+        }
+        2 => {
+            let n = get_varint(buf, &mut pos)? as usize;
+            if pos + n > buf.len() {
+                return None;
+            }
+            let v = buf[pos..pos + n].to_vec();
+            pos += n;
+            Some(ScalarValue::Vector(v))
+        }
+        3 => {
+            if pos + 8 > buf.len() {
+                return None;
+            }
+            let mut a = [0u8; 8];
+            a.copy_from_slice(&buf[pos..pos + 8]);
+            pos += 8;
+            Some(ScalarValue::Real(f64::from_le_bytes(a)))
+        }
+        _ => return None,
+    };
+    Some((width, init, pos))
 }
 
 /// 时间线 → 字节流(delta 编码: 时间戳单调, 差值多为小数字)
@@ -1479,6 +1605,8 @@ impl FsdbTrace {
         let session_load: Option<u32> = std::env::var("WAL_FSDB_SESSION_LOAD").ok().and_then(|v| v.parse().ok());
         let mut entries = 0usize;
         let mut chunk_start = 0usize;
+        // 每块的"块内已去重升序时间表"。收齐后一次性归并(见函数末尾), 不边扫边并。
+        let mut tl_parts: Vec<Vec<u64>> = Vec::new();
         while chunk_start < targets.len() {
             let chunk_end = (chunk_start + chunk).min(targets.len());
             let mut it = IterObj::new(npi);
@@ -1526,7 +1654,7 @@ impl FsdbTrace {
                         last = t;
                     }
                 }
-                out.times = merge_sorted_unique(&out.times, &chunk_times);
+                tl_parts.push(chunk_times);
                 drop(it);
                 if unload_each_chunk() {
                     if let Some(f) = npi.unload_vc {
@@ -1573,9 +1701,8 @@ impl FsdbTrace {
                 }
             }
             if want_timeline {
-                // 增量归并: 每块结束就把时间去重进主表 → 主表长度 = 去重后的时间点数,
-                // 不随"块数 × 块内时间点数"膨胀。
-                out.times = merge_sorted_unique(&out.times, &chunk_times);
+                // 块内已升序去重 → 收起来最后统一归并(不逐块并进主表)
+                tl_parts.push(chunk_times);
             }
             drop(it);
             if unload_each_chunk() {
@@ -1599,8 +1726,25 @@ impl FsdbTrace {
             chunk_start = chunk_end;
         }
         if want_timeline {
-            out.times.sort_unstable();
-            out.times.dedup();
+            // 收齐所有分片再一次归并。**不能边扫边并进主表**: 每块都会把已累积的
+            // 主表整份拷贝一遍, 总拷贝量 = O(块数 × 主表长) —— 1.88M 信号(4096/块
+            // = 459 块)× 上千万时间点 = 几十 GB memcpy, 纯浪费。
+            let mut parts = tl_parts;
+            while parts.len() > 1 {
+                let mut next: Vec<Vec<u64>> = Vec::with_capacity(parts.len().div_ceil(2));
+                let mut it = parts.into_iter();
+                while let Some(a) = it.next() {
+                    match it.next() {
+                        Some(b) => next.push(merge_sorted_unique(&a, &b)),
+                        None => next.push(a),
+                    }
+                }
+                parts = next;
+            }
+            let mut times = parts.pop().unwrap_or_default();
+            times.sort_unstable();
+            times.dedup();
+            out.times = times;
             out.has_timeline = true;
         }
         if dbg {
@@ -1661,6 +1805,126 @@ impl FsdbTrace {
         }
         if std::env::var("WAL_DEBUG_FSDB").is_ok() {
             eprintln!("[fsdb] 时间线缓存写入 {} 个时间点 → {}", times.len(), f.display());
+        }
+    }
+
+    // ============ 逐信号变更列的旁挂缓存(跨进程) ============
+    //
+    // 为什么需要: FSDB 每个进程都要重走一遍 NPI 变更流才能拿到某信号的列
+    // (`scan(&{idx}, false)` → `npiFsdbTimeBasedVcIter`), 而 `(get s)`/
+    // `(getwave s)`/`(at s T)`/`(count (rising s))` **只要这一个信号自己的变更列**。
+    // 实测(2M 时间戳夹具, TCG 客机): 只加载 3.3s, 而"取一个 2M 变更信号的列"要
+    // +4.9s —— 每次查询都重扫一遍纯属浪费。VCD 侧早有同构的旁挂列缓存(`.cols`),
+    // FSDB 一直没有。
+    //
+    // 格式: `WALFCOL1` + 指纹(u64) + 位宽(u32) + 条数(u32) + [delta 时间, 值]*
+    // 路径: `<cache>/<文件身份>-v1.fcol/<fnv1a(全名)>-v1.col`(与 `.ftl`/`.fnames` 同一身份 key)
+    fn col_cache_dir(&self) -> Option<PathBuf> {
+        cache_path(&self.cache_root, &self.filename, ".fcol")
+    }
+
+    fn col_cache_file(&self, idx: usize) -> Option<PathBuf> {
+        let sig = self.sigs.get(idx)?;
+        let dir = self.col_cache_dir()?;
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for b in sig.full.as_bytes() {
+            h ^= *b as u64;
+            h = h.wrapping_mul(0x100_0000_01b3);
+        }
+        Some(dir.join(format!("{:016x}-v1.col", h)))
+    }
+
+    /// 单列点数上限: 几千万点的信号一个文件上百 MB, 不值当(`WAL_FSDB_COL_MAX` 可调)
+    fn col_cache_max_points() -> usize {
+        std::env::var("WAL_FSDB_COL_MAX")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(50_000_000)
+    }
+
+    /// 解析旁挂列缓存头部(指纹由本 trace 的波形算出)
+    fn parse_col_header(&self, buf: &[u8]) -> Option<(usize, Option<ScalarValue>, usize)> {
+        let fp = crate::trace::vcd::wave_fingerprint(Path::new(&self.filename));
+        parse_col_header(buf, fp)
+    }
+
+    fn try_load_col_cache(&self, idx: usize) -> Option<(Option<ScalarValue>, Vec<(u64, ScalarValue)>)> {
+        if crate::trace::vcd::cache_mode() == crate::trace::vcd::CacheMode::Off {
+            return None;
+        }
+        let f = self.col_cache_file(idx)?;
+        let buf = std::fs::read(&f).ok()?;
+        let (width, init, mut pos) = self.parse_col_header(&buf)?;
+        if width != self.sigs[idx].width {
+            return None;
+        }
+        let n = u32::from_le_bytes(buf.get(pos..pos + 4)?.try_into().ok()?) as usize;
+        pos += 4;
+        let mut out = Vec::with_capacity(n);
+        let mut t = 0u64;
+        for _ in 0..n {
+            t = t.wrapping_add(get_varint(&buf, &mut pos)?);
+            out.push((t, get_scalar(&buf, &mut pos)?));
+        }
+        if std::env::var("WAL_DEBUG_FSDB").is_ok() {
+            eprintln!("[fsdb] 列缓存命中: {} 点(初值 {:?}) ← {}", out.len(), init, f.display());
+        }
+        Some((init, out))
+    }
+
+    /// 只要 t0 初值: 读头部即可, 不解整列(宽信号超出缓冲区时退回整文件读)
+    fn try_load_init_cache(&self, idx: usize) -> Option<Option<ScalarValue>> {
+        if crate::trace::vcd::cache_mode() == crate::trace::vcd::CacheMode::Off {
+            return None;
+        }
+        let f = self.col_cache_file(idx)?;
+        use std::io::Read;
+        let mut file = std::fs::File::open(&f).ok()?;
+        let mut head = vec![0u8; 65536];
+        let n = file.read(&mut head).ok()?;
+        head.truncate(n);
+        let parsed = self.parse_col_header(&head).or_else(|| {
+            let all = std::fs::read(&f).ok()?;
+            self.parse_col_header(&all)
+        })?;
+        if parsed.0 != self.sigs[idx].width {
+            return None;
+        }
+        Some(parsed.1)
+    }
+
+    fn save_col_cache(&self, idx: usize, pts: &[(u64, ScalarValue)]) {
+        use crate::trace::vcd::CacheMode;
+        if !matches!(crate::trace::vcd::cache_mode(), CacheMode::Auto | CacheMode::Build) {
+            return;
+        }
+        if pts.len() < 2 || pts.len() > Self::col_cache_max_points() {
+            return;
+        }
+        let Ok(meta) = std::fs::metadata(&self.filename) else { return };
+        if meta.len() < crate::trace::vcd::cache_min_bytes() {
+            return;
+        }
+        let Some(f) = self.col_cache_file(idx) else { return };
+        if let Some(dir) = f.parent() {
+            if std::fs::create_dir_all(dir).is_err() {
+                return;
+            }
+        }
+        let init = self.initials.borrow().get(&idx).cloned().flatten();
+        let fp = crate::trace::vcd::wave_fingerprint(Path::new(&self.filename));
+        let out = encode_col_cache(fp, self.sigs[idx].width, init.as_ref(), pts);
+        let tmp = f.with_extension("tmp");
+        match std::fs::write(&tmp, &out) {
+            Ok(()) => {
+                if let Err(e) = std::fs::rename(&tmp, &f) {
+                    crate::trace::warn_cache_write(&f, &e);
+                }
+            }
+            Err(e) => crate::trace::warn_cache_write(&tmp, &e),
+        }
+        if std::env::var("WAL_DEBUG_FSDB").is_ok() {
+            eprintln!("[fsdb] 列缓存写入 {} 点 → {}", pts.len(), f.display());
         }
     }
 
@@ -1775,16 +2039,22 @@ impl FsdbTrace {
         if let Some(c) = self.cols.borrow().get(&idx) {
             return Ok(c.clone());
         }
+        // 跨进程旁挂缓存: 命中就完全不用碰 NPI 的变更流(连 t0 初值一起拿回来)
+        if let Some((init, pts)) = self.try_load_col_cache(idx) {
+            self.initials.borrow_mut().entry(idx).or_insert(init);
+            let rc = Rc::new(Column { points: pts });
+            self.cols.borrow_mut().insert(idx, rc.clone());
+            return Ok(rc);
+        }
         let mut want = HashSet::new();
         want.insert(idx);
         let out = self.scan(&want, false)?;
         self.apply_scan(out);
-        Ok(self
-            .cols
-            .borrow()
-            .get(&idx)
-            .cloned()
-            .unwrap_or_else(|| Rc::new(Column::default())))
+        let got = self.cols.borrow().get(&idx).cloned();
+        if let Some(c) = &got {
+            self.save_col_cache(idx, &c.points);
+        }
+        Ok(got.unwrap_or_else(|| Rc::new(Column::default())))
     }
 
     /// 取**索引基**变更列(把时间映射到索引空间; 会建时间线)。
@@ -1809,10 +2079,15 @@ impl FsdbTrace {
         Ok(rc)
     }
 
-    /// 信号初值(t0 快照; 没有条目 → None)    /// 信号初值(t0 快照; 没有条目 → None)
+    /// 信号初值(t0 快照; 没有条目 → None)
     fn initial_of(&self, idx: usize) -> Option<ScalarValue> {
         if let Some(v) = self.initials.borrow().get(&idx) {
             return v.clone();
+        }
+        // 旁挂缓存头部就带着初值 → 不必为一个初值扫完整条变更流
+        if let Some(got) = self.try_load_init_cache(idx) {
+            self.initials.borrow_mut().insert(idx, got.clone());
+            return got;
         }
         let mut want = HashSet::new();
         want.insert(idx);
@@ -2029,15 +2304,34 @@ impl Trace for FsdbTrace {
         if want.is_empty() {
             return;
         }
-        let missing: HashSet<usize> = want
-            .into_iter()
-            .filter(|i| !self.cols.borrow().contains_key(i))
-            .collect();
+        // 先吃跨进程旁挂缓存(命中就不必再走 NPI); 剩下的才合并成一次扫描。
+        let mut missing: HashSet<usize> = HashSet::new();
+        for i in want {
+            if self.cols.borrow().contains_key(&i) {
+                continue;
+            }
+            match self.try_load_col_cache(i) {
+                Some((init, pts)) => {
+                    self.initials.borrow_mut().entry(i).or_insert(init);
+                    self.cols.borrow_mut().insert(i, Rc::new(Column { points: pts }));
+                }
+                None => {
+                    missing.insert(i);
+                }
+            }
+        }
         if missing.is_empty() {
             return;
         }
         if let Ok(out) = self.scan(&missing, false) {
             self.apply_scan(out);
+        }
+        // 扫完落盘: 下一个进程(同一条查询)直接命中 —— FSDB 拿列只能靠 NPI 全扫该信号
+        let scanned: Vec<usize> = missing.into_iter().collect();
+        for i in scanned {
+            if let Some(c) = self.cols.borrow().get(&i).cloned() {
+                self.save_col_cache(i, &c.points);
+            }
         }
     }
 
@@ -2382,5 +2676,78 @@ impl Trace for FsdbTrace {
         v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
         v.truncate(k);
         v
+    }
+}
+
+#[cfg(test)]
+mod col_cache_tests {
+    use super::*;
+
+    /// 从编码后的字节流解出变更点(与 `try_load_col_cache` 同一读法)
+    fn decode_points(buf: &[u8], mut pos: usize) -> Option<Vec<(u64, ScalarValue)>> {
+        let n = u32::from_le_bytes(buf.get(pos..pos + 4)?.try_into().ok()?) as usize;
+        pos += 4;
+        let mut out = Vec::with_capacity(n);
+        let mut t = 0u64;
+        for _ in 0..n {
+            t = t.wrapping_add(get_varint(buf, &mut pos)?);
+            out.push((t, get_scalar(buf, &mut pos)?));
+        }
+        Some(out)
+    }
+
+    /// 4-state 必须原样往返: 0/1/x/z 与矢量里的 x/z 都不能被"规范化"掉
+    #[test]
+    fn col_cache_round_trip_keeps_4state() {
+        let fp = 0x1234_5678_9abc_def0u64;
+        let init = ScalarValue::Bit(b'x');
+        let pts = vec![
+            (5u64, ScalarValue::Bit(b'0')),
+            (9u64, ScalarValue::Bit(b'z')),
+            (12u64, ScalarValue::Bit(b'1')),
+            (40u64, ScalarValue::Vector(vec![b'1', b'0', b'x', b'z'])),
+        ];
+        let buf = encode_col_cache(fp, 4, Some(&init), &pts);
+        let (width, got_init, off) = parse_col_header(&buf, fp).expect("header");
+        assert_eq!(width, 4);
+        assert_eq!(got_init, Some(ScalarValue::Bit(b'x')));
+        assert_eq!(decode_points(&buf, off).unwrap(), pts);
+    }
+
+    /// "没有 t0 条目"(None)与"初值是某个值"必须能区分 —— 引擎的索引 0 特例靠它
+    #[test]
+    fn col_cache_distinguishes_absent_init() {
+        let fp = 7u64;
+        let buf = encode_col_cache(fp, 1, None, &[(3u64, ScalarValue::Bit(b'1'))]);
+        let (_, init, _) = parse_col_header(&buf, fp).expect("header");
+        assert_eq!(init, None);
+    }
+
+    #[test]
+    fn col_cache_real_value_round_trip() {
+        let fp = 42u64;
+        let pts = vec![(11u64, ScalarValue::Real(1.5)), (19u64, ScalarValue::Real(-0.25))];
+        let buf = encode_col_cache(fp, 64, Some(&ScalarValue::Real(3.0)), &pts);
+        let (_, init, off) = parse_col_header(&buf, fp).expect("header");
+        assert_eq!(init, Some(ScalarValue::Real(3.0)));
+        assert_eq!(decode_points(&buf, off).unwrap(), pts);
+    }
+
+    /// 指纹不符(同一秒等长改写)必须视为未命中 —— 否则会拿旧列答"看似正常"的错值
+    #[test]
+    fn col_cache_rejects_stale_fingerprint() {
+        let buf = encode_col_cache(1u64, 1, None, &[(3u64, ScalarValue::Bit(b'1'))]);
+        assert!(parse_col_header(&buf, 2u64).is_none());
+    }
+
+    /// 损坏/截断的缓存不能 panic, 只能是未命中
+    #[test]
+    fn col_cache_rejects_corrupt() {
+        let buf = encode_col_cache(1u64, 1, None, &[(3u64, ScalarValue::Bit(b'1'))]);
+        assert!(parse_col_header(&buf[..10], 1u64).is_none());
+        let mut bad = buf.clone();
+        bad[20] = 9; // 未知 init 编码
+        assert!(parse_col_header(&bad, 1u64).is_none());
+        assert!(decode_points(&buf, buf.len() - 1).is_none());
     }
 }

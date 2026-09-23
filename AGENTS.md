@@ -89,6 +89,17 @@ Flags: `-l <waveform>`(可重复), `--halt-on-error`(遇错即停)。
   `(SIGNALS)`/`sigs`/`find-sig` 这类**显式**请求。
   FSDB 短名解析另有懒建的叶子名排序索引(`leaf_order`, 只存 u32, O(log N)), 不再线性扫全表。
   基准: `./scripts/bench_name_resolution.sh [信号数] [时间戳数]`。
+- **FSDB 变更列必须走旁挂缓存(`.fcol`)**: FSDB 取"某信号的变更列"只能重走一遍 NPI 变更流
+  (`npiFsdbTimeBasedVcIter`), 没有 VCD 那种内存映射索引 —— 于是**每个新进程**都要为该查询
+  用到的信号重扫一遍, 与查询复杂度无关(现场 265MB / 3700 万时间戳上表现为"每次查询都慢")。
+  现在 `column_time`/`prepare` 先吃 `<cache>/<file_identity>-v1.fcol/<fnv(全名)>.col`
+  (列 + **t0 初值放在文件头部**: `initial_of()` 只读前 64KB, 不必解整列), 冷扫描后落盘;
+  指纹(`wave_fingerprint`)+位宽 + 文件身份 key 三重校验, 不匹配一律视为未命中。
+  实测: 暖查询 8.6s → 4.1s(电平)/8.0s → 3.6s(沿), 冷查询 48.5s → 36.6s(200 万时间戳夹具)。
+  基准: `make bench-fsdb FSDB=x.fsdb [SIG=tb.clk]`(或 `WAL_FSDB_BENCH=x.fsdb ./scripts/ci.sh --only perf`)。
+- **时间线冷建别逐块拷主表**: `FsdbTrace::scan` 每 4096 信号一块, 曾把已累积的时间线
+  每块整份拷贝一次 → O(块数 × 主表长)(1.88M 信号 = 459 块 × 上千万时间点 = 几十 GB memcpy)。
+  现在分片收齐后一次归并(收完再平衡归并)。
 - **帮助文案里的数字要有测试守门**: `--help` 曾写 "125 named operators" 而实际 146
   (`scripts/check_docs.py` 不扫 help 文本)。现在 `src/cli.rs` 有单元测试比对
   `builtins::registered_operator_count()`, 改注册表不同步改文案就会红。
@@ -134,6 +145,7 @@ Flags: `-l <waveform>`(可重复), `--halt-on-error`(遇错即停)。
 | **统一区间扫描引擎** | `interval_scan`(变更点并集边界 + 解释器值覆盖): count/find/whenever/count/step 同一实现;含边沿谓词时"边界真值 + 区间内部真值(边沿强制 false)"两段计入 |
 | **多文件选源与索引空间收口** | 加载顺序决定选源(first-match), 且 `interval_scan`/`step_scan`/`find_indices` 只对**会读值的**波形取 `max_index`; 禁止跨波形合并索引集合(内网 #32: `-l vcd -l fsdb` 查同名信号 >900s → 秒级) |
 | **旁挂列缓存(跨进程)** | 冷扫描后按信号落盘 `<cache>/<file_identity>-v1.cols/<fnv(name)>.col`(key 含 ctime+inode);下一个进程 `anchored_changes` 直接命中(58.7GB 同查询 113.8s → 3.35s) |
+| **FSDB 列缓存(`.fcol`)** | 同构但独立的一套(FSDB 只能靠 NPI 重扫): 列 + t0 初值在头部, 指纹/位宽校验; 暖查询 8.6s→4.1s, 冷 48.5s→36.6s(200 万时间戳夹具); `make bench-fsdb` |
 | **纯逐拍 oracle** | `WAL_NO_ENGINE=1` 让引擎直接返回 None → 全部走逐拍;矩阵在子进程里用它做独立对拍 |
 
 > 统一查询引擎(变更点并集区间扫描)已落地(docs/query-engine-design.md §IntervalSweep):

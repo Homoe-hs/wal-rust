@@ -11,6 +11,28 @@
 
 ## [未发布]
 
+### Performance
+- **FSDB 逐信号变更列有了跨进程缓存(`.fcol`)**: FSDB 取某信号的变更列只能重走一遍
+  NPI 变更流(`npiFsdbTimeBasedVcIter`), 以前**每个新进程都要为该查询用到的信号重扫一遍**,
+  与查询复杂度无关 —— 大波形上就是"每次查询都慢"。现在冷扫描后把列(t0 初值放在文件头部,
+  取值不必解整列)落盘, 下一个进程直接命中;`prepare()` 声明的多信号查询同样先吃缓存。
+  实测(客机, 200 万时间戳 / 100 万沿夹具, TCG 模拟下偏保守):
+  电平计数暖查询 8.6s → **4.1s**(2.1×)、沿计数 8.0s → **3.6s**(2.2×), 冷查询 48.5s → **36.6s**;
+  暖查询已逼近"只加载"的 3.2s 底线。
+- **时间线冷建不再逐块拷贝主表**: 每 4096 信号一块, 以前每块结束都把已累积的时间线整份
+  拷贝一遍(O(块数 × 主表长) —— 1.88M 信号 = 459 块 × 上千万时间点 = 几十 GB memcpy),
+  现在收齐分片后一次归并。
+
+### Added
+- `scripts/bench_fsdb.sh`(`make bench-fsdb FSDB=x.fsdb [SIG=tb.clk]`): FSDB 查询基准,
+  冷建/暖查询/只加载分开计时并追加到 `bench/perf-history.csv`; CI `perf` 阶段在设了
+  `WAL_FSDB_BENCH=<file.fsdb>` 时自动跑(判据: 暖查询应接近"只加载")。
+
+### Internal
+- `tests/fsdb_diff.rs` 新增 `fsdb_col_cache_hit_matches_cold`(需 Verdi): 同一查询在
+  "不用缓存 / 建缓存 / 命中缓存"三次运行下必须同答, 且 `.fcol` 确实落盘;
+  `src/trace/fsdb.rs` 增加列缓存编解码往返单测(含 4-state、初值缺失、指纹失效、损坏)。
+
 <!-- 新一轮变更写在这里(下面直接写 ### Added / ### Fixed / ...)。
      发版时把本标题改成 `## [x.y.z] - YYYY-MM-DD`, 并在文件顶部新开一个「未发布」小节 ——
      只留本注释, 不要留占位条目:`scripts/check_docs.py` 与 `scripts/release.sh` 都会拒绝

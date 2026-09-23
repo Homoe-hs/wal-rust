@@ -202,6 +202,21 @@ stage_perf() {
         return 1
     fi
 
+    # ①b FSDB 查询基准(有 Verdi + 大 FSDB 才跑: 设 WAL_FSDB_BENCH=<file.fsdb>)。
+    #     判据是"暖查询应当接近只加载": 若 fsdb-hit-* 退化到 cold 量级, 说明旁挂列
+    #     缓存(`.fcol`)没生效 —— 那正是现场"每次查询都慢"的根因。
+    if [ -n "${WAL_FSDB_BENCH:-}" ]; then
+        local flog="$LOG_DIR/bench_fsdb.log"
+        echo "  FSDB 基准: $WAL_FSDB_BENCH"
+        if ./scripts/bench_fsdb.sh "$WAL_FSDB_BENCH" ${WAL_FSDB_BENCH_SIG:-} >"$flog" 2>&1; then
+            grep -E "load|edge|level|at" "$flog" | sed 's/^/  /'
+        else
+            echo "  FSDB 基准失败(见 $flog; 记录数字但不拦 CI)"; tail -3 "$flog" | sed 's/^/  /'
+        fi
+    else
+        echo "  跳过 FSDB 基准(设 WAL_FSDB_BENCH=<file.fsdb> 开启)"
+    fi
+
     # ② 大样本冒烟(有 bench/data 才跑)
     if [ ! -d bench/data ] || [ -z "$(ls -A bench/data 2>/dev/null | grep -E '\.(vcd|fst|fsdb)$')" ]; then
         echo "跳过: bench/data 里没有大样本(见 bench/README.md 的生成方法)"; return 0

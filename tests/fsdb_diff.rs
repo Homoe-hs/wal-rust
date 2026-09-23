@@ -306,3 +306,85 @@ fn timeline_round_robin_partition_covers_all() {
         }
     }
 }
+
+/// 旁挂列缓存(跨进程 `.fcol`)必须**命中 == 未命中**给出同一个答案。
+///
+/// 事故背景: FSDB 拿某信号的变更列只能重走一遍 NPI 变更流(`npiFsdbTimeBasedVcIter`),
+/// 于是同一个查询每次进程启动都付一遍全量扫描 —— 188 万信号 / 几千万时间戳上就是
+/// "每次都慢"。加了 `.fcol`(列 + t0 初值)之后, **第二次运行**必须与冷扫逐字节同答,
+/// 且缓存文件真的要落在缓存目录里。
+///
+/// 需要:
+/// ```bash
+/// VERDI_HOME=… SNPSLMD_LICENSE_FILE=…
+/// WAL_FSDB_TEST_FILE=x.fsdb WAL_FSDB_TEST_SIG=<信号全名> \
+///   cargo test --release --test fsdb_diff -- --include-ignored fsdb_col_cache
+/// ```
+#[test]
+#[ignore = "需要 Verdi/NPI + WAL_FSDB_TEST_SIG: 用 --include-ignored 跑"]
+fn fsdb_col_cache_hit_matches_cold() {
+    let fsdb = match env_or_skip("WAL_FSDB_TEST_FILE") {
+        Some(v) => v,
+        None => return,
+    };
+    let sig = match env_or_skip("WAL_FSDB_TEST_SIG") {
+        Some(v) => v,
+        None => return,
+    };
+    if !std::path::Path::new(&fsdb).exists() {
+        eprintln!("skip: {} 不存在", fsdb);
+        return;
+    }
+    let bin = env!("CARGO_BIN_EXE_wal-rust");
+    // 缓存目录 = 执行目录(用户明确要求), 所以用两个临时 CWD 隔离"冷"与"暖"
+    let base = std::env::temp_dir().join(format!("wal-fcol-{}", std::process::id()));
+    let cold = base.join("cold");
+    let warm = base.join("warm");
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&cold).unwrap();
+    std::fs::create_dir_all(&warm).unwrap();
+
+    let queries = [
+        format!("(count (= (get \"{}\") 1))", sig),
+        format!("(count (rising \"{}\"))", sig),
+        format!("(at \"{}\" 3)", sig),
+    ];
+    let run = |dir: &std::path::Path, cache: &str, q: &str| -> String {
+        let out = std::process::Command::new(bin)
+            .arg(q)
+            .arg("-l")
+            .arg(&fsdb)
+            .current_dir(dir)
+            .env("WAL_CACHE", cache)
+            .env("WAL_CACHE_MIN_MB", "0")
+            .output()
+            .expect("spawn wal-rust");
+        assert!(
+            out.status.success(),
+            "查询失败 [{} / {}]: {}",
+            q,
+            cache,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+
+    for q in &queries {
+        let a = run(&cold, "off", q); // 完全不用缓存
+        let b = run(&warm, "build", q); // 冷建 + 落盘
+        let c = run(&warm, "build", q); // 命中缓存
+        assert_eq!(a, b, "冷扫与建缓存结果不一致: {}", q);
+        assert_eq!(a, c, "缓存命中与冷扫结果不一致: {}", q);
+    }
+
+    // 缓存目录里必须有列文件(否则这个测试什么也没证明)
+    let mut n_col = 0usize;
+    for e in std::fs::read_dir(&warm).unwrap() {
+        let p = e.unwrap().path();
+        if p.is_dir() && p.file_name().unwrap().to_string_lossy().ends_with(".fcol") {
+            n_col += std::fs::read_dir(&p).unwrap().count();
+        }
+    }
+    let _ = std::fs::remove_dir_all(&base);
+    assert!(n_col > 0, "没有写出任何 .fcol 列缓存 —— 缓存路径或写入门槛有问题");
+}
