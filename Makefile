@@ -10,7 +10,7 @@ CARGO_HOME ?= $(CURDIR)/.cargo-home
 XDG_CACHE_HOME ?= $(CURDIR)/.tools/cache
 export CARGO_HOME XDG_CACHE_HOME
 
-.PHONY: help ci ci-fast ci-full fmt fmt-check lint build test gates test-fsdb docs-check docs-serve perf bench-names bench-fsdb fsdb-prewarm quickcheck release release-dry clean dist clean-logs
+.PHONY: help ci ci-fast ci-full fmt fmt-check lint build test gates test-fsdb docs-check docs-serve perf bench-names bench-fsdb fsdb-prewarm lsf-run quickcheck release release-dry clean dist clean-logs
 
 help: ## 显示所有可用任务
 	@grep -hE '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN{FS=":.*?## "}{printf "  \033[1m%-16s\033[0m %s\n", $$1, $$2}'
@@ -63,6 +63,11 @@ bench-fsdb: ## FSDB 查询基准(冷建时间线/暖查询): make bench-fsdb FSD
 fsdb-prewarm: ## 并行预计算 FSDB 时间线缓存: make fsdb-prewarm FSDB=a.fsdb [SHARDS=8] [QUEUE=q] [LOCAL=1]
 	@: $${FSDB:?用法: make fsdb-prewarm FSDB=a.fsdb [SHARDS=8] [QUEUE=队列] [LOCAL=1]}
 	./scripts/lsf_fsdb_prewarm.sh "$$FSDB" $(or $(SHARDS),8) $(if $(QUEUE),--queue $(QUEUE)) $(if $(LOCAL),--local)
+
+lsf-run: ## 把 stdin 探针提交成 bsub -n N: make lsf-run FSDB=a.fsdb PROBES=p.wal [SLOTS=8] [QUEUE=q] [WAIT=1]
+	@: $${FSDB:?用法: make lsf-run FSDB=a.fsdb PROBES=p.wal [SLOTS=8]}
+	@: $${PROBES:?用法: make lsf-run FSDB=a.fsdb PROBES=p.wal [SLOTS=8]}
+	./scripts/lsf_wal_run.sh "$$FSDB" "$$PROBES" $(or $(SLOTS),8) $(if $(QUEUE),--queue $(QUEUE)) $(if $(WAIT),--wait)
 
 quickcheck: ## FSDB↔VCD 一分钟一致性诊断: make quickcheck FSDB=a.fsdb VCD=a.vcd [SIG=tb.clk]
 	@: $${FSDB:?用法: make quickcheck FSDB=a.fsdb VCD=a.vcd}

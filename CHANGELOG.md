@@ -17,14 +17,22 @@
   `wal-rust fsdb-timeline-merge <file> <part>...`(归并 → 安装 `.ftl`)。
   集群上用 `scripts/lsf_fsdb_prewarm.sh <file.fsdb> [shards]` 一条命令提交/等待/归并
   (`bsub -n 1` × N, 无 LSF 时 `--local` 本机并发, `--dry-run` 只打印提交命令)。
-  `WAL_FSDB_TL_JOBS` 支持 `auto`(= min(核数, 8))。
+  `WAL_FSDB_TL_JOBS` 支持 `auto`(= min(额度, 8))。
   **归并产物与单进程写出的 `.ftl` 逐字节一致**(单测 + 真机 `cmp` 双重验证), 分片怎么切、
   归并顺序如何都不影响结果。
+- **`bsub -n N` + stdin 会话**: `scripts/lsf_wal_run.sh <wave> <probes.wal> [slots]`
+  把 `wal-rust --stdin -l wave < probes.wal`(一次加载、多探针)提交成 `bsub -n N`
+  (`--queue/--wall/--wait/--dry-run`, 默认加 `-R "span[hosts=1]"`)。
 - `scripts/bench_fsdb.sh`(`make bench-fsdb FSDB=x.fsdb [SIG=tb.clk]`): FSDB 查询基准,
   冷建/暖查询/只加载分开计时并追加到 `bench/perf-history.csv`; CI `perf` 阶段在设了
   `WAL_FSDB_BENCH=<file.fsdb>` 时自动跑(判据: 暖查询应接近"只加载")。
 
 ### Performance
+- **批处理里按申请的 slot 自动并行冷建**: `bsub -n N` 会导出 `LSB_DJOB_NUMPROC`, wal-rust
+  现在按它(其次 `LSB_MCPU_HOSTS`, 再其次核数)决定时间线 worker 数(封顶 8), 不用再手设
+  `WAL_FSDB_TL_JOBS`;只在检测到批处理变量时才这样(登录节点仍默认单进程, 不会偷偷吃许可),
+  自动开时往 stderr 打一行提示。实测(客机模拟 `LSB_DJOB_NUMPROC=8`, 200 万时间戳夹具,
+  一个进程跑两条 stdin 探针): **21.5s**(单进程 40.1s)。
 - **FSDB 逐信号变更列有了跨进程缓存(`.fcol`)**: FSDB 取某信号的变更列只能重走一遍
   NPI 变更流(`npiFsdbTimeBasedVcIter`), 以前**每个新进程都要为该查询用到的信号重扫一遍**,
   与查询复杂度无关 —— 大波形上就是"每次查询都慢"。现在冷扫描后把列(t0 初值放在文件头部,

@@ -265,9 +265,9 @@ NPI 变更流**(`npiFsdbTimeBasedVcIter`), 每次进程启动都要为这次查�
 冷建时间线是**唯一**还在"整文件过一遍"量级的操作(§6.5 之后查询侧已经压到"只加载"),
 而它是纯并集 —— 天然可并行, 且**分片方式不影响结果**。三条路径:
 
-**① 单机多进程**: `WAL_FSDB_TL_JOBS=N`(或 `auto` = min(核数, 8))。
-每个 worker 是独立进程(一次 NPI 初始化 ~2s + 一个 Verdi 许可), 扫 `idx % N == k`
-那批信号的变更时间, 父进程归并。
+**① 单机多进程**: `WAL_FSDB_TL_JOBS=N`(或 `auto` = min(额度, 8);额度优先取
+LSF 分配的 slot 数, 见 ④)。每个 worker 是独立进程(一次 NPI 初始化 ~2s + 一个 Verdi 许可),
+扫 `idx % N == k` 那批信号的变更时间, 父进程归并。
 
 **② LSF(集群)**: `scripts/lsf_fsdb_prewarm.sh <file.fsdb> [shards] [--queue Q] [--wall HH:MM]`
 
@@ -287,6 +287,28 @@ NPI 变更流**(`npiFsdbTimeBasedVcIter`), 每次进程启动都要为这次查�
 wal-rust fsdb-timeline-map   design.fsdb 0 16 tl.0.part    # 每片一个 job
 wal-rust fsdb-timeline-merge design.fsdb tl.*.part         # 归并 → .ftl
 ```
+
+**④ `bsub -n N` + stdin 会话**(最贴近日常用法: `wal-rust --stdin -l wave.fsdb < probes.wal`
+= 一次加载、多探针顺序复用缓存)。批处理里 wal-rust 会读 `$LSB_DJOB_NUMPROC`(=`bsub -n N`),
+**自动按 slot 数并行冷建**(封顶 8), 不用再设 `WAL_FSDB_TL_JOBS`;许可紧张就显式 `=1`。
+这条策略只在检测到 LSF 变量时才生效 —— 登录节点上不设变量仍然默认单进程, 不会偷偷吃许可;
+自动并行时会往 stderr 打一行提示。
+
+```bash
+./scripts/lsf_wal_run.sh /shared/wave/design.fsdb /shared/wave/probes.wal 8 \
+    --queue normal --wait
+# 等价于:
+# bsub -J wal-probes -n 8 -R "span[hosts=1]" -o … \
+#   "cd /shared/wave && WAL_CACHE_DIR=/shared/wave/.wal-rust-cache \
+#    wal-rust --stdin -l design.fsdb < probes.wal"
+```
+
+⚠️ 批处理 job 的 stdin **不是**提交机的 stdin(`bsub` 从 stdin 读的是 **job 脚本本身**),
+所以探针文件必须在 job 命令里用 `<` 重定向, 并且它和波形一样得放在共享文件系统上。
+想"从提交机直接喂进去"只能用 `-I`/`-Is` 交互式提交(占着终端、语义也不同), 日常批处理别用。
+
+实测(客机模拟 `LSB_DJOB_NUMPROC=8`, 200 万时间戳夹具, 冷缓存, 一个进程跑两条探针):
+**21.5s**(单进程 40.1s), 两条探针答案一致, 缓存落在共享 `WAL_CACHE_DIR`。
 
 **正确性契约**(有闸盯着):
 

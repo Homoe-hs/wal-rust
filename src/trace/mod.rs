@@ -76,6 +76,11 @@ pub mod fsdb_test_api {
         super::fsdb::parse_timeline_jobs(raw, cores)
     }
 
+    /// 分片数策略(测试用): 显式值 × 并行额度 × 是否在批处理里
+    pub fn resolve_timeline_jobs(explicit: Option<&str>, budget: usize, in_batch: bool) -> usize {
+        super::fsdb::resolve_timeline_jobs(explicit, budget, in_batch)
+    }
+
     /// 波形指纹(测试用): 旁挂缓存的失效判据
     pub fn wave_fingerprint(path: &std::path::Path) -> u64 {
         super::vcd::wave_fingerprint(path)

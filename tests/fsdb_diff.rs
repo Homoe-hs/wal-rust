@@ -463,3 +463,27 @@ fn timeline_jobs_parsing_is_conservative() {
     assert_eq!(p("nonsense", 32), 1, "非法值不能变成 0 或 panic");
     assert_eq!(p("0", 32), 0, "0 表示显式关闭并行(由调用方 clamp)");
 }
+
+/// 批处理(LSF)下的并行额度策略: `bsub -n 8` = 用户明确要了 8 个 slot, 就该按 8 路
+/// 并行(否则 stdin 一次加载 + 多探针的用法在冷建上还是单核); 登录节点上不设变量时
+/// 仍然默认 1, 免得偷偷吃掉 8 个 Verdi 许可。
+#[test]
+fn timeline_jobs_follows_lsf_slots() {
+    use wal_rust::trace::fsdb_test_api::resolve_timeline_jobs as r;
+    // 没设置 + 不在批处理里 → 1(保守)
+    assert_eq!(r(None, 32, false), 1);
+    // 没设置 + LSF 给了 slot → 按 slot 数(封顶 8)
+    assert_eq!(r(None, 8, true), 8);
+    assert_eq!(r(None, 4, true), 4);
+    assert_eq!(r(None, 1, true), 1);
+    assert_eq!(r(None, 64, true), 8, "slot 再多也封顶 8(后面再靠 job 数扩)");
+    // 显式值永远优先: 用户可以用 =1 在批处理里关掉并行(许可紧张时)
+    assert_eq!(r(Some("1"), 8, true), 1);
+    assert_eq!(r(Some("4"), 8, true), 4);
+    assert_eq!(r(Some("16"), 8, true), 16, "显式数字不被封顶");
+    assert_eq!(r(Some("auto"), 64, false), 8);
+    assert_eq!(r(Some("auto"), 2, true), 2);
+    // 空字符串视为"没设置"(环境变量导出为空是常态)
+    assert_eq!(r(Some("  "), 8, true), 8);
+    assert_eq!(r(Some("junk"), 8, true), 1);
+}

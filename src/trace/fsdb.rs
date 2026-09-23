@@ -795,22 +795,76 @@ fn read_times(path: &std::path::Path) -> Option<Vec<u64>> {
     Some(out)
 }
 
-/// `WAL_FSDB_TL_JOBS` 的解析规则(纯函数, 便于测试):
-/// * 空 / 非法 / `1` → 1(默认不并行: 每个 worker 是一次独立 NPI 会话, 各占一个 Verdi 许可);
-/// * `auto` → min(核数, 8);
-/// * 数字 N → N。
-pub(crate) fn parse_timeline_jobs(raw: &str, cores: usize) -> usize {
-    let v = raw.trim().to_ascii_lowercase();
-    if v == "auto" {
-        return cores.clamp(1, 8);
+/// 本进程"可用的并行额度": 优先看批处理系统实际分配了什么, 再看机器核数。
+///
+/// * LSF: `$LSB_DJOB_NUMPROC`(= `bsub -n N`), 或 `$LSB_MCPU_HOSTS` 里各主机 slot 数之和;
+/// * 其它: `available_parallelism()`。
+///
+/// 为什么要看 LSF 而不是核数: `bsub -n 8` 只给这个 job 8 个 slot, 而节点可能有 64 核 ——
+/// 按核数开 worker 会跟同节点的别人抢 CPU, 也远超用户申请的资源。
+pub(crate) fn parallel_budget() -> usize {
+    if let Ok(v) = std::env::var("LSB_DJOB_NUMPROC") {
+        if let Ok(n) = v.trim().parse::<usize>() {
+            if n > 0 {
+                return n;
+            }
+        }
     }
-    v.parse::<usize>().ok().unwrap_or(1)
+    // LSB_MCPU_HOSTS 形如 "hostA 4 hostB 4"(主机名与 slot 数交替)
+    if let Ok(v) = std::env::var("LSB_MCPU_HOSTS") {
+        let slots: usize = v
+            .split_whitespace()
+            .skip(1)
+            .step_by(2)
+            .filter_map(|s| s.parse::<usize>().ok())
+            .sum();
+        if slots > 0 {
+            return slots;
+        }
+    }
+    std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
+}
+
+/// 分片数策略(纯函数, 便于测试):
+/// * 显式给了 `WAL_FSDB_TL_JOBS` → 听它的(`auto` = min(额度, 8), 数字 = 原样);
+/// * 没给 + 在批处理里(LSF 有 slot) → min(额度, 8): 用户用 `-n 8` 明确要了 8 个 slot,
+///   就该按 8 路并行;默认 1 是为了"登录节点上别偷偷吃 8 个许可", 不是"永远单进程";
+/// * 没给 + 不在批处理里 → 1。
+pub(crate) fn resolve_timeline_jobs(explicit: Option<&str>, budget: usize, in_batch: bool) -> usize {
+    match explicit.map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        Some(raw) => {
+            let v = raw.to_ascii_lowercase();
+            if v == "auto" {
+                budget.clamp(1, 8)
+            } else {
+                v.parse::<usize>().ok().unwrap_or(1)
+            }
+        }
+        None if in_batch => budget.clamp(1, 8),
+        None => 1,
+    }
+}
+
+/// `WAL_FSDB_TL_JOBS` 的解析(向后兼容的入口): 只按核数算额度
+pub(crate) fn parse_timeline_jobs(raw: &str, cores: usize) -> usize {
+    resolve_timeline_jobs(Some(raw), cores, false)
+}
+
+/// 是否在批处理系统里(LSF 会导出这些变量)
+pub(crate) fn in_batch_system() -> bool {
+    std::env::var_os("LSB_DJOB_NUMPROC").is_some()
+        || std::env::var_os("LSB_MCPU_HOSTS").is_some()
+        || std::env::var_os("LSB_JOBID").is_some()
 }
 
 /// 时间线分片数: `WAL_FSDB_TL_JOBS` 见 `parse_timeline_jobs`。
 pub fn timeline_jobs() -> usize {
-    let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
-    parse_timeline_jobs(&std::env::var("WAL_FSDB_TL_JOBS").unwrap_or_default(), cores)
+    let explicit = std::env::var("WAL_FSDB_TL_JOBS").ok();
+    resolve_timeline_jobs(
+        explicit.as_deref(),
+        parallel_budget(),
+        in_batch_system(),
+    )
 }
 
 /// 写 `<cache>/<file_identity>-v1.ftl`(原子: 先写 .tmp 再 rename)。
@@ -2036,6 +2090,16 @@ impl FsdbTrace {
         // 时间轴)永远走单进程, 明明可以并行。(轮转分片对任何 n 都成立。)
         let jobs = timeline_jobs();
         if jobs > 1 && self.sigs.len() >= jobs {
+            // 没显式设 WAL_FSDB_TL_JOBS 而开了并行 → 只可能是"批处理分配了 slot",
+            // 这件事必须说出来(每个 worker 各占一个 NPI 许可)。
+            let explicit = std::env::var("WAL_FSDB_TL_JOBS").map(|v| !v.trim().is_empty()).unwrap_or(false);
+            if !explicit && std::env::var("WAL_DEBUG_FSDB").is_err() {
+                eprintln!(
+                    "[fsdb] LSF 分配了 {} 个 slot → 时间线冷建用 {} 个 worker(每个各占一个 NPI 许可); 想单进程设 WAL_FSDB_TL_JOBS=1",
+                    parallel_budget(),
+                    jobs
+                );
+            }
             match self.parallel_timeline(jobs) {
                 Ok(times) if !times.is_empty() => {
                     if std::env::var("WAL_DEBUG_FSDB").is_ok() {
