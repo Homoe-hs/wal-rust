@@ -464,26 +464,32 @@ fn timeline_jobs_parsing_is_conservative() {
     assert_eq!(p("0", 32), 0, "0 表示显式关闭并行(由调用方 clamp)");
 }
 
-/// 批处理(LSF)下的并行额度策略: `bsub -n 8` = 用户明确要了 8 个 slot, 就该按 8 路
-/// 并行(否则 stdin 一次加载 + 多探针的用法在冷建上还是单核); 登录节点上不设变量时
-/// 仍然默认 1, 免得偷偷吃掉 8 个 Verdi 许可。
+/// 并行度策略: 默认 auto(`-j` 未给)但要跳过小波形, `-j 1` 强制单进程,
+/// 显式数字一律照办;批处理(`bsub -n 8`)的 slot 数作为可用额度。
 #[test]
-fn timeline_jobs_follows_lsf_slots() {
-    use wal_rust::trace::fsdb_test_api::resolve_timeline_jobs as r;
-    // 没设置 + 不在批处理里 → 1(保守)
-    assert_eq!(r(None, 32, false), 1);
-    // 没设置 + LSF 给了 slot → 按 slot 数(封顶 8)
-    assert_eq!(r(None, 8, true), 8);
-    assert_eq!(r(None, 4, true), 4);
-    assert_eq!(r(None, 1, true), 1);
-    assert_eq!(r(None, 64, true), 8, "slot 再多也封顶 8(后面再靠 job 数扩)");
-    // 显式值永远优先: 用户可以用 =1 在批处理里关掉并行(许可紧张时)
-    assert_eq!(r(Some("1"), 8, true), 1);
-    assert_eq!(r(Some("4"), 8, true), 4);
-    assert_eq!(r(Some("16"), 8, true), 16, "显式数字不被封顶");
-    assert_eq!(r(Some("auto"), 64, false), 8);
-    assert_eq!(r(Some("auto"), 2, true), 2);
-    // 空字符串视为"没设置"(环境变量导出为空是常态)
-    assert_eq!(r(Some("  "), 8, true), 8);
-    assert_eq!(r(Some("junk"), 8, true), 1);
+fn timeline_jobs_decision_is_auto_but_size_gated() {
+    use wal_rust::trace::fsdb_test_api::decide_jobs as d;
+    const MB: u64 = 1024 * 1024;
+    let big = 256 * MB;
+    let small = 1 * MB;
+    let min = 32 * MB;
+
+    // 什么都没给 → 自动: 小波形 1 路, 大波形按额度(封顶 8)
+    assert_eq!(d(None, 32, small, 100, min), (1, true));
+    assert_eq!(d(None, 32, big, 100, min), (8, true));
+    assert_eq!(d(None, 4, big, 100, min), (4, true));
+    // 信号特别多(188 万那种)即使文件不大也值得并行
+    assert_eq!(d(None, 4, small, 20000, min), (4, true));
+
+    // `-j 1` 强制单进程(许可紧张时用);`-j 8` 一律照办(不看大小)
+    assert_eq!(d(Some("1"), 32, big, 100, min), (1, false));
+    assert_eq!(d(Some("8"), 32, small, 100, min), (8, false));
+    // `-j auto` 仍跳过小波形
+    assert_eq!(d(Some("auto"), 32, small, 100, min), (1, true));
+    assert_eq!(d(Some("auto"), 32, big, 100, min), (8, true));
+    assert_eq!(d(Some("  "), 32, big, 100, min), (8, true), "空串 = 没设置");
+    assert_eq!(d(Some("junk"), 32, big, 100, min), (1, false), "非法值退化成 1");
+    // 额度上限: 64 核的机器 auto 也只开 8(许可与收益的权衡)
+    assert_eq!(d(Some("auto"), 64, big, 100, min), (8, true));
+    assert_eq!(d(Some("16"), 64, big, 100, min), (16, false), "显式数字不封顶");
 }

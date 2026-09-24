@@ -76,9 +76,20 @@ pub mod fsdb_test_api {
         super::fsdb::parse_timeline_jobs(raw, cores)
     }
 
-    /// 分片数策略(测试用): 显式值 × 并行额度 × 是否在批处理里
-    pub fn resolve_timeline_jobs(explicit: Option<&str>, budget: usize, in_batch: bool) -> usize {
-        super::fsdb::resolve_timeline_jobs(explicit, budget, in_batch)
+    /// 一个波形的并行度决策(测试用) → (worker 数, 是否自动)
+    pub fn timeline_jobs_decision(file_bytes: u64, sigs: usize) -> (usize, bool) {
+        super::fsdb::timeline_jobs_decision(file_bytes, sigs)
+    }
+
+    /// 纯决策函数(测试用): 设置值 × 额度 × 文件大小 → (worker 数, 是否自动)
+    pub fn decide_jobs(
+        setting: Option<&str>,
+        budget: usize,
+        file_bytes: u64,
+        sigs: usize,
+        min_bytes: u64,
+    ) -> (usize, bool) {
+        super::fsdb::decide_jobs(setting, budget, file_bytes, sigs, min_bytes)
     }
 
     /// 波形指纹(测试用): 旁挂缓存的失效判据

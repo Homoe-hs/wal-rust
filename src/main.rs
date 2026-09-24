@@ -40,6 +40,32 @@ fn main() {
 
     let args = Args::parse();
 
+    // `-j/--jobs`: 一个波形的并行度(见 docs/fsdb-npi.md §6.6)。
+    // FSDB 索引构建按这个数开 worker 进程;VCD 扫描按这个数建线程池。
+    //
+    // 实现成**环境变量**而不是进程内 static: `src/main.rs` 自己也 `mod trace;`
+    // (二进制 crate 二次编译了一份), 所以进程内 static 在 bin/lib 两份代码里
+    // 不是同一个变量 —— 环境变量两个副本都读得到, 子进程 worker 也能继承。
+    if let Some(raw) = args.jobs.as_deref() {
+        let v = raw.trim().to_ascii_lowercase();
+        let n = if v == "auto" {
+            None
+        } else {
+            match v.parse::<usize>() {
+                Ok(n) if n >= 1 => Some(n),
+                _ => {
+                    eprintln!("--jobs: 需要一个正整数或 auto(收到 {:?})", raw);
+                    std::process::exit(2);
+                }
+            }
+        };
+        std::env::set_var("WAL_FSDB_TL_JOBS", n.map(|n| n.to_string()).unwrap_or_else(|| "auto".into()));
+        if let Some(n) = n {
+            // VCD 侧线程池: 只认第一次调用(库内若已建池则忽略, 不改既有行为)
+            let _ = rayon::ThreadPoolBuilder::new().num_threads(n).build_global();
+        }
+    }
+
     match args.resolve() {
         ExecMode::FsdbTimelineMap { file, shard, shards, out } => {
             // 并行/集群预计算全局时间线的一"片"(见 docs/fsdb-npi.md §6.6)。

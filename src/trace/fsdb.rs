@@ -825,46 +825,78 @@ pub(crate) fn parallel_budget() -> usize {
     std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
 }
 
-/// 分片数策略(纯函数, 便于测试):
-/// * 显式给了 `WAL_FSDB_TL_JOBS` → 听它的(`auto` = min(额度, 8), 数字 = 原样);
-/// * 没给 + 在批处理里(LSF 有 slot) → min(额度, 8): 用户用 `-n 8` 明确要了 8 个 slot,
-///   就该按 8 路并行;默认 1 是为了"登录节点上别偷偷吃 8 个许可", 不是"永远单进程";
-/// * 没给 + 不在批处理里 → 1。
-pub(crate) fn resolve_timeline_jobs(explicit: Option<&str>, budget: usize, in_batch: bool) -> usize {
-    match explicit.map(|s| s.trim()).filter(|s| !s.is_empty()) {
-        Some(raw) => {
-            let v = raw.to_ascii_lowercase();
-            if v == "auto" {
-                budget.clamp(1, 8)
-            } else {
-                v.parse::<usize>().ok().unwrap_or(1)
-            }
-        }
-        None if in_batch => budget.clamp(1, 8),
-        None => 1,
+/// 解析一个并行度取值 → (worker 数, 是否 auto)。`auto` = min(额度, 8)。
+pub(crate) fn parse_jobs_value(raw: &str, budget: usize) -> (usize, bool) {
+    let v = raw.trim().to_ascii_lowercase();
+    if v == "auto" {
+        (budget.clamp(1, 8), true)
+    } else {
+        (v.parse::<usize>().unwrap_or(1), false)
     }
 }
 
-/// `WAL_FSDB_TL_JOBS` 的解析(向后兼容的入口): 只按核数算额度
+/// 旧入口(测试/兼容): 只按给定核数解析取值
 pub(crate) fn parse_timeline_jobs(raw: &str, cores: usize) -> usize {
-    resolve_timeline_jobs(Some(raw), cores, false)
+    parse_jobs_value(raw, cores).0
 }
 
-/// 是否在批处理系统里(LSF 会导出这些变量)
-pub(crate) fn in_batch_system() -> bool {
-    std::env::var_os("LSB_DJOB_NUMPROC").is_some()
-        || std::env::var_os("LSB_MCPU_HOSTS").is_some()
-        || std::env::var_os("LSB_JOBID").is_some()
+/// 自动并行还要看文件够不够大: 每个 worker 一次独立 NPI 初始化(~1s 量级),
+/// 小波形并行反而更慢。`WAL_FSDB_TL_MIN_MB` 可调(默认 32MB)。
+pub(crate) fn auto_min_bytes() -> u64 {
+    std::env::var("WAL_FSDB_TL_MIN_MB")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map(|mb| mb.saturating_mul(1024 * 1024))
+        .unwrap_or(32 * 1024 * 1024)
 }
 
-/// 时间线分片数: `WAL_FSDB_TL_JOBS` 见 `parse_timeline_jobs`。
-pub fn timeline_jobs() -> usize {
-    let explicit = std::env::var("WAL_FSDB_TL_JOBS").ok();
-    resolve_timeline_jobs(
-        explicit.as_deref(),
+/// **一个波形**的并行度决策(纯函数, 便于测试) → (worker 数, 是否"自动决定")。
+///
+/// 优先级: `-j N`(CLI) > `WAL_FSDB_TL_JOBS`(env) > 自动。
+/// 自动 = min(可用额度, 8)(额度见 `parallel_budget`), 且**只对够大的波形**生效
+/// (小波形每个 worker 一次 NPI 初始化的开销盖过收益);
+/// 想要"永远单进程"给 `-j 1` 或 `WAL_FSDB_TL_JOBS=1`。
+pub(crate) fn decide_jobs(
+    setting: Option<&str>,
+    budget: usize,
+    file_bytes: u64,
+    sigs: usize,
+    min_bytes: u64,
+) -> (usize, bool) {
+    // 小波形不折腾(显式数字除外: 用户说了就照办)
+    let small = file_bytes < min_bytes && sigs < 16384;
+    if let Some(raw) = setting.filter(|v| !v.trim().is_empty()) {
+        let (n, is_auto) = parse_jobs_value(raw, budget);
+        return if is_auto && small { (1, true) } else { (n.max(1), is_auto) };
+    }
+    // 没设置 → 自动(够大才并行)
+    if small {
+        (1, true)
+    } else {
+        (budget.clamp(1, 8), true)
+    }
+}
+
+/// 读 `WAL_FSDB_TL_JOBS`(CLI `-j` 由 main 转写成它)后的实际决策
+pub(crate) fn timeline_jobs_decision(file_bytes: u64, sigs: usize) -> (usize, bool) {
+    let env_raw = std::env::var("WAL_FSDB_TL_JOBS").ok();
+    decide_jobs(
+        env_raw.as_deref(),
         parallel_budget(),
-        in_batch_system(),
+        file_bytes,
+        sigs,
+        auto_min_bytes(),
     )
+}
+
+/// 时间线分片数(时间线真正要建的时候才调用, 所以这里知道文件有多大)
+pub fn timeline_jobs_for(file_bytes: u64, sigs: usize) -> usize {
+    timeline_jobs_decision(file_bytes, sigs).0
+}
+
+/// 时间线分片数(不知道文件大小的入口: 只用于文档/调试)
+pub fn timeline_jobs() -> usize {
+    timeline_jobs_decision(u64::MAX, 0).0
 }
 
 /// 写 `<cache>/<file_identity>-v1.ftl`(原子: 先写 .tmp 再 rename)。
@@ -2088,16 +2120,30 @@ impl FsdbTrace {
         // 变更条数有关 —— 所以判据是"每个 worker 至少分到一个信号", 不是"信号数够多"。
         // 曾经写成 `sigs >= 2048`, 于是"信号少但时间戳几千万"的波形(一组计数器打满
         // 时间轴)永远走单进程, 明明可以并行。(轮转分片对任何 n 都成立。)
-        let jobs = timeline_jobs();
+        let jobs = {
+            let bytes = std::fs::metadata(&self.filename).map(|m| m.len()).unwrap_or(0);
+            if std::env::var("WAL_DEBUG_FSDB").is_ok() {
+                eprintln!(
+                    "[fsdb] jobs 决策: env={:?} budget={} bytes={} sigs={}",
+                    std::env::var("WAL_FSDB_TL_JOBS").ok(),
+                    parallel_budget(),
+                    bytes,
+                    self.sigs.len()
+                );
+            }
+            timeline_jobs_for(bytes, self.sigs.len())
+        };
         if jobs > 1 && self.sigs.len() >= jobs {
-            // 没显式设 WAL_FSDB_TL_JOBS 而开了并行 → 只可能是"批处理分配了 slot",
-            // 这件事必须说出来(每个 worker 各占一个 NPI 许可)。
-            let explicit = std::env::var("WAL_FSDB_TL_JOBS").map(|v| !v.trim().is_empty()).unwrap_or(false);
+            // 自动决定(不是 -j N / WAL_FSDB_TL_JOBS 显式指定)时要说一声:
+            // 每个 worker 各占一个 NPI 许可, 用户得知道这件事。
+            let explicit = std::env::var("WAL_FSDB_TL_JOBS")
+                .map(|v| !v.trim().is_empty())
+                .unwrap_or(false);
             if !explicit && std::env::var("WAL_DEBUG_FSDB").is_err() {
                 eprintln!(
-                    "[fsdb] LSF 分配了 {} 个 slot → 时间线冷建用 {} 个 worker(每个各占一个 NPI 许可); 想单进程设 WAL_FSDB_TL_JOBS=1",
-                    parallel_budget(),
-                    jobs
+                    "[fsdb] 时间线冷建按 {} 路并行(自动: 可用额度 {}; 每个 worker 各占一个 NPI 许可); 想单进程用 -j 1",
+                    jobs,
+                    parallel_budget()
                 );
             }
             match self.parallel_timeline(jobs) {

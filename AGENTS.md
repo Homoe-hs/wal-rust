@@ -101,16 +101,22 @@ Flags: `-l <waveform>`(可重复), `--halt-on-error`(遇错即停)。
   每块整份拷贝一次 → O(块数 × 主表长)(1.88M 信号 = 459 块 × 上千万时间点 = 几十 GB memcpy)。
   现在分片收齐后一次归并(收完再平衡归并)。
 - **并行冷建 = 分片 map/reduce, 产物必须逐字节一致**: 冷建时间线是唯一还在"整文件过一遍"
-  的操作, 且是纯并集。单机: `WAL_FSDB_TL_JOBS=N|auto`;集群: `make fsdb-prewarm FSDB=x.fsdb
-  SHARDS=16 [QUEUE=q]`(=`bsub -n 1` × N 跑 `fsdb-timeline-map`, 再 `fsdb-timeline-merge`);
-  或 `scripts/lsf_wal_run.sh wave.fsdb probes.wal 8`(把 stdin 会话提交成 `bsub -n 8`,
-  一次加载多探针)。**归并走 `write_timeline_cache()` 同一份实现**, 与单进程产物逐字节相同
+  的操作, 且是纯并集。**默认就并行**: `-j N|auto`(`--jobs`)或 `WAL_FSDB_TL_JOBS`,
+  auto = min(额度, 8), 额度优先取 `$LSB_DJOB_NUMPROC`/`$LSB_MCPU_HOSTS`(= `bsub -n`)其次核数;
+  **小波形自动退回单进程**(`WAL_FSDB_TL_MIN_MB`, 默认 32MB;或信号数 ≥ 16384)——
+  worker 各有一次 NPI 初始化开销。`-j 1` 强制单进程;自动并行时打一行提示。
+  集群: `make fsdb-prewarm FSDB=x.fsdb SHARDS=16 [QUEUE=q]`(=`bsub -n 1` × N 跑
+  `fsdb-timeline-map`, 再 `fsdb-timeline-merge`);或 `scripts/lsf_wal_run.sh wave.fsdb
+  probes.wal 8`(把 stdin 会话提交成 `bsub -n 8`, 一次加载多探针)。
+  **归并走 `write_timeline_cache()` 同一份实现**, 与单进程产物逐字节相同
   (闸: `timeline_map_reduce_matches_single_process_encoding`)。分片判据是"每个 worker 至少
   一个信号"(曾错写 `sigs >= 2048`, 于是"信号少但时间戳几千万"的波形永远不并行)。
-  并行额度优先取 `$LSB_DJOB_NUMPROC`/`$LSB_MCPU_HOSTS`(= `bsub -n`), 其次核数;只在批处理里
-  才自动并行(登录节点默认单进程), 自动开时打一行提示(闸: `timeline_jobs_follows_lsf_slots`)。
   ⚠️ 每个 worker 一次 NPI 会话 = 一个 Verdi 许可;集群各节点要能看到 FSDB/二进制/缓存目录;
   `bsub -n N` 的 job 要加 `-R "span[hosts=1]"`, 否则 slot 可能散在多台机器而 worker 只在首节点跑。
+- **`src/main.rs` 会二次编译一部分模块**(它自己 `mod cli; mod fst; mod vcd; pub mod trace;`
+  之外还链了 `wal_rust` 库): 所以**进程内 static 在 bin/lib 两份代码里不是同一个变量**。
+  给库传"进程级开关"必须走环境变量 —— `-j/--jobs` 就是这么做的(踩过: 用 `OnceLock` static
+  传参, bin 侧读到的永远是 None, `-j 1` 静默失效)。
 - **帮助文案里的数字要有测试守门**: `--help` 曾写 "125 named operators" 而实际 146
   (`scripts/check_docs.py` 不扫 help 文本)。现在 `src/cli.rs` 有单元测试比对
   `builtins::registered_operator_count()`, 改注册表不同步改文案就会红。

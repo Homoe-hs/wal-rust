@@ -23,6 +23,11 @@
 - **`bsub -n N` + stdin 会话**: `scripts/lsf_wal_run.sh <wave> <probes.wal> [slots]`
   把 `wal-rust --stdin -l wave < probes.wal`(一次加载、多探针)提交成 `bsub -n N`
   (`--queue/--wall/--wait/--dry-run`, 默认加 `-R "span[hosts=1]"`)。
+- **`-j N|auto` / `--jobs`: 一个波形的并行度**(默认 `auto`, 不需要 LSF 也能用 —— 单机就是多核)。
+  默认 = min(可用额度, 8), 额度优先取 `bsub -n` 分配的 slot 数, 否则核数;
+  **小波形自动退回单进程**(`WAL_FSDB_TL_MIN_MB` 默认 32MB, 或信号数 ≥ 16384), 因为每个
+  worker 各有一次 NPI 初始化开销;`-j 1` 强制单进程, 显式数字一律照办。VCD 侧同步按该数建
+  线程池。实测(200 万时间戳夹具, 冷缓存): 默认(小文件)39.1s / `-j 8` **21.0s**。
 - `scripts/bench_fsdb.sh`(`make bench-fsdb FSDB=x.fsdb [SIG=tb.clk]`): FSDB 查询基准,
   冷建/暖查询/只加载分开计时并追加到 `bench/perf-history.csv`; CI `perf` 阶段在设了
   `WAL_FSDB_BENCH=<file.fsdb>` 时自动跑(判据: 暖查询应接近"只加载")。
@@ -48,6 +53,10 @@
   现在收齐分片后一次归并。
 
 ### Internal
+- **`-j/--jobs` 用环境变量而不是进程内 static 传递**: `src/main.rs` 自己 `mod trace;`
+  (二进制 crate 二次编译了一份库代码), 两边的 `OnceLock` static 不是同一个变量 —— 用 static
+  传参会静默失效(踩过: `-j 1` 照旧开 8 个 worker)。现在 `-j` 统一写 `WAL_FSDB_TL_JOBS`,
+  两份编译与子进程 worker 都读同一个值。
 - `tests/fsdb_diff.rs` 新增三个闸: `fsdb_col_cache_hit_matches_cold`(需 Verdi, 同一查询在
   "不用缓存 / 建缓存 / 命中缓存"三次运行下必须同答且 `.fcol` 落盘)、
   `timeline_map_reduce_matches_single_process_encoding`(map/reduce 的 `.ftl` 与单进程

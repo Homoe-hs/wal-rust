@@ -265,9 +265,12 @@ NPI 变更流**(`npiFsdbTimeBasedVcIter`), 每次进程启动都要为这次查�
 冷建时间线是**唯一**还在"整文件过一遍"量级的操作(§6.5 之后查询侧已经压到"只加载"),
 而它是纯并集 —— 天然可并行, 且**分片方式不影响结果**。三条路径:
 
-**① 单机多进程**: `WAL_FSDB_TL_JOBS=N`(或 `auto` = min(额度, 8);额度优先取
-LSF 分配的 slot 数, 见 ④)。每个 worker 是独立进程(一次 NPI 初始化 ~2s + 一个 Verdi 许可),
-扫 `idx % N == k` 那批信号的变更时间, 父进程归并。
+**① 单机多进程(默认就开着)**: `-j N` / `--jobs N`, 或环境变量 `WAL_FSDB_TL_JOBS`。
+默认 = `auto`: min(可用额度, 8) —— 额度优先取 LSF 分配的 slot 数(见 ④), 否则核数;
+**小波形自动退回单进程**(阈值 `WAL_FSDB_TL_MIN_MB`, 默认 32MB, 或信号数 ≥ 16384),
+因为每个 worker 都要一次独立 NPI 初始化(~1s)与一个 Verdi 许可。
+`-j 1` / `WAL_FSDB_TL_JOBS=1` 强制单进程;显式数字一律照办(不受阈值限制)。
+每个 worker 扫 `idx % N == k` 那批信号的变更时间, 父进程归并。
 
 **② LSF(集群)**: `scripts/lsf_fsdb_prewarm.sh <file.fsdb> [shards] [--queue Q] [--wall HH:MM]`
 

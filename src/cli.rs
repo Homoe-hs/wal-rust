@@ -79,6 +79,20 @@ Example: wal-rust --stdin -l big.vcd < probes.txt"
     )]
     pub stdin: bool,
 
+    /// 并行度: 加速"一个波形"的解析/索引(默认 auto = min(可用核数, 8))
+    #[arg(
+        short = 'j',
+        long = "jobs",
+        global = true,
+        value_name = "N|auto",
+        help = "How many cores to use for analyzing ONE waveform.\n\
+default: auto = min(available cores, 8), and only for waveforms big enough to pay off.\n\
+FSDB index building fans out to that many worker processes (each takes one Verdi\n\
+license); VCD scans use that many threads. -j 1 forces single-process.\n\
+Env override: WAL_FSDB_TL_JOBS (and WAL_FSDB_TL_MIN_MB for the auto size threshold)."
+    )]
+    pub jobs: Option<String>,
+
     #[command(subcommand)]
     pub command: Option<Command>,
 }
