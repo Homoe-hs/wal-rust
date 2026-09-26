@@ -4,6 +4,7 @@
 
 mod trace;
 mod container;
+mod name_store;
 mod vcd;
 mod fst;
 pub mod fsdb;

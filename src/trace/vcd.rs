@@ -2,6 +2,7 @@
 //!
 //! Optimized loading: zero-copy byte-parsing, packed signal IDs, pre-allocation.
 
+use crate::trace::name_store::OpenIndex;
 use crate::trace::{Trace, TraceId, ScalarValue, FindCondition, BatchEntry};
 use crate::vcd::types::VcdValue;
 use std::cell::RefCell;
@@ -1752,80 +1753,6 @@ fn decode_initial(b: &[u8]) -> VcdValue {
             VcdValue::Real(f64::from_bits(bits))
         }
         _ => VcdValue::Bit(b'x'),
-    }
-}
-
-/// 开放寻址索引(波形内部表): keys[i] = 64 位哈希, slots[i] = 索引+1(0 = 空槽)。
-/// 相比 std HashMap: 无 per-entry 分配、无 SipHash、约 12B/槽(负载 ≤0.7 → ~17B/条目)。
-#[derive(Clone)]
-struct OpenIndex {
-    keys: Vec<u64>,
-    slots: Vec<u32>,
-    mask: usize,
-    len: usize,
-}
-
-/// 探针位置必须用"混合后"的哈希: FNV 的低位周期性很强, 直接拿低位做
-/// 开放寻址会让插入退化成 O(n²)(实测 4M 信号 23s → 0.2s)。
-#[inline]
-fn mix64(mut z: u64) -> u64 {
-    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-    z ^ (z >> 31)
-}
-
-impl OpenIndex {
-    fn new(cap_hint: usize) -> Self {
-        // 1.5x 预留 → 负载 ≈0.66(增长阈值 0.7), 比 2x 省 ~25% 内存
-        let cap = (cap_hint.saturating_mul(3) / 2 + 16).max(16).next_power_of_two();
-        OpenIndex { keys: vec![0; cap], slots: vec![0; cap], mask: cap - 1, len: 0 }
-    }
-    #[inline]
-    fn find(&self, h: u64) -> Option<u32> {
-        let mut i = (mix64(h) as usize) & self.mask;
-        loop {
-            let s = self.slots[i];
-            if s == 0 { return None; }
-            if self.keys[i] == h { return Some(s - 1); }
-            i = (i + 1) & self.mask;
-        }
-    }
-    /// 命中哈希后还要比对真实字节的表(名字表: 处理哈希冲突)
-    #[inline]
-    fn find_verified(&self, h: u64, verify: impl Fn(u32) -> bool) -> Option<u32> {
-        let mut i = (mix64(h) as usize) & self.mask;
-        loop {
-            let s = self.slots[i];
-            if s == 0 { return None; }
-            if self.keys[i] == h && verify(s - 1) { return Some(s - 1); }
-            i = (i + 1) & self.mask;
-        }
-    }
-    fn insert(&mut self, h: u64, idx: u32, rehash: impl Fn(u32) -> u64) {
-        if (self.len + 1) * 10 >= self.slots.len() * 7 {
-            self.grow(&rehash);
-        }
-        let mut i = (mix64(h) as usize) & self.mask;
-        while self.slots[i] != 0 { i = (i + 1) & self.mask; }
-        self.keys[i] = h;
-        self.slots[i] = idx + 1;
-        self.len += 1;
-    }
-    fn grow(&mut self, rehash: &impl Fn(u32) -> u64) {
-        let old = std::mem::take(&mut self.slots);
-        let new_cap = (old.len() * 4).max(16);
-        self.slots = vec![0; new_cap];
-        self.keys = vec![0; new_cap];
-        self.mask = new_cap - 1;
-        for s in old {
-            if s == 0 { continue; }
-            let idx = s - 1;
-            let h = rehash(idx);
-            let mut i = (mix64(h) as usize) & self.mask;
-            while self.slots[i] != 0 { i = (i + 1) & self.mask; }
-            self.keys[i] = h;
-            self.slots[i] = s;
-        }
     }
 }
 

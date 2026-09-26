@@ -97,6 +97,12 @@ Flags: `-l <waveform>`(可重复), `--halt-on-error`(遇错即停)。
   指纹(`wave_fingerprint`)+位宽 + 文件身份 key 三重校验, 不匹配一律视为未命中。
   实测: 暖查询 8.6s → 4.1s(电平)/8.0s → 3.6s(沿), 冷查询 48.5s → 36.6s(200 万时间戳夹具)。
   基准: `make bench-fsdb FSDB=x.fsdb [SIG=tb.clk]`(或 `WAL_FSDB_BENCH=x.fsdb ./scripts/ci.sh --only perf`)。
+- **名字存储必须走 arena + 开放寻址索引**: `trace::name_store::{NameArena, OpenIndex}`。
+  百万~千万信号级波形上"每个信号一个 `String`"本身就是 GB 级开销 —— 微基准实测
+  **280B/信号**(`Sig.name`+`Sig.full`+`sig_names[]`+`HashMap<String,_>` 四份)对 **73B/信号**
+  (arena 34 + spans 8 + 索引 31);4M 信号 = 1.1GB → 0.3GB。**读/写 `.fnames` 缓存要直接对
+  arena 编解码**(`decode_tree_into`/`encode_tree_arena`), 别先解/编 `Vec<String>` ——
+  那是 4M 信号下各一次几百 MB 的瞬时峰值。闸: `per_signal_bytes_stay_small`。
 - **时间线冷建别逐块拷主表**: `FsdbTrace::scan` 每 4096 信号一块, 曾把已累积的时间线
   每块整份拷贝一次 → O(块数 × 主表长)(1.88M 信号 = 459 块 × 上千万时间点 = 几十 GB memcpy)。
   现在分片收齐后一次归并(收完再平衡归并)。

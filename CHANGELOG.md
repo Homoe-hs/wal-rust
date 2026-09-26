@@ -33,6 +33,12 @@
   `WAL_FSDB_BENCH=<file.fsdb>` 时自动跑(判据: 暖查询应接近"只加载")。
 
 ### Performance
+- **FSDB 名字存储改 arena + 开放寻址索引(4M 信号级的头号开销)**: 改动前同一份名字在
+  进程里存了**四遍**(`Sig.name` 叶子名 / `Sig.full` 全名 / `sig_names[]` / `HashMap<String,_>`
+  的键), 微基准口径 **280B/信号** → 4M 信号 ≈ **1.1GB**;现在名字进连续 arena(每信号只多
+  8B 的 (偏移,长度))、索引只存 64 位哈希 + 下标, **73B/信号** → 4M 信号 ≈ 0.3GB(**省 74%**)。
+  读/写 `.fnames` 缓存也改成**直接对 arena 编解码**, 省掉 4M 信号下两次几百 MB 的瞬时峰值。
+  闸: `trace::name_store::per_signal_bytes_stay_small`(同时打印新旧口径)。
 - **批处理里按申请的 slot 自动并行冷建**: `bsub -n N` 会导出 `LSB_DJOB_NUMPROC`, wal-rust
   现在按它(其次 `LSB_MCPU_HOSTS`, 再其次核数)决定时间线 worker 数(封顶 8), 不用再手设
   `WAL_FSDB_TL_JOBS`;只在检测到批处理变量时才这样(登录节点仍默认单进程, 不会偷偷吃许可),
@@ -61,6 +67,12 @@
   magic / 许可 / 真实 open 一次", 拿到别人的波形先跑它。
 
 ### Internal
+- `trace::name_store`: 把 VCD 后端早就有的 `NameArena`/`OpenIndex` 提成共享类型, FSDB 后端
+  迁到同一套;补了 arena 往返、开放寻址扩容/碰撞、每信号字节数的单测。
+- `tests/fsdb_diff.rs::fsdb_col_cache_hit_matches_cold` 之前**从未真正跑过**(需要 Verdi)。
+  环境打通后第一次跑就暴露两处测试自身的问题: ①缓存落在 CWD 下的 `.wal-rust-cache/`, 断言
+  却只看工作目录顶层;②没显式设 `WAL_CACHE_DIR`, 环境里若已有它(CI 会设)缓存就写到别处。
+  两条都修掉后, 这个门现在真的在跑(冷/建/命中三次同答 + `.fcol` 落盘)。
 - `scripts/bench_fsdb.sh` 修两处: 二进制解析成绝对路径(run 里会 cd, 相对路径会静默 0.00s)、
   查询失败直接报错而不是把 `NA` 混进回归库(并把之前误写的 14 行清掉)。
 - **`-j/--jobs` 用环境变量而不是进程内 static 传递**: `src/main.rs` 自己 `mod trace;`

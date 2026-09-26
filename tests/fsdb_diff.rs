@@ -350,6 +350,8 @@ fn fsdb_col_cache_hit_matches_cold() {
         format!("(at \"{}\" 3)", sig),
     ];
     let run = |dir: &std::path::Path, cache: &str, q: &str| -> String {
+        // `WAL_CACHE_DIR` 必须**显式**指到本测试的目录: 环境里若已有它(CI 会设),
+        // 子进程会把缓存写到别处, 于是"缓存到底落在哪"就不是这个测试能控制的了。
         let out = std::process::Command::new(bin)
             .arg(q)
             .arg("-l")
@@ -357,6 +359,7 @@ fn fsdb_col_cache_hit_matches_cold() {
             .current_dir(dir)
             .env("WAL_CACHE", cache)
             .env("WAL_CACHE_MIN_MB", "0")
+            .env("WAL_CACHE_DIR", dir.join(".wal-rust-cache"))
             .output()
             .expect("spawn wal-rust");
         assert!(
@@ -377,12 +380,17 @@ fn fsdb_col_cache_hit_matches_cold() {
         assert_eq!(a, c, "缓存命中与冷扫结果不一致: {}", q);
     }
 
-    // 缓存目录里必须有列文件(否则这个测试什么也没证明)
+    // 缓存目录里必须有列文件(否则这个测试什么也没证明)。
+    // 注意缓存落在 **CWD 下的 `.wal-rust-cache/`**(用户要求"缓存在执行命令的路径下"),
+    // 不在工作目录顶层 —— 这里要往里看一层。
+    let cache_root = warm.join(".wal-rust-cache");
     let mut n_col = 0usize;
-    for e in std::fs::read_dir(&warm).unwrap() {
-        let p = e.unwrap().path();
-        if p.is_dir() && p.file_name().unwrap().to_string_lossy().ends_with(".fcol") {
-            n_col += std::fs::read_dir(&p).unwrap().count();
+    if let Ok(entries) = std::fs::read_dir(&cache_root) {
+        for e in entries {
+            let p = e.unwrap().path();
+            if p.is_dir() && p.file_name().unwrap().to_string_lossy().ends_with(".fcol") {
+                n_col += std::fs::read_dir(&p).unwrap().count();
+            }
         }
     }
     let _ = std::fs::remove_dir_all(&base);

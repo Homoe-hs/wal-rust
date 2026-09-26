@@ -342,6 +342,28 @@ wal-rust fsdb-timeline-merge design.fsdb tl.*.part         # 归并 → .ftl
 "信号很少但时间戳几千万"的波形(一组计数器打满时间轴)永远不会并行 —— 现在放开了,
 轮转分片对任何信号数都成立。
 
+### 6.7 名字存储: arena + 开放寻址(百万~千万信号级的头号内存开销)
+
+FSDB 后端此前把**同一份名字存四遍**: `Sig.name`(叶子名)、`Sig.full`(全名)、
+`sig_names[]`(全名, `(SIGNALS)` 用)、以及 `HashMap<String, usize>` 的键。微基准口径
+**280B/信号** —— 400 万信号就是 **1.1GB**, 还没算 NPI 自己的开销。
+
+现在与 VCD 后端共用一套(`src/trace/name_store.rs`):
+
+| | 存法 | 每信号 |
+|---|---|---|
+| 名字本体 | `NameArena`: 连续 `Vec<u8>` + `(u32 偏移, u32 长度)` | 34 + 8 B |
+| 名字 → 下标 | `OpenIndex`: `keys[]=64 位哈希` + `slots[]=下标+1`(负载 ≤0.7) | ~31 B |
+| 合计 | | **73 B**(4M 信号 ≈ 0.3GB, **省 74%**) |
+
+两条配套规则(否则省下的会被瞬时峰值吃掉):
+
+* **读** `.fnames` 缓存走 `decode_tree_into()` —— 直接解进 arena, 不要先解成 `Vec<String>`;
+* **写** `.fnames` 缓存走 `encode_tree_arena()` —— 直接从 arena 编码。
+
+闸: `trace::name_store::per_signal_bytes_stay_small`(同时打印新旧两个口径),
+外加 arena 往返 / 开放寻址扩容碰撞的单测。
+
 ## 7 内网实测环境(2026-09-16)
 
 | 项 | 值 |

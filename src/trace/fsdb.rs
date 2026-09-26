@@ -17,6 +17,7 @@
 //!   构建(`Trace::prepare` 会把"建时间线"和"取被查询信号的变更列"合到一次
 //!   遍历里)。
 
+use crate::trace::name_store::{fnv1a, NameArena, OpenIndex};
 use crate::trace::{BatchEntry, FindCondition, ScalarValue, Trace, TraceId};
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
@@ -359,6 +360,27 @@ pub(crate) struct TreeSnapshot {
     pub scopes: Vec<String>,
 }
 
+/// 由 **arena 直接编码**(写缓存路径): 老路子先 `Vec<String>` 再编码, 4M 信号下
+/// 那是又一次几百 MB 的瞬时峰值 —— 而这两个方向(读/写缓存)都该比走 NPI 树省内存。
+pub(crate) fn encode_tree_arena(names: &NameArena, widths: &[usize], scopes: &[String]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(64 + names.len() * 24);
+    out.extend_from_slice(TREE_MAGIC);
+    out.extend_from_slice(&[0u8; 8]); // 指纹占位
+    put_varint(&mut out, names.len() as u64);
+    for i in 0..names.len() as u32 {
+        let n = names.get(i);
+        put_varint(&mut out, n.len() as u64);
+        out.extend_from_slice(n.as_bytes());
+        put_varint(&mut out, widths.get(i as usize).copied().unwrap_or(1) as u64);
+    }
+    put_varint(&mut out, scopes.len() as u64);
+    for sc in scopes {
+        put_varint(&mut out, sc.len() as u64);
+        out.extend_from_slice(sc.as_bytes());
+    }
+    out
+}
+
 pub(crate) fn encode_tree(t: &TreeSnapshot) -> Vec<u8> {
     let mut out = Vec::with_capacity(64 + t.names.len() * 24);
     out.extend_from_slice(TREE_MAGIC);
@@ -377,7 +399,14 @@ pub(crate) fn encode_tree(t: &TreeSnapshot) -> Vec<u8> {
     out
 }
 
-pub(crate) fn decode_tree(buf: &[u8], expect_fp: u64) -> Option<TreeSnapshot> {
+/// 名字树缓存 → **直接解进名字 arena**。
+///
+/// 为什么单独一个入口: 老路子先解出 `Vec<String>` 再逐个拷进 arena, 4M 信号下
+/// 那是一次几百 MB 的**瞬时峰值**(而"读缓存"本该比"走 NPI 树"省内存)。
+pub(crate) fn decode_tree_into(
+    buf: &[u8],
+    expect_fp: u64,
+) -> Option<(NameArena, Vec<usize>, Vec<String>)> {
     if buf.len() < 24 || &buf[..8] != TREE_MAGIC {
         return None;
     }
@@ -389,12 +418,12 @@ pub(crate) fn decode_tree(buf: &[u8], expect_fp: u64) -> Option<TreeSnapshot> {
     if n > buf.len() {
         return None;
     }
-    let mut names = Vec::with_capacity(n);
+    let mut names = NameArena::with_capacity(n, n * 32);
     let mut widths = Vec::with_capacity(n);
     for _ in 0..n {
         let l = get_varint(buf, &mut pos)? as usize;
         let end = pos.checked_add(l)?;
-        names.push(String::from_utf8(buf.get(pos..end)?.to_vec()).ok()?);
+        names.push(std::str::from_utf8(buf.get(pos..end)?).ok()?);
         pos = end;
         widths.push(get_varint(buf, &mut pos)? as usize);
     }
@@ -409,7 +438,18 @@ pub(crate) fn decode_tree(buf: &[u8], expect_fp: u64) -> Option<TreeSnapshot> {
         scopes.push(String::from_utf8(buf.get(pos..end)?.to_vec()).ok()?);
         pos = end;
     }
-    Some(TreeSnapshot { names, widths, scopes })
+    Some((names, widths, scopes))
+}
+
+/// 老入口(测试/调试用): 解成 `Vec<String>`。
+/// 生产路径走 `decode_tree_into` —— 4M 信号下这一步的差别是几百 MB 峰值。
+pub(crate) fn decode_tree(buf: &[u8], expect_fp: u64) -> Option<TreeSnapshot> {
+    let (arena, widths, scopes) = decode_tree_into(buf, expect_fp)?;
+    Some(TreeSnapshot {
+        names: (0..arena.len() as u32).map(|i| arena.get(i).to_string()).collect(),
+        widths,
+        scopes,
+    })
 }
 
 fn put_varint(out: &mut Vec<u8>, mut v: u64) {
@@ -640,20 +680,59 @@ fn cache_path(cache_root: &std::path::Path, filename: &str, ext: &str) -> Option
     Some(cache_root.join(format!("{}-v1{}", id, ext)))
 }
 
-fn try_load_tree_cache(cache_root: &std::path::Path, filename: &str) -> Option<TreeSnapshot> {
+fn try_load_tree_cache(
+    cache_root: &std::path::Path,
+    filename: &str,
+) -> Option<(NameArena, Vec<usize>, Vec<String>)> {
     if crate::trace::vcd::cache_mode() == crate::trace::vcd::CacheMode::Off {
         return None;
     }
     let f = cache_path(cache_root, filename, ".fnames")?;
     let buf = std::fs::read(&f).ok()?;
     let fp = crate::trace::vcd::wave_fingerprint(std::path::Path::new(filename));
-    let snap = decode_tree(&buf, fp);
+    let snap = decode_tree_into(&buf, fp);
     if snap.is_none() && std::env::var("WAL_DEBUG_FSDB").is_ok() {
         eprintln!("[fsdb] 名字树缓存未命中/损坏: {}", f.display());
     }
     snap
 }
 
+/// 写名字树缓存(arena 版; 生产路径)
+fn save_tree_cache_arena(
+    cache_root: &std::path::Path,
+    filename: &str,
+    names: &NameArena,
+    widths: &[usize],
+    scopes: &[String],
+) {
+    use crate::trace::vcd::CacheMode;
+    if crate::trace::vcd::cache_mode() == CacheMode::Read {
+        return;
+    }
+    let Some(f) = cache_path(cache_root, filename, ".fnames") else { return };
+    if let Some(dir) = f.parent() {
+        if std::fs::create_dir_all(dir).is_err() {
+            return;
+        }
+    }
+    let fp = crate::trace::vcd::wave_fingerprint(std::path::Path::new(filename));
+    let mut blob = encode_tree_arena(names, widths, scopes);
+    blob[8..16].copy_from_slice(&fp.to_le_bytes());
+    let tmp = tmp_path(&f);
+    match std::fs::write(&tmp, &blob) {
+        Ok(()) => {
+            if let Err(e) = std::fs::rename(&tmp, &f) {
+                crate::trace::warn_cache_write(&f, &e);
+            }
+        }
+        Err(e) => crate::trace::warn_cache_write(&tmp, &e),
+    }
+    if std::env::var("WAL_DEBUG_FSDB").is_ok() {
+        eprintln!("[fsdb] 名字树缓存写入 {} 信号 → {}", names.len(), f.display());
+    }
+}
+
+#[allow(dead_code)] // 测试用(Vec<String> 入口); 生产走 save_tree_cache_arena
 fn save_tree_cache(
     cache_root: &std::path::Path,
     filename: &str,
@@ -1321,11 +1400,10 @@ struct Sig {
     /// 句柄。**可能为空** —— 从名字缓存恢复时不知道句柄, 第一次用到才
     /// `npi_fsdb_sig_by_name(全名)` 解析(实测 2000 次 114ms, 而整棵树遍历
     /// 60k 信号要 ~800ms)。
+    ///
+    /// 名字**不在这里**: 全名存在 `FsdbTrace::names`(连续 arena)。4M 信号下
+    /// "每信号一个 String"本身就吃掉 GB 级内存 —— 见 `trace::name_store` 的说明。
     handle: Cell<*mut c_void>,
-    /// 短名(诊断/调试用; 查询走 `full`)
-    #[allow(dead_code)]
-    name: String,
-    full: String,
     width: usize,
     /// 是否实数/字符串: 懒取(第一次读到这个信号的值时才问 NPI)
     real_str: Cell<Option<(bool, bool)>>,
@@ -1362,8 +1440,10 @@ pub struct FsdbTrace {
     cache_root: std::path::PathBuf,
     file: *mut c_void,
     sigs: Vec<Sig>,
-    sig_names: Vec<String>,
-    name_to_idx: HashMap<String, usize>,
+    /// 全名 arena(每信号一份; 连续存放, 每信号只多 8B 的 (偏移,长度))
+    names: NameArena,
+    /// 全名 → 信号下标(开放寻址, 键是 64 位哈希; 命中后再比对 arena 里的真实字节)
+    name_index: OpenIndex,
 
     scopes: Vec<String>,
     ts_exp: Option<i8>,
@@ -1379,9 +1459,9 @@ pub struct FsdbTrace {
     #[allow(dead_code)]
     prepared: RefCell<Vec<usize>>,
     name_cache: RefCell<HashMap<String, Option<usize>>>,
-    /// 叶子名(短名)索引: 按叶子名排序的 `sig_names` 下标, 懒建一次。
+    /// 叶子名(短名)索引: 按叶子名排序的**信号下标**, 懒建一次。
     ///
-    /// 为什么需要: 短名(`clk`)不是 `name_to_idx` 的键, 旧实现在这里**线性扫 188 万个名字**
+    /// 为什么需要: 短名(`clk`)不是全名索引的键, 旧实现在这里**线性扫 188 万个名字**
     /// (首个不同拼写各付一次)。188 万信号的 FSDB 上, 一次解析要几十~几百毫秒;
     /// 而查询里每次 `get` 解析一次 → 直接卡死。排序索引只存 u32(约 7.5MB @188万),
     /// 查找 O(log N), 且不复制名字字符串。
@@ -1459,25 +1539,23 @@ impl FsdbTrace {
             let dbg = std::env::var("WAL_DEBUG_FSDB").is_ok();
             let t_walk = std::time::Instant::now();
             let mut sigs: Vec<Sig> = Vec::new();
+            let mut names = NameArena::with_capacity(0, 0);
             let mut scopes: Vec<String> = Vec::new();
             // 名字树缓存: 命中就**完全跳过树遍历**(60k 信号实测 ~800ms)。句柄不进
             // 缓存, 第一次用到某个信号时按名字解析(`npi_fsdb_sig_by_name`)。
-            let mut quoted_names: Vec<String> = Vec::new();
-            #[allow(unused_assignments)]
-            let mut quoted_widths: Vec<usize> = Vec::new();
-            if let Some(snap) = try_load_tree_cache(&cache_root, &filename) {
-                quoted_names = snap.names;
-                quoted_widths = snap.widths;
-                scopes = snap.scopes;
-                for (i, full) in quoted_names.iter().enumerate() {
+            let mut cache_hit = false;
+            if let Some((arena, widths, sc)) = try_load_tree_cache(&cache_root, &filename) {
+                // 直接解进 arena(不再先造一遍 Vec<String>)
+                names = arena;
+                scopes = sc;
+                for w in widths.iter() {
                     sigs.push(Sig {
                         handle: Cell::new(ptr::null_mut()),
-                        name: full.rsplit('.').next().unwrap_or(full).to_string(),
-                        full: full.clone(),
-                        width: quoted_widths.get(i).copied().unwrap_or(1),
+                        width: if *w > 0 { *w } else { 1 },
                         real_str: Cell::new(None),
                     });
                 }
+                cache_hit = true;
             } else {
                 let top = (npi.iter_top_scope)(file);
                 if !top.is_null() {
@@ -1486,7 +1564,7 @@ impl FsdbTrace {
                         if s.is_null() {
                             break;
                         }
-                        walk_scope(npi, s, &mut sigs, &mut scopes);
+                        walk_scope(npi, s, &mut sigs, &mut names, &mut scopes);
                     }
                     (npi.iter_scope_stop)(top);
                 }
@@ -1506,21 +1584,32 @@ impl FsdbTrace {
                     max_t
                 );
             }
-            if quoted_names.is_empty() && !sigs.is_empty() {
-                // 刚走完树 → 落盘, 之后的进程直接跳过遍历
-                let names: Vec<String> = sigs.iter().map(|s| s.full.clone()).collect();
+            if !cache_hit && !sigs.is_empty() {
+                // 刚走完树 → 落盘, 之后的进程直接跳过遍历(直接从 arena 编码, 不再造 Vec<String>)
                 let widths: Vec<usize> = sigs.iter().map(|s| s.width).collect();
-                save_tree_cache(&cache_root, &filename, &names, &widths, &scopes);
+                save_tree_cache_arena(&cache_root, &filename, &names, &widths, &scopes);
             }
             if sigs.is_empty() {
                 (npi.close)(file);
                 return Err(format!("{}: FSDB 里没有任何信号", filename));
             }
-            let mut name_to_idx = HashMap::with_capacity(sigs.len());
-            let mut sig_names = Vec::with_capacity(sigs.len());
-            for (i, s) in sigs.iter().enumerate() {
-                name_to_idx.entry(s.full.clone()).or_insert(i);
-                sig_names.push(s.full.clone());
+            // 名字索引: 哈希 → 下标, 命中后比对 arena 里的真实字节(处理哈希碰撞)。
+            // 同名取**下标最小**的(与旧的 `entry().or_insert()` 语义一致)。
+            let mut name_index = OpenIndex::new(names.len());
+            for i in 0..names.len() as u32 {
+                let h = fnv1a(names.get(i).as_bytes());
+                if name_index.find_verified(h, |j| names.get(j) == names.get(i)).is_none() {
+                    name_index.insert(h, i, |j| fnv1a(names.get(j).as_bytes()));
+                }
+            }
+            if dbg {
+                eprintln!(
+                    "[fsdb] 名字存储: arena {} KB + spans {} KB + 索引 {} KB ({} 信号)",
+                    names.blob_len() / 1024,
+                    names.len() * 8 / 1024,
+                    name_index.bytes() / 1024,
+                    names.len()
+                );
             }
             Ok(FsdbTrace {
                 id,
@@ -1528,8 +1617,8 @@ impl FsdbTrace {
                 cache_root,
                 file,
                 sigs,
-                sig_names,
-                name_to_idx,
+                names,
+                name_index,
                 scopes,
                 ts_exp,
                 min_t,
@@ -1551,16 +1640,22 @@ impl FsdbTrace {
     }
 
     /// 名字解析: 精确 → 叶子名(短名/无点) → 子串(与 VCD/FST 同口径), 结果缓存。
-    /// 叶子名(最后一个 `.` 之后)在 `sig_names` 里的下标, 按 (叶子名, 下标) 排序。
+    /// 信号全名(在 arena 里; 4M 信号下这是唯一一份名字)
+    #[inline]
+    fn name_at(&self, i: usize) -> &str {
+        self.names.get(i as u32)
+    }
+
+    /// 叶子名(最后一个 `.` 之后)的下标, 按 (叶子名, 信号下标) 排序。
     /// 相同叶子名时取**下标最小**的, 与旧的线性扫描语义一致。
     fn leaf_order_index(&self) -> &Vec<u32> {
         self.leaf_order.get_or_init(|| {
             fn leaf(s: &str) -> &str {
                 s.rsplitn(2, '.').next().unwrap_or("")
             }
-            let mut v: Vec<u32> = (0..self.sig_names.len() as u32).collect();
+            let mut v: Vec<u32> = (0..self.names.len() as u32).collect();
             v.sort_unstable_by(|a, b| {
-                let (sa, sb) = (&self.sig_names[*a as usize], &self.sig_names[*b as usize]);
+                let (sa, sb) = (self.name_at(*a as usize), self.name_at(*b as usize));
                 leaf(sa).cmp(leaf(sb)).then(a.cmp(b))
             });
             v
@@ -1573,9 +1668,9 @@ impl FsdbTrace {
             s.rsplitn(2, '.').next().unwrap_or("")
         }
         let order = self.leaf_order_index();
-        let lo = order.partition_point(|&i| leaf(&self.sig_names[i as usize]) < want);
+        let lo = order.partition_point(|&i| leaf(self.name_at(i as usize)) < want);
         let first = *order.get(lo)?;
-        if leaf(&self.sig_names[first as usize]) == want {
+        if leaf(self.name_at(first as usize)) == want {
             Some(first as usize)
         } else {
             None
@@ -1588,18 +1683,23 @@ impl FsdbTrace {
             s.rsplitn(2, '.').next().unwrap_or("")
         }
         let order = self.leaf_order_index();
-        let lo = order.partition_point(|&i| leaf(&self.sig_names[i as usize]) < want);
+        let lo = order.partition_point(|&i| leaf(self.name_at(i as usize)) < want);
         let first = *order.get(lo)?;
-        if leaf(&self.sig_names[first as usize]) != want {
+        if leaf(self.name_at(first as usize)) != want {
             return None;
         }
-        let hi = lo + order[lo..].iter().take_while(|&&i| leaf(&self.sig_names[i as usize]) == want).count();
+        let hi = lo
+            + order[lo..]
+                .iter()
+                .take_while(|&&i| leaf(self.name_at(i as usize)) == want)
+                .count();
         Some(hi - lo == 1)
     }
 
     fn resolve_idx(&self, name: &str) -> Option<usize> {
-        if let Some(i) = self.name_to_idx.get(name) {
-            return Some(*i);
+        let h = fnv1a(name.as_bytes());
+        if let Some(i) = self.name_index.find_verified(h, |j| self.name_at(j as usize) == name) {
+            return Some(i as usize);
         }
         if let Some(c) = self.name_cache.borrow().get(name) {
             return *c;
@@ -1609,8 +1709,8 @@ impl FsdbTrace {
         let hit = if allow_leaf { self.lookup_leaf(name) } else { None };
         if hit.is_none() {
             // 子串匹配仍然只能线性扫(这类写法本身代价高);结果同样进 name_cache。
-            for (i, s) in self.sig_names.iter().enumerate() {
-                if s.contains(name) {
+            for i in 0..self.names.len() {
+                if self.name_at(i).contains(name) {
                     let found = Some(i);
                     self.name_cache.borrow_mut().insert(name.to_string(), found);
                     return found;
@@ -1996,13 +2096,11 @@ impl FsdbTrace {
     }
 
     fn col_cache_file(&self, idx: usize) -> Option<PathBuf> {
-        let sig = self.sigs.get(idx)?;
-        let dir = self.col_cache_dir()?;
-        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-        for b in sig.full.as_bytes() {
-            h ^= *b as u64;
-            h = h.wrapping_mul(0x100_0000_01b3);
+        if idx >= self.sigs.len() {
+            return None;
         }
+        let dir = self.col_cache_dir()?;
+        let h = fnv1a(self.name_at(idx).as_bytes());
         Some(dir.join(format!("{:016x}-v1.col", h)))
     }
 
@@ -2314,13 +2412,13 @@ impl FsdbTrace {
             return Ok(h);
         }
         let npi = npi()?;
-        let c = CString::new(self.sigs[idx].full.as_str())
-            .map_err(|_| format!("信号名含 NUL: {}", self.sigs[idx].full))?;
+        let full = self.name_at(idx);
+        let c = CString::new(full).map_err(|_| format!("信号名含 NUL: {}", full))?;
         let h = unsafe { (npi.sig_by_name)(self.file, c.as_ptr(), ptr::null_mut()) };
         if h.is_null() {
             return Err(format!(
                 "npi_fsdb_sig_by_name 取不到信号 '{}'(缓存里的名字与文件不匹配?)",
-                self.sigs[idx].full
+                self.name_at(idx)
             ));
         }
         self.sigs[idx].handle.set(h);
@@ -2425,7 +2523,13 @@ impl FsdbTrace {
 
 }
 
-unsafe fn walk_scope(npi: &'static Npi, scope: *mut c_void, sigs: &mut Vec<Sig>, scopes: &mut Vec<String>) {
+unsafe fn walk_scope(
+    npi: &'static Npi,
+    scope: *mut c_void,
+    sigs: &mut Vec<Sig>,
+    names: &mut NameArena,
+    scopes: &mut Vec<String>,
+) {
     unsafe {
         let full = Npi::cstr((npi.scope_property_str)(SCOPE_FULLNAME, scope));
         let _name = Npi::cstr((npi.scope_property_str)(SCOPE_NAME, scope));
@@ -2447,10 +2551,9 @@ unsafe fn walk_scope(npi: &'static Npi, scope: *mut c_void, sigs: &mut Vec<Sig>,
                 };
                 let mut size: c_int = 0;
                 (npi.sig_property)(SIG_SIZE, s, &mut size);
+                names.push(&sfull);
                 sigs.push(Sig {
                     handle: Cell::new(s),
-                    name: sname,
-                    full: sfull,
                     width: if size > 0 { size as usize } else { 1 },
                     real_str: Cell::new(None),
                 });
@@ -2464,7 +2567,7 @@ unsafe fn walk_scope(npi: &'static Npi, scope: *mut c_void, sigs: &mut Vec<Sig>,
                 if child.is_null() {
                     break;
                 }
-                walk_scope(npi, child, sigs, scopes);
+                walk_scope(npi, child, sigs, names, scopes);
             }
             (npi.iter_scope_stop)(cit);
         }
@@ -2588,12 +2691,13 @@ impl Trace for FsdbTrace {
     }
 
     fn resolve_name(&self, name: &str) -> Option<String> {
-        self.resolve_idx(name).map(|i| self.sig_names[i].clone())
+        self.resolve_idx(name).map(|i| self.name_at(i).to_string())
     }
 
     fn resolve_name_strict(&self, name: &str) -> Result<String, String> {
-        if let Some(i) = self.name_to_idx.get(name) {
-            return Ok(self.sig_names[*i].clone());
+        let h = fnv1a(name.as_bytes());
+        if let Some(i) = self.name_index.find_verified(h, |j| self.name_at(j as usize) == name) {
+            return Ok(self.name_at(i as usize).to_string());
         }
         fn leaf(s: &str) -> &str {
             s.rsplitn(2, '.').next().unwrap_or("")
@@ -2606,7 +2710,7 @@ impl Trace for FsdbTrace {
                     let i = self.lookup_leaf(name).ok_or_else(|| {
                         format!("signal '{}' not found in any loaded trace.", name)
                     })?;
-                    return Ok(self.sig_names[i].clone());
+                    return Ok(self.name_at(i).to_string());
                 }
                 Some(false) => {
                     return Err(format!(
@@ -2617,8 +2721,9 @@ impl Trace for FsdbTrace {
                 None => {}
             }
         }
-        let mut hits: Vec<&String> = Vec::new();
-        for s in &self.sig_names {
+        let mut hits: Vec<&str> = Vec::new();
+        for i in 0..self.names.len() {
+            let s = self.name_at(i);
             if (allow_leaf && leaf(s) == name) || s.contains(name) {
                 if !hits.is_empty() {
                     hits.push(s);
@@ -2633,13 +2738,14 @@ impl Trace for FsdbTrace {
             }
         }
         match hits.len() {
-            1 => Ok(hits.pop().unwrap().clone()),
+            1 => Ok(hits.pop().unwrap().to_string()),
             _ => Err(format!("signal '{}' not found in any loaded trace.", name)),
         }
     }
 
     fn signals(&self) -> Vec<String> {
-        self.sig_names.clone()
+        // 显式请求整表(4M 信号 ≈ 数百 MB): 只有 `(SIGNALS)`/`sigs`/`find-sig` 走这里
+        (0..self.names.len()).map(|i| self.name_at(i).to_string()).collect()
     }
 
     /// `$dumpvars` 快照(t0 写入的原值; 含 x/z)。FSDB 写者在 t=0 落一条初值条目,
@@ -2874,10 +2980,8 @@ impl Trace for FsdbTrace {
             }
             chunk_start = chunk_end;
         }
-        let mut v: Vec<(String, usize)> = self
-            .sig_names
-            .iter()
-            .cloned()
+        let mut v: Vec<(String, usize)> = (0..self.names.len())
+            .map(|i| self.name_at(i).to_string())
             .zip(counts.into_iter())
             .collect();
         v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
