@@ -62,8 +62,10 @@ T0=$(date +%s)
 OUT=$(WAL_DEBUG_FSDB=1 timeout 600 "$BIN" '(length (SIGNALS))' -l "$FILE" 2>&1)
 RC=$?
 T1=$(date +%s)
+# NPI 库自己会往 stdout 打一段版权 banner —— 只取结果行, 其余丢掉
+RESULT=$(printf '%s\n' "$OUT" | grep -E '^(=>|\()' | tail -1)
 if [ $RC -eq 0 ]; then
-    echo "  结果: $OUT"
+    echo "  结果: ${RESULT:-$(printf '%s\n' "$OUT" | tail -1)}"
     echo "  耗时: $((T1 - T0))s(含 NPI 初始化)"
     exit 0
 else
