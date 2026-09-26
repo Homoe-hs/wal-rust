@@ -10,7 +10,7 @@ CARGO_HOME ?= $(CURDIR)/.cargo-home
 XDG_CACHE_HOME ?= $(CURDIR)/.tools/cache
 export CARGO_HOME XDG_CACHE_HOME
 
-.PHONY: help ci ci-fast ci-full fmt fmt-check lint build test gates test-fsdb docs-check docs-serve perf bench-names bench-fsdb fsdb-prewarm lsf-run quickcheck release release-dry clean dist clean-logs
+.PHONY: help ci ci-fast ci-full fmt fmt-check lint build test gates test-fsdb docs-check docs-serve perf bench-names bench-fsdb fsdb-env fsdb-prewarm lsf-run quickcheck release release-dry clean dist clean-logs
 
 help: ## 显示所有可用任务
 	@grep -hE '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN{FS=":.*?## "}{printf "  \033[1m%-16s\033[0m %s\n", $$1, $$2}'
@@ -55,6 +55,9 @@ docs-check: ## 文档一致性: 断链、索引完整性、声称的数字
 # --- 性能 -------------------------------------------------------------------
 bench-names: ## 名字解析/裸符号求值基准(默认 200k 信号 × 2000 时间戳)
 	./scripts/bench_name_resolution.sh $(N) $(T)
+
+fsdb-env: ## FSDB 环境自检(写者版本/magic/许可/能否打开): make fsdb-env [FSDB=a.fsdb]
+	./scripts/fsdb_env_check.sh $(FSDB)
 
 bench-fsdb: ## FSDB 查询基准(冷建时间线/暖查询): make bench-fsdb FSDB=a.fsdb [SIG=tb.clk]
 	@: $${FSDB:?用法: make bench-fsdb FSDB=a.fsdb [SIG=tb.clk]}

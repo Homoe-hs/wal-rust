@@ -5,9 +5,7 @@ version,date,op,fixture,wall_s,rss_mb,note
 0.12.1,2026-09-07,count-lit,bench_10g.vcd,151,-,IO-1 锚定扫描
 0.12.2,2026-09-07,load,bench_10g.vcd,42,-,全局行采样加载
 0.12.3,2026-09-07,count-var,bench_10g.vcd,138,-,变量 RHS 快路径
-0.12.4,2026-09-08,count-lit(column),bench_2g.vcd,NA,NA,列缓存路径;计数与锚定一致 77629;加载成本提升(待干净复测)
 0.12.8,2026-09-08,count-any-expr,bench_2g.vcd,31,4547,区间扫描引擎(load+变更列扫描主导;逐拍回退原>90s超时)
-0.12.9,2026-09-08,whenever-any-expr,bench_2g.vcd,NA,NA,引擎命中索引+body逐拍执行(矩阵12项==oracle)
 0.12.24,2026-09-08,count-lit,bench_2g.vcd,29.08,3945,语义修复轮无回归(==77629 oracle)
 0.12.24,2026-09-08,count-edge-level,bench_2g.vcd,58.69,3949,(&& (rising s0) (= (get s1) 1)) 引擎==逐拍==0
 0.12.24,2026-09-08,count-mixed,bench_2g.vcd,57.85,3901,(|| (rising s0) (= (get s0) 1)) == 77757(电平+边沿并集)
@@ -28,3 +26,15 @@ version,date,op,fixture,wall_s,rss_mb,note
 0.13.2,2026-09-10,count-lit-cold-fused,bench_10g.vcd,70.48,13641,懒索引+变更列融合单遍 (count (= (get s0) 1)) == 92871; 0.13.1 = 109s, 0.12.45 = 216s (RSS 含 mmap 页)
 0.13.2,2026-09-10,count-lit-cold-fused,bench_2g.vcd,6.69,11013,同上 == 77629; 0.13.1 = 12.5s, 0.12.45 = 41.6s (RSS 含 mmap 页)
 0.13.2,2026-09-10,count-rise-real-vcs,.tools/vmwave/big1g.vcd,0.29,1142,(count (rising r000)) == 1168; 页缓存暖, 三轮 0.29/0.42/0.39 vs 旧 0.46/0.52/0.39
+0.14.31,2026-09-26,fsdb-cold-load,cal1m.fsdb,0.08,97800,=> 19
+0.14.31,2026-09-26,fsdb-build-load,cal1m.fsdb,0.08,97184,=> 19
+0.14.31,2026-09-26,fsdb-hit-load,cal1m.fsdb,0.08,96968,=> 19
+0.14.31,2026-09-26,fsdb-cold-edge,cal1m.fsdb,0.36,240280,=> 1000001
+0.14.31,2026-09-26,fsdb-build-edge,cal1m.fsdb,0.38,246836,=> 1000001
+0.14.31,2026-09-26,fsdb-hit-edge,cal1m.fsdb,0.08,169172,=> 1000001
+0.14.31,2026-09-26,fsdb-cold-level,cal1m.fsdb,2.37,301856,=> 1000001
+0.14.31,2026-09-26,fsdb-build-level,cal1m.fsdb,2.14,291064,=> 1000001
+0.14.31,2026-09-26,fsdb-hit-level,cal1m.fsdb,0.13,286152,=> 1000001
+0.14.31,2026-09-26,fsdb-cold-at,cal1m.fsdb,0.36,243352,=> (0 0)
+0.14.31,2026-09-26,fsdb-build-at,cal1m.fsdb,0.08,232852,=> (0 0)
+0.14.31,2026-09-26,fsdb-hit-at,cal1m.fsdb,0.08,232664,=> (0 0)

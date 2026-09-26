@@ -27,6 +27,8 @@ FSDB="${1:?用法: scripts/bench_fsdb.sh <file.fsdb> [信号全名]}"
 SIG="${2:-}"
 BIN="${WAL_BIN:-target/release/wal-rust}"
 [ -x "$BIN" ] || { echo "找不到 $BIN(先 cargo build --release)"; exit 2; }
+# 绝对路径: run() 会 cd 进临时目录, 相对路径会找不到二进制(踩过: 全 0.00s 却看不出错)
+BIN="$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")"
 [ -f "$FSDB" ] || { echo "找不到波形: $FSDB"; exit 2; }
 FSDB_ABS="$(cd "$(dirname "$FSDB")" && pwd)/$(basename "$FSDB")"
 command -v /usr/bin/time >/dev/null || { echo "需要 GNU time(/usr/bin/time)"; exit 2; }
@@ -57,15 +59,23 @@ mkdir -p "$work/cold" "$work/warm"
 
 # run <op> <cache 模式> <工作目录> <查询>
 run() {
-    local op="$1" mode="$2" dir="$3" q="$4" out t m
+    local op="$1" mode="$2" dir="$3" q="$4" out t m rc
     out=$( cd "$dir" && env WAL_CACHE="$mode" timeout 1800 /usr/bin/time -f "%e %M" \
-        "$BIN" "$q" -l "$FSDB_ABS" 2>&1 | tail -2 )
+        "$BIN" "$q" -l "$FSDB_ABS" 2>&1 )
+    rc=$?
     t=$(echo "$out" | sed -n 's/^\([0-9][0-9.]*\) [0-9]*$/\1/p' | tail -1)
     m=$(echo "$out" | sed -n 's/^[0-9.]* \([0-9]*\)$/\1/p' | tail -1)
     local val; val=$(echo "$out" | grep -E '^(=>|\()' | tail -1)
-    printf "%s,%s,%s,%s,%s,%s,%s\n" "$VERSION" "$DATE" "$op" "$FIXTURE" "${t:-NA}" "${m:-NA}" "$(echo "$val" | cut -c1-40 | tr ',' ' ')" >> "$CSV"
-    printf '%-22s %8ss  rss=%-9s %s\n' "$op" "${t:-NA}" "${m:-NA}KB" "$val"
+    # 查询失败时不要把 NA 混进回归库: 打印原因并直接失败(免得"看起来跑过了")
+    if [ -z "$t" ] || [ -z "$val" ]; then
+        printf '%-22s 失败(rc=%s): %s\n' "$op" "$rc" "$(echo "$out" | head -2 | tr '\n' ' ')"
+        FAILED=$((FAILED + 1))
+        return
+    fi
+    printf "%s,%s,%s,%s,%s,%s,%s\n" "$VERSION" "$DATE" "$op" "$FIXTURE" "$t" "$m" "$(echo "$val" | cut -c1-40 | tr ',' ' ')" >> "$CSV"
+    printf '%-22s %8ss  rss=%-9s %s\n' "$op" "$t" "${m}KB" "$val"
 }
+FAILED=0
 
 echo
 echo "== 冷(不读不写缓存) vs 暖(建一次缓存, 再命中) =="

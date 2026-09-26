@@ -12,6 +12,7 @@
 | 搞清查 `(get)`/边沿/`count`/`find` 的语义 | [`query-engine-design.md`](query-engine-design.md) §1 — **权威定义** |
 | 加一个新波形后端(VCD/FST/FSDB 之外的) | [`query-engine-design.md`](query-engine-design.md) + `src/trace/trace.rs` 的 `Trace` trait |
 | 动 FSDB 后端 / 排查 NPI 问题 | [`fsdb-npi.md`](fsdb-npi.md) |
+| 读不了/写不了 FSDB(版本、许可、环境) | [`fsdb-env.md`](fsdb-env.md) |
 | 改性能路径前先看历史教训 | [`waveform-io-plan.md`](waveform-io-plan.md)、[`152gb-round.md`](152gb-round.md) |
 | 知道每个版本改了什么 | [`../CHANGELOG.md`](../CHANGELOG.md) |
 | 参与开发/发版 | [`../CONTRIBUTING.md`](../CONTRIBUTING.md) |
@@ -24,6 +25,7 @@
 | [`4-state-semantics.md`](4-state-semantics.md) | 104 | 规范 | ✅ 现行(四值语义**唯一权威**) |
 | [`query-engine-design.md`](query-engine-design.md) | 219 | 设计 | ✅ 现行(§1 查询语义权威; 后半是当初的方案, 实现进度见文内标注) |
 | [`fsdb-npi.md`](fsdb-npi.md) | 319 | 设计 + 实测 | ✅ 现行(FSDB 后端; §9 多文件/缓存规则) |
+| [`fsdb-env.md`](fsdb-env.md) | 91 | 运行手册 | ✅ 现行(FSDB 读写环境/许可/版本兼容) |
 | [`waveform-io-plan.md`](waveform-io-plan.md) | 154 | 调研 + 计划 | 🟡 部分落地(IO-1..6 的进度见文内) |
 | [`agent-cli.md`](agent-cli.md) | 163 | 草案 | 🟡 草案 v0, **未实现**, 只作为接口约定讨论稿 |
 | [`migration-0.8-0.11.md`](migration-0.8-0.11.md) | 37 | 迁移指南 | 🟡 历史区间(0.8→0.11), 供老用户对照 |

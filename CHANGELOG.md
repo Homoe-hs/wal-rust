@@ -52,7 +52,17 @@
   拷贝一遍(O(块数 × 主表长) —— 1.88M 信号 = 459 块 × 上千万时间点 = 几十 GB memcpy),
   现在收齐分片后一次归并。
 
+### Docs
+- 新增 [`docs/fsdb-env.md`](docs/fsdb-env.md): FSDB 读写环境/许可/版本兼容运行手册 ——
+  两套许可(25A 27080 / 2018 27051)身份互斥、宿主机原生读 FSDB 的四步、以及三个真实坑
+  (SERVER 主机名要换 127.0.0.1、vendor daemon 端口要钉、**客机 NixOS 防火墙默认 reject
+  会被误判成 FlexLM -16,287**)。
+- 新增 `scripts/fsdb_env_check.sh`(`make fsdb-env [FSDB=…]`): 一条命令打出"写者版本 /
+  magic / 许可 / 真实 open 一次", 拿到别人的波形先跑它。
+
 ### Internal
+- `scripts/bench_fsdb.sh` 修两处: 二进制解析成绝对路径(run 里会 cd, 相对路径会静默 0.00s)、
+  查询失败直接报错而不是把 `NA` 混进回归库(并把之前误写的 14 行清掉)。
 - **`-j/--jobs` 用环境变量而不是进程内 static 传递**: `src/main.rs` 自己 `mod trace;`
   (二进制 crate 二次编译了一份库代码), 两边的 `OnceLock` static 不是同一个变量 —— 用 static
   传参会静默失效(踩过: `-j 1` 照旧开 8 个 worker)。现在 `-j` 统一写 `WAL_FSDB_TL_JOBS`,
