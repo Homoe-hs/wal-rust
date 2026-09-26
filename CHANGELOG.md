@@ -33,6 +33,16 @@
   `WAL_FSDB_BENCH=<file.fsdb>` 时自动跑(判据: 暖查询应接近"只加载")。
 
 ### Performance
+- **4M 信号的"名字路径"实测与两处修补**: 加了离线基准
+  `cargo test --release --lib -- --ignored --nocapture fsdb_name_path_4m`(不需要波形文件,
+  直接造 400 万名字走 encode/decode/建索引/叶子排序), 一跑就露出两个问题:
+  ① **叶子名排序 3.5s**: 比较器里现算 `rsplitn('.')` → 每个名字被重复扫描 O(log N) 次;
+  改成"先一遍预计算叶子 (偏移,长度), 排序只比字节切片"后 **0.36s**(9.8×);
+  ② **`.fnames` 缓存要额外背 207MB**: 改成从文件**流式**解码进 arena(`decode_tree_file`),
+  多花 ~70ms 换掉 207MB 峰值; 截断/损坏仍当未命中回退走 NPI 树(真波形上验过)。
+  4M 信号名字路径现状: encode 56ms → 207MB; 流式 decode 127ms; 建索引 558ms; 叶子排序 360ms;
+  内存 arena 199MB + spans 30MB + 索引 96MB + 叶子序 15MB ≈ **340MB**(改动前 ≈1.1GB)。
+  数字与复现命令记在 `bench/RESULTS.md`。
 - **FSDB 名字存储改 arena + 开放寻址索引(4M 信号级的头号开销)**: 改动前同一份名字在
   进程里存了**四遍**(`Sig.name` 叶子名 / `Sig.full` 全名 / `sig_names[]` / `HashMap<String,_>`
   的键), 微基准口径 **280B/信号** → 4M 信号 ≈ **1.1GB**;现在名字进连续 arena(每信号只多

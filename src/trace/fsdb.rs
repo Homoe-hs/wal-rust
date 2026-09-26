@@ -399,6 +399,90 @@ pub(crate) fn encode_tree(t: &TreeSnapshot) -> Vec<u8> {
     out
 }
 
+/// 逐字节流式读取(解 `.fnames` 缓存用): 不再把整份缓存读进内存 ——
+/// 4M 信号那份是 **207MB**, 而 "读缓存" 本该比 "走 NPI 树" 省内存。
+struct StreamReader<R: std::io::Read> {
+    inner: R,
+}
+
+impl<R: std::io::Read> StreamReader<R> {
+    fn new(inner: R) -> Self {
+        StreamReader { inner }
+    }
+    fn fixed(&mut self, out: &mut [u8]) -> Option<()> {
+        self.inner.read_exact(out).ok()
+    }
+    fn byte(&mut self) -> Option<u8> {
+        let mut b = [0u8; 1];
+        self.inner.read_exact(&mut b).ok()?;
+        Some(b[0])
+    }
+    fn varint(&mut self) -> Option<u64> {
+        let mut v = 0u64;
+        let mut shift = 0u32;
+        loop {
+            let b = self.byte()?;
+            v |= ((b & 0x7f) as u64) << shift;
+            if b & 0x80 == 0 {
+                return Some(v);
+            }
+            shift += 7;
+            if shift > 63 {
+                return None;
+            }
+        }
+    }
+    /// 读 len 字节进 buf, 返回 `buf[..len]`(生命周期绑定到 buf, 不是 &mut self)
+    fn into_buf<'a>(&mut self, len: usize, buf: &'a mut Vec<u8>) -> Option<&'a [u8]> {
+        buf.clear();
+        buf.resize(len, 0);
+        self.inner.read_exact(buf).ok()?;
+        Some(&buf[..])
+    }
+}
+
+/// 从**文件**流式解码名字树缓存(生产路径)。截断/损坏 → None(调用方回退走 NPI 树)。
+pub(crate) fn decode_tree_file(
+    path: &Path,
+    expect_fp: u64,
+) -> Option<(NameArena, Vec<usize>, Vec<String>)> {
+    let file = std::fs::File::open(path).ok()?;
+    let mut r = StreamReader::new(std::io::BufReader::with_capacity(1 << 20, file));
+    let mut head = [0u8; 16];
+    r.fixed(&mut head)?;
+    if &head[..8] != TREE_MAGIC {
+        return None;
+    }
+    if u64::from_le_bytes(head[8..16].try_into().ok()?) != expect_fp {
+        return None;
+    }
+    let n = r.varint()? as usize;
+    let mut names = NameArena::with_capacity(n, n * 32);
+    let mut widths = Vec::with_capacity(n);
+    let mut scratch: Vec<u8> = Vec::with_capacity(256);
+    for _ in 0..n {
+        let l = r.varint()? as usize;
+        if l > (1 << 20) {
+            return None; // 明显损坏(名字不会超过 1MB)
+        }
+        let bytes = r.into_buf(l, &mut scratch)?;
+        let name = std::str::from_utf8(bytes).ok()?;
+        names.push(name);
+        widths.push(r.varint()? as usize);
+    }
+    let ns = r.varint()? as usize;
+    let mut scopes = Vec::with_capacity(ns);
+    for _ in 0..ns {
+        let l = r.varint()? as usize;
+        if l > (1 << 20) {
+            return None;
+        }
+        let bytes = r.into_buf(l, &mut scratch)?;
+        scopes.push(String::from_utf8(bytes.to_vec()).ok()?);
+    }
+    Some((names, widths, scopes))
+}
+
 /// 名字树缓存 → **直接解进名字 arena**。
 ///
 /// 为什么单独一个入口: 老路子先解出 `Vec<String>` 再逐个拷进 arena, 4M 信号下
@@ -688,9 +772,12 @@ fn try_load_tree_cache(
         return None;
     }
     let f = cache_path(cache_root, filename, ".fnames")?;
-    let buf = std::fs::read(&f).ok()?;
+    if !f.exists() {
+        return None;
+    }
     let fp = crate::trace::vcd::wave_fingerprint(std::path::Path::new(filename));
-    let snap = decode_tree_into(&buf, fp);
+    // 流式解码: 不把整份缓存(4M 信号 ≈ 207MB)搬进内存
+    let snap = decode_tree_file(&f, fp);
     if snap.is_none() && std::env::var("WAL_DEBUG_FSDB").is_ok() {
         eprintln!("[fsdb] 名字树缓存未命中/损坏: {}", f.display());
     }
@@ -1650,13 +1737,29 @@ impl FsdbTrace {
     /// 相同叶子名时取**下标最小**的, 与旧的线性扫描语义一致。
     fn leaf_order_index(&self) -> &Vec<u32> {
         self.leaf_order.get_or_init(|| {
-            fn leaf(s: &str) -> &str {
-                s.rsplitn(2, '.').next().unwrap_or("")
+            // 预计算每信号的叶子名在 arena 里的绝对 (偏移, 长度), 排序时只比字节切片。
+            // 曾经的写法是在比较器里 `rsplitn('.')` —— 4M 信号实测 **3.5s**(每个名字被
+            // 重复扫描 O(log N) 次), 而这一遍是"第一次用短名解析"时要付的延迟尖峰。
+            // 现在: 一遍 O(名字总字节) 预计算 + 只比 slice, 4M 信号 ~0.5s 量级。
+            let n = self.names.len();
+            let mut leaf_keys: Vec<(u32, u32)> = Vec::with_capacity(n);
+            for i in 0..n as u32 {
+                let (off, len) = self.names.span(i);
+                let s = self.names.bytes_at(off, len);
+                let rel = match s.iter().rposition(|&b| b == b'.') {
+                    Some(p) => p + 1,
+                    None => 0,
+                };
+                leaf_keys.push((off + rel as u32, len - rel as u32));
             }
-            let mut v: Vec<u32> = (0..self.names.len() as u32).collect();
+            let mut v: Vec<u32> = (0..n as u32).collect();
             v.sort_unstable_by(|a, b| {
-                let (sa, sb) = (self.name_at(*a as usize), self.name_at(*b as usize));
-                leaf(sa).cmp(leaf(sb)).then(a.cmp(b))
+                let (oa, la) = leaf_keys[*a as usize];
+                let (ob, lb) = leaf_keys[*b as usize];
+                self.names
+                    .bytes_at(oa, la)
+                    .cmp(self.names.bytes_at(ob, lb))
+                    .then(a.cmp(b))
             });
             v
         })

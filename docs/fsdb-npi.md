@@ -361,6 +361,27 @@ FSDB 后端此前把**同一份名字存四遍**: `Sig.name`(叶子名)、`Sig.f
 * **读** `.fnames` 缓存走 `decode_tree_into()` —— 直接解进 arena, 不要先解成 `Vec<String>`;
 * **写** `.fnames` 缓存走 `encode_tree_arena()` —— 直接从 arena 编码。
 
+两条配套规则(否则省下的会被瞬时峰值吃掉):
+
+* **读** `.fnames` 缓存走 `decode_tree_file()` —— **流式**解码进 arena: 4M 信号那份缓存
+  是 207MB, 先 `fs::read` 再解就多背一份;流式解码多花 ~70ms, 换掉 207MB 峰值(生产选它)。
+  `decode_tree_into()`(内存版)留给测试;截断/损坏 → 当作未命中, 回退走 NPI 树(实测有效)。
+* **写** `.fnames` 缓存走 `encode_tree_arena()` —— 直接从 arena 编码。
+
+4M 信号的实测(离线基准 `cargo test --release --lib -- --ignored --nocapture fsdb_name_path_4m`,
+数字与复现命令也记在 `bench/RESULTS.md`):
+
+| 阶段 | 时间 |
+|---|---|
+| 名字进 arena | 220ms |
+| encode(→207MB) | 56ms |
+| 文件流式 decode | 127ms |
+| 建名字索引 | 558ms |
+| 叶子名排序 | **360ms**(曾经 3528ms) |
+
+> 叶子名排序的坑: 在比较器里现算 `rsplitn('.')` → 每个名字被重复扫描 O(log N) 次;
+> 改成"先一遍预计算叶子 (偏移,长度), 排序只比字节切片"后 3.5s → 0.36s。
+
 闸: `trace::name_store::per_signal_bytes_stay_small`(同时打印新旧两个口径),
 外加 arena 往返 / 开放寻址扩容碰撞的单测。
 

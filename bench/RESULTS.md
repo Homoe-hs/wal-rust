@@ -148,3 +148,32 @@ python3 scripts/gen_big_vcd.py bench/data/bench_10g.vcd 3500000 1500000 1100 # 5
 `scripts/run_bench.sh` / `scripts/perf_history.sh` 依赖这些文件;`scripts/diff_find.sh`
 在缺少 `bench/data/small.vcd` 时会自动跳过。性能数字本身在 `bench/perf-history.csv`
 与本文里,不依赖文件常驻。
+
+## FSDB 名字路径 @ 400 万信号(2026-09-26, 离线基准, 不需要波形文件)
+
+现场形状: **300MB / 400 万信号**。名字表是这一档波形的头号内存开销, 所以先把它单独量出来:
+
+```bash
+cargo test --release --lib -- --ignored --nocapture fsdb_name_path_4m
+```
+
+| 阶段 | 时间 | 说明 |
+|---|---|---|
+| 名字进 arena(4M) | 220ms | 复用 buffer 直接 push, 不造 4M 个 String |
+| 写 `.fnames`(encode) | 56ms | → **207MB** |
+| 读 `.fnames`(内存 decode) | 58ms | 需要额外背一份 207MB 缓存 |
+| 读 `.fnames`(**文件流式 decode**, 生产路径) | 127ms | 峰值省掉那 207MB |
+| 建名字索引(哈希→下标) | 558ms | OpenIndex, 负载 ≤0.7 |
+| 叶子名排序(短名解析用) | **360ms** | 曾经 3528ms(比较器里 rsplitn → 先预计算叶子 span) |
+
+内存(4M 信号, 名字表本体):
+
+| 项 | 大小 |
+|---|---|
+| arena(名字字节) | 199MB |
+| spans(每信号 8B) | 30MB |
+| 名字索引 | 96MB |
+| 叶子序(每信号 4B) | 15MB |
+| **合计** | **~340MB**(改动前"四份 String + HashMap"≈ **1.1GB**) |
+
+> 改动前口径见 `trace::name_store::per_signal_bytes_stay_small` 的输出: 280B/信号 → 73B/信号(**省 74%**)。

@@ -31,6 +31,20 @@ impl NameArena {
         (self.spans.len() - 1) as u32
     }
 
+    /// 第 i 个名字的绝对 (偏移, 长度) —— 叶子名排序要预计算它
+    #[inline]
+    pub(crate) fn span(&self, i: u32) -> (u32, u32) {
+        self.spans[i as usize]
+    }
+
+    /// arena 里的一段字节(越界视为空)
+    #[inline]
+    pub(crate) fn bytes_at(&self, off: u32, len: u32) -> &[u8] {
+        let a = off as usize;
+        let b = a.saturating_add(len as usize);
+        self.blob.get(a..b).unwrap_or(&[])
+    }
+
     #[inline]
     pub(crate) fn get(&self, i: u32) -> &str {
         let (off, len) = self.spans[i as usize];
@@ -175,6 +189,7 @@ impl OpenIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::trace::fsdb::{decode_tree_file, decode_tree_into, encode_tree_arena};
 
     #[test]
     fn arena_round_trip() {
@@ -228,6 +243,141 @@ mod tests {
         let keys_heap: usize = full.iter().map(|s| s.capacity()).sum(); // map 里那份键的堆副本
         let map_buckets = map.capacity() * 48; // 开放寻址桶: hash + key(24) + value(8) + 控制位
         (str_cost(&full) * 2 + str_cost(&leaf) + keys_heap + map_buckets) / n
+    }
+
+    /// 进程 RSS(KB; 只读 /proc/self/statm 的常驻页数)
+    fn rss_kb() -> usize {
+        let s = std::fs::read_to_string("/proc/self/statm").unwrap_or_default();
+        let pages: usize = s.split_whitespace().nth(1).and_then(|x| x.parse().ok()).unwrap_or(0);
+        pages * 4
+    }
+
+    /// **4M 信号规模的离线上限基准**(默认 `#[ignore]`, 手动跑):
+    ///
+    /// ```bash
+    /// cargo test --release --lib -- --ignored --nocapture fsdb_name_path_4m
+    /// ```
+    ///
+    /// 量的是 FSDB **读 `.fnames` 缓存 → 建索引 → 建叶子名索引**这条路径(不需要 NPI,
+    /// 也就等真波形来之前就能回答"加载这一段要多久/多少内存")。
+    /// 现场形状: 300MB / 400 万信号。
+    #[test]
+    #[ignore = "4M 名字 ≈ 1GB 瞬时内存; 手动 --ignored 跑"]
+    fn fsdb_name_path_4m() {
+        use std::time::Instant;
+        const N: usize = 4_000_000;
+        let t0 = Instant::now();
+        let rss0 = rss_kb();
+        // 名字生成: 复用同一个 buffer 直接进 arena(不造 4M 个 String —— 那正是要避免的)
+        let mut arena = NameArena::with_capacity(N, N * 34);
+        let mut widths: Vec<usize> = Vec::with_capacity(N);
+        let mut buf = String::with_capacity(64);
+        for i in 0..N {
+            buf.clear();
+            use std::fmt::Write as _;
+            let _ = write!(
+                buf,
+                "tb_top.u_subsys_{}.u_blk_{}.u_core_{}.sig_reg_{}",
+                i % 64,
+                (i / 64) % 64,
+                (i / 4096) % 64,
+                i
+            );
+            arena.push(&buf);
+            widths.push((i % 33) + 1);
+        }
+        let t_gen = t0.elapsed();
+        let scopes: Vec<String> = (0..4096).map(|i| format!("tb_top.u_subsys.u_blk_{}", i)).collect();
+
+        // ① 写缓存(encode)
+        let t = Instant::now();
+        let blob = encode_tree_arena(&arena, &widths, &scopes);
+        let t_enc = t.elapsed();
+
+        // ② 读缓存(decode → 直接进 arena)
+        let t = Instant::now();
+        let (arena2, widths2, scopes2) = decode_tree_into(&blob, 0).expect("decode");
+        let t_dec = t.elapsed();
+        assert_eq!(arena2.len(), N);
+        assert_eq!(widths2.len(), N);
+        assert_eq!(scopes2.len(), scopes.len());
+        assert_eq!(arena2.get(123_456), arena.get(123_456));
+
+        // ②b 生产路径: 从**文件**流式解码(不把整份缓存搬进内存)
+        let blob_mb = blob.len() / 1024 / 1024;
+        let tmpdir = std::env::temp_dir().join(format!("wal-fnames-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&tmpdir);
+        let tmpf = tmpdir.join("x.fnames");
+        std::fs::write(&tmpf, &blob).expect("write tmp fnames");
+        let rss_before_file = rss_kb();
+        let t = Instant::now();
+        let (arena_file, _w, _s) = decode_tree_file(&tmpf, 0).expect("decode_tree_file");
+        let t_dec_file = t.elapsed();
+        let rss_after_file = rss_kb();
+        assert_eq!(arena_file.len(), N);
+        assert_eq!(arena_file.get(123_456), arena.get(123_456));
+        let _ = std::fs::remove_file(&tmpf);
+
+        // ③ 建名字索引(哈希 → 下标)
+        let t = Instant::now();
+        let mut hashes: Vec<u64> = Vec::with_capacity(N);
+        let mut ix = OpenIndex::new(N);
+        for i in 0..N as u32 {
+            let h = fnv1a(arena2.get(i).as_bytes());
+            hashes.push(h);
+            ix.insert(h, i, |j| hashes[j as usize]);
+        }
+        let t_ix = t.elapsed();
+        assert_eq!(ix.find_verified(hashes[999_999], |j| arena2.get(j) == arena2.get(999_999)), Some(999_999));
+
+        // ④ 叶子名排序索引(短名解析用) —— 与 fsdb.rs 的 `leaf_order_index` 同口径:
+        //    先一遍预计算叶子 (偏移,长度), 然后只比字节切片
+        let t = Instant::now();
+        let mut leaf_keys: Vec<(u32, u32)> = Vec::with_capacity(N);
+        for i in 0..N as u32 {
+            let (off, len) = arena2.span(i);
+            let s = arena2.bytes_at(off, len);
+            let rel = s.iter().rposition(|&b| b == b'.').map(|p| p + 1).unwrap_or(0);
+            leaf_keys.push((off + rel as u32, len - rel as u32));
+        }
+        let mut order: Vec<u32> = (0..N as u32).collect();
+        order.sort_unstable_by(|a, b| {
+            let (oa, la) = leaf_keys[*a as usize];
+            let (ob, lb) = leaf_keys[*b as usize];
+            arena2.bytes_at(oa, la).cmp(arena2.bytes_at(ob, lb)).then(a.cmp(b))
+        });
+        let t_leaf = t.elapsed();
+
+        let rss1 = rss_kb();
+        println!(
+            "4M 信号名字路径: 生成 {}ms | encode {}ms({}MB) | 内存 decode {}ms | **文件流式 decode {}ms** | 建索引 {}ms | 叶子排序 {}ms",
+            t_gen.as_millis(),
+            t_enc.as_millis(),
+            blob_mb,
+            t_dec.as_millis(),
+            t_dec_file.as_millis(),
+            t_ix.as_millis(),
+            t_leaf.as_millis()
+        );
+        println!(
+            "  文件流式 decode 期间 RSS: {}MB → {}MB(+{}MB; 内存 decode 会多背一份 {}MB 缓存)",
+            rss_before_file / 1024,
+            rss_after_file / 1024,
+            (rss_after_file - rss_before_file) / 1024,
+            blob_mb
+        );
+        println!(
+            "  内存: arena {}MB + spans {}MB + 索引 {}MB + 叶子序 {}MB ; RSS {}MB → {}MB(+{}MB)",
+            arena2.blob_len() / 1024 / 1024,
+            arena2.len() * 8 / 1024 / 1024,
+            ix.bytes() / 1024 / 1024,
+            order.len() * 4 / 1024 / 1024,
+            rss0 / 1024,
+            rss1 / 1024,
+            (rss1 - rss0) / 1024
+        );
+        // 别让编译器把东西优化掉
+        assert!(order[0] < N as u32 && arena2.len() == N);
     }
 
     /// 4M 信号下的**每信号字节数** —— 目标 1 的验收口径。

@@ -101,8 +101,11 @@ Flags: `-l <waveform>`(可重复), `--halt-on-error`(遇错即停)。
   百万~千万信号级波形上"每个信号一个 `String`"本身就是 GB 级开销 —— 微基准实测
   **280B/信号**(`Sig.name`+`Sig.full`+`sig_names[]`+`HashMap<String,_>` 四份)对 **73B/信号**
   (arena 34 + spans 8 + 索引 31);4M 信号 = 1.1GB → 0.3GB。**读/写 `.fnames` 缓存要直接对
-  arena 编解码**(`decode_tree_into`/`encode_tree_arena`), 别先解/编 `Vec<String>` ——
-  那是 4M 信号下各一次几百 MB 的瞬时峰值。闸: `per_signal_bytes_stay_small`。
+  arena 编解码**, 且**读要走文件流式**(`decode_tree_file` — 4M 信号那份缓存 207MB, 先
+  `fs::read` 再解就多背一份);别先解/编 `Vec<String>`。**叶子名排序先预计算叶子 span 再比
+  字节切片**: 在比较器里 `rsplitn('.')` 实测 3.5s → 0.36s(4M 信号)。
+  离线基准(不需要波形文件): `cargo test --release --lib -- --ignored --nocapture fsdb_name_path_4m`;
+  闸: `per_signal_bytes_stay_small`。
 - **时间线冷建别逐块拷主表**: `FsdbTrace::scan` 每 4096 信号一块, 曾把已累积的时间线
   每块整份拷贝一次 → O(块数 × 主表长)(1.88M 信号 = 459 块 × 上千万时间点 = 几十 GB memcpy)。
   现在分片收齐后一次归并(收完再平衡归并)。
