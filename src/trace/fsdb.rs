@@ -115,6 +115,8 @@ struct Npi {
     file_property_str: unsafe extern "C" fn(c_int, *mut c_void) -> *const c_char,
     /// `npi_fsdb_unload_vc(file)`: 丢掉 NPI 为这个文件缓存的 VC 数据
     unload_vc: Option<unsafe extern "C" fn(*mut c_void) -> c_int>,
+    /// `npi_fsdb_release_sig(sig)`: 释放一个信号句柄(边走边扫时用完即放)
+    release_sig: Option<unsafe extern "C" fn(*mut c_void) -> c_int>,
     sig_property: unsafe extern "C" fn(c_int, *mut c_void, *mut c_int) -> c_int,
     sig_property_str: unsafe extern "C" fn(c_int, *mut c_void) -> *const c_char,
     /// `npi_fsdb_sig_by_name(file, name, scope)`: 按全名取句柄(不遍历树)
@@ -285,6 +287,7 @@ impl Npi {
                 max_time: sym!("_Z17npi_fsdb_max_timePvPy", unsafe extern "C" fn(*mut c_void, *mut NpiTime) -> c_int),
                 file_property_str: sym!("_Z26npi_fsdb_file_property_str23npiFsdbFilePropertyTypePv", unsafe extern "C" fn(c_int, *mut c_void) -> *const c_char),
                 unload_vc: sym_opt!("_Z20npi_fsdb_unload_vcPv", unsafe extern "C" fn(*mut c_void) -> c_int),
+                release_sig: sym_opt!("_Z20npi_fsdb_release_sigPv", unsafe extern "C" fn(*mut c_void) -> c_int),
                 sig_property: sym!("_Z21npi_fsdb_sig_property22npiFsdbSigPropertyTypePvPi", unsafe extern "C" fn(c_int, *mut c_void, *mut c_int) -> c_int),
                 sig_property_str: sym!("_Z25npi_fsdb_sig_property_str22npiFsdbSigPropertyTypePv", unsafe extern "C" fn(c_int, *mut c_void) -> *const c_char),
                 sig_by_name: sym!("_Z20npi_fsdb_sig_by_namePvPKcS_", unsafe extern "C" fn(*mut c_void, *const c_char, *mut c_void) -> *mut c_void),
@@ -1322,6 +1325,260 @@ pub fn merge_timeline_parts(
 }
 
 /// worker 入口: 只算 [lo, hi) 这些信号的变更时间并落盘。
+/// 大到什么程度就优先走"边走边扫"建时间线(信号数)。
+///
+/// 分界依据: 400 万信号的合成夹具上, 常规路径(块大小优化后)冷建 14.2s 已经够用;
+/// 而 1796 万信号的真波形上, 常规路径要先按名字解析 18M 次句柄(**实测 550µs/个**),
+/// 等于两小时起步 —— 必须换路。`WAL_FSDB_WALK_SCAN=0` 可显式关掉, 方便 A/B。
+fn walk_scan_min_signals() -> usize {
+    if matches!(std::env::var("WAL_FSDB_WALK_SCAN").as_deref(), Ok("0") | Ok("off")) {
+        return usize::MAX;
+    }
+    std::env::var("WAL_FSDB_WALK_SCAN_MIN")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(2_000_000)
+}
+
+/// 同进程做"边走边扫"之前的内存护栏。
+///
+/// 为什么需要: 父进程已经背着名字表(1796 万信号 ≈ 6GB), 而 NPI 遍历期自己还要涨
+/// ~10GB —— 两者叠加在 27GB 机器上(再有 10GB 的许可 VM)会开始 thrash, 越跑越慢。
+/// 护栏看**可用内存**: 低于估算需求就**不在本进程里叠**, 让调用方回退(worker 子进程
+/// 走同一条边走边扫, 但它是独立进程, 峰值不叠加)。`WAL_FSDB_WALK_SCAN_FORCE=1` 可强制。
+fn inprocess_walk_scan_allowed() -> bool {
+    if std::env::var("WAL_FSDB_WALK_SCAN_FORCE").is_ok() {
+        return true;
+    }
+    let avail_kb = std::fs::read_to_string("/proc/meminfo")
+        .ok()
+        .and_then(|t| {
+            t.lines()
+                .find(|l| l.starts_with("MemAvailable:"))
+                .and_then(|l| l.split_whitespace().nth(1))
+                .and_then(|v| v.parse::<u64>().ok())
+        })
+        .unwrap_or(u64::MAX);
+    // 估算: 本进程已有名字表(这档 ~6GB) + 遍历期 NPI ~10GB + 2GB 余量 = 18GB
+    avail_kb / 1024 / 1024 >= 18
+}
+
+/// **边走边扫**的全局时间线(单进程, 内存与"信号总数"解耦)。
+///
+/// 为什么需要它: 常规路径要么先把 1796 万个名字读进来(6GB)再逐信号解析句柄
+/// (实测 550µs/个 → 2.75 小时), 要么走树把 18M 句柄全攒着(NPI 自身涨到 ~10GB)。
+/// 建时间线只需要"变更时间的并集", 于是可以:
+///   走到一批信号(默认 65536 个) → 塞进迭代器 → `start`/逐条取时间 → `unload_vc` →
+///   **丢掉这批句柄** → 继续走。峰值内存 ≈ 一批句柄 + 一批时间点, 与信号总数无关。
+///
+/// `stride`/`offset` 用于分片: 树遍历顺序即信号下标顺序(`idx % stride == offset`),
+/// 与 `round_robin_slice` 的分片口径一致 → 产物可与其它 worker 归并。
+pub fn timeline_by_walk(
+    path: &str,
+    stride: usize,
+    offset: usize,
+) -> Result<Vec<u64>, String> {
+    timeline_by_walk_split(path, stride, offset, None)
+}
+
+/// `split = Some((shards, shard, depth))` 时按 **scope 子树**切分(而不是按信号下标):
+/// 每个 worker 只走自己那几棵子树, NPI 遍历期内存随之降到那份子树的大小。
+pub fn timeline_by_walk_split(
+    path: &str,
+    stride: usize,
+    offset: usize,
+    split: Option<(usize, usize, usize)>,
+) -> Result<Vec<u64>, String> {
+    let npi = npi()?;
+    let abs = std::fs::canonicalize(path)
+        .map_err(|e| format!("{}: 打不开({})", path, e))?;
+    let cpath = CString::new(abs.to_string_lossy().as_bytes())
+        .map_err(|_| "路径含 NUL 字节".to_string())?;
+    let _box = NpiSandbox::enter(false);
+    unsafe {
+        if let Some(f) = npi.is_fsdb {
+            if f(cpath.as_ptr()) == 0 {
+                return Err(format!("{}: 不是 FSDB 文件(NPI 判定)", path));
+            }
+        }
+        let file = (npi.open)(cpath.as_ptr());
+        if file.is_null() {
+            return Err(format!("{}: npi_fsdb_open 失败", path));
+        }
+        let mut min_t: NpiTime = 0;
+        let mut max_t: NpiTime = 0;
+        (npi.min_time)(file, &mut min_t);
+        (npi.max_time)(file, &mut max_t);
+        let mut w = WalkScan {
+            npi,
+            file,
+            batch: Vec::with_capacity(65536),
+            parts: Vec::new(),
+            idx: 0,
+            stride: stride.max(1),
+            offset,
+            chunk: 65536,
+            min_t,
+            max_t,
+            dbg: std::env::var("WAL_DEBUG_FSDB").is_ok(),
+            flushed: 0,
+            split,
+            depth: 1,
+            node: 0,
+            trees: 0,
+        };
+        let top = (npi.iter_top_scope)(file);
+        if !top.is_null() {
+            loop {
+                let s = (npi.iter_scope_next)(top);
+                if s.is_null() {
+                    break;
+                }
+                w.scope(s);
+            }
+            (npi.iter_scope_stop)(top);
+        }
+        w.flush();
+        (npi.close)(file);
+        let times = merge_time_sets(std::mem::take(&mut w.parts));
+        if w.dbg {
+            eprintln!(
+                "[fsdb] 边走边扫: 走过 {} 个信号 / {} 棵子树(分片 {}/{}), {} 批 → {} 个时间点",
+                w.idx, w.trees, offset, w.stride, w.flushed, times.len()
+            );
+        }
+        Ok(times)
+    }
+}
+
+/// `timeline_by_walk` 的遍历状态机
+struct WalkScan {
+    npi: &'static Npi,
+    file: *mut c_void,
+    batch: Vec<*mut c_void>,
+    parts: Vec<Vec<u64>>,
+    idx: usize,
+    stride: usize,
+    offset: usize,
+    chunk: usize,
+    min_t: NpiTime,
+    max_t: NpiTime,
+    dbg: bool,
+    flushed: usize,
+    /// scope 分片(可选): 只在"第 `split_depth` 层的第 `idx % n_shards == shard` 个 scope"
+    /// 子树里干活。NPI 遍历期的内存 ∝ 走过的子树大小, 所以按子树切分才能让
+    /// "多进程并行"真的省内存(按信号下标轮转切不省: 每个 worker 都要走整棵树)。
+    split: Option<(usize, usize, usize)>,
+    depth: usize,
+    node: usize,
+    /// 本 worker 真正碰到的顶层 scope 数(调试用)
+    trees: usize,
+}
+
+impl WalkScan {
+    unsafe fn scope(&mut self, scope: *mut c_void) {
+        // scope 分片: 到切分深度时给节点编号, 不属于本片的子树整棵跳过
+        if let Some((n_shards, shard, split_depth)) = self.split {
+            if self.depth == split_depth {
+                let i = self.node;
+                self.node += 1;
+                if i % n_shards != shard {
+                    return;
+                }
+                self.trees += 1;
+            }
+        }
+        let sit = (self.npi.iter_sig)(scope);
+        if !sit.is_null() {
+            loop {
+                let s = (self.npi.iter_sig_next)(sit);
+                if s.is_null() {
+                    break;
+                }
+                let i = self.idx;
+                self.idx += 1;
+                if i % self.stride == self.offset {
+                    self.batch.push(s);
+                    if self.batch.len() >= self.chunk {
+                        self.flush();
+                    }
+                }
+            }
+            (self.npi.iter_sig_stop)(sit);
+        }
+        let cit = (self.npi.iter_child_scope)(scope);
+        if !cit.is_null() {
+            loop {
+                let c = (self.npi.iter_scope_next)(cit);
+                if c.is_null() {
+                    break;
+                }
+                self.depth += 1;
+                self.scope(c);
+                self.depth -= 1;
+            }
+            (self.npi.iter_scope_stop)(cit);
+        }
+    }
+
+    /// 把当前这批句柄的时间并集扫出来, 然后**丢掉句柄**(只留时间点分片)
+    unsafe fn flush(&mut self) {
+        if self.batch.is_empty() {
+            return;
+        }
+        let mut it = IterObj::new(self.npi);
+        // 句柄用完即放(NPI 的句柄对象是它遍历期内存增长的大头; 默认关, 免得踩到
+        // "释放后 NPI 仍引用"的坑 —— 想量就开 WAL_FSDB_RELEASE_SIG=1)
+        let release = std::env::var("WAL_FSDB_RELEASE_SIG").is_ok();
+        let handles: Vec<*mut c_void> = self.batch.drain(..).collect();
+        for h in &handles {
+            (self.npi.iter.add)(it.this(), *h);
+        }
+        (self.npi.iter.start)(it.this(), self.min_t, self.max_t);
+        let mut part: Vec<u64> = Vec::new();
+        let mut last = u64::MAX;
+        if let Some(nt) = self.npi.iter.next_time {
+            loop {
+                let mut t: NpiTime = 0;
+                if (nt)(it.this(), &mut t) <= 0 {
+                    break;
+                }
+                if t > 0 && t != last {
+                    part.push(t);
+                    last = t;
+                }
+            }
+        } else {
+            loop {
+                let mut t: NpiTime = 0;
+                let mut sig: *mut c_void = ptr::null_mut();
+                if (self.npi.iter.next)(it.this(), &mut t, &mut sig) <= 0 || sig.is_null() {
+                    break;
+                }
+                if t > 0 && t != last {
+                    part.push(t);
+                    last = t;
+                }
+            }
+        }
+        drop(it);
+        if unload_each_chunk() {
+            if let Some(f) = self.npi.unload_vc {
+                (f)(self.file);
+            }
+        }
+        if release {
+            if let Some(rel) = self.npi.release_sig {
+                for h in &handles {
+                    (rel)(*h);
+                }
+            }
+        }
+        self.parts.push(part);
+        self.flushed += 1;
+    }
+}
+
 pub fn run_timeline_worker(
     file: &std::path::Path,
     offset: usize,
@@ -1331,6 +1588,17 @@ pub fn run_timeline_worker(
     // worker 不需要名字: 只取句柄(省掉 arena 2.85GB + 索引 384MB + scope 串 ~1GB)
     if std::env::var("WAL_FSDB_WORKER_NAMES").is_err() {
         std::env::set_var("WAL_FSDB_HANDLES_ONLY", "1");
+    }
+    // 边走边扫: 不建名字表也不攒句柄数组, 峰值内存与信号总数解耦
+    if std::env::var("WAL_FSDB_WALK_SCAN").is_ok() {
+        // 默认按信号下标轮转(与常规 worker 口径一致); 设 WAL_FSDB_SCOPE_SPLIT=<depth>
+        // 则按 scope 子树切分 —— 每个 worker 只走一部分子树, 遍历期内存随子树大小降。
+        let split = std::env::var("WAL_FSDB_SCOPE_SPLIT")
+            .ok()
+            .and_then(|d| d.parse::<usize>().ok())
+            .map(|depth| (stride, offset, depth));
+        let times = timeline_by_walk_split(&file.to_string_lossy(), stride, offset, split)?;
+        return write_times(out, &times).map_err(|e| e.to_string());
     }
     let trace = FsdbTrace::load(file, "w".to_string())?;
     let n = trace.sigs.len();
@@ -2449,6 +2717,46 @@ impl FsdbTrace {
     }
 
     /// 时间线缓存文件: 与 VCD 旁挂缓存同一套 key(路径 basename+size+mtime)。
+    /// 让**子进程**去建 `.ftl`(子进程自己走"边走边扫"), 父进程随后读缓存。
+    ///
+    /// 为什么不总在本进程做: 父进程已经背着名字表(这档波形 6GB), NPI 遍历期还要涨 ~10GB ——
+    /// 叠加会把 27GB 的机器压到 thrash(实测 26GB/0 可用, 越跑越慢)。子进程的 12GB 随它退出,
+    /// 父进程常驻不变; 而且进度可见、可中止。
+    fn build_timeline_via_child(&self) -> Result<(), String> {
+        let exe = std::env::current_exe().map_err(|e| format!("current_exe: {}", e))?;
+        let some = cache_path(&self.cache_root, &self.filename, ".part")
+            .ok_or_else(|| "缓存目录取不到, 无法放子进程产物".to_string())?;
+        if let Some(dir) = some.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let part = some.to_string_lossy().to_string();
+        let _ = std::fs::remove_file(&part);
+        let st = std::process::Command::new(&exe)
+            .arg("fsdb-timeline-map")
+            .arg(&self.filename)
+            .arg("0")
+            .arg("1")
+            .arg(&part)
+            .env("WAL_FSDB_WALK_SCAN", "1")
+            .status()
+            .map_err(|e| format!("起子进程失败: {}", e))?;
+        if !st.success() {
+            let _ = std::fs::remove_file(&part);
+            return Err(format!("子进程 fsdb-timeline-map 退出码 {:?}", st.code()));
+        }
+        let st2 = std::process::Command::new(&exe)
+            .arg("fsdb-timeline-merge")
+            .arg(&self.filename)
+            .arg(&part)
+            .status()
+            .map_err(|e| format!("起合并子进程失败: {}", e))?;
+        let _ = std::fs::remove_file(&part);
+        if !st2.success() {
+            return Err(format!("子进程 fsdb-timeline-merge 退出码 {:?}", st2.code()));
+        }
+        Ok(())
+    }
+
     fn timeline_cache_file(&self) -> Option<std::path::PathBuf> {
         cache_path(&self.cache_root, &self.filename, ".ftl")
     }
@@ -2611,6 +2919,60 @@ impl FsdbTrace {
             return Ok(rc);
         }
         let t_begin = std::time::Instant::now();
+        // ★ 大波形换路: **边走边扫**(见 `timeline_by_walk_split`)。常规路径在本进程里
+        //   要先按名字把 18M 个句柄解析出来(550µs/个 → 小时级), 而边走边扫不建名字表、
+        //   不攒句柄, 走一批扫一批 —— 1796 万信号的真波形上全量 **369s / 11.9GB**。
+        if self.sigs.len() >= walk_scan_min_signals() && inprocess_walk_scan_allowed() {
+            match timeline_by_walk_split(&self.filename, 1, 0, None) {
+                Ok(times) if !times.is_empty() => {
+                    if std::env::var("WAL_DEBUG_FSDB").is_ok() {
+                        eprintln!(
+                            "[fsdb] 边走边扫构建时间线: {} 个时间点, {:.1}s",
+                            times.len(),
+                            t_begin.elapsed().as_secs_f64()
+                        );
+                    }
+                    self.first_change.set(Some(times.first().copied()));
+                    let rc = Rc::new(times);
+                    *self.timeline.borrow_mut() = Some(rc.clone());
+                    if timeline_worth_caching(rc.len(), t_begin.elapsed()) {
+                        self.save_timeline_cache(&rc, self.first_change.get().flatten());
+                    }
+                    return Ok(rc);
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    if std::env::var("WAL_DEBUG_FSDB").is_ok() {
+                        eprintln!("[fsdb] 边走边扫失败, 回退常规路径: {}", e);
+                    }
+                }
+            }
+        }
+        // 大文件但内存不够在本进程叠 → 交给子进程建 `.ftl`, 然后读缓存
+        if self.sigs.len() >= walk_scan_min_signals() {
+            match self.build_timeline_via_child() {
+                Ok(()) => {
+                    if let Some((times, first)) = self.try_load_timeline_cache() {
+                        if std::env::var("WAL_DEBUG_FSDB").is_ok() {
+                            eprintln!(
+                                "[fsdb] 子进程建好时间线并命中缓存: {} 个时间点, {:.1}s",
+                                times.len(),
+                                t_begin.elapsed().as_secs_f64()
+                            );
+                        }
+                        self.first_change.set(Some(first));
+                        let rc = Rc::new(times);
+                        *self.timeline.borrow_mut() = Some(rc.clone());
+                        return Ok(rc);
+                    }
+                }
+                Err(e) => {
+                    if std::env::var("WAL_DEBUG_FSDB").is_ok() {
+                        eprintln!("[fsdb] 子进程建时间线失败, 回退常规路径: {}", e);
+                    }
+                }
+            }
+        }
         // 并行构建: 冷启动的时间线是"把全文件每条变更过一遍", 与信号数无关、只与
         // 变更条数有关 —— 所以判据是"每个 worker 至少分到一个信号", 不是"信号数够多"。
         // 曾经写成 `sigs >= 2048`, 于是"信号少但时间戳几千万"的波形(一组计数器打满

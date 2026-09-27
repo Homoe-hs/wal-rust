@@ -349,18 +349,6 @@ impl VcdTrace {
 
     /// 第 idx 个信号的全名(arena 视图, 零分配)
     #[inline]
-    fn signal_count(&self) -> usize {
-        self.name_meta.len()
-    }
-
-    fn signal_at(&self, idx: usize) -> Option<String> {
-        if idx < self.name_meta.len() {
-            Some(self.name_at(idx as u32).to_string())
-        } else {
-            None
-        }
-    }
-
     fn name_at(&self, idx: u32) -> &str {
         match self.name_meta.get(idx as usize) {
             Some(&m) => {
@@ -2279,6 +2267,20 @@ impl VcdTrace {
 }
 
 impl Trace for VcdTrace {
+    /// O(1) 信号数(不物化整表; `signals()` 在大波形上是几百 MB 的分配)
+    fn signal_count(&self) -> usize {
+        self.name_meta.len()
+    }
+
+    /// 按下标取名字(与 `signals()` 同序; VCD 名字本来就在 arena 里)
+    fn signal_at(&self, idx: usize) -> Option<String> {
+        if idx < self.name_meta.len() {
+            Some(self.name_at(idx as u32).to_string())
+        } else {
+            None
+        }
+    }
+
     fn prepare(&self, names: &[String]) {
         self.prepare_names(names);
     }

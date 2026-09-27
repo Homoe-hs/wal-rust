@@ -351,3 +351,28 @@ WAL_DEBUG_FSDB=1 target/release/wal-rust fsdb-timeline-map aicore_smoke_test_000
 2. **边走边扫**: 按 scope 分批(平均 11 信号/scope)边走树边喂迭代器并释放句柄,
    把 worker 常驻内存压到 GB 以下, 再谈 8 路并行;
 3. 试 `npi_fsdb_load_vc_by_range` / `npi_fsdb_sigdb_*` 的批量装载(未测)。
+
+### "边走边扫"建时间线(2026-09-27, 真波形)
+
+常规路径在大波形上有两个坏选择: 要么先按名字把句柄一个个解析出来(**550µs/个** → 18M ≈ 2.75h),
+要么把 18M 个句柄全攒着(NPI 遍历期自己涨到 ~10GB)。"边走边扫"把两者都绕开:
+
+```text
+走树 → 攒到 65536 个信号 → 塞进 TimeBasedVcIter → start → 逐条取时间并集 → unload_vc
+     → **丢掉这批句柄** → 继续走
+```
+
+* **正确性**: 与常规 worker 的 `.part` **逐字节相同**(`cal1m.fsdb` 上 `cmp` 验证);
+  默认在信号数 ≥ `WAL_FSDB_WALK_SCAN_MIN`(2,000,000)时启用, `WAL_FSDB_WALK_SCAN=0` 关闭。
+* **实测(1/8 分片, 约 224 万信号)**: **369s / 11.9GB**, 产出 318,809 个时间点。
+  单 walker 全量按线性外推 **≈45 分钟** —— 换路免掉的是"按名字解析 18M 次句柄"的两小时,
+  **没有**免掉逐条扫描的 ~1.45µs/记录。
+* **按 scope 子树分片**(`WAL_FSDB_SCOPE_SPLIT=<depth>`): depth=1 时这份设计只有**一个顶层
+  scope**, 切不动(实测分 8 片只有 shard0 有活); 要用更深的切分点才能让多 worker 的内存
+  各自随子树大小下降 —— 这是下一步做并行的入口。
+* **内存叠加**: 同进程里父进程已背着名字表(6GB), NPI 遍历期再加 ~10GB, 27GB 机器(还有
+  7GB 级常驻的许可 VM)会压到 0 可用、构建被拖慢 3 倍。为此加了内存护栏
+  (`inprocess_walk_scan_allowed`, 可用 < 18GB 就不在本进程叠)与**子进程建 `.ftl`**
+  (`fsdb-timeline-map` + `fsdb-timeline-merge`)两条路。
+* **运维建议**: 这类波形第一次用索引空间查询前, 先跑 `make fsdb-prewarm FSDB=x.fsdb LOCAL=1`
+  (或 LSF), 让构建独占机器; 之后 `.ftl` 命中, 查询进程常驻只要 6GB。
