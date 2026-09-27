@@ -150,6 +150,13 @@ Flags: `-l <waveform>`(可重复), `--halt-on-error`(遇错即停)。
 - **`-j auto`(8 worker)在 1800 万信号级是不安全的**: 每个 worker 都是一次独立 NPI 会话 +
   名字树(实测落盘前 ~2GB, 落盘后 ~6GB), 8 路 = 十 GB 级;这一档要么单进程, 要么先把
   `-j` 压到内存装得下的数字(landing 脚本会报可用内存)。
+- **大波形时间线并行 = 按 scope 子树分片**(`WAL_FSDB_SCOPE_SPLIT=<depth>`): 每个 worker 只走
+  自己那几棵子树, NPI 遍历期内存随子树下降(实测每 worker **2.8~3.9GB** vs 单 walker ~12GB)。
+  选层前先用 `WAL_FSDB_SCOPE_STATS=<depth>` 标定(一次树遍历, 这份设计 depth1/2 只有 1 棵子树、
+  depth3=7 棵、depth4=334 棵)。⚠️ **两套分片口径互斥**: 用了 scope 分片就不能再按信号下标
+  轮转过滤, 否则每个 worker 会丢掉自己子树里 (N-1)/N 的信号 —— 表现很隐蔽(并集只少几十个
+  时间点, 因为并集接近饱和), 只有"不同分片口径必须产出同一并集"的对拍才能抓到(已修 +
+  写进 CHANGELOG)。
 - **大波形的时间线冷建走"边走边扫"**(`timeline_by_walk_split`, 信号数 ≥ 2,000,000 默认启用;
   `WAL_FSDB_WALK_SCAN=0` 关; `WAL_FSDB_WALK_SCAN_MIN` 调阈值): 树遍历走到一批(默认 65536 个)
   信号就塞进迭代器扫一批时间并集、然后**丢掉句柄** —— 不建名字表、不攒 18M 句柄, 峰值内存与

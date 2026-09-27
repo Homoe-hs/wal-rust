@@ -47,9 +47,9 @@ version,date,op,fixture,wall_s,rss_mb,note
 0.14.35,2026-09-27,fsdb-cold-level,many4m.fsdb,21.20,1599,=> 0
 0.14.35,2026-09-27,fsdb-build-level,many4m.fsdb,17.49,1510,=> 0
 0.14.35,2026-09-27,fsdb-hit-level,many4m.fsdb,4.85,1486,=> 0
-0.14.35,2026-09-27,fsdb-cold-at,many4m.fsdb,6.27,1530,=> (0 "x")
-0.14.35,2026-09-27,fsdb-build-at,many4m.fsdb,4.89,1485,=> (0 "x")
-0.14.35,2026-09-27,fsdb-hit-at,many4m.fsdb,4.86,1486,=> (0 "x")
+0.14.35,2026-09-27,fsdb-cold-at,many4m.fsdb,6.27,1530,"=> (0 ""x"")"
+0.14.35,2026-09-27,fsdb-build-at,many4m.fsdb,4.89,1485,"=> (0 ""x"")"
+0.14.35,2026-09-27,fsdb-hit-at,many4m.fsdb,4.86,1486,"=> (0 ""x"")"
 0.14.35,2026-09-27,fsdb-par-j1,many4m.fsdb,22.60,2233,
 0.14.35,2026-09-27,fsdb-par-jauto,many4m.fsdb,18.39,1532,
 0.14.35,2026-09-27,fsdb-par-j8,many4m.fsdb,19.17,1512,
@@ -60,3 +60,5 @@ version,date,op,fixture,wall_s,rss_mb,note
 0.14.37,2026-09-27,fsdb-cold-edge,aicore_smoke_test_000.fsdb,56.63,13267,=> 0
 0.14.37,2026-09-27,fsdb-build-edge,aicore_smoke_test_000.fsdb,10.54,6199,=> 0
 0.14.37,2026-09-27,fsdb-hit-edge,aicore_smoke_test_000.fsdb,10.11,6200,=> 0
+0.14.40,2026-09-27,fsdb-par-build,aicore_smoke_test_000.fsdb,570,5800,"8片×scope-depth4 并行建时间线(320,204 点; 单 walker 外推 ~2700s)"
+0.14.40,2026-09-27,fsdb-hit-level,aicore_smoke_test_000.fsdb,11.39,6198,=> 320172(.ftl 命中: 320204 点)

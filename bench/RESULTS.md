@@ -376,3 +376,34 @@ WAL_DEBUG_FSDB=1 target/release/wal-rust fsdb-timeline-map aicore_smoke_test_000
   (`fsdb-timeline-map` + `fsdb-timeline-merge`)两条路。
 * **运维建议**: 这类波形第一次用索引空间查询前, 先跑 `make fsdb-prewarm FSDB=x.fsdb LOCAL=1`
   (或 LSF), 让构建独占机器; 之后 `.ftl` 命中, 查询进程常驻只要 6GB。
+
+### 按 scope 子树的并行时间线(2026-09-27, 真波形)
+
+单 walker 全量 ≈45 分钟; 按 scope 子树切开后每个 worker 只走自己那几棵子树, 遍历期内存随之下降:
+
+```bash
+export WAL_FSDB_WALK_SCAN=1 WAL_FSDB_SCOPE_SPLIT=4      # 先标定: WAL_FSDB_SCOPE_STATS=6
+for i in $(seq 0 7); do wal-rust fsdb-timeline-map aicore_smoke_test_000.fsdb $i 8 p$i.part & done; wait
+wal-rust fsdb-timeline-merge aicore_smoke_test_000.fsdb p*.part   # 装 .ftl
+```
+
+| 分片口径 | 墙钟 | 每 worker RSS | 并集 |
+|---|---|---|---|
+| 单 walker(全量) | ~2700s(外推) | ~12GB | — |
+| depth4 / 8 片 | 570s | 5.1~6.0GB | **320,204 点** |
+| **depth5 / 8 片** | **494s** | 4.0~7.9GB | **320,204 点** |
+| depth3 / 7 片 | (仅取并集) | — | **320,204 点** |
+
+> **三种互不相同的分片口径并集逐点相同(320,204)** —— 这条对拍就是抓上面那个 bug 的手段,
+> 也是"并行 map/reduce 产物正确"的现场证据。
+
+* **选层靠一次标定**: `WAL_FSDB_SCOPE_STATS=6` 一次树遍历(44s)打出各层子树数与最大子树占比 ——
+  这份设计 depth1/2 **只有 1 个子树**(切了等于没切), depth3 = 7 棵(最大 24.5%),
+  depth4 = 334 棵(最大 13.7%), depth5 = 2121 棵。
+* **并行度受"最慢的 worker"限制**: depth4 的 8 片里快的一半 ~190s、慢的一半 ~530s(子树大小
+  按 `下标 % N` 分配, 不均匀) → 墙钟 570s。更细的 depth5 或按子树大小做 LPT 贪心分桶还能再压。
+* **暖查询回到秒级**: `.ftl` 装好后 `(count (= (get "concern_sig") 1))` = **11.4s / 6.35GB**
+  (命中 320,204 个时间点), 这是之前 20 分钟都跑不完的那条查询。
+* ⚠️ **抓到一个真 bug**: 用了 scope 分片后仍叠加"信号下标 % N"过滤, 每个 worker 丢掉自己子树里
+  7/8 的信号 —— 并集只少 43 个时间点(接近饱和, 很隐蔽)。靠"**不同分片口径必须产出同一并集**"
+  的三方对拍抓到, 已修; 修复后 depth3/depth4 两条独立分片口径逐点一致。

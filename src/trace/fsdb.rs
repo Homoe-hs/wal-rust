@@ -1325,6 +1325,107 @@ pub fn merge_timeline_parts(
 }
 
 /// worker 入口: 只算 [lo, hi) 这些信号的变更时间并落盘。
+/// 标定"按哪一层 scope 子树切分"用的一次遍历统计。
+///
+/// 只走树、不碰变更列, 所以约一次树遍历的代价(这份 1796 万信号波形 ~41s), 换来的是:
+/// 每一层有多少个子树、各自多大、够不够分成 N 片、均不均匀。多进程并行时必须先有这个
+/// 数字 —— 按 depth=1 切在这份设计上只有 1 个顶层 scope, 分了等于没分(实测)。
+pub fn scope_stats_dump(path: &str, max_depth: usize) -> Result<String, String> {
+    let npi = npi()?;
+    let abs = std::fs::canonicalize(path).map_err(|e| format!("{}: {}", path, e))?;
+    let cpath = CString::new(abs.to_string_lossy().as_bytes())
+        .map_err(|_| "路径含 NUL".to_string())?;
+    let _box = NpiSandbox::enter(false);
+    unsafe {
+        let file = (npi.open)(cpath.as_ptr());
+        if file.is_null() {
+            return Err(format!("{}: npi_fsdb_open 失败", path));
+        }
+        let mut st = ScopeStats {
+            npi,
+            nodes: vec![0usize; max_depth + 1],
+            sigs: vec![0usize; max_depth + 1],
+            max_node: vec![0usize; max_depth + 1],
+        };
+        let top = (npi.iter_top_scope)(file);
+        if !top.is_null() {
+            loop {
+                let sc = (npi.iter_scope_next)(top);
+                if sc.is_null() {
+                    break;
+                }
+                let n = st.scope(sc, 1, max_depth);
+                st.nodes[1] += 1;
+                st.sigs[1] += n;
+                if n > st.max_node[1] {
+                    st.max_node[1] = n;
+                }
+            }
+            (npi.iter_scope_stop)(top);
+        }
+        (npi.close)(file);
+        let mut out = String::new();
+        for d in 1..=max_depth {
+            out.push_str(&format!(
+                "depth {}: {} 个子树, 信号共 {}, 最大子树 {} ({:.1}%)
+",
+                d,
+                st.nodes[d],
+                st.sigs[d],
+                st.max_node[d],
+                if st.sigs[d] > 0 { st.max_node[d] as f64 * 100.0 / st.sigs[d] as f64 } else { 0.0 }
+            ));
+        }
+        Ok(out)
+    }
+}
+
+/// `scope_stats_dump` 的遍历状态(只数数, 不取变更列)
+struct ScopeStats {
+    npi: &'static Npi,
+    nodes: Vec<usize>,
+    sigs: Vec<usize>,
+    max_node: Vec<usize>,
+}
+
+impl ScopeStats {
+    /// 返回这棵子树的信号数; 沿途把 depth 层的节点/信号记账
+    unsafe fn scope(&mut self, scope: *mut c_void, depth: usize, max_depth: usize) -> usize {
+        let mut n = 0usize;
+        let sit = (self.npi.iter_sig)(scope);
+        if !sit.is_null() {
+            loop {
+                let s = (self.npi.iter_sig_next)(sit);
+                if s.is_null() {
+                    break;
+                }
+                n += 1;
+            }
+            (self.npi.iter_sig_stop)(sit);
+        }
+        let cit = (self.npi.iter_child_scope)(scope);
+        if !cit.is_null() {
+            loop {
+                let c = (self.npi.iter_scope_next)(cit);
+                if c.is_null() {
+                    break;
+                }
+                let sub = self.scope(c, depth + 1, max_depth);
+                n += sub;
+                if depth + 1 <= max_depth {
+                    self.nodes[depth + 1] += 1;
+                    self.sigs[depth + 1] += sub;
+                    if sub > self.max_node[depth + 1] {
+                        self.max_node[depth + 1] = sub;
+                    }
+                }
+            }
+            (self.npi.iter_scope_stop)(cit);
+        }
+        n
+    }
+}
+
 /// 大到什么程度就优先走"边走边扫"建时间线(信号数)。
 ///
 /// 分界依据: 400 万信号的合成夹具上, 常规路径(块大小优化后)冷建 14.2s 已经够用;
@@ -1427,6 +1528,13 @@ pub fn timeline_by_walk_split(
             node: 0,
             trees: 0,
         };
+        // ⚠️ 两套分片口径**互斥**: 已经按 scope 子树切了, 就不能再按"信号下标 % stride"
+        // 过滤 —— 否则只有当 `子树号 % N == 信号号 % N` 的信号会被扫到, 每个 worker 会
+        // 丢掉自己子树里 7/8 的信号(实测: 并集少了 43 个时间点, 靠"三种分片互相对拍"抓到)。
+        if split.is_some() {
+            w.stride = 1;
+            w.offset = 0;
+        }
         let top = (npi.iter_top_scope)(file);
         if !top.is_null() {
             loop {
@@ -1458,6 +1566,7 @@ struct WalkScan {
     batch: Vec<*mut c_void>,
     parts: Vec<Vec<u64>>,
     idx: usize,
+    /// **信号级**轮转过滤(与 `round_robin_slice` 同口径)
     stride: usize,
     offset: usize,
     chunk: usize,
@@ -1590,6 +1699,11 @@ pub fn run_timeline_worker(
         std::env::set_var("WAL_FSDB_HANDLES_ONLY", "1");
     }
     // 边走边扫: 不建名字表也不攒句柄数组, 峰值内存与信号总数解耦
+    if let Ok(d) = std::env::var("WAL_FSDB_SCOPE_STATS") {
+        let depth = d.parse::<usize>().unwrap_or(6);
+        println!("{}", scope_stats_dump(&file.to_string_lossy(), depth)?);
+        return Ok(());
+    }
     if std::env::var("WAL_FSDB_WALK_SCAN").is_ok() {
         // 默认按信号下标轮转(与常规 worker 口径一致); 设 WAL_FSDB_SCOPE_SPLIT=<depth>
         // 则按 scope 子树切分 —— 每个 worker 只走一部分子树, 遍历期内存随子树大小降。
