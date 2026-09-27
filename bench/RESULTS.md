@@ -452,5 +452,61 @@ catch signal 11 (Segmentation fault)
   (只有真扫一遍才知道)就能做 LPT 贪心分桶。depth5 快慢两半仍有 ~1.4× 差, 上限大概就是把
   这个差抹平的 ~15%。
 
+### 回归库补齐: 0.14.43 vs 0.14.37(同一台机, 321MB / 1796 万信号)
 
+`bench/perf-history.csv` 里这个 fixture 原来只有 0.14.37 的 7 行;现在 0.14.43 有 11 行
+(cold/build/hit × load/edge/at + hit-level + par-build)。冷热都换了 `WAL_CACHE` 状态与 cwd,
+口径见 `bench/README.md`。
 
+| op | 0.14.37 | 0.14.43 | 备注 |
+|---|---|---|---|
+| cold-load(`(length (SIGNALS))`) | 54.16s / 13,295MB | **52.54s / 13,293MB** | 冷建名字树 |
+| build-load | 57.94s / 13,601MB | **53.36s / 13,602MB** | 顺带落盘缓存 |
+| hit-load | 11.08s / 6,197MB | **10.49s / 6,197MB** | `.fnames` 命中 |
+| cold-edge | 56.63s / 13,267MB | **54.56s / 13,294MB** | `(count (rising sig))` |
+| build-edge | 10.54s / 6,199MB | 11.78s / 6,199MB | edge 走时间域, 不建索引空间 |
+| hit-edge | 10.11s / 6,200MB | 10.46s / 6,199MB | |
+| cold-at | — | **56.71s / 13,116MB** | 新增行 |
+| build-at | — | **11.19s / 6,202MB** | 新增行 |
+| hit-at | — | **10.50s / 6,201MB** | 新增行 |
+| **hit-level**(`.ftl` 命中) | 11.39s / 6,198MB | **11.10s / 6,199MB** | → 320,172(时间线 320,204 点) |
+| **par-build**(8 片自动选层) | 570s / 5,800MB(depth4 手工) | **636s**(自动 depth5, 含 44s 统计遍历) | 单 walker 外推 ~2700s |
+
+* **冷加载达标**: 52.5s / 13.0GB(cold)、10.5s / 6.2GB(warm);`fsdb-par-build` 636s 换来的
+  `.ftl` 让之后每次索引空间查询回到 ~11s。相对 0.14.37 全线持平或更好, 无 >20% 回归。
+* `fsdb-cold-level` / `fsdb-build-level` 这两行**故意不记**: 在查询里冷建整条时间线实测
+  **>8min**(480s 超时被杀), 会撞脚本的 1800s 上限;规范路径是先 `make fsdb-prewarm`。
+
+### 指标算子(Goal-2)在真实波形上的验收(0.14.43, 321MB)
+
+`.tools/bench/goal2_full.wal` 一次进程跑完 8 个形式, **10.0s / 6.2GB**:
+
+| 形式 | 结果 |
+|---|---|
+| `(stats (latency (rising …hart0_sync_holder.op_inst_valid) (rising …op_inst_ready)))` | `n=10 min=0 p50=0 mean=1143.200 p90=1143.200 p99=10403.120 max=11432 stddev=3615.116` |
+| `(histogram (latency …) 8)` | 8 桶: `[0,1429)` 9 次, `[10003,11432]` 1 次(其余 0) |
+| `(percentile (latency …) 50)` / `95` | `0` / `6287.600` |
+| `(median (latency …))` | `0` |
+| `(stddev (latency …))` | `3615.1158` |
+| `(stats (latency (rising …u_store_0.awvalid) (rising …bvalid)))` | `n=1 min=max=28794`(ps, ≈43 个 670ps 周期) |
+| `(ipc (rising …op_inst_valid) (rising …hvm2sm_adapter.clk))` | `1.6847e-4` |
+
+指标只读**时间域变更列**(不建索引空间), 所以千万时间戳的大波形上不会触发全文件物化;
+语义与手算闸见 `docs/waveform-metrics.md` 与 `tests/metrics_test.rs`。
+
+### 4M 夹具上的一个真回归: "只看信号数"的换路判据(0.14.43 → 0.14.44 修)
+
+`many4m.fsdb`(400 万信号 / 3.6MB / 200 个时间戳)的 cold-level 从 0.14.35 的 21.2s 涨到
+0.14.43 的 31.4s(+48%, 越过仓库"回归 >20% 必须写明原因"的线)。三次测量确认不是噪声:
+
+| 口径 | cold level(3 次) | 说明 |
+|---|---|---|
+| 0.14.43 默认 | 30.1 / 31.2 / 31.3s | 被"信号数 ≥ 200 万"判据拖去走**单 walker**(子进程被强制 `WALK_SCAN=1`) |
+| `WAL_FSDB_WALK_SCAN=0` | 13.0 / 12.9 / 13.3s | 常规 8 路并行(可见 `jobs 决策` + `并行构建时间线: 8 workers, 11.1s`) |
+| 0.14.44 默认(判据改成"信号数 **且** 文件 ≥128MB") | **15.0 / 15.3 / 15.5s** | 与 `WALK_SCAN=0` 同路; 真波形不受影响(它两个条件都满足) |
+
+* 同轮还修掉一个语义反转: worker 用 `env_ok("WAL_FSDB_WALK_SCAN")` 判"要不要换路", 于是
+  **`=0`(文档写的"关")反而打开了它**;现在三态判断。真波形上 `=0` 已实测走回常规 worker
+  (`worker offset=0 stride=8: 2244513 个信号`, 名字表 9.8GB), `=1` / 未设走边走边扫。
+* 教训: 阈值判据要反映**真正的成本驱动量**(变更记录数), 文件大小是它的代理; 只数信号数会
+  在"多信号、少变更"的夹具上做错选择。

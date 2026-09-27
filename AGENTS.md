@@ -170,9 +170,13 @@ Flags: `-l <waveform>`(可重复), `--halt-on-error`(遇错即停)。
   轮转过滤, 否则每个 worker 会丢掉自己子树里 (N-1)/N 的信号 —— 表现很隐蔽(并集只少几十个
   时间点, 因为并集接近饱和), 只有"不同分片口径必须产出同一并集"的对拍才能抓到(已修 +
   写进 CHANGELOG)。
-- **大波形的时间线冷建走"边走边扫"**(`timeline_by_walk_split`, 信号数 ≥ 2,000,000 默认启用;
-  `WAL_FSDB_WALK_SCAN=0` 关; `WAL_FSDB_WALK_SCAN_MIN` 调阈值)。**worker(`fsdb-timeline-map`)
-  对 ≥128MB 的文件默认就开**(`WAL_FSDB_WALK_SCAN_MB` 调阈值; 小文件保持旧路), 所以
+- **大波形的时间线冷建走"边走边扫"**(`timeline_by_walk_split`)。判据是
+  **信号数 ≥ `WAL_FSDB_WALK_SCAN_MIN`(默认 200 万) 且 文件 ≥ `WAL_FSDB_WALK_SCAN_MB`(默认 128MB)**
+  —— 两个条件是"与": 只看信号数会误伤"信号多但时间戳少"的小夹具(400 万信号 / 3.6MB 上单 walker
+  30.6s vs 常规 8 路 15.3s, 0.14.44 修)。`WAL_FSDB_WALK_SCAN` 是三态:
+  `0/off/no` 关、`1/on/yes` 开(不看阈值)、未设才按上面的阈值;⚠️ 曾经写成 `env_ok(...)` 判"开",
+  于是 `=0` 反而打开了。worker(`fsdb-timeline-map`)对 ≥128MB 的文件默认就开
+  (`WAL_FSDB_WALK_SCAN_MB` 调阈值; 小文件保持旧路), 所以
   `make fsdb-prewarm` 不需要额外环境变量。树遍历走到一批(默认 65536 个)
   信号就塞进迭代器扫一批时间并集、然后**丢掉句柄** —— 不建名字表、不攒 18M 句柄, 峰值内存与
   信号总数解耦。**产物与常规 worker 逐字节相同**(cal1m `cmp` 验过)。1796 万信号真波形全量

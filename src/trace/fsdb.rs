@@ -1723,11 +1723,39 @@ fn store_scope_counts_in(root: &std::path::Path, path: &str, counts: &ScopeCount
 /// 而 1796 万信号的真波形上, 常规路径要先按名字解析 18M 次句柄(**实测 550µs/个**),
 /// 等于两小时起步 —— 必须换路。`WAL_FSDB_WALK_SCAN=0` 可显式关掉, 方便 A/B。
 /// "多大算大文件"(MB): 默认 128MB。大文件才默认走边走边扫 + 按子树自动分片。
+///
+/// ⚠️ **两个条件是"与"关系**(信号数 ≥ `walk_scan_min_signals()` **且** 文件 ≥ 这个值):
+/// 只看信号数会误伤"信号多但时间戳少"的小夹具 —— 400 万信号 / 3.6MB 的合成夹具上,
+/// 边走边扫(单进程)冷建时间线 30~31s, 而常规路径只要 **13s**(0.14.35 的 21.2s 也更差),
+/// 因为它只有 200 个时间戳, "按名字解析句柄"那笔钱根本不存在; 文件大小才反映"有多少变更记录"。
+/// 真波形(336MB / 1796 万信号 / 4377 万时间戳)两个条件都满足 → 照旧换路。
 fn walk_scan_min_mb() -> u64 {
     std::env::var("WAL_FSDB_WALK_SCAN_MB")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(128)
+}
+
+/// 文件的 MB 数(取不到按 0 算 → 不触发"大文件"路径)。
+fn file_mb_of(path: &str) -> u64 {
+    std::fs::metadata(path).map(|m| m.len() / 1048576).unwrap_or(0)
+}
+
+/// `WAL_FSDB_WALK_SCAN` 的三态: Some(true)=显式开(不看阈值), Some(false)=显式关,
+/// None=按阈值自动决定。
+fn walk_scan_explicit() -> Option<bool> {
+    match std::env::var("WAL_FSDB_WALK_SCAN").as_deref() {
+        Ok("0") | Ok("off") | Ok("no") => Some(false),
+        Ok("1") | Ok("on") | Ok("yes") => Some(true),
+        _ => None,
+    }
+}
+
+/// 该不该走"边走边扫"这条路(不含内存护栏与进程形态): 显式开关优先, 否则要求
+/// **信号数够多 且 文件够大**(见 `walk_scan_min_mb` 的注释)。
+fn walk_scan_wanted(signals: usize, file_mb: u64) -> bool {
+    walk_scan_explicit()
+        .unwrap_or(signals >= walk_scan_min_signals() && file_mb >= walk_scan_min_mb())
 }
 
 fn walk_scan_min_signals() -> usize {
@@ -2001,16 +2029,15 @@ pub fn run_timeline_worker(
     // **大文件默认行为**: 走"边走边扫"(不建名字表), 并按 scope 子树自动分片 ——
     // 这两件事本该是默认, 否则 `make fsdb-prewarm` 直接跑会让每个 worker 走整棵树
     // (内存 ~12GB × N)。小文件保持原样(走缓存/名字, 省一次树遍历)。
-    let file_mb = std::fs::metadata(file).map(|m| m.len() / 1048576).unwrap_or(0);
-    if file_mb >= walk_scan_min_mb() && std::env::var("WAL_FSDB_WALK_SCAN").is_err() {
-        std::env::set_var("WAL_FSDB_WALK_SCAN", "1");
-    }
+    let file_mb = file_mb_of(&file.to_string_lossy());
     if let Ok(d) = std::env::var("WAL_FSDB_SCOPE_STATS") {
         let depth = d.parse::<usize>().unwrap_or(6);
         println!("{}", scope_stats_dump(&file.to_string_lossy(), depth)?);
         return Ok(());
     }
-    if std::env::var("WAL_FSDB_WALK_SCAN").is_ok() {
+    // ⚠️ 曾经这里写 `env_ok("WAL_FSDB_WALK_SCAN")` —— 于是 `WAL_FSDB_WALK_SCAN=0`
+    // 反而**打开**了边走边扫(与文档相反)。现在用三态判断。
+    if walk_scan_explicit().unwrap_or(file_mb >= walk_scan_min_mb()) {
         // 默认按信号下标轮转(与常规 worker 口径一致); 设 WAL_FSDB_SCOPE_SPLIT=<depth>
         // 则按 scope 子树切分 —— 每个 worker 只走一部分子树, 遍历期内存随子树大小降。
         // SCOPE_SPLIT: 空/`auto` 且大文件 → 自动选层; `0`/`off` 不切; 数字显式指定
@@ -3356,7 +3383,8 @@ impl FsdbTrace {
         // ★ 大波形换路: **边走边扫**(见 `timeline_by_walk_split`)。常规路径在本进程里
         //   要先按名字把 18M 个句柄解析出来(550µs/个 → 小时级), 而边走边扫不建名字表、
         //   不攒句柄, 走一批扫一批 —— 1796 万信号的真波形上全量 **369s / 11.9GB**。
-        if self.sigs.len() >= walk_scan_min_signals() && inprocess_walk_scan_allowed() {
+        let file_mb = file_mb_of(&self.filename);
+        if walk_scan_wanted(self.sigs.len(), file_mb) && inprocess_walk_scan_allowed() {
             match timeline_by_walk_split(&self.filename, 1, 0, None) {
                 Ok(times) if !times.is_empty() => {
                     if std::env::var("WAL_DEBUG_FSDB").is_ok() {
@@ -3382,8 +3410,12 @@ impl FsdbTrace {
                 }
             }
         }
-        // 大文件但内存不够在本进程叠 → 交给子进程建 `.ftl`, 然后读缓存
-        if self.sigs.len() >= walk_scan_min_signals() {
+        // 大文件但内存不够在本进程叠 → 交给子进程建 `.ftl`, 然后读缓存。
+        // ⚠️ 这条路会把子进程强制成 `WAL_FSDB_WALK_SCAN=1` 的**单片 walker**, 所以判据
+        // 必须与进程内那条一致(信号数 **且** 文件大小): 只看信号数时, 400 万信号 / 3.6MB 的
+        // 合成夹具(只有 200 个时间戳、"按名字解析句柄"那笔钱根本不存在)会被拖去走单 walker
+        // 30s, 而 8 路常规路径只要 11s(0.14.35 是 21.2s)。
+        if walk_scan_wanted(self.sigs.len(), file_mb) {
             match self.build_timeline_via_child() {
                 Ok(()) => {
                     if let Some((times, first)) = self.try_load_timeline_cache() {

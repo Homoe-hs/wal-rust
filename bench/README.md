@@ -7,7 +7,7 @@
 | 路径 | 内容 |
 |---|---|
 | `RESULTS.md` | 历史性能数字与对照表(读之前先看它的"测量口径") |
-| `perf-history.csv` | 逐次测量的追加记录(`scripts/perf_history.sh` 写入) |
+| `perf-history.csv` | 逐次测量的追加记录(`scripts/perf_history.sh`; FSDB 查询行由 `scripts/bench_fsdb.sh` 写入) |
 | `benchmark.wal` | 基准用 WAL 脚本 |
 | `gen_vcd.rs` | 合成波形生成器(源码; 编译见下) |
 | `data/` | 大样本目录(**不入库**, 按需生成) |
@@ -36,3 +36,14 @@ bash scripts/bench_wal.sh       # 端到端对照
 2. 写清**冷/热**(换 `WAL_CACHE_DIR` 目录即可模拟冷启动)。
 3. 同一结论至少 **3 次**测量取中位数, 避免被 page cache 与调度噪声骗。
 4. 回归 >20% 必须在 `CHANGELOG.md` 的对应版本里写明原因。
+
+## FSDB 行的口径(op = `fsdb-*`)
+
+`scripts/bench_fsdb.sh <file.fsdb> [信号全名]` 按 `cold / build / hit` × `load / edge / level / at`
+逐个追加。三条容易误解的:
+
+* `load` = `(length (SIGNALS))`(只加载, 不碰变更列);`edge`/`level`/`at` 才付"读该信号变更列"的钱。
+* **`cold-level` / `build-level` 故意不记**: 那两条 = 在查询里冷建整条全局时间线(本机对 321MB /
+  1796 万信号的文件实测 **>8min**, 会撞脚本的 1800s 上限)。用户侧的规范路径是先
+  `make fsdb-prewarm FSDB=x.fsdb SHARDS=8`(见 `fsdb-par-build` 行), 之后 `fsdb-hit-level` ≈ `load`。
+* `at` 走时间域取值,**不建索引空间**(所以 cold/build/hit 都在 10~57s 一档)。

@@ -62,3 +62,26 @@ version,date,op,fixture,wall_s,rss_mb,note
 0.14.37,2026-09-27,fsdb-hit-edge,aicore_smoke_test_000.fsdb,10.11,6200,=> 0
 0.14.40,2026-09-27,fsdb-par-build,aicore_smoke_test_000.fsdb,570,5800,"8片×scope-depth4 并行建时间线(320,204 点; 单 walker 外推 ~2700s)"
 0.14.40,2026-09-27,fsdb-hit-level,aicore_smoke_test_000.fsdb,11.39,6198,=> 320172(.ftl 命中: 320204 点)
+0.14.43,2026-09-28,fsdb-cold-load,aicore_smoke_test_000.fsdb,52.54,13293,=> 17956098
+0.14.43,2026-09-28,fsdb-build-load,aicore_smoke_test_000.fsdb,53.36,13602,=> 17956098
+0.14.43,2026-09-28,fsdb-hit-load,aicore_smoke_test_000.fsdb,10.49,6197,=> 17956098
+0.14.43,2026-09-28,fsdb-cold-edge,aicore_smoke_test_000.fsdb,54.56,13294,=> 1
+0.14.43,2026-09-28,fsdb-build-edge,aicore_smoke_test_000.fsdb,11.78,6199,=> 1
+0.14.43,2026-09-28,fsdb-hit-edge,aicore_smoke_test_000.fsdb,10.46,6199,=> 1
+0.14.43,2026-09-28,fsdb-cold-at,aicore_smoke_test_000.fsdb,56.71,13116,=> (0 0)
+0.14.43,2026-09-28,fsdb-build-at,aicore_smoke_test_000.fsdb,11.19,6202,=> (0 0)
+0.14.43,2026-09-28,fsdb-hit-at,aicore_smoke_test_000.fsdb,10.50,6201,=> (0 0)
+0.14.43,2026-09-28,fsdb-hit-level,aicore_smoke_test_000.fsdb,11.10,6199,=> 320172 (.ftl 命中: 320204 点)
+0.14.43,2026-09-28,fsdb-par-build,aicore_smoke_test_000.fsdb,636,-,冷启动 8片×自动选层 depth5(320204 点; 含 44s 层统计遍历); 单 walker 外推 ~2700s
+0.14.43,2026-09-28,fsdb-cold-load,many4m.fsdb,4.49,1547,=> 4000000
+0.14.43,2026-09-28,fsdb-build-load,many4m.fsdb,4.70,1495,=> 4000000
+0.14.43,2026-09-28,fsdb-hit-load,many4m.fsdb,0.47,454,=> 4000000
+0.14.43,2026-09-28,fsdb-cold-edge,many4m.fsdb,4.73,1547,=> 0
+0.14.43,2026-09-28,fsdb-build-edge,many4m.fsdb,3.63,1487,=> 0
+0.14.43,2026-09-28,fsdb-hit-edge,many4m.fsdb,3.58,1487,=> 0
+0.14.43,2026-09-28,fsdb-cold-level,many4m.fsdb,31.42,1931,=> 0
+0.14.43,2026-09-28,fsdb-build-level,many4m.fsdb,16.27,2208,=> 0
+0.14.43,2026-09-28,fsdb-hit-level,many4m.fsdb,3.57,1487,=> 0
+0.14.43,2026-09-28,fsdb-cold-at,many4m.fsdb,4.70,1547,=> (0 "x")
+0.14.43,2026-09-28,fsdb-build-at,many4m.fsdb,3.39,1487,=> (0 "x")
+0.14.43,2026-09-28,fsdb-hit-at,many4m.fsdb,3.57,1485,=> (0 "x")
