@@ -26,15 +26,31 @@ version,date,op,fixture,wall_s,rss_mb,note
 0.13.2,2026-09-10,count-lit-cold-fused,bench_10g.vcd,70.48,13641,懒索引+变更列融合单遍 (count (= (get s0) 1)) == 92871; 0.13.1 = 109s, 0.12.45 = 216s (RSS 含 mmap 页)
 0.13.2,2026-09-10,count-lit-cold-fused,bench_2g.vcd,6.69,11013,同上 == 77629; 0.13.1 = 12.5s, 0.12.45 = 41.6s (RSS 含 mmap 页)
 0.13.2,2026-09-10,count-rise-real-vcs,.tools/vmwave/big1g.vcd,0.29,1142,(count (rising r000)) == 1168; 页缓存暖, 三轮 0.29/0.42/0.39 vs 旧 0.46/0.52/0.39
-0.14.31,2026-09-26,fsdb-cold-load,cal1m.fsdb,0.08,97800,=> 19
-0.14.31,2026-09-26,fsdb-build-load,cal1m.fsdb,0.08,97184,=> 19
-0.14.31,2026-09-26,fsdb-hit-load,cal1m.fsdb,0.08,96968,=> 19
-0.14.31,2026-09-26,fsdb-cold-edge,cal1m.fsdb,0.36,240280,=> 1000001
-0.14.31,2026-09-26,fsdb-build-edge,cal1m.fsdb,0.38,246836,=> 1000001
-0.14.31,2026-09-26,fsdb-hit-edge,cal1m.fsdb,0.08,169172,=> 1000001
-0.14.31,2026-09-26,fsdb-cold-level,cal1m.fsdb,2.37,301856,=> 1000001
-0.14.31,2026-09-26,fsdb-build-level,cal1m.fsdb,2.14,291064,=> 1000001
-0.14.31,2026-09-26,fsdb-hit-level,cal1m.fsdb,0.13,286152,=> 1000001
-0.14.31,2026-09-26,fsdb-cold-at,cal1m.fsdb,0.36,243352,=> (0 0)
-0.14.31,2026-09-26,fsdb-build-at,cal1m.fsdb,0.08,232852,=> (0 0)
-0.14.31,2026-09-26,fsdb-hit-at,cal1m.fsdb,0.08,232664,=> (0 0)
+0.14.31,2026-09-26,fsdb-cold-load,cal1m.fsdb,0.08,96,=> 19
+0.14.31,2026-09-26,fsdb-build-load,cal1m.fsdb,0.08,95,=> 19
+0.14.31,2026-09-26,fsdb-hit-load,cal1m.fsdb,0.08,95,=> 19
+0.14.31,2026-09-26,fsdb-cold-edge,cal1m.fsdb,0.36,235,=> 1000001
+0.14.31,2026-09-26,fsdb-build-edge,cal1m.fsdb,0.38,241,=> 1000001
+0.14.31,2026-09-26,fsdb-hit-edge,cal1m.fsdb,0.08,165,=> 1000001
+0.14.31,2026-09-26,fsdb-cold-level,cal1m.fsdb,2.37,295,=> 1000001
+0.14.31,2026-09-26,fsdb-build-level,cal1m.fsdb,2.14,284,=> 1000001
+0.14.31,2026-09-26,fsdb-hit-level,cal1m.fsdb,0.13,279,=> 1000001
+0.14.31,2026-09-26,fsdb-cold-at,cal1m.fsdb,0.36,238,=> (0 0)
+0.14.31,2026-09-26,fsdb-build-at,cal1m.fsdb,0.08,227,=> (0 0)
+0.14.31,2026-09-26,fsdb-hit-at,cal1m.fsdb,0.08,227,=> (0 0)
+0.14.35,2026-09-27,fsdb-cold-load,many4m.fsdb,6.58,2013,=> 4000000
+0.14.35,2026-09-27,fsdb-build-load,many4m.fsdb,6.15,2014,=> 4000000
+0.14.35,2026-09-27,fsdb-hit-load,many4m.fsdb,0.78,956,=> 4000000
+0.14.35,2026-09-27,fsdb-cold-edge,many4m.fsdb,6.28,1531,=> 0
+0.14.35,2026-09-27,fsdb-build-edge,many4m.fsdb,4.51,1485,=> 0
+0.14.35,2026-09-27,fsdb-hit-edge,many4m.fsdb,4.65,1485,=> 0
+0.14.35,2026-09-27,fsdb-cold-level,many4m.fsdb,21.20,1599,=> 0
+0.14.35,2026-09-27,fsdb-build-level,many4m.fsdb,17.49,1510,=> 0
+0.14.35,2026-09-27,fsdb-hit-level,many4m.fsdb,4.85,1486,=> 0
+0.14.35,2026-09-27,fsdb-cold-at,many4m.fsdb,6.27,1530,=> (0 "x")
+0.14.35,2026-09-27,fsdb-build-at,many4m.fsdb,4.89,1485,=> (0 "x")
+0.14.35,2026-09-27,fsdb-hit-at,many4m.fsdb,4.86,1486,=> (0 "x")
+0.14.35,2026-09-27,fsdb-par-j1,many4m.fsdb,22.60,2233,
+0.14.35,2026-09-27,fsdb-par-jauto,many4m.fsdb,18.39,1532,
+0.14.35,2026-09-27,fsdb-par-j8,many4m.fsdb,19.17,1512,
+0.14.35,2026-09-27,fsdb-par-jauto-hit,many4m.fsdb,4.84,1485,

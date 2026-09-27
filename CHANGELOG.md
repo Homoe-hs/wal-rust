@@ -33,6 +33,18 @@
   `WAL_FSDB_BENCH=<file.fsdb>` 时自动跑(判据: 暖查询应接近"只加载")。
 
 ### Performance
+- **FSDB 时间线冷建 @ 400 万信号: 112s → 14.2s(单进程) / 69.6s → 12.1s(8 路)**。
+  病根不是"把数据过一遍", 而是 `npiFsdbTimeBasedVcIter::start()` 的**每块固定开销
+  ~100~140ms**(与块内信号数、文件数据量都无关: 19 信号/200 万时间戳夹具上 18 块比 1 块
+  多 2.45s;4M 信号夹具上 977 块比 16 块多 98s) —— 400 万信号按老的 4096/块切 = **977 次
+  start = 100s 纯开销**。现在默认块大小随信号数放大 `clamp(signals/64, 4096, 65536)`
+  (总块数 ≈64 封顶;并行 worker 也按文件总信号数定块, 否则每片 50 万信号又变 122 块),
+  `WAL_FSDB_CHUNK` 仍可显式覆盖做 A/B。峰值 RSS 不变(1.5~2.0GB)。
+- **时间线 `.ftl` 的落盘判据不再只看点数**: FSDB 冷建代价 ≈ 信号数 × 每信号开销(~3.5µs),
+  与时间点数几乎无关 —— "400 万信号 / 200 个时间点"点数 <256 曾因此**每个新进程都重建一次**
+  (75.6s/次, `hit` 与 `cold` 一样慢)。现在"本次建了 ≥150ms"也算数(并行/单进程共用同一
+  判据), 暖查询 **75.6s → 4.9s(15.6×)**;电平计数冷查询 75.6s → 21.2s。数字与复现记在
+  `bench/RESULTS.md`。
 - **4M 信号的"名字路径"实测与两处修补**: 加了离线基准
   `cargo test --release --lib -- --ignored --nocapture fsdb_name_path_4m`(不需要波形文件,
   直接造 400 万名字走 encode/decode/建索引/叶子排序), 一跑就露出两个问题:
@@ -68,13 +80,25 @@
   拷贝一遍(O(块数 × 主表长) —— 1.88M 信号 = 459 块 × 上千万时间点 = 几十 GB memcpy),
   现在收齐分片后一次归并。
 
+### Fixed
+- **许可不可用时别再报"缺 libNPI.so"**: NPI 库加载成功、但 `npi_init` 因 check out 不到
+  Verdi 席位而失败时, 原来的报错头一句是"FSDB 需要 Verdi 的 NPI 读库(libNPI.so)…设置
+  `$VERDI_HOME`" —— 实测库好得很(`dlopen` 13ms 成功), 照这条线索会白翻安装目录。
+  现在按 `npi_init` 与否分成两种文案: 库缺失照旧;初始化失败明确写"是**许可**"(并给出
+  `$SNPSLMD_LICENSE_FILE`、`scripts/fsdb_env_check.sh`、并发 worker 各占一个席位三条线索)。
+
 ### Docs
 - 新增 [`docs/fsdb-env.md`](docs/fsdb-env.md): FSDB 读写环境/许可/版本兼容运行手册 ——
-  两套许可(25A 27080 / 2018 27051)身份互斥、宿主机原生读 FSDB 的四步、以及三个真实坑
+  两套许可(25A 27080 / 2018 27051)身份互斥、宿主机原生读 FSDB 的启动顺序(`run25.sh` 起 VM →
+  `license_up.sh` 拉通道, **VM 只当许可服务器, 解析在宿主原生跑**)、以及四个真实坑
   (SERVER 主机名要换 127.0.0.1、vendor daemon 端口要钉、**客机 NixOS 防火墙默认 reject
-  会被误判成 FlexLM -16,287**)。
+  会被误判成 FlexLM -16,287**、**起 daemon 前要等旧进程死透否则 lmgrd 只会重试 5 分钟**);
+  第 8 节是"现场大波形就位后的接收流程"。
 - 新增 `scripts/fsdb_env_check.sh`(`make fsdb-env [FSDB=…]`): 一条命令打出"写者版本 /
-  magic / 许可 / 真实 open 一次", 拿到别人的波形先跑它。
+  magic / 许可(**含端口可达性探测**) / 真实 open 一次", 拿到别人的波形先跑它。
+- 新增 `scripts/fsdb_landing_check.sh`(`make fsdb-land FSDB=…`): 波形到手一条命令做完
+  身份 sha256/写者 → 环境与许可 → 磁盘余量 → 冷/建/暖基线(`bench_fsdb.sh`) → 并行轴
+  `-j 1|auto|8` → **`.ftl` 逐字节一致性**(并行正确性闸)。`--quick` 只做能读+并行收益。
 
 ### Internal
 - `trace::name_store`: 把 VCD 后端早就有的 `NameArena`/`OpenIndex` 提成共享类型, FSDB 后端

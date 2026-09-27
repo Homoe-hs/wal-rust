@@ -52,6 +52,30 @@ for v in SNPSLMD_LICENSE_FILE LM_LICENSE_FILE; do
 done
 [ -z "${SNPSLMD_LICENSE_FILE:-}${LM_LICENSE_FILE:-}" ] && echo "  (两个许可变量都没设 —— NPI 多半会在 open 时失败)"
 
+# 真探一下 `port@host` 形式的 daemon: 直接 TCP 连, 免得等到 open 才发现"许可服务器不可达"。
+# NPI 在 npi_init 时就 checkout Verdi 席位, 失败时输出只是 *WARN* + "Failed to check out
+# Verdi license", 很容易被误读成"缺 libNPI.so"(踩过) —— 所以这一项要独立可见。
+LIC_BAD=0
+probe_lic() {
+    local spec user port host
+    spec=$(printf '%s' "$1" | tr ':' ' ')
+    for user in $spec; do
+        case "$user" in *@*) port="${user%%@*}"; host="${user#*@}" ;; *) continue ;; esac
+        case "$port" in ''|*[!0-9]*) continue ;; esac
+        if timeout 5 bash -c "exec 3<>/dev/tcp/$host/$port" 2>/dev/null; then
+            echo "  探测 $host:$port 可达 ✓"
+        else
+            echo "  探测 $host:$port **不可达** ✗(daemon 没起 / 端口没转发 / 防火墙拦了)"
+            LIC_BAD=1
+        fi
+    done
+}
+probe_lic "${SNPSLMD_LICENSE_FILE:-} ${LM_LICENSE_FILE:-}"
+if [ "$LIC_BAD" = 1 ]; then
+    echo "  修: 内网 → 确认 license daemon 与端口;本仓库开发机 → sh .tools/vm/license_up.sh"
+    echo "      (VM 只当**许可服务器**, 解析本身在宿主原生跑;见 docs/fsdb-env.md)"
+fi
+
 echo
 echo "== 真实打开一次 =="
 if [ ! -x "$BIN" ]; then

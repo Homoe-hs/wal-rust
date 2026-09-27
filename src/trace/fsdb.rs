@@ -868,9 +868,17 @@ pub(crate) fn round_robin_slice(n: usize, offset: usize, stride: usize) -> Vec<u
     (offset..n).step_by(stride).collect()
 }
 
-/// 时间线"值得落盘缓存"的判据(点数够多, 或这次构建确实慢 —— 由调用方补时长判断)
-fn times_len_ok(n: usize) -> bool {
-    n >= 256
+/// 时间线"值得落盘缓存"的判据。
+///
+/// ⚠️ **不能只看点数**。FSDB 冷建全局时间线的代价 ≈ **信号数 × 每信号 NPI 开销**
+/// (时间优先后端只能逐个信号走 `npiFsdbTimeBasedVcIter`, 实测 ~28µs/信号),
+/// 与"时间点数"几乎无关。于是 "400 万信号 / 200 个时间点" 这种波形点数少得可怜,
+/// 每次重建却要 70~110s —— 点数少了就不缓存 = 每个进程都白付一次(实测 4M 信号
+/// 夹具上 `hit` 与 `cold` 一模一样, 都是 75s)。所以"这次建了很久"本身就是充分条件。
+fn timeline_worth_caching(points: usize, build_time: std::time::Duration) -> bool {
+    points >= 256
+        || build_time >= std::time::Duration::from_millis(150)
+        || crate::trace::vcd::cache_mode() == crate::trace::vcd::CacheMode::Build
 }
 
 /// 两个**已升序去重**的时间序列 → 归并后的升序去重序列。
@@ -1570,10 +1578,25 @@ pub struct FsdbTrace {
     scanning: Cell<bool>,
 }
 
-/// 分块大小: 一次往归并迭代器里塞太多信号会占大量内存。
-/// `WAL_FSDB_CHUNK` 可调(性能排查用; 分块越小 NPI 峰值内存越低, 但重复装载越多)。
-fn chunk_size() -> usize {
-    std::env::var("WAL_FSDB_CHUNK").ok().and_then(|v| v.parse().ok()).filter(|&n| n > 0).unwrap_or(4096)
+/// 分块大小: 一次往归并迭代器里塞多少个信号。
+///
+/// ⚠️ **`iter.start(begin,end)` 有"每块固定"开销**(实测 100~140ms, 与块内信号数、
+/// 与文件数据量都无关):
+///   · 19 信号 / 200 万时间戳夹具: 18 块比 1 块多花 2.45s → 136ms/块;
+///   · 400 万信号夹具: 977 块(4M/4096)比 16 块(4M/262144)多花 **98s** → 102ms/块,
+///     冷建全局时间线 **112s → 14.2s**(同一个查询、同一个进程模型, 只改块大小)。
+/// 所以块大小必须随信号数放大, 否则"信号多"直接变成"start 次数多": 4M 信号 =
+/// 977 次 start = 100s 纯开销 —— 时间线冷建的真正瓶颈在这里, 不在"过一遍数据"。
+///
+/// 上限 65536: 块内 NPI 的 VC 缓存驻留 ∝ 块内信号数 × 每信号变更数, 太大在"每信号
+/// 变更极多"的波形上会顶内存(历史: 174MB 波形 RSS 17.2GB 就是这份缓存)。
+/// 自己权衡就设 `WAL_FSDB_CHUNK`(显式值永远优先, 也便于 A/B)。
+fn chunk_size(signals: usize) -> usize {
+    if let Some(n) = std::env::var("WAL_FSDB_CHUNK").ok().and_then(|v| v.parse().ok()).filter(|&n| n > 0) {
+        return n;
+    }
+    // 目标: 总块数 ≈ 64(上限), 这样固定开销封顶在 ~6.5s; 小波形保持老行为(4096)。
+    (signals / 64).clamp(4096, 65536)
 }
 
 /// 调完一块之后是否 `npi_fsdb_unload_vc`(丢掉 NPI 的文件级 VC 缓存)。
@@ -1945,7 +1968,9 @@ impl FsdbTrace {
     /// 只算"这些信号的变更时间并集"(升序去重) —— 并行构建时间线的 worker 用。
     fn scan_times(&self, targets: &[usize]) -> Result<Vec<u64>, String> {
         let npi = npi()?;
-        let chunk = chunk_size();
+        // 用**文件的总信号数**定块(不是本片的目标数): worker 分片也要把 start 次数压到 ~个位数,
+        // 否则每片 500k 信号按 4096 切 = 122 次 start = 12s 纯开销(实测踩过)。
+        let chunk = chunk_size(self.sigs.len());
         let mut all: Vec<u64> = Vec::new();
         let mut lo = 0usize;
         while lo < targets.len() {
@@ -2008,7 +2033,7 @@ impl FsdbTrace {
         }
         let dbg = std::env::var("WAL_DEBUG_FSDB").is_ok();
         let t_begin = std::time::Instant::now();
-        let chunk = chunk_size();
+        let chunk = chunk_size(self.sigs.len());
         let session_load: Option<u32> = std::env::var("WAL_FSDB_SESSION_LOAD").ok().and_then(|v| v.parse().ok());
         let mut entries = 0usize;
         let mut chunk_start = 0usize;
@@ -2360,7 +2385,7 @@ impl FsdbTrace {
                     self.first_change.set(Some(times.first().copied()));
                     let rc = Rc::new(times);
                     *self.timeline.borrow_mut() = Some(rc.clone());
-                    if times_len_ok(rc.len()) {
+                    if timeline_worth_caching(rc.len(), t_begin.elapsed()) {
                         self.save_timeline_cache(&rc, self.first_change.get().flatten());
                     }
                     return Ok(rc);
@@ -2395,13 +2420,8 @@ impl FsdbTrace {
                 times.len()
             );
         }
-        // 只缓存"值得缓存"的: 小时间线(<1k 点)重扫也比读文件快, 而且不污染目录。
-        // `WAL_CACHE=build` 时无条件写(测试/预热用)。
-        // 判据: 时间点够多, 或者这次构建确实慢(平台/文件差异都能覆盖到)。
-        if times.len() >= 256
-            || elapsed >= std::time::Duration::from_millis(150)
-            || crate::trace::vcd::cache_mode() == crate::trace::vcd::CacheMode::Build
-        {
+        // 只缓存"值得缓存"的(判据见 `timeline_worth_caching`: 点数 或 这次构建耗时)。
+        if timeline_worth_caching(times.len(), elapsed) {
             self.save_timeline_cache(&times, self.first_change.get().flatten());
         }
         Ok(t)
@@ -2585,7 +2605,7 @@ impl FsdbTrace {
             return Ok(v);
         }
         let npi = npi()?;
-        let chunk = chunk_size();
+        let chunk = chunk_size(self.sigs.len());
         let mut best: Option<u64> = None;
         let mut lo = 0usize;
         while lo < self.sigs.len() {
@@ -3050,7 +3070,7 @@ impl Trace for FsdbTrace {
             }
         }
         let mut counts = vec![0usize; self.sigs.len()];
-        let chunk = chunk_size();
+        let chunk = chunk_size(self.sigs.len());
         let mut chunk_start = 0usize;
         while chunk_start < self.sigs.len() {
             let chunk_end = (chunk_start + chunk).min(self.sigs.len());
@@ -3163,5 +3183,21 @@ mod col_cache_tests {
         bad[20] = 9; // 未知 init 编码
         assert!(parse_col_header(&bad, 1u64).is_none());
         assert!(decode_points(&buf, buf.len() - 1).is_none());
+    }
+
+    /// ★回归★ 时间线"值不值得落盘"不能只看点数: FSDB 冷建代价 ≈ 信号数 × 每信号
+    /// NPI 开销, 与点数无关 —— "4M 信号 / 200 个时间点"曾因点数 <256 而不缓存, 于是
+    /// 每个新进程都重建一次(实测 75s/次), `hit` 与 `cold` 一样慢。
+    #[test]
+    fn timeline_cache_judged_by_cost_not_only_points() {
+        use std::time::Duration;
+        assert!(timeline_worth_caching(256, Duration::ZERO), "点数够多 → 缓存");
+        assert!(
+            timeline_worth_caching(200, Duration::from_secs(75)),
+            "点少但建得慢 → 必须缓存(否则每个进程白付一次)"
+        );
+        if crate::trace::vcd::cache_mode() != crate::trace::vcd::CacheMode::Build {
+            assert!(!timeline_worth_caching(10, Duration::ZERO), "又少又快 → 不缓存");
+        }
     }
 }

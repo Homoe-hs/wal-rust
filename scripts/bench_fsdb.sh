@@ -64,7 +64,9 @@ run() {
         "$BIN" "$q" -l "$FSDB_ABS" 2>&1 )
     rc=$?
     t=$(echo "$out" | sed -n 's/^\([0-9][0-9.]*\) [0-9]*$/\1/p' | tail -1)
+    # GNU time 的 %M 是 KB; 表头写的是 rss_mb → 这里就归一成 MB(历史 fsdb-* 行已重算)
     m=$(echo "$out" | sed -n 's/^[0-9.]* \([0-9]*\)$/\1/p' | tail -1)
+    [ -n "$m" ] && m=$((m / 1024))
     local val; val=$(echo "$out" | grep -E '^(=>|\()' | tail -1)
     # 查询失败时不要把 NA 混进回归库: 打印原因并直接失败(免得"看起来跑过了")
     if [ -z "$t" ] || [ -z "$val" ]; then

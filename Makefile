@@ -10,7 +10,7 @@ CARGO_HOME ?= $(CURDIR)/.cargo-home
 XDG_CACHE_HOME ?= $(CURDIR)/.tools/cache
 export CARGO_HOME XDG_CACHE_HOME
 
-.PHONY: help ci ci-fast ci-full fmt fmt-check lint build test gates test-fsdb docs-check docs-serve perf bench-names bench-fsdb fsdb-env fsdb-prewarm lsf-run quickcheck release release-dry clean dist clean-logs
+.PHONY: help ci ci-fast ci-full fmt fmt-check lint build test gates test-fsdb docs-check docs-serve perf bench-names bench-fsdb fsdb-env fsdb-land fsdb-prewarm lsf-run quickcheck release release-dry clean dist clean-logs
 
 help: ## 显示所有可用任务
 	@grep -hE '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN{FS=":.*?## "}{printf "  \033[1m%-16s\033[0m %s\n", $$1, $$2}'
@@ -62,6 +62,10 @@ fsdb-env: ## FSDB 环境自检(写者版本/magic/许可/能否打开): make fsd
 bench-fsdb: ## FSDB 查询基准(冷建时间线/暖查询): make bench-fsdb FSDB=a.fsdb [SIG=tb.clk]
 	@: $${FSDB:?用法: make bench-fsdb FSDB=a.fsdb [SIG=tb.clk]}
 	./scripts/bench_fsdb.sh "$$FSDB" "$(SIG)"
+
+fsdb-land: ## 现场波形接收入库 + 基线体检(身份/许可/基线/并行轴/一致性): make fsdb-land FSDB=a.fsdb [SIG=tb.clk] [QUICK=1]
+	@: $${FSDB:?用法: make fsdb-land FSDB=a.fsdb [SIG=tb.clk] [QUICK=1]}
+	./scripts/fsdb_landing_check.sh "$$FSDB" "$(SIG)" $(if $(QUICK),--quick)
 
 fsdb-prewarm: ## 并行预计算 FSDB 时间线缓存: make fsdb-prewarm FSDB=a.fsdb [SHARDS=8] [QUEUE=q] [LOCAL=1]
 	@: $${FSDB:?用法: make fsdb-prewarm FSDB=a.fsdb [SHARDS=8] [QUEUE=队列] [LOCAL=1]}

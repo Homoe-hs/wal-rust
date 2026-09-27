@@ -127,6 +127,22 @@ impl TraceContainer {
                 return Ok(());
             }
             let why = super::fsdb::npi_unavailable_reason();
+            // 两种情况要分开说, 否则用户会照错的线索修:
+            //   * dlopen 失败 = 真的缺库/装不全 → 指 $VERDI_HOME/$WAL_NPI_LIB;
+            //   * 库加载成功但 `npi_init` 没过 = **许可**不可用(NPI 在 init 时 checkout
+            //     Verdi-Elite/Apex, 失败时 stdout 只有 *WARN* + "Failed to check out
+            //     Verdi license")。实测踩过: 报"缺 libNPI.so"把人引去翻安装目录, 而库好得很。
+            if why.contains("npi_init") {
+                return Err(format!(
+                    "{}: FSDB 需要 Verdi 的 NPI **许可**(库已找到, 是 NPI 初始化没过)。\n  \
+                     ① 确认 $SNPSLMD_LICENSE_FILE / $LM_LICENSE_FILE 指向可用的许可 daemon(形如 27080@主机);\n  \
+                     ② `scripts/fsdb_env_check.sh <file.fsdb>` 会分别打印 写者 / reader / 许可 三段, 用它定位;\n  \
+                     ③ 并发冷建时间线时每个 worker 各占 1 个 Verdi 席位, 席位不够也会走到这里;\n  \
+                     原因: {}",
+                    path.display(),
+                    why
+                ));
+            }
             return Err(format!(
                 "{}: FSDB 需要 Verdi 的 NPI 读库(libNPI.so)。\n  \
                  设置 $VERDI_HOME(Verdi 安装根)或 $WAL_NPI_LIB(libNPI.so 绝对路径)后重试;\n  \

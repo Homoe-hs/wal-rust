@@ -18,6 +18,8 @@ WAL_NO_ENGINE=1 target/release/wal-rust '(count (&& (rising "c") (= (get "d") 3)
 cargo test --test fuzz_vcd_fst_diff   # 随机波形差分: VCD↔FST 等价 + 引擎↔逐拍(可调 WAL_FUZZ_N/WAL_FUZZ_SEED)
 cargo run --release --example npi_probe -- design.fsdb clk   # NPI 探针(不需要 wal-rust 全功能)
 WAL_FSDB_TEST_FILE=x.fsdb WAL_FSDB_TEST_VCD=x.vcd cargo test --release --test fsdb_diff  # FSDB↔VCD 差分门(需 Verdi)
+scripts/fsdb_landing_check.sh x.fsdb   # 现场波形"接收入库+基线体检"(身份/许可/冷热基线/并行轴/.ftl 一致性)
+sh .tools/vm/license_up.sh             # 本机: 拉起"宿主原生读 FSDB"的许可通道(VM 只当许可服务器;幂等)
 ```
 
 ## CLI input auto-detect
@@ -106,7 +108,7 @@ Flags: `-l <waveform>`(可重复), `--halt-on-error`(遇错即停)。
   字节切片**: 在比较器里 `rsplitn('.')` 实测 3.5s → 0.36s(4M 信号)。
   离线基准(不需要波形文件): `cargo test --release --lib -- --ignored --nocapture fsdb_name_path_4m`;
   闸: `per_signal_bytes_stay_small`。
-- **时间线冷建别逐块拷主表**: `FsdbTrace::scan` 每 4096 信号一块, 曾把已累积的时间线
+- **时间线冷建别逐块拷主表**: `FsdbTrace::scan` 分块扫(块大小见下面那条 `chunk_size`), 曾把已累积的时间线
   每块整份拷贝一次 → O(块数 × 主表长)(1.88M 信号 = 459 块 × 上千万时间点 = 几十 GB memcpy)。
   现在分片收齐后一次归并(收完再平衡归并)。
 - **并行冷建 = 分片 map/reduce, 产物必须逐字节一致**: 冷建时间线是唯一还在"整文件过一遍"
@@ -122,6 +124,21 @@ Flags: `-l <waveform>`(可重复), `--halt-on-error`(遇错即停)。
   一个信号"(曾错写 `sigs >= 2048`, 于是"信号少但时间戳几千万"的波形永远不并行)。
   ⚠️ 每个 worker 一次 NPI 会话 = 一个 Verdi 许可;集群各节点要能看到 FSDB/二进制/缓存目录;
   `bsub -n N` 的 job 要加 `-R "span[hosts=1]"`, 否则 slot 可能散在多台机器而 worker 只在首节点跑。
+- **FSDB 时间线冷建的瓶颈是"每块固定开销", 不是"过一遍数据"**: `npiFsdbTimeBasedVcIter`
+  的 `start(begin,end)` 每次调用固定花 **100~140ms**(与块内信号数、与文件数据量都无关:
+  19 信号的 200 万时间戳夹具上 18 块比 1 块多 2.45s → 136ms/块;400 万信号夹具上
+  977 块比 16 块多 98s → 102ms/块)。所以**块大小必须随信号数放大**, 否则"信号多"直接
+  变成"start 次数多" —— 400 万信号默认 4096/块 = 977 次 start = **100s 纯开销**:
+  冷建时间线 **112s → 14.2s(单进程)**、**69.6s → 12s(8 路)** 只改了这一件事。
+  现在默认 `chunk_size(signals) = clamp(signals/64, 4096, 65536)`(总块数 ≈64 封顶),
+  worker 分片也按**文件总信号数**定块(按本片信号数切会让每片 500k 又变成 122 块);
+  `WAL_FSDB_CHUNK` 显式覆盖(仍可 A/B)。上限 65536 的原因: 块内 NPI 的 VC 缓存驻留
+  ∝ 块内信号数 × 每信号变更数(历史 174MB 波形 RSS 17.2GB 就是这份缓存)。
+- **时间线"值不值得落盘"不能只看点数**: FSDB 冷建代价 ≈ 信号数 × 每信号开销(~3.5µs),
+  与时间点数几乎无关 —— "400 万信号 / 200 个时间点"点数 <256 曾因此不写 `.ftl`,
+  于是**每个新进程都重建一次**(实测 75.6s/次, `hit` 与 `cold` 一样慢)。
+  现在判据 `timeline_worth_caching(points, build_time)`: 点数 ≥256 **或**本次建了 ≥150ms
+  **或** `WAL_CACHE=build`;并行/单进程两条路径共用它。暖路径实测 75.6s → 5.9s。
 - **`src/main.rs` 会二次编译一部分模块**(它自己 `mod cli; mod fst; mod vcd; pub mod trace;`
   之外还链了 `wal_rust` 库): 所以**进程内 static 在 bin/lib 两份代码里不是同一个变量**。
   给库传"进程级开关"必须走环境变量 —— `-j/--jobs` 就是这么做的(踩过: 用 `OnceLock` static
