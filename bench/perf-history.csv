@@ -85,3 +85,15 @@ version,date,op,fixture,wall_s,rss_mb,note
 0.14.43,2026-09-28,fsdb-cold-at,many4m.fsdb,4.70,1547,=> (0 "x")
 0.14.43,2026-09-28,fsdb-build-at,many4m.fsdb,3.39,1487,=> (0 "x")
 0.14.43,2026-09-28,fsdb-hit-at,many4m.fsdb,3.57,1485,=> (0 "x")
+0.14.44,2026-09-28,fsdb-cold-load,many4m.fsdb,4.35,1547,=> 4000000
+0.14.44,2026-09-28,fsdb-build-load,many4m.fsdb,4.39,1495,=> 4000000
+0.14.44,2026-09-28,fsdb-hit-load,many4m.fsdb,0.43,454,=> 4000000
+0.14.44,2026-09-28,fsdb-cold-edge,many4m.fsdb,4.04,1547,=> 0
+0.14.44,2026-09-28,fsdb-build-edge,many4m.fsdb,3.17,1486,=> 0
+0.14.44,2026-09-28,fsdb-hit-edge,many4m.fsdb,3.41,1486,=> 0
+0.14.44,2026-09-28,fsdb-cold-level,many4m.fsdb,15.65,1547,=> 0
+0.14.44,2026-09-28,fsdb-build-level,many4m.fsdb,14.84,1493,=> 0
+0.14.44,2026-09-28,fsdb-hit-level,many4m.fsdb,3.44,1486,=> 0
+0.14.44,2026-09-28,fsdb-cold-at,many4m.fsdb,4.31,1547,=> (0 "x")
+0.14.44,2026-09-28,fsdb-build-at,many4m.fsdb,3.39,1486,=> (0 "x")
+0.14.44,2026-09-28,fsdb-hit-at,many4m.fsdb,3.21,1486,=> (0 "x")

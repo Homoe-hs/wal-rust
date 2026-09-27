@@ -505,6 +505,11 @@ catch signal 11 (Segmentation fault)
 | `WAL_FSDB_WALK_SCAN=0` | 13.0 / 12.9 / 13.3s | 常规 8 路并行(可见 `jobs 决策` + `并行构建时间线: 8 workers, 11.1s`) |
 | 0.14.44 默认(判据改成"信号数 **且** 文件 ≥128MB") | **15.0 / 15.3 / 15.5s** | 与 `WALK_SCAN=0` 同路; 真波形不受影响(它两个条件都满足) |
 
+同轮把夹具的 12 行回归全量补齐(`scripts/bench_fsdb.sh .tools/bench/v2f/many4m.fsdb`), 0.14.44 全线
+不差于两条基线: cold-load 4.35s/1,547MB(0.14.35: 6.58s/2,013MB)、cold-edge 4.04s、cold-level
+**15.65s**(0.14.43: 31.42s, 0.14.35: 21.20s)、build-level 14.84s/**1,493MB**(0.14.43: 16.27s/2,208MB
+—— 单 walker 那份多出来的内存也一起消失了)、hit-level 3.44s。
+
 * 同轮还修掉一个语义反转: worker 用 `env_ok("WAL_FSDB_WALK_SCAN")` 判"要不要换路", 于是
   **`=0`(文档写的"关")反而打开了它**;现在三态判断。真波形上 `=0` 已实测走回常规 worker
   (`worker offset=0 stride=8: 2244513 个信号`, 名字表 9.8GB), `=1` / 未设走边走边扫。
