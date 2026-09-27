@@ -39,6 +39,23 @@
   冷建/暖查询/只加载分开计时并追加到 `bench/perf-history.csv`; CI `perf` 阶段在设了
   `WAL_FSDB_BENCH=<file.fsdb>` 时自动跑(判据: 暖查询应接近"只加载")。
 
+### Changed
+- **大波形的并行冷建不再需要人工配环境变量**: 波形文件 ≥ `WAL_FSDB_WALK_SCAN_MB`(默认 128MB)时,
+  每个 `fsdb-timeline-map` worker **自动**启用"边走边扫"(`WAL_FSDB_WALK_SCAN=1`)并在多分片下
+  **自动选切分层**(`WAL_FSDB_SCOPE_SPLIT` 留空/`auto` ⇒ 取"节点数 ≥ 分片数"的最浅一层:
+  这份 core 级设计各层子树数 `[1,1,7,334,2121,4761,13106,36760]`, 8 片自动落 **depth4**)。
+  于是 `make fsdb-prewarm FSDB=big.fsdb SHARDS=8 LOCAL=1` 直接就是内存安全的那条路 ——
+  以前必须自己 `export WAL_FSDB_WALK_SCAN=1 WAL_FSDB_SCOPE_SPLIT=4`, 忘了就会让 8 个 worker
+  各走整棵树。小文件行为不变;想回到旧口径: `WAL_FSDB_WALK_SCAN=0`、
+  `WAL_FSDB_SCOPE_SPLIT=0|off`, 显式数字仍然照办。
+  * 统计"每层多少棵子树"本身要一次只数数的树遍历(这份 1796 万信号波形 ~44s, NPI 驻留 ~10GB):
+    **8 路并发走这一遍会 OOM** —— 首版实测 8 个 worker 同时统计时 NPI 直接
+    `SIGSEGV`(`[fhdb][fatal] Can not get user data` 刷屏)。现在用 **flock 串行化**:
+    第一个 worker 走一遍并把结果写进 `<cache>/<file_identity>-v1.fscope`(9 个 u64, 原子 rename),
+    其余 worker 在锁上等 ~44s 后直接命中, 之后的每次运行 0 代价。缓存目录不可写时**不猜也不走树**,
+    直接按最深一层分片(子树最小 = 每 worker 最省内存; 而"不切分"意味着每个 worker 走整棵树)。
+    自动选中的层 `WAL_DEBUG_FSDB=1` 会打印。闸: 单测比对选层规则与 9 值往返(含文件身份失效)。
+
 ### Performance
 - **大波形时间线: 按 scope 子树的多进程并行(以及一个靠"三种分片对拍"抓到的真 bug)**。
   `WAL_FSDB_SCOPE_SPLIT=<depth>` 让每个 worker 只走自己那几棵子树 —— NPI 遍历期内存随子树

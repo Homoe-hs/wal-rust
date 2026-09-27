@@ -407,3 +407,39 @@ wal-rust fsdb-timeline-merge aicore_smoke_test_000.fsdb p*.part   # 装 .ftl
 * ⚠️ **抓到一个真 bug**: 用了 scope 分片后仍叠加"信号下标 % N"过滤, 每个 worker 丢掉自己子树里
   7/8 的信号 —— 并集只少 43 个时间点(接近饱和, 很隐蔽)。靠"**不同分片口径必须产出同一并集**"
   的三方对拍抓到, 已修; 修复后 depth3/depth4 两条独立分片口径逐点一致。
+
+### 自动化这两步: worker 自己开"边走边扫 + 按 scope 分片"(2026-09-28, 真波形)
+
+上一节的配方要人工 `export WAL_FSDB_WALK_SCAN=1 WAL_FSDB_SCOPE_SPLIT=<depth>`;忘一个,
+8 个 worker 就各走整棵树。现在 `fsdb-timeline-map` 对 ≥128MB(`WAL_FSDB_WALK_SCAN_MB`)的文件
+**默认**开边走边扫, 并在多分片时自动选切分层 —— 即用户敲的就是
+`make fsdb-prewarm FSDB=… SHARDS=8 LOCAL=1`。
+
+**但"自动选层"第一版把自己坑了**: 选层要先数一遍树, 而这一遍的 NPI 驻留约 10GB。8 个 worker
+同时启动 = 80GB, 27GB 机器上实测 NPI 直接**段错误**:
+
+```
+[fhdb][fatal] Can not get user data        ← 刷了 22 万行
+*WARN* [fhdb][error] Ei/Cg/Fn (16440/-1/564) with no driver and not primary.
+catch signal 11 (Segmentation fault)
+```
+
+修复 = **flock 串行化 + 双检缓存**: 第一个 worker 拿
+`<cache>/<file_identity>-v1.fscope.lock` 走一遍, 把每层子树数写进 `.fscope`(72B, 原子 rename),
+其余 worker 在锁上等 ~44s 后命中;以后每次运行 0 代价。缓存目录不可写时不猜也不走树,
+直接按最深一层分片。修好后同一条命令:
+
+| 口径 | 墙钟 | 每 worker RSS | 并集 | `.ftl` md5 |
+|---|---|---|---|---|
+| depth4/8(自动选中) | **668s** | — | 320,204 点 | `ca1cb095…` |
+| depth5/8(手工, 上一节) | 494s | 4.0~7.9GB | 320,204 点 | `ca1cb095…` |
+
+**归并出来的 `.ftl` 与上一节的 depth5/8 手工口径逐字节相同**(md5 `ca1cb095c9a46800c3a014c06e60a959`,
+460,014 B)—— 自动路径的正确性由"同一条并集必须产同一份缓存"守门。
+本机实测各层子树数(GET `WAL_DEBUG_FSDB=1`)= `[1,1,7,334,2121,4761,13106,36760]`,
+"子树数 ≥ 分片数的最浅一层"在 8 片时落 **depth4**;按实测 depth5 更快(见上一节:
+depth4 快慢两半 190s/530s 不均衡),所以**下一步是把"选层"从"够切就行"改成"用各层子树大小
+模拟 `% N` 分配, 取预测 makespan 最小的那层"** —— 只需缓存每层的子树大小列表(约 230KB),
+不动 worker 的分配口径, 因此不影响正确性。执行: `make fsdb-prewarm FSDB=… SHARDS=8 LOCAL=1`。
+
+

@@ -153,12 +153,21 @@ Flags: `-l <waveform>`(可重复), `--halt-on-error`(遇错即停)。
 - **大波形时间线并行 = 按 scope 子树分片**(`WAL_FSDB_SCOPE_SPLIT=<depth>`): 每个 worker 只走
   自己那几棵子树, NPI 遍历期内存随子树下降(实测每 worker **2.8~3.9GB** vs 单 walker ~12GB)。
   选层前先用 `WAL_FSDB_SCOPE_STATS=<depth>` 标定(一次树遍历, 这份设计 depth1/2 只有 1 棵子树、
-  depth3=7 棵、depth4=334 棵)。⚠️ **两套分片口径互斥**: 用了 scope 分片就不能再按信号下标
+  depth3=7 棵、depth4=334 棵)。**但在 worker 里这件事现在是自动的**: 文件 ≥ `WAL_FSDB_WALK_SCAN_MB`
+  (默认 128MB)且分片数 > 1 时, `WAL_FSDB_SCOPE_SPLIT` 留空/`auto` 会**先数一遍树**(`auto_split_depth`,
+  复用 `ScopeStats`)取"节点数 ≥ 分片数"的最浅一层(这份设计各层 `[1,1,7,334,2121,4761,13106,36760]`,
+  8 片 → depth4), `0`/`off` 关, 数字照办。⚠️ **这一遍树遍历本身约 10GB NPI 驻留, 绝不能让 N 个 worker
+  同时做**: 首版实测 8 worker 并发统计 → 27GB 机器直接 `SIGSEGV`(`[fhdb][fatal] Can not get user data`),
+  现在用 **flock + 双检** 串行化(`<cache>/<file_identity>-v1.fscope`, 9 个 u64; 锁是
+  `.fscope.lock`), 第一个 worker 走、其余等锁命中, 缓存目录不可写时按最深一层保守分片(不走树)。
+  手工标定只在想固定层/做 A/B 时才需要。⚠️ **两套分片口径互斥**: 用了 scope 分片就不能再按信号下标
   轮转过滤, 否则每个 worker 会丢掉自己子树里 (N-1)/N 的信号 —— 表现很隐蔽(并集只少几十个
   时间点, 因为并集接近饱和), 只有"不同分片口径必须产出同一并集"的对拍才能抓到(已修 +
   写进 CHANGELOG)。
 - **大波形的时间线冷建走"边走边扫"**(`timeline_by_walk_split`, 信号数 ≥ 2,000,000 默认启用;
-  `WAL_FSDB_WALK_SCAN=0` 关; `WAL_FSDB_WALK_SCAN_MIN` 调阈值): 树遍历走到一批(默认 65536 个)
+  `WAL_FSDB_WALK_SCAN=0` 关; `WAL_FSDB_WALK_SCAN_MIN` 调阈值)。**worker(`fsdb-timeline-map`)
+  对 ≥128MB 的文件默认就开**(`WAL_FSDB_WALK_SCAN_MB` 调阈值; 小文件保持旧路), 所以
+  `make fsdb-prewarm` 不需要额外环境变量。树遍历走到一批(默认 65536 个)
   信号就塞进迭代器扫一批时间并集、然后**丢掉句柄** —— 不建名字表、不攒 18M 句柄, 峰值内存与
   信号总数解耦。**产物与常规 worker 逐字节相同**(cal1m `cmp` 验过)。1796 万信号真波形全量
   **1/8 分片(224 万信号)369s / 11.9GB** → 单 walker 全量按线性外推 **~45 分钟**(逐条扫描的

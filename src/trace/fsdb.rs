@@ -1426,11 +1426,200 @@ impl ScopeStats {
     }
 }
 
+/// 自动选层的最深层(与 `WAL_FSDB_SCOPE_STATS` 的常用深度一致); 统计表存 depth 0..=8。
+const SCOPE_MAX_DEPTH: usize = 8;
+
+/// 自动选"按哪层 scope 切" —— 取**节点数 ≥ 分片数**的最浅一层(太浅切不动)。
+///
+/// 代价是一次只数数的树遍历(这份 1796 万信号波形 ~44s), 换来的是"不用人工先标定";
+/// 对 8 片而言 depth3 只有 7 棵 → 自动落到 depth4(334 棵)。
+///
+/// ⚠️ **多 worker 同时启动时必须只让一个人走这一遍**: 这次树遍历的 NPI 驻留内存约 10GB,
+/// 8 路并发 = 80GB, 27GB 机器上实测 NPI 直接 SIGSEGV(`[fhdb][fatal] Can not get user data`
+/// 刷屏 + `catch signal 11`)。所以统计走 **flock 串行化 + 双检缓存**:
+/// 第一个 worker 拿到 `<cache>/<file_identity>-v1.fscope.lock` 走一遍并把结果写进
+/// `.fscope`(8+1 个 u64, 原子 rename), 其余 worker 在锁上等 ~44s 后直接命中缓存。
+/// 缓存/锁都拿不到时**不猜也不走树**, 直接返回最深一层(子树最小 → 每 worker 最省内存)。
+pub fn auto_split_depth(path: &str, shards: usize) -> usize {
+    let nodes = match load_scope_counts(path) {
+        Some(n) => n,
+        None => compute_scope_counts(path),
+    };
+    let d = pick_split_depth(&nodes, shards);
+    if std::env::var("WAL_DEBUG_FSDB").is_ok() {
+        eprintln!(
+            "[fsdb] 自动选切分层: depth={} (分片 {}, 各层子树数 {:?})",
+            d,
+            shards,
+            &nodes[1..]
+        );
+    }
+    d
+}
+
+/// 选层规则: 取"子树数 ≥ 分片数"的最浅一层。都切不动/统计失败 → **最深一层**
+/// (切得越深每片子树越小; 而"不切"等于让每个 worker 各走整棵树, 是内存上最危险的选择)。
+fn pick_split_depth(nodes: &[usize], shards: usize) -> usize {
+    if shards <= 1 {
+        return 0;
+    }
+    for d in 2..=SCOPE_MAX_DEPTH {
+        if nodes.get(d).copied().unwrap_or(0) >= shards {
+            return d;
+        }
+    }
+    SCOPE_MAX_DEPTH
+}
+
+/// 统计一次并落盘; **全程持 flock**, 保证同一波形的 N 个 worker 只走一遍树。
+/// 拿不到锁/缓存目录不可写 → 返回空表(调用方按最深一层处理), 绝不并发走树。
+fn compute_scope_counts(path: &str) -> Vec<usize> {
+    let Some(lock) = scope_lock(path) else {
+        eprintln!(
+            "[fsdb] 提示: 缓存目录不可写, 无法安全统计 scope 分层 → 保守按最深一层(depth={})分片",
+            SCOPE_MAX_DEPTH
+        );
+        return Vec::new();
+    };
+    // 双检: 抢锁期间别人可能已经算完并落盘
+    if let Some(n) = load_scope_counts(path) {
+        return n;
+    }
+    let n = scope_node_counts(path, SCOPE_MAX_DEPTH);
+    // 即使统计失败(全 0)也落盘: 否则后面 N 个 worker 会各自重走一遍 44s 的树(而且串行)
+    store_scope_counts(path, &n);
+    drop(lock);
+    n
+}
+
+/// 波形的 scope 统计锁(flock, 进程退出自动释放)。拿不到返回 None。
+fn scope_lock(path: &str) -> Option<ScopeLock> {
+    use std::os::unix::io::AsRawFd;
+    let root = abs_cache_root();
+    let p = cache_path(&root, path, ".fscope.lock")?;
+    std::fs::create_dir_all(&root).ok()?;
+    let f = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&p)
+        .ok()?;
+    if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) } != 0 {
+        return None;
+    }
+    Some(ScopeLock { _f: f })
+}
+
+struct ScopeLock {
+    _f: std::fs::File,
+}
+
+impl Drop for ScopeLock {
+    fn drop(&mut self) {
+        use std::os::unix::io::AsRawFd;
+        unsafe {
+            libc::flock(self._f.as_raw_fd(), libc::LOCK_UN);
+        }
+    }
+}
+
+/// 数一遍每层有多少个 scope 子树(不碰变更列)。失败返回空 vec。
+fn scope_node_counts(path: &str, max_depth: usize) -> Vec<usize> {
+    let npi = match npi() {
+        Ok(n) => n,
+        Err(_) => return Vec::new(),
+    };
+    let abs = match std::fs::canonicalize(path) {
+        Ok(p) => p,
+        Err(_) => return Vec::new(),
+    };
+    let cpath = match CString::new(abs.to_string_lossy().as_bytes()) {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+    let _box = NpiSandbox::enter(false);
+    unsafe {
+        let file = (npi.open)(cpath.as_ptr());
+        if file.is_null() {
+            return Vec::new();
+        }
+        let mut st = ScopeStats {
+            npi,
+            nodes: vec![0usize; max_depth + 1],
+            sigs: vec![0usize; max_depth + 1],
+            max_node: vec![0usize; max_depth + 1],
+        };
+        let top = (npi.iter_top_scope)(file);
+        if !top.is_null() {
+            loop {
+                let sc = (npi.iter_scope_next)(top);
+                if sc.is_null() {
+                    break;
+                }
+                let n = st.scope(sc, 1, max_depth);
+                st.nodes[1] += 1;
+                st.sigs[1] += n;
+            }
+            (npi.iter_scope_stop)(top);
+        }
+        (npi.close)(file);
+        st.nodes
+    }
+}
+
+fn load_scope_counts(path: &str) -> Option<Vec<usize>> {
+    load_scope_counts_in(&abs_cache_root(), path)
+}
+
+fn load_scope_counts_in(root: &std::path::Path, path: &str) -> Option<Vec<usize>> {
+    let p = cache_path(root, path, ".fscope")?;
+    let b = std::fs::read(p).ok()?;
+    if b.len() != (SCOPE_MAX_DEPTH + 1) * 8 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(SCOPE_MAX_DEPTH + 1);
+    for i in 0..=SCOPE_MAX_DEPTH {
+        let w: [u8; 8] = b[i * 8..i * 8 + 8].try_into().ok()?;
+        out.push(u64::from_le_bytes(w) as usize);
+    }
+    Some(out)
+}
+
+/// 落盘失败只当没缓存(与其它缓存一致: 绝不影响结果)。
+fn store_scope_counts(path: &str, counts: &[usize]) {
+    store_scope_counts_in(&abs_cache_root(), path, counts)
+}
+
+fn store_scope_counts_in(root: &std::path::Path, path: &str, counts: &[usize]) {
+    let Some(p) = cache_path(root, path, ".fscope") else {
+        return;
+    };
+    let mut buf = Vec::with_capacity((SCOPE_MAX_DEPTH + 1) * 8);
+    for i in 0..=SCOPE_MAX_DEPTH {
+        buf.extend_from_slice(&(counts.get(i).copied().unwrap_or(0) as u64).to_le_bytes());
+    }
+    if std::fs::create_dir_all(root).is_err() {
+        return;
+    }
+    let tmp = p.with_extension("fscope.tmp");
+    if std::fs::write(&tmp, &buf).is_ok() {
+        let _ = std::fs::rename(&tmp, &p);
+    }
+}
+
 /// 大到什么程度就优先走"边走边扫"建时间线(信号数)。
 ///
 /// 分界依据: 400 万信号的合成夹具上, 常规路径(块大小优化后)冷建 14.2s 已经够用;
 /// 而 1796 万信号的真波形上, 常规路径要先按名字解析 18M 次句柄(**实测 550µs/个**),
 /// 等于两小时起步 —— 必须换路。`WAL_FSDB_WALK_SCAN=0` 可显式关掉, 方便 A/B。
+/// "多大算大文件"(MB): 默认 128MB。大文件才默认走边走边扫 + 按子树自动分片。
+fn walk_scan_min_mb() -> u64 {
+    std::env::var("WAL_FSDB_WALK_SCAN_MB")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(128)
+}
+
 fn walk_scan_min_signals() -> usize {
     if matches!(std::env::var("WAL_FSDB_WALK_SCAN").as_deref(), Ok("0") | Ok("off")) {
         return usize::MAX;
@@ -1699,6 +1888,13 @@ pub fn run_timeline_worker(
         std::env::set_var("WAL_FSDB_HANDLES_ONLY", "1");
     }
     // 边走边扫: 不建名字表也不攒句柄数组, 峰值内存与信号总数解耦
+    // **大文件默认行为**: 走"边走边扫"(不建名字表), 并按 scope 子树自动分片 ——
+    // 这两件事本该是默认, 否则 `make fsdb-prewarm` 直接跑会让每个 worker 走整棵树
+    // (内存 ~12GB × N)。小文件保持原样(走缓存/名字, 省一次树遍历)。
+    let file_mb = std::fs::metadata(file).map(|m| m.len() / 1048576).unwrap_or(0);
+    if file_mb >= walk_scan_min_mb() && std::env::var("WAL_FSDB_WALK_SCAN").is_err() {
+        std::env::set_var("WAL_FSDB_WALK_SCAN", "1");
+    }
     if let Ok(d) = std::env::var("WAL_FSDB_SCOPE_STATS") {
         let depth = d.parse::<usize>().unwrap_or(6);
         println!("{}", scope_stats_dump(&file.to_string_lossy(), depth)?);
@@ -1707,10 +1903,24 @@ pub fn run_timeline_worker(
     if std::env::var("WAL_FSDB_WALK_SCAN").is_ok() {
         // 默认按信号下标轮转(与常规 worker 口径一致); 设 WAL_FSDB_SCOPE_SPLIT=<depth>
         // 则按 scope 子树切分 —— 每个 worker 只走一部分子树, 遍历期内存随子树大小降。
-        let split = std::env::var("WAL_FSDB_SCOPE_SPLIT")
-            .ok()
-            .and_then(|d| d.parse::<usize>().ok())
-            .map(|depth| (stride, offset, depth));
+        // SCOPE_SPLIT: 空/`auto` 且大文件 → 自动选层; `0`/`off` 不切; 数字显式指定
+        let raw = std::env::var("WAL_FSDB_SCOPE_SPLIT").unwrap_or_default();
+        let split = match raw.as_str() {
+            "0" | "off" => None,
+            "" | "auto" => {
+                if file_mb >= walk_scan_min_mb() && stride > 1 {
+                    let d = auto_split_depth(&file.to_string_lossy(), stride);
+                    if d > 0 {
+                        Some((stride, offset, d))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            }
+            d => d.parse::<usize>().ok().filter(|x| *x > 0).map(|depth| (stride, offset, depth)),
+        };
         let times = timeline_by_walk_split(&file.to_string_lossy(), stride, offset, split)?;
         return write_times(out, &times).map_err(|e| e.to_string());
     }
@@ -3953,6 +4163,46 @@ impl Trace for FsdbTrace {
         v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
         v.truncate(k);
         v
+    }
+}
+
+#[cfg(test)]
+mod scope_cache_tests {
+    use super::*;
+
+    /// 自动选层的依据(每层子树节点数)必须能原样落盘/读回 —— 它是"8 路并行只走一遍树"的前提。
+    #[test]
+    fn scope_count_cache_round_trips_and_keys_on_identity() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/tmp-scope-cache");
+        let _ = std::fs::remove_dir_all(&dir);
+        let wave = dir.join("fake.fsdb");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&wave, b"not-really-an-fsdb").unwrap();
+        let w = wave.to_string_lossy().to_string();
+
+        // 未缓存 → None
+        assert!(load_scope_counts_in(&dir, &w).is_none(), "空目录不该命中");
+
+        // 真实 core 级设计的实测口径: depth1/2 只有 1 个子树, depth3=7, depth4=334, depth5=2121
+        let counts = vec![0usize, 1, 1, 7, 334, 2121, 0, 0, 0]; // depth 0..=8
+        store_scope_counts_in(&dir, &w, &counts);
+        assert_eq!(load_scope_counts_in(&dir, &w).unwrap(), counts, "往返必须一致");
+
+        // 选层规则: 取"子树数 ≥ 分片数"的最浅一层(从 depth2 起; depth1 常常切不动)
+        assert_eq!(pick_split_depth(&counts, 7), 3, "7 片: depth3 刚好 7 棵");
+        assert_eq!(pick_split_depth(&counts, 8), 4, "8 片: depth3 不够 → depth4(334 棵)");
+        assert_eq!(pick_split_depth(&counts, 334), 4);
+        assert_eq!(pick_split_depth(&counts, 400), 5);
+        assert_eq!(pick_split_depth(&counts, 1), 0, "单进程不切");
+        // 统计失败(全 0)或怎么切都不够 → **最深一层**: 子树最小, 比"每 worker 走整棵树"安全
+        let zeros = [0usize; 9];
+        assert_eq!(pick_split_depth(&zeros, 8), SCOPE_MAX_DEPTH);
+        assert_eq!(pick_split_depth(&counts, 99_999), SCOPE_MAX_DEPTH);
+
+        // 文件变了(size/ctime 变) → 旧统计必须失效
+        std::fs::write(&wave, b"not-really-an-fsdb CHANGED").unwrap();
+        assert!(load_scope_counts_in(&dir, &w).is_none(), "文件身份变了必须视为未命中");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 
