@@ -186,6 +186,15 @@ pub enum Operator {
     DumpTrace,
 
     StringAppend,
+
+    // 指标与统计 (docs/waveform-metrics.md)
+    Median,
+    Percentile,
+    Stddev,
+    Stats,
+    Histogram,
+    Latency,
+    Ipc,
 }
 
 impl Operator {
@@ -259,6 +268,13 @@ impl Operator {
     "zip",
     "sum",
     "third",
+    "median",
+    "percentile",
+    "stddev",
+    "stats",
+    "histogram",
+    "latency",
+    "ipc",
     "convert/bin",
     "string->int",
     "bits->sint",
@@ -421,6 +437,13 @@ impl Operator {
             "zip" => Some(Operator::Zip),
             "sum" => Some(Operator::Sum),
             "third" => Some(Operator::Third),
+            "median" => Some(Operator::Median),
+            "percentile" => Some(Operator::Percentile),
+            "stddev" => Some(Operator::Stddev),
+            "stats" => Some(Operator::Stats),
+            "histogram" => Some(Operator::Histogram),
+            "latency" => Some(Operator::Latency),
+            "ipc" => Some(Operator::Ipc),
 
             // Type checks
             "defined?" => Some(Operator::IsDefined),
@@ -596,6 +619,13 @@ impl Operator {
             Operator::Zip => "zip",
             Operator::Sum => "sum",
             Operator::Third => "third",
+            Operator::Median => "median",
+            Operator::Percentile => "percentile",
+            Operator::Stddev => "stddev",
+            Operator::Stats => "stats",
+            Operator::Histogram => "histogram",
+            Operator::Latency => "latency",
+            Operator::Ipc => "ipc",
             Operator::IsDefined => "defined?",
             Operator::IsAtom => "atom?",
             Operator::IsSymbol => "symbol?",

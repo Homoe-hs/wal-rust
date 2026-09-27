@@ -34,6 +34,19 @@ pub trait Trace {
     fn signal_value(&self, name: &str, offset: usize) -> Result<ScalarValue, String>;
     fn signal_width(&self, name: &str) -> Result<usize, String>;
     fn signals(&self) -> Vec<String>;
+
+    /// 信号**个数**。默认把整表数出来;大波形后端应覆盖成 O(1) ——
+    /// 真实 core 级波形 1796 万信号, 整表 `Vec<String>` 实测 ~4.8GB RSS,
+    /// 而 `(length (SIGNALS))` 只要个数。
+    fn signal_count(&self) -> usize {
+        self.signals().len()
+    }
+
+    /// 按下标取信号全名(顺序与 `signals()` 一致)。默认实现每次都会解出整表 ——
+    /// 只适合小后端;大后端(FSDB/VCD 都是 arena)要覆盖。循环里**不要**用默认实现。
+    fn signal_at(&self, idx: usize) -> Option<String> {
+        self.signals().into_iter().nth(idx)
+    }
     fn scopes(&self) -> Vec<String>;
     fn max_index(&self) -> usize;
     fn set_index(&mut self, index: usize) -> Result<(), String>;

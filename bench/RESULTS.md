@@ -237,3 +237,72 @@ worker 分片按**文件总信号数**定块。
   自己那 50 万信号, 合并前没有共享。放大小块之后瓶颈已经转到"每信号成本 × 每 worker 的信号数"。
 * **线性扫描类查询**(电平计数、区间引擎)按语义必须物化全局时间线; 边沿计数
   (`(count (rising s))`)走时间域, 不付这笔钱(edge 6.3s vs level 21.2s)。
+
+## 真实现场波形: core 级 smoke test(2026-09-27 收到, 321MB / 1796 万信号)
+
+```
+aicore_smoke_test_000.fsdb   336,004,134 B   VCS Release X-2025.06-SP2_Full64
+信号 17,956,098 / scope 1,620,912 / 时间跨度 0..43,776,606(1ps 时基, 43.78µs)
+```
+**本机 reader(X-2025.06-SP1)能直接打开**, 没有 NSIS —— 不用搬 SP3 的 NPI 也能读。
+
+### 加载: 时间与内存(宿主原生读, 单进程)
+
+| 操作 | 修前 | 修后 |
+|---|---|---|
+| 冷加载(`WAL_CACHE=off`, 走 NPI 树) | 66.9s / **17.8GB** | 54.2s / **13.0GB** |
+| 建缓存加载(写 `.fnames`) | 72.6s / 17.3GB | 57.9s / **13.3GB** |
+| 暖加载(`.fnames` 命中) | 13.5s / **11.0GB** | 11.1s / **6.1GB** |
+| `(length (SIGNALS))`(只要个数) | 12.1s / 11.3GB | **11.0s / 6.1GB** |
+| `sigs <pattern> 8`(按名字搜) | ~11GB | **6.1GB**(按下标懒遍历) |
+
+改动三处(见 `AGENTS.md`):`.fnames` 升 v2 定长 header + 精确 reserve;冷路径边遍历边**流式**
+写缓存;`(length (SIGNALS))` 与 CLI `sigs` 不再物化整张名字表(~4.8GB)。
+
+内存账(暖加载, `WAL_DEBUG_FSDB=1` 的三段 RSS):NPI open 后 **1.43GB** → 名字就位
+**6.13GB**(名字 arena 2.85GB + spans 140MB + `sigs` 18M×24B + 162 万 scope 字符串)
+→ 索引建完 **6.20GB**。**冷加载的 13.6GB 峰值大头在 NPI 自己**(遍历 18M 信号期间涨到 ~10GB,
+`mmap` 之外还持续增长), 不是我们的 arena —— 这一条是下一轮的目标。
+
+### 还没量完的: 时间线冷建
+
+`(MAX-INDEX)` / `(count (= (get s) 1))` 这类**索引空间**查询要物化全局时间线 = 整文件过一遍。
+在 1796 万信号 / 4377 万时间戳上**单进程 20 分钟没跑完**(`scripts/bench_fsdb.sh` 里 1800s 超时被打掉),
+所以本轮没有 level/at 的基线。已知约束:
+* `-j auto`(8 worker)**不安全**: 每个 worker 要 6GB 级内存, 8 路 = 十 GB 级;
+* 下一轮方向: 让 worker **只取句柄不建名字表**(分片只需要 handle), 把单 worker 压到 1~2GB,
+  再谈并行;或试 NPI 的 `npi_fsdb_load_vc_by_range` / `sigdb` 批量装载。
+
+### 这份 smoke test 到底做了什么(用新算子量出来的)
+
+```bash
+# 一次加载问完(单进程复用加载):
+target/release/wal-rust --stdin -l aicore_smoke_test_000.fsdb < probes.wal
+```
+
+| 事件 | 时刻(ps) | 说明 |
+|---|---|---|
+| 4 个 core 的 `por_rstn` 释放 | **27,000** | core0..3 同时(复位只动这一次) |
+| gnode load 引擎收到命令 `elane_rx_tvalid_i` | 39,957,869(宽 7.4ns) | e0s0 lane 一条命令 |
+| tnode_top_0 **hart0** `op_inst_valid` ×11 | 39,857,558 → 40,260,469 | 全部走 `strong_barrier_exe`(`weak` 路径 0 次) |
+| tnode_top_0 **hart1/2/3** 各 1 次 | ~40,00x,xxx | 三个 hart 几乎同时各发一拍 |
+| tnode_top_1/2/3 的 16 个 hart 信号 | — | **全 0**(只有 tnode_top_0 在动) |
+| gnode `store_0.awvalid` → 4 拍 `wvalid` → `bvalid` | 40,089,184 → 40,117,978 | 一笔 4-beat 写 |
+
+延迟/性能(时钟 `period = 670ps` ≈ 1.49GHz):
+
+| 指标 | 值 | 换算 |
+|---|---|---|
+| `(latency (rising awvalid) (rising bvalid))` | 28,794 ps | **≈43 cycle**(写响应往返) |
+| AW → 第一拍 W | 5,309 ps | ≈7.9 cycle |
+| `op_inst_valid → op_inst_ready`(10 对) | p50=0 / mean=1,143 / **max=11,432 ps** | 9 次当拍接受, 1 次停 17 cycle |
+| `sync_holder → strong_barrier_exe`(11 对) | 全 0 ps | 组合直通(两者波形逐点相同) |
+| 11 条 op 的窗口 | 402,911 ps | ≈601 cycle → **~55 cycle/op** |
+| IPC(整段 43.78µs) | **1.7e-4** | 11 op / 65,296 clk 上升沿 |
+| IPC(活跃窗口 ~601 cycle) | ≈0.018 | 相对"能跑的额定吞吐"极低 |
+
+**结论**: 这是一个**上电连通性 smoke test** —— 4 个 core 同时出复位后, 空闲约 **39.83µs
+(≈59.4k cycle, 占整段 99.9%)**, 然后只有 tnode_top_0 动了 ~0.4µs: 4 个 hart 各跑几条
+barrier/sync 类操作 + 一笔 4-beat 写 + 一条 load lane 命令;APB/CSR 访问 0 次, HVM→SM 通路
+0 次(见上)。它证明"复位、时钟、hart 唤醒、store 通路能通", **但它不是性能测试** ——
+拿它算 IPC/延迟只能当"通路健康"的基线, 不能当吞吐基线。

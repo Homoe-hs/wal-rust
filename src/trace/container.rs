@@ -217,6 +217,11 @@ impl TraceContainer {
         self.get(id).map(|t| t.signals())
     }
 
+    /// 已加载波形的信号总数(与 `all_signals().len()` 同义但**不物化整表**)。
+    pub fn all_signal_count(&self) -> usize {
+        self.ordered_values().map(|t| t.signal_count()).sum()
+    }
+
     pub fn all_signals(&self) -> Vec<String> {
         let mut signals = Vec::new();
         for trace in self.ordered_values() {

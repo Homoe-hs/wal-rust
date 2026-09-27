@@ -11,6 +11,7 @@ pub mod scope;
 pub mod virtual_sig;
 pub mod wave;
 pub mod special;
+mod metrics;
 
 pub use core::register_core;
 pub use math::register_math;
@@ -23,6 +24,7 @@ pub use scope::register_scope;
 pub use virtual_sig::register_virtual;
 pub use wave::register_wave;
 pub use special::register_special;
+pub use metrics::register_metrics;
 
 use super::eval::Dispatcher;
 
@@ -38,6 +40,7 @@ pub fn register_all(disp: &mut Dispatcher) {
     register_virtual(disp);
     register_wave(disp);
     register_special(disp);
+    register_metrics(disp);
 }
 
 /// 已注册的算子个数(去重) —— 用于 CLI 帮助文案, 保证"帮助里写的数字"不会和实现漂移。

@@ -13,6 +13,7 @@
 | 加一个新波形后端(VCD/FST/FSDB 之外的) | [`query-engine-design.md`](query-engine-design.md) + `src/trace/trace.rs` 的 `Trace` trait |
 | 动 FSDB 后端 / 排查 NPI 问题 | [`fsdb-npi.md`](fsdb-npi.md) |
 | 读不了/写不了 FSDB(版本、许可、环境) | [`fsdb-env.md`](fsdb-env.md) |
+| [`waveform-metrics.md`](waveform-metrics.md) | ✅ 现行 | 指标与统计算子: 延迟/IPC/分位数/直方图的语义与用例 |
 | 改性能路径前先看历史教训 | [`waveform-io-plan.md`](waveform-io-plan.md)、[`152gb-round.md`](152gb-round.md) |
 | 知道每个版本改了什么 | [`../CHANGELOG.md`](../CHANGELOG.md) |
 | 参与开发/发版 | [`../CONTRIBUTING.md`](../CONTRIBUTING.md) |

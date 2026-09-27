@@ -474,6 +474,11 @@ pub fn eval_value(&mut self, value: Value) -> Result<Value, String> {
                         return self.eval_count(&rest);
                     } else if op == Operator::Whenever {
                         return self.eval_whenever(&rest);
+                    } else if op == Operator::Latency || op == Operator::Ipc {
+                        // `(latency (rising "req") (rising "ack"))`: 参数是**条件表达式**,
+                        // 必须先当 AST 拿到手 —— 走通用路径会被先求值成 true/false,
+                        // 条件就没了(与 count/find/whenever 同一处理方式)。
+                        return self.eval_dispatch(op, &rest);
                     } else if op == Operator::CountStep {
                         return self.eval_count_step(&rest);
                     } else if op == Operator::FindStep {
@@ -501,6 +506,20 @@ pub fn eval_value(&mut self, value: Value) -> Result<Value, String> {
                             _ => Ok(closure_val),
                         }
                     } else {
+                        // 快路: `(length (SIGNALS))` / `(length SIGNALS)` —— 只要个数,
+                        // 不要为了数个数把整张名字表物化(真实 core 级波形 1796 万信号,
+                        // `signals()` 一次 ~4.8GB RSS + 数秒)。`(SIGNALS)` 本身语义不变。
+                        if op == Operator::Length {
+                            if let Some(first) = rest.first() {
+                                if Self::is_signals_form(first) {
+                                    if let Some(traces) = self.env.get_traces() {
+                                        let t = traces.read().unwrap_or_else(|e| e.into_inner());
+                                        return Ok(Value::Int(t.all_signal_count() as i64));
+                                    }
+                                    return Ok(Value::Int(0));
+                                }
+                            }
+                        }
                         let mut evaluated_args = Vec::new();
                         for arg in &rest {
                             evaluated_args.push(self.eval_value(arg.clone())?);
@@ -2687,6 +2706,18 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
             Value::Symbol(s) => self.eval_symbol(s),
             Value::List(lst) => self.eval_list(lst),
             _ => Ok(value),
+        }
+    }
+
+    /// `SIGNALS` / `(SIGNALS)` 两种写法都算"整表信号"形式(供 `(length ...)` 快路判定)。
+    fn is_signals_form(v: &Value) -> bool {
+        match v {
+            Value::Symbol(s) => s.name == "SIGNALS",
+            Value::List(lst) => {
+                lst.0.len() == 1
+                    && matches!(&lst.0[0], Value::Symbol(s) if s.name == "SIGNALS")
+            }
+            _ => false,
         }
     }
 

@@ -606,7 +606,7 @@ pub(crate) fn parse_edge_condition(expr: &Value) -> Option<(String, FindConditio
     Some((sig, cond))
 }
 
-fn parse_simple_condition(expr: &Value) -> Option<(String, i64)> {
+pub(crate) fn parse_simple_condition(expr: &Value) -> Option<(String, i64)> {
     let lst = match expr {
         Value::List(lst) if lst.len() == 3 => lst,
         _ => return None,

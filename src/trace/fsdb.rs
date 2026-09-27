@@ -351,6 +351,14 @@ impl Npi {
 
 const TL_MAGIC: &[u8; 8] = b"WALFTL01";
 const TREE_MAGIC: &[u8; 8] = b"WALFNM01";
+/// v2: header 里带上"名字总字节 / scope 数 / scope 总字节"。
+///
+/// 为什么值得改格式: 读缓存时的 arena 容量原来只能靠 `n * 32` 猜, 之后**按翻倍增长**。
+/// 真实 core 级波形(1796 万信号)亲测: 名字字节 2.85GB → 翻倍会涨到 4.6GB 容量,
+/// 且最后一次扩容时旧新两份同时驻留(≈7GB 瞬时) —— 进程峰值 RSS 10.8GB 里有 3~4GB
+/// 是这么来的。v2 让读侧**一次 reserve 到位**(容量 = 实际字节数), 写侧也能**流式**
+/// 写盘(不再先拼一个 3.2GB 的 Vec)。
+const TREE_MAGIC_V2: &[u8; 8] = b"WALFNM02";
 
 /// 名字树缓存的内容: 全名 + 位宽 + scope 列表。
 /// 句柄**不进缓存**(跨进程无效) —— 恢复后第一次用到再按名字问 NPI。
@@ -360,44 +368,118 @@ pub(crate) struct TreeSnapshot {
     pub scopes: Vec<String>,
 }
 
-/// 由 **arena 直接编码**(写缓存路径): 老路子先 `Vec<String>` 再编码, 4M 信号下
-/// 那是又一次几百 MB 的瞬时峰值 —— 而这两个方向(读/写缓存)都该比走 NPI 树省内存。
+/// 往任意 `Write` 写 varint(与 `put_varint` 同格式)。
+fn put_varint_w<W: std::io::Write>(w: &mut W, mut v: u64) -> std::io::Result<()> {
+    loop {
+        let mut b = (v & 0x7f) as u8;
+        v >>= 7;
+        if v != 0 {
+            b |= 0x80;
+        }
+        w.write_all(&[b])?;
+        if v == 0 {
+            return Ok(());
+        }
+    }
+}
+
+/// v2 header 的字节开销: magic(8) + 指纹(8) + **定长** 4×u64(信号数 / 名字总字节 /
+/// scope 数 / scope 总字节)。
+///
+/// 为什么定长: 冷路径是"边走树边把名字写文件", 走完才知道总量 —— 定长 header 让
+/// 收尾时 `seek(0)` 回填即可, 不必把 body 重写一遍(`WALFNM01` 是 varint, 长度不定)。
+const TREE_HEADER_MAX: usize = 48;
+
+/// v2 header 字节
+fn tree_header_v2(n: u64, nbytes: u64, ns: u64, nsbytes: u64, fp: u64) -> [u8; TREE_HEADER_MAX] {
+    let mut h = [0u8; TREE_HEADER_MAX];
+    h[..8].copy_from_slice(TREE_MAGIC_V2);
+    h[8..16].copy_from_slice(&fp.to_le_bytes());
+    h[16..24].copy_from_slice(&n.to_le_bytes());
+    h[24..32].copy_from_slice(&nbytes.to_le_bytes());
+    h[32..40].copy_from_slice(&ns.to_le_bytes());
+    h[40..48].copy_from_slice(&nsbytes.to_le_bytes());
+    h
+}
+
+/// 把 arena 编码成字节(仅测试/离线基准用; 生产路径是**流式**落盘, 不拼整份 Vec)。
+#[cfg(test)]
 pub(crate) fn encode_tree_arena(names: &NameArena, widths: &[usize], scopes: &[String]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(64 + names.len() * 24);
-    out.extend_from_slice(TREE_MAGIC);
-    out.extend_from_slice(&[0u8; 8]); // 指纹占位
-    put_varint(&mut out, names.len() as u64);
-    for i in 0..names.len() as u32 {
-        let n = names.get(i);
-        put_varint(&mut out, n.len() as u64);
-        out.extend_from_slice(n.as_bytes());
-        put_varint(&mut out, widths.get(i as usize).copied().unwrap_or(1) as u64);
-    }
-    put_varint(&mut out, scopes.len() as u64);
-    for sc in scopes {
-        put_varint(&mut out, sc.len() as u64);
-        out.extend_from_slice(sc.as_bytes());
-    }
+    let cap = TREE_HEADER_MAX
+        + names.blob_len()
+        + names.len() * 2
+        + scopes.iter().map(|s| s.len() + 2).sum::<usize>();
+    let mut out = Vec::with_capacity(cap);
+    write_tree_cache_arena(&mut out, names, widths, scopes).expect("Vec 写入不会失败");
     out
 }
 
+/// 流式写名字树缓存: header(含总量) + 逐名字 + scope 列表。
+/// 指纹占位在 `[8..16]`, 调用方回填。
+fn write_tree_cache_arena<W: std::io::Write>(
+    w: &mut W,
+    names: &NameArena,
+    widths: &[usize],
+    scopes: &[String],
+) -> std::io::Result<()> {
+    let nsbytes: u64 = scopes.iter().map(|s| s.len() as u64).sum();
+    w.write_all(&tree_header_v2(
+        names.len() as u64,
+        names.blob_len() as u64,
+        scopes.len() as u64,
+        nsbytes,
+        0, // 指纹占位, 调用方回填
+    ))?;
+    for i in 0..names.len() as u32 {
+        let n = names.get(i);
+        put_varint_w(w, n.len() as u64)?;
+        w.write_all(n.as_bytes())?;
+        put_varint_w(w, widths.get(i as usize).copied().unwrap_or(1) as u64)?;
+    }
+    for sc in scopes {
+        put_varint_w(w, sc.len() as u64)?;
+        w.write_all(sc.as_bytes())?;
+    }
+    Ok(())
+}
+
 pub(crate) fn encode_tree(t: &TreeSnapshot) -> Vec<u8> {
-    let mut out = Vec::with_capacity(64 + t.names.len() * 24);
-    out.extend_from_slice(TREE_MAGIC);
-    out.extend_from_slice(&[0u8; 8]); // 指纹占位
-    put_varint(&mut out, t.names.len() as u64);
-    for (n, w) in t.names.iter().zip(t.widths.iter()) {
-        put_varint(&mut out, n.len() as u64);
-        out.extend_from_slice(n.as_bytes());
-        put_varint(&mut out, *w as u64);
-    }
-    put_varint(&mut out, t.scopes.len() as u64);
-    for sc in &t.scopes {
-        put_varint(&mut out, sc.len() as u64);
-        out.extend_from_slice(sc.as_bytes());
-    }
+    let cap = TREE_HEADER_MAX
+        + t.names.iter().map(|s| s.len() + 2).sum::<usize>()
+        + t.scopes.iter().map(|s| s.len() + 2).sum::<usize>();
+    let mut out = Vec::with_capacity(cap);
+    write_tree_cache_v2_vec(&mut out, &t.names, &t.widths, &t.scopes).expect("Vec 写入不会失败");
     out
 }
+
+/// `encode_tree` 用: 与流式版同一布局, 只是数据源是 `Vec<String>`。
+fn write_tree_cache_v2_vec<W: std::io::Write>(
+    w: &mut W,
+    names: &[String],
+    widths: &[usize],
+    scopes: &[String],
+) -> std::io::Result<()> {
+    let nbytes: u64 = names.iter().map(|s| s.len() as u64).sum();
+    let nsbytes: u64 = scopes.iter().map(|s| s.len() as u64).sum();
+    w.write_all(&tree_header_v2(
+        names.len() as u64,
+        nbytes,
+        scopes.len() as u64,
+        nsbytes,
+        0,
+    ))?;
+    for (n, wd) in names.iter().zip(widths.iter()) {
+        put_varint_w(w, n.len() as u64)?;
+        w.write_all(n.as_bytes())?;
+        put_varint_w(w, *wd as u64)?;
+    }
+    for sc in scopes {
+        put_varint_w(w, sc.len() as u64)?;
+        w.write_all(sc.as_bytes())?;
+    }
+    Ok(())
+}
+
 
 /// 逐字节流式读取(解 `.fnames` 缓存用): 不再把整份缓存读进内存 ——
 /// 4M 信号那份是 **207MB**, 而 "读缓存" 本该比 "走 NPI 树" 省内存。
@@ -446,18 +528,37 @@ pub(crate) fn decode_tree_file(
     path: &Path,
     expect_fp: u64,
 ) -> Option<(NameArena, Vec<usize>, Vec<String>)> {
+    let file_len = std::fs::metadata(path).ok()?.len() as usize;
     let file = std::fs::File::open(path).ok()?;
     let mut r = StreamReader::new(std::io::BufReader::with_capacity(1 << 20, file));
     let mut head = [0u8; 16];
     r.fixed(&mut head)?;
-    if &head[..8] != TREE_MAGIC {
+    let v2 = &head[..8] == TREE_MAGIC_V2;
+    if !v2 && &head[..8] != TREE_MAGIC {
         return None;
     }
     if u64::from_le_bytes(head[8..16].try_into().ok()?) != expect_fp {
         return None;
     }
-    let n = r.varint()? as usize;
-    let mut names = NameArena::with_capacity(n, n * 32);
+    // v2: header 里带定长的 4×u64 → **一次 reserve 到位**, 不再翻倍增长
+    // (真实 1796 万信号波形: 2.85GB 名字字节, 老口径会涨到 4.6GB 容量 + 7GB 瞬时)
+    let (n, nbytes, ns_hdr) = if v2 {
+        let mut body = [0u8; 32];
+        r.fixed(&mut body)?;
+        (
+            u64::from_le_bytes(body[0..8].try_into().ok()?) as usize,
+            u64::from_le_bytes(body[8..16].try_into().ok()?) as usize,
+            Some(u64::from_le_bytes(body[16..24].try_into().ok()?) as usize),
+        )
+    } else {
+        let n = r.varint()? as usize;
+        (n, n * 32, None)
+    };
+    // 损坏保护: 总量不得超过文件大小(名字是文件内容的一部分)
+    if nbytes > file_len {
+        return None;
+    }
+    let mut names = NameArena::with_capacity(n, nbytes);
     let mut widths = Vec::with_capacity(n);
     let mut scratch: Vec<u8> = Vec::with_capacity(256);
     for _ in 0..n {
@@ -470,7 +571,10 @@ pub(crate) fn decode_tree_file(
         names.push(name);
         widths.push(r.varint()? as usize);
     }
-    let ns = r.varint()? as usize;
+    let ns = match ns_hdr {
+        Some(ns) => ns,
+        None => r.varint()? as usize,
+    };
     let mut scopes = Vec::with_capacity(ns);
     for _ in 0..ns {
         let l = r.varint()? as usize;
@@ -491,18 +595,37 @@ pub(crate) fn decode_tree_into(
     buf: &[u8],
     expect_fp: u64,
 ) -> Option<(NameArena, Vec<usize>, Vec<String>)> {
-    if buf.len() < 24 || &buf[..8] != TREE_MAGIC {
+    if buf.len() < 24 {
+        return None;
+    }
+    let v2 = &buf[..8] == TREE_MAGIC_V2;
+    if !v2 && &buf[..8] != TREE_MAGIC {
         return None;
     }
     if u64::from_le_bytes(buf[8..16].try_into().ok()?) != expect_fp {
         return None;
     }
     let mut pos = 16usize;
-    let n = get_varint(buf, &mut pos)? as usize;
-    if n > buf.len() {
+    let (n, nbytes, ns_hdr) = if v2 {
+        if buf.len() < TREE_HEADER_MAX {
+            return None;
+        }
+        (
+            u64::from_le_bytes(buf[16..24].try_into().ok()?) as usize,
+            u64::from_le_bytes(buf[24..32].try_into().ok()?) as usize,
+            Some(u64::from_le_bytes(buf[32..40].try_into().ok()?) as usize),
+        )
+    } else {
+        let n = get_varint(buf, &mut pos)? as usize;
+        (n, n * 32, None)
+    };
+    if n > buf.len() || nbytes > buf.len() {
         return None;
     }
-    let mut names = NameArena::with_capacity(n, n * 32);
+    if v2 {
+        pos = TREE_HEADER_MAX;
+    }
+    let mut names = NameArena::with_capacity(n, nbytes);
     let mut widths = Vec::with_capacity(n);
     for _ in 0..n {
         let l = get_varint(buf, &mut pos)? as usize;
@@ -511,7 +634,10 @@ pub(crate) fn decode_tree_into(
         pos = end;
         widths.push(get_varint(buf, &mut pos)? as usize);
     }
-    let ns = get_varint(buf, &mut pos)? as usize;
+    let ns = match ns_hdr {
+        Some(ns) => ns,
+        None => get_varint(buf, &mut pos)? as usize,
+    };
     if ns > buf.len() {
         return None;
     }
@@ -784,6 +910,46 @@ fn try_load_tree_cache(
     snap
 }
 
+/// 骨架: 流式写临时文件 → 回填指纹(`[8..16]`) → 原子 rename 的调用方负责 rename。
+/// 写失败只提示一次、不影响结果(与其它缓存同样的策略)。
+fn write_tree_cache_file<F>(tmp: &std::path::Path, fp: &u64, body: F) -> bool
+where
+    F: FnOnce(&mut std::io::BufWriter<std::fs::File>) -> std::io::Result<()>,
+{
+    use std::io::{Seek, SeekFrom, Write};
+    let file = match std::fs::File::create(tmp) {
+        Ok(f) => f,
+        Err(e) => {
+            crate::trace::warn_cache_write(tmp, &e);
+            return false;
+        }
+    };
+    let mut w = std::io::BufWriter::with_capacity(1 << 20, file);
+    if let Err(e) = body(&mut w) {
+        crate::trace::warn_cache_write(tmp, &e);
+        let _ = std::fs::remove_file(tmp);
+        return false;
+    }
+    let mut f = match w.into_inner() {
+        Ok(f) => f,
+        Err(e) => {
+            crate::trace::warn_cache_write(tmp, &e.into_error());
+            let _ = std::fs::remove_file(tmp);
+            return false;
+        }
+    };
+    // 指纹写回(header 第 8..16 字节): 位置固定, 不必把整份缓存留在内存里
+    if let Err(e) = f
+        .seek(SeekFrom::Start(8))
+        .and_then(|_| f.write_all(&fp.to_le_bytes()))
+    {
+        crate::trace::warn_cache_write(tmp, &e);
+        let _ = std::fs::remove_file(tmp);
+        return false;
+    }
+    true
+}
+
 /// 写名字树缓存(arena 版; 生产路径)
 fn save_tree_cache_arena(
     cache_root: &std::path::Path,
@@ -803,16 +969,14 @@ fn save_tree_cache_arena(
         }
     }
     let fp = crate::trace::vcd::wave_fingerprint(std::path::Path::new(filename));
-    let mut blob = encode_tree_arena(names, widths, scopes);
-    blob[8..16].copy_from_slice(&fp.to_le_bytes());
     let tmp = tmp_path(&f);
-    match std::fs::write(&tmp, &blob) {
-        Ok(()) => {
-            if let Err(e) = std::fs::rename(&tmp, &f) {
-                crate::trace::warn_cache_write(&f, &e);
-            }
-        }
-        Err(e) => crate::trace::warn_cache_write(&tmp, &e),
+    // **流式**落盘: 真实 core 级波形这份缓存 3.2GB —— 先拼一个 Vec 等于把整份缓存
+    // 再背一遍(而这一遍恰好发生在树遍历刚把 arena 撑大之后, 峰值最难看的时候)。
+    if !write_tree_cache_file(&tmp, &fp, |w| write_tree_cache_arena(w, names, widths, scopes)) {
+        return;
+    }
+    if let Err(e) = std::fs::rename(&tmp, &f) {
+        crate::trace::warn_cache_write(&f, &e);
     }
     if std::env::var("WAL_DEBUG_FSDB").is_ok() {
         eprintln!("[fsdb] 名字树缓存写入 {} 信号 → {}", names.len(), f.display());
@@ -838,21 +1002,12 @@ fn save_tree_cache(
         }
     }
     let fp = crate::trace::vcd::wave_fingerprint(std::path::Path::new(filename));
-    let snap = TreeSnapshot {
-        names: names.to_vec(),
-        widths: widths.to_vec(),
-        scopes: scopes.to_vec(),
-    };
-    let mut blob = encode_tree(&snap);
-    blob[8..16].copy_from_slice(&fp.to_le_bytes());
     let tmp = tmp_path(&f);
-    match std::fs::write(&tmp, &blob) {
-        Ok(()) => {
-            if let Err(e) = std::fs::rename(&tmp, &f) {
-                crate::trace::warn_cache_write(&f, &e);
-            }
-        }
-        Err(e) => crate::trace::warn_cache_write(&tmp, &e),
+    if !write_tree_cache_file(&tmp, &fp, |w| write_tree_cache_v2_vec(w, names, widths, scopes)) {
+        return;
+    }
+    if let Err(e) = std::fs::rename(&tmp, &f) {
+        crate::trace::warn_cache_write(&f, &e);
     }
     if std::env::var("WAL_DEBUG_FSDB").is_ok() {
         eprintln!("[fsdb] 名字树缓存写入 {} 信号 → {}", names.len(), f.display());
@@ -1647,6 +1802,9 @@ impl FsdbTrace {
             let version = Npi::cstr((npi.file_property_str)(FILE_VERSION, file));
             let ts_exp = crate::vcd::convert::parse_timescale(scale.as_bytes());
             let dbg = std::env::var("WAL_DEBUG_FSDB").is_ok();
+            if dbg {
+                eprintln!("[fsdb] RSS: open 后 {} MB", rss_kb() / 1024);
+            }
             let t_walk = std::time::Instant::now();
             let mut sigs: Vec<Sig> = Vec::new();
             let mut names = NameArena::with_capacity(0, 0);
@@ -1654,6 +1812,8 @@ impl FsdbTrace {
             // 名字树缓存: 命中就**完全跳过树遍历**(60k 信号实测 ~800ms)。句柄不进
             // 缓存, 第一次用到某个信号时按名字解析(`npi_fsdb_sig_by_name`)。
             let mut cache_hit = false;
+            // 冷路径是否已经把名字直接流式写进缓存(写了就不必在收尾再落一次盘)
+            let mut streamed_here = false;
             if let Some((arena, widths, sc)) = try_load_tree_cache(&cache_root, &filename) {
                 // 直接解进 arena(不再先造一遍 Vec<String>)
                 names = arena;
@@ -1667,17 +1827,61 @@ impl FsdbTrace {
                 }
                 cache_hit = true;
             } else {
-                let top = (npi.iter_top_scope)(file);
-                if !top.is_null() {
-                    loop {
-                        let s = (npi.iter_scope_next)(top);
-                        if s.is_null() {
-                            break;
+                // 冷路径: 名字有两个落点 ——
+                //   A. 这次会写缓存 → **边遍历边写 `.fnames`**(内存里不攒 arena, 收尾按
+                //      精确容量解码回来; 就是上面 TreeStream 注释里那个 17.8GB → 几 GB);
+                //   B. 缓存只读/关闭 → 直接进 arena。
+                // A 失败(磁盘满/目录不可写)不能影响"能不能读波形" → 回退成 B **重走一遍**。
+                let writable_cache = matches!(
+                    crate::trace::vcd::cache_mode(),
+                    crate::trace::vcd::CacheMode::Auto | crate::trace::vcd::CacheMode::Build
+                );
+                let final_path = if writable_cache {
+                    cache_path(&cache_root, &filename, ".fnames")
+                } else {
+                    None
+                };
+                if let Some(fpath) = final_path {
+                    let fp = crate::trace::vcd::wave_fingerprint(Path::new(&filename));
+                    if let Ok(mut st) = TreeStream::create(tmp_path(&fpath)) {
+                        let mut err: Option<std::io::Error> = None;
+                        {
+                            let mut push = |n: &str, w: usize| {
+                                if err.is_none() {
+                                    if let Err(e) = st.push(n, w) {
+                                        err = Some(e);
+                                    }
+                                }
+                            };
+                            walk_top(npi, file, &mut sigs, &mut scopes, &mut push);
                         }
-                        walk_scope(npi, s, &mut sigs, &mut names, &mut scopes);
+                        if err.is_none() && st.finish(&scopes, fp, &fpath).is_ok() {
+                            if let Some((arena, _w, sc)) = decode_tree_file(&fpath, fp) {
+                                names = arena;
+                                scopes = sc;
+                                streamed_here = true;
+                            }
+                        }
+                        if !streamed_here {
+                            let _ = std::fs::remove_file(&fpath);
+                            sigs.clear();
+                            scopes.clear();
+                            names = NameArena::with_capacity(0, 0);
+                            if dbg {
+                                eprintln!("[fsdb] 名字树流式落盘失败 → 回退内存 arena(重走一遍树)");
+                            }
+                        }
                     }
-                    (npi.iter_scope_stop)(top);
                 }
+                if !streamed_here {
+                    let mut push = |n: &str, _w: usize| {
+                        names.push(n);
+                    };
+                    walk_top(npi, file, &mut sigs, &mut scopes, &mut push);
+                }
+            }
+            if dbg {
+                eprintln!("[fsdb] RSS: 名字就位后 {} MB(信号 {} / scope {})", rss_kb() / 1024, sigs.len(), scopes.len());
             }
             if dbg {
                 eprintln!(
@@ -1694,8 +1898,9 @@ impl FsdbTrace {
                     max_t
                 );
             }
-            if !cache_hit && !sigs.is_empty() {
-                // 刚走完树 → 落盘, 之后的进程直接跳过遍历(直接从 arena 编码, 不再造 Vec<String>)
+            // 流式路径已经在遍历时就写好缓存了; 走 arena 的路径(缓存关闭/只读, 或流式失败)
+            // 才需要在这里补一次落盘。
+            if !cache_hit && !streamed_here && !sigs.is_empty() {
                 let widths: Vec<usize> = sigs.iter().map(|s| s.width).collect();
                 save_tree_cache_arena(&cache_root, &filename, &names, &widths, &scopes);
             }
@@ -1711,6 +1916,9 @@ impl FsdbTrace {
                 if name_index.find_verified(h, |j| names.get(j) == names.get(i)).is_none() {
                     name_index.insert(h, i, |j| fnv1a(names.get(j).as_bytes()));
                 }
+            }
+            if dbg {
+                eprintln!("[fsdb] RSS: 名字索引建完 {} MB", rss_kb() / 1024);
             }
             if dbg {
                 eprintln!(
@@ -2646,11 +2854,95 @@ impl FsdbTrace {
 
 }
 
+/// 进程 RSS(KB)。用于把"这一档波形到底谁在吃内存"分段量出来(只读 /proc, 零成本)。
+fn rss_kb() -> u64 {
+    std::fs::read_to_string("/proc/self/statm")
+        .ok()
+        .and_then(|s| s.split_whitespace().nth(1).and_then(|v| v.parse::<u64>().ok()))
+        .map(|pages| pages * 4)
+        .unwrap_or(0)
+}
+
+/// 冷路径的名字落点: **边遍历树边把名字写进 `.fnames`**, 遍历期间内存里不攒 arena。
+///
+/// 为什么: 真实 core 级波形(1796 万信号 / 名字字节 2.85GB)攒 arena 是按翻倍增长 ——
+/// 容量最后涨到 4.6GB, 且最后一次扩容旧新两份同时驻留;实测冷加载峰值 **17.8GB RSS**。
+/// 流式写法把"内存里的名字"推迟到遍历结束后: 那时从这份文件**按精确容量**解回 arena,
+/// 峰值只要 实际字节数 而不是 2×容量。代价: 多写/读一遍 3.2GB(本地 NVMe 上是秒级)。
+struct TreeStream {
+    w: std::io::BufWriter<std::fs::File>,
+    tmp: PathBuf,
+    n: u64,
+    nbytes: u64,
+}
+
+impl TreeStream {
+    /// 建临时文件并占位 header(定长 48B, 收尾 seek(0) 回填)
+    fn create(tmp: PathBuf) -> std::io::Result<Self> {
+        use std::io::Write as _;
+        let f = std::fs::File::create(&tmp)?;
+        let mut w = std::io::BufWriter::with_capacity(1 << 20, f);
+        w.write_all(&[0u8; TREE_HEADER_MAX])?;
+        Ok(TreeStream { w, tmp, n: 0, nbytes: 0 })
+    }
+
+    /// 追加一个信号(名字 + 位宽)
+    fn push(&mut self, name: &str, width: usize) -> std::io::Result<()> {
+        use std::io::Write as _;
+        put_varint_w(&mut self.w, name.len() as u64)?;
+        self.w.write_all(name.as_bytes())?;
+        put_varint_w(&mut self.w, width as u64)?;
+        self.n += 1;
+        self.nbytes += name.len() as u64;
+        Ok(())
+    }
+
+    /// 收尾: 追 scope 列表 → 回填 header → 落到最终路径
+    fn finish(mut self, scopes: &[String], fp: u64, final_path: &Path) -> std::io::Result<()> {
+        use std::io::{Seek, SeekFrom, Write as _};
+        let mut nsbytes = 0u64;
+        for sc in scopes {
+            put_varint_w(&mut self.w, sc.len() as u64)?;
+            self.w.write_all(sc.as_bytes())?;
+            nsbytes += sc.len() as u64;
+        }
+        let head = tree_header_v2(self.n, self.nbytes, scopes.len() as u64, nsbytes, fp);
+        let mut f = self.w.into_inner().map_err(|e| e.into_error())?;
+        f.seek(SeekFrom::Start(0))?;
+        f.write_all(&head)?;
+        f.flush()?;
+        drop(f);
+        std::fs::rename(&self.tmp, final_path)?;
+        Ok(())
+    }
+}
+
+/// 从最外层作用域走完整棵树; 名字交给 `push`(arena 或流式文件)。
+unsafe fn walk_top(
+    npi: &'static Npi,
+    file: *mut c_void,
+    sigs: &mut Vec<Sig>,
+    scopes: &mut Vec<String>,
+    push: &mut dyn FnMut(&str, usize),
+) {
+    let top = (npi.iter_top_scope)(file);
+    if !top.is_null() {
+        loop {
+            let s = (npi.iter_scope_next)(top);
+            if s.is_null() {
+                break;
+            }
+            walk_scope(npi, s, sigs, push, scopes);
+        }
+        (npi.iter_scope_stop)(top);
+    }
+}
+
 unsafe fn walk_scope(
     npi: &'static Npi,
     scope: *mut c_void,
     sigs: &mut Vec<Sig>,
-    names: &mut NameArena,
+    push_name: &mut dyn FnMut(&str, usize),
     scopes: &mut Vec<String>,
 ) {
     unsafe {
@@ -2674,10 +2966,11 @@ unsafe fn walk_scope(
                 };
                 let mut size: c_int = 0;
                 (npi.sig_property)(SIG_SIZE, s, &mut size);
-                names.push(&sfull);
+                let width = if size > 0 { size as usize } else { 1 };
+                push_name(&sfull, width);
                 sigs.push(Sig {
                     handle: Cell::new(s),
-                    width: if size > 0 { size as usize } else { 1 },
+                    width,
                     real_str: Cell::new(None),
                 });
             }
@@ -2690,7 +2983,7 @@ unsafe fn walk_scope(
                 if child.is_null() {
                     break;
                 }
-                walk_scope(npi, child, sigs, names, scopes);
+                walk_scope(npi, child, sigs, &mut *push_name, scopes);
             }
             (npi.iter_scope_stop)(cit);
         }
@@ -2867,8 +3160,21 @@ impl Trace for FsdbTrace {
     }
 
     fn signals(&self) -> Vec<String> {
-        // 显式请求整表(4M 信号 ≈ 数百 MB): 只有 `(SIGNALS)`/`sigs`/`find-sig` 走这里
+        // 显式请求整表(1796 万信号 ≈ 4.8GB!): 只有 `(SIGNALS)`/`sigs`/`find-sig` 走这里。
+        // 只要个数/要按名字搜的信号请走 `signal_count()`/`signal_at()`(O(1) 与 O(名长))。
         (0..self.names.len()).map(|i| self.name_at(i).to_string()).collect()
+    }
+
+    fn signal_count(&self) -> usize {
+        self.names.len()
+    }
+
+    fn signal_at(&self, idx: usize) -> Option<String> {
+        if idx < self.names.len() {
+            Some(self.name_at(idx).to_string())
+        } else {
+            None
+        }
     }
 
     /// `$dumpvars` 快照(t0 写入的原值; 含 x/z)。FSDB 写者在 t=0 落一条初值条目,
@@ -3183,6 +3489,32 @@ mod col_cache_tests {
         bad[20] = 9; // 未知 init 编码
         assert!(parse_col_header(&bad, 1u64).is_none());
         assert!(decode_points(&buf, buf.len() - 1).is_none());
+    }
+
+    /// v2 名字树缓存: arena → 字节 → arena 往返, 布局(含总量 header)与顺序都不能错。
+    /// 顺序错 = 恢复出来的句柄挂到别的信号上(查询结果整体错位)。
+    #[test]
+    fn tree_cache_v2_round_trip() {
+        let mut a = NameArena::with_capacity(0, 0);
+        for n in ["tb.clk", "tb.u_dut.g_inst[3].u_leaf.data_reg[7:0]", "", "中文 名字"] {
+            a.push(n);
+        }
+        let widths = vec![1usize, 8, 32, 4];
+        let scopes = vec!["tb".to_string(), "tb.u_dut".to_string()];
+        let mut blob = Vec::new();
+        write_tree_cache_arena(&mut blob, &a, &widths, &scopes).expect("写进 Vec");
+        assert_eq!(&blob[..8], TREE_MAGIC_V2, "v2 header 必须带总量字段");
+        // 指纹占位为 0 → 用 0 校验(生产路径由 write_tree_cache_file 回填)
+        let (got, gw, gs) = decode_tree_into(&blob, 0).expect("v2 decode");
+        assert_eq!(got.len(), 4);
+        for i in 0..4u32 {
+            assert_eq!(got.get(i), a.get(i), "第 {} 个名字错位", i);
+        }
+        assert_eq!(gw, widths);
+        assert_eq!(gs, scopes);
+        // 截断 / 指纹不符 → 拒绝(不 panic)
+        assert!(decode_tree_into(&blob[..blob.len() - 1], 0).is_none());
+        assert!(decode_tree_into(&blob, 7).is_none());
     }
 
     /// ★回归★ 时间线"值不值得落盘"不能只看点数: FSDB 冷建代价 ≈ 信号数 × 每信号

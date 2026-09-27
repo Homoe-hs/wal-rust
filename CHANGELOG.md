@@ -12,6 +12,13 @@
 ## [未发布]
 
 ### Added
+- **波形指标与统计算子(延迟/吞吐/分布)**: `median` / `percentile` / `stddev` / `stats` /
+  `histogram`(纯数值列表)与 `latency` / `ipc`(波形侧配对)。
+  `(stats (latency (rising "req") (rising "ack")))` 这种组合就是"握手延迟分布"的完整答案。
+  语义写死在 `docs/waveform-metrics.md`:latency 用**原生时间单位**、默认 **FIFO 配对**
+  (`#restart` 让新 start 作废未配对的旧 start)、配不上的两端丢弃、边沿口径与查询引擎一致
+  (x→1 是 `changes` 不是 `rising`);两个波形算子只在**时间域**取变更列, **不建索引空间** ——
+  千万时间戳的大波形上不会触发"全文件物化时间线"。闸:`tests/metrics_test.rs`(手算期望值)。
 - **FSDB 时间线的并行/集群预计算**: 新增两个正式子命令 ——
   `wal-rust fsdb-timeline-map <file> <shard> <shards> <out.part>`(算一片)与
   `wal-rust fsdb-timeline-merge <file> <part>...`(归并 → 安装 `.ftl`)。
@@ -33,6 +40,19 @@
   `WAL_FSDB_BENCH=<file.fsdb>` 时自动跑(判据: 暖查询应接近"只加载")。
 
 ### Performance
+- **真实 core 级波形(321MB / 1796 万信号 / 162 万 scope): 加载内存砍半、名字表不再物化**。
+  实测(本机原生读, VCS X-2025.06-SP2 写的文件): 冷加载 66.9s/**17.8GB** → 52.9s/**13.6GB**;
+  暖加载 13.5s/**11.0GB** → 10.1s/**6.35GB**;`(length (SIGNALS))` 11.3GB → **6.35GB**。三处改动:
+  ① **`.fnames` 缓存升 v2**: 定长 48B header 带"信号数 / 名字总字节 / scope 数 / scope 总字节",
+     读侧**一次精确 reserve**(老口径按 `n*32` 猜 + 翻倍增长: 2.85GB 名字字节会涨到 4.6GB 容量,
+     最后一次扩容旧新两份同时驻留 ≈7GB);
+  ② **冷路径边遍历边流式写 `.fnames`**: 遍历期间内存里不攒 arena, 走完按精确容量解码回来;
+     顺带把"先拼 3.2GB Vec 再落盘"改成流式(指纹 `seek` 回填)。缓存不可写或流式失败 → 自动
+     回退内存 arena(重走一遍树), 绝不影响"能不能读波形";
+  ③ **`(length (SIGNALS))` 不再物化整表**: 新增 `Trace::signal_count()/signal_at()`(FSDB/VCD
+     都是 O(1)/O(名长)), 求值器给 `(length (SIGNALS))` 加快路, CLI `sigs` 按下标懒遍历 ——
+     1796 万信号上少背一张 ≈4.8GB 的 `Vec<String>`。`(SIGNALS)` 整表语义不变。
+  `WAL_DEBUG_FSDB=1` 现在按 open 后 / 名字就位 / 索引建完三段打印 RSS, 便于定位内存大头。
 - **FSDB 时间线冷建 @ 400 万信号: 112s → 14.2s(单进程) / 69.6s → 12.1s(8 路)**。
   病根不是"把数据过一遍", 而是 `npiFsdbTimeBasedVcIter::start()` 的**每块固定开销
   ~100~140ms**(与块内信号数、文件数据量都无关: 19 信号/200 万时间戳夹具上 18 块比 1 块

@@ -54,3 +54,9 @@ version,date,op,fixture,wall_s,rss_mb,note
 0.14.35,2026-09-27,fsdb-par-jauto,many4m.fsdb,18.39,1532,
 0.14.35,2026-09-27,fsdb-par-j8,many4m.fsdb,19.17,1512,
 0.14.35,2026-09-27,fsdb-par-jauto-hit,many4m.fsdb,4.84,1485,
+0.14.37,2026-09-27,fsdb-cold-load,aicore_smoke_test_000.fsdb,54.16,13295,=> 17956098
+0.14.37,2026-09-27,fsdb-build-load,aicore_smoke_test_000.fsdb,57.94,13601,=> 17956098
+0.14.37,2026-09-27,fsdb-hit-load,aicore_smoke_test_000.fsdb,11.08,6197,=> 17956098
+0.14.37,2026-09-27,fsdb-cold-edge,aicore_smoke_test_000.fsdb,56.63,13267,=> 0
+0.14.37,2026-09-27,fsdb-build-edge,aicore_smoke_test_000.fsdb,10.54,6199,=> 0
+0.14.37,2026-09-27,fsdb-hit-edge,aicore_smoke_test_000.fsdb,10.11,6200,=> 0

@@ -422,17 +422,27 @@ fn cmd_count(wave: &Path, sig: &str, value: i64) -> Result<(), String> {
 fn cmd_sigs(wave: &Path, pattern: &str, limit: usize) -> Result<(), String> {
     let tc = load_one_wave(wave)?;
     let tr = tc.get(&"t".to_string()).ok_or("no trace loaded")?;
-    let all = tr.signals();
-    let matched: Vec<&String> = all.iter()
-        .filter(|s| wal::builtins::wave::sig_name_matches(pattern, s))
-        .collect();
-    println!("{} signal(s) matching '{}':", matched.len(), pattern);
-    let shown = if limit == 0 { matched.len() } else { limit.min(matched.len()) };
-    for m in matched.iter().take(shown) {
+    // 按**下标懒遍历**: 真实 core 级波形 1796 万信号, `tr.signals()` 会物化整张表
+    // (实测 ~4.8GB RSS), 而这里通常只印前 N 个。`signal_at` 由后端给 O(名字长度)
+    // 的实现(FSDB/VCD 都是 arena)。
+    let n = tr.signal_count();
+    let mut matched = 0usize;
+    let mut show: Vec<String> = Vec::new();
+    for i in 0..n {
+        let Some(name) = tr.signal_at(i) else { continue };
+        if wal::builtins::wave::sig_name_matches(pattern, &name) {
+            matched += 1;
+            if limit == 0 || show.len() < limit {
+                show.push(name);
+            }
+        }
+    }
+    println!("{} signal(s) matching '{}':", matched, pattern);
+    for m in &show {
         println!("{}", m);
     }
-    if shown < matched.len() {
-        println!("... ({} more, use a larger limit)", matched.len() - shown);
+    if show.len() < matched {
+        println!("... ({} more, use a larger limit)", matched - show.len());
     }
     Ok(())
 }
