@@ -1346,6 +1346,7 @@ pub fn scope_stats_dump(path: &str, max_depth: usize) -> Result<String, String> 
             nodes: vec![0usize; max_depth + 1],
             sigs: vec![0usize; max_depth + 1],
             max_node: vec![0usize; max_depth + 1],
+            sizes: vec![Vec::new(); max_depth + 1],
         };
         let top = (npi.iter_top_scope)(file);
         if !top.is_null() {
@@ -1386,6 +1387,8 @@ struct ScopeStats {
     nodes: Vec<usize>,
     sigs: Vec<usize>,
     max_node: Vec<usize>,
+    /// 每层的**每棵子树**信号数(按 DFS 顺序) —— 自动选层要拿它模拟 `子树号 % N` 的分配
+    sizes: Vec<Vec<u32>>,
 }
 
 impl ScopeStats {
@@ -1418,6 +1421,7 @@ impl ScopeStats {
                     if sub > self.max_node[depth + 1] {
                         self.max_node[depth + 1] = sub;
                     }
+                    self.sizes[depth + 1].push(sub as u32);
                 }
             }
             (self.npi.iter_scope_stop)(cit);
@@ -1429,67 +1433,133 @@ impl ScopeStats {
 /// 自动选层的最深层(与 `WAL_FSDB_SCOPE_STATS` 的常用深度一致); 统计表存 depth 0..=8。
 const SCOPE_MAX_DEPTH: usize = 8;
 
-/// 自动选"按哪层 scope 切" —— 取**节点数 ≥ 分片数**的最浅一层(太浅切不动)。
+/// `.fscope` 缓存的魔数+版本(格式变了就自动视为未命中, 不读半截数据)。
+const SCOPE_CACHE_MAGIC: &[u8; 8] = b"WSCP2\0\0\0";
+
+/// "这个波形每层有多少棵子树、每棵多大" —— 自动选层的依据。
+#[derive(Default, Clone)]
+struct ScopeCounts {
+    /// 下标 = 层深, 值 = 该层子树个数
+    nodes: Vec<u32>,
+    /// 下标 = 层深, 值 = 该层每棵子树的信号数(DFS 顺序, 与 worker 的 `子树号 % N` 编号一致)
+    sizes: Vec<Vec<u32>>,
+}
+
+impl ScopeCounts {
+    /// 统计失败(没 NPI/打不开)时的空表: 选层会退回"最深一层"。
+    fn empty() -> Self {
+        ScopeCounts {
+            nodes: vec![0; SCOPE_MAX_DEPTH + 1],
+            sizes: vec![Vec::new(); SCOPE_MAX_DEPTH + 1],
+        }
+    }
+}
+
+/// 自动选"按哪层 scope 切"。
 ///
-/// 代价是一次只数数的树遍历(这份 1796 万信号波形 ~44s), 换来的是"不用人工先标定";
-/// 对 8 片而言 depth3 只有 7 棵 → 自动落到 depth4(334 棵)。
+/// 判据不是"够切就行", 而是**用各层子树大小模拟 worker 的分配**(`子树号 % N`)算出
+/// 最慢那个 worker 要扫多少信号, 取最小的那层 —— 因为墙钟由最慢的 worker 决定。
+/// 实测这份 core 级设计: depth4/8 片快慢两半是 190s / 530s(墙钟 570s),
+/// depth5 更细 → 494s;只看"子树数 ≥ 8"会停在 depth4。
 ///
-/// ⚠️ **多 worker 同时启动时必须只让一个人走这一遍**: 这次树遍历的 NPI 驻留内存约 10GB,
-/// 8 路并发 = 80GB, 27GB 机器上实测 NPI 直接 SIGSEGV(`[fhdb][fatal] Can not get user data`
-/// 刷屏 + `catch signal 11`)。所以统计走 **flock 串行化 + 双检缓存**:
-/// 第一个 worker 拿到 `<cache>/<file_identity>-v1.fscope.lock` 走一遍并把结果写进
-/// `.fscope`(8+1 个 u64, 原子 rename), 其余 worker 在锁上等 ~44s 后直接命中缓存。
+/// 选层要**先数一遍树**(只数 scope 与每棵子树的信号数, 不碰变更列; 这份 1796 万信号波形
+/// 约 44s, NPI 驻留约 10GB)。⚠️ **绝不能让 N 个 worker 同时走这一遍**: 8 路并发 = 80GB,
+/// 27GB 机器上实测 NPI 直接 SIGSEGV(`[fhdb][fatal] Can not get user data` 刷屏 +
+/// `catch signal 11`)。所以统计走 **flock 串行化 + 双检缓存**: 第一个 worker 拿到
+/// `<cache>/<file_identity>-v1.fscope.lock` 走一遍并落盘 `.fscope`(原子 rename),
+/// 其余 worker 在锁上等 ~44s 后直接命中; 第二次运行 0 代价。
 /// 缓存/锁都拿不到时**不猜也不走树**, 直接返回最深一层(子树最小 → 每 worker 最省内存)。
 pub fn auto_split_depth(path: &str, shards: usize) -> usize {
-    let nodes = match load_scope_counts(path) {
-        Some(n) => n,
+    let counts = match load_scope_counts(path) {
+        Some(c) => c,
         None => compute_scope_counts(path),
     };
-    let d = pick_split_depth(&nodes, shards);
+    let d = pick_split_depth(&counts, shards);
     if std::env::var("WAL_DEBUG_FSDB").is_ok() {
         eprintln!(
-            "[fsdb] 自动选切分层: depth={} (分片 {}, 各层子树数 {:?})",
+            "[fsdb] 自动选切分层: depth={} (分片 {}, 各层子树数 {:?}; 参考——各层按信号数模拟的最慢 worker {:?})",
             d,
             shards,
-            &nodes[1..]
+            &counts.nodes[1..],
+            (2..=SCOPE_MAX_DEPTH)
+                .map(|x| simulate_makespan(counts.sizes.get(x).map(|v| v.as_slice()).unwrap_or(&[]), shards))
+                .collect::<Vec<_>>()
         );
     }
     d
 }
 
-/// 选层规则: 取"子树数 ≥ 分片数"的最浅一层。都切不动/统计失败 → **最深一层**
-/// (切得越深每片子树越小; 而"不切"等于让每个 worker 各走整棵树, 是内存上最危险的选择)。
-fn pick_split_depth(nodes: &[usize], shards: usize) -> usize {
+/// 每 worker 认领多少棵子树最划算(真波形实测的甜点, 见 `pick_split_depth` 的注释)。
+fn scope_target_per_worker() -> usize {
+    std::env::var("WAL_FSDB_SCOPE_TARGET_PER_WORKER")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(256)
+}
+
+/// 选层: 在"子树数 ≥ 分片数"的层里, 取**每 worker 认领的子树数最接近甜点**
+/// (`WAL_FSDB_SCOPE_TARGET_PER_WORKER`, 默认 256)的那层;并列取更浅的。
+/// 没有能切的层 → **最深一层**(切得越深每片子树越小; 而"不切"等于让每个 worker
+/// 各走整棵树, 是内存上最危险的选择)。
+///
+/// 为什么不按"信号数最均衡"选(试过, 真波形实测, 同一台机器同一天):
+/// * depth4/8 片: 42 棵/worker → **668s**
+/// * depth5/8 片: 265 棵/worker → **538s** ← 实测最快
+/// * depth8/8 片: 4595 棵/worker → **760s**
+/// depth8 的**信号数**其实是三档里最均衡的(每片恰好 ≈ 总信号的 12.3%, 数学上就是
+/// "完美平衡"), 但每 worker 要认领 4595 棵树 —— 因为决定耗时的是**变更密度**
+/// (时钟类信号每条 13 万次变化, 逻辑信号常常几次), 均匀切信号数并不等于均匀切工作量;
+/// 而且更深切的层还有"每个 worker 都要重复处理的浅层信号"与逐子树遍历开销。
+/// 所以: 层要够深(把变更密集的区域拆开), 但别碎过头 —— 这条规则的依据就是上面三个点。
+fn pick_split_depth(c: &ScopeCounts, shards: usize) -> usize {
     if shards <= 1 {
         return 0;
     }
+    let target = scope_target_per_worker();
+    let mut best: Option<(usize, usize)> = None; // (偏差, depth)
     for d in 2..=SCOPE_MAX_DEPTH {
-        if nodes.get(d).copied().unwrap_or(0) >= shards {
-            return d;
+        let Some(sizes) = c.sizes.get(d) else { continue };
+        if sizes.len() < shards {
+            continue;
+        }
+        let per = sizes.len() / shards;
+        let diff = per.abs_diff(target);
+        if best.map_or(true, |(b, _)| diff < b) {
+            best = Some((diff, d));
         }
     }
-    SCOPE_MAX_DEPTH
+    best.map(|(_, d)| d).unwrap_or(SCOPE_MAX_DEPTH)
+}
+
+/// 模拟 worker 的 `子树号 % N` 分配, 返回**最慢 worker** 的信号数(单位: 信号, 非秒)。
+fn simulate_makespan(sizes: &[u32], shards: usize) -> u64 {
+    let mut load = vec![0u64; shards.max(1)];
+    for (i, s) in sizes.iter().enumerate() {
+        load[i % shards] += *s as u64;
+    }
+    load.into_iter().max().unwrap_or(0)
 }
 
 /// 统计一次并落盘; **全程持 flock**, 保证同一波形的 N 个 worker 只走一遍树。
 /// 拿不到锁/缓存目录不可写 → 返回空表(调用方按最深一层处理), 绝不并发走树。
-fn compute_scope_counts(path: &str) -> Vec<usize> {
+fn compute_scope_counts(path: &str) -> ScopeCounts {
     let Some(lock) = scope_lock(path) else {
         eprintln!(
             "[fsdb] 提示: 缓存目录不可写, 无法安全统计 scope 分层 → 保守按最深一层(depth={})分片",
             SCOPE_MAX_DEPTH
         );
-        return Vec::new();
+        return ScopeCounts::empty();
     };
     // 双检: 抢锁期间别人可能已经算完并落盘
-    if let Some(n) = load_scope_counts(path) {
-        return n;
+    if let Some(c) = load_scope_counts(path) {
+        return c;
     }
-    let n = scope_node_counts(path, SCOPE_MAX_DEPTH);
-    // 即使统计失败(全 0)也落盘: 否则后面 N 个 worker 会各自重走一遍 44s 的树(而且串行)
-    store_scope_counts(path, &n);
+    let c = walk_scope_counts(path, SCOPE_MAX_DEPTH);
+    // 即使统计失败(空表)也落盘: 否则后面 N 个 worker 会各自重走一遍 44s 的树(而且串行)
+    store_scope_counts(path, &c);
     drop(lock);
-    n
+    c
 }
 
 /// 波形的 scope 统计锁(flock, 进程退出自动释放)。拿不到返回 None。
@@ -1523,31 +1593,32 @@ impl Drop for ScopeLock {
     }
 }
 
-/// 数一遍每层有多少个 scope 子树(不碰变更列)。失败返回空 vec。
-fn scope_node_counts(path: &str, max_depth: usize) -> Vec<usize> {
+/// 数一遍每层的子树个数与每棵子树大小(不碰变更列)。失败返回空表。
+fn walk_scope_counts(path: &str, max_depth: usize) -> ScopeCounts {
     let npi = match npi() {
         Ok(n) => n,
-        Err(_) => return Vec::new(),
+        Err(_) => return ScopeCounts::empty(),
     };
     let abs = match std::fs::canonicalize(path) {
         Ok(p) => p,
-        Err(_) => return Vec::new(),
+        Err(_) => return ScopeCounts::empty(),
     };
     let cpath = match CString::new(abs.to_string_lossy().as_bytes()) {
         Ok(c) => c,
-        Err(_) => return Vec::new(),
+        Err(_) => return ScopeCounts::empty(),
     };
     let _box = NpiSandbox::enter(false);
     unsafe {
         let file = (npi.open)(cpath.as_ptr());
         if file.is_null() {
-            return Vec::new();
+            return ScopeCounts::empty();
         }
         let mut st = ScopeStats {
             npi,
             nodes: vec![0usize; max_depth + 1],
             sigs: vec![0usize; max_depth + 1],
             max_node: vec![0usize; max_depth + 1],
+            sizes: vec![Vec::new(); max_depth + 1],
         };
         let top = (npi.iter_top_scope)(file);
         if !top.is_null() {
@@ -1559,48 +1630,87 @@ fn scope_node_counts(path: &str, max_depth: usize) -> Vec<usize> {
                 let n = st.scope(sc, 1, max_depth);
                 st.nodes[1] += 1;
                 st.sigs[1] += n;
+                st.sizes[1].push(n as u32);
             }
             (npi.iter_scope_stop)(top);
         }
         (npi.close)(file);
-        st.nodes
+        ScopeCounts {
+            nodes: st.nodes.iter().map(|x| *x as u32).collect(),
+            sizes: st.sizes,
+        }
     }
 }
 
-fn load_scope_counts(path: &str) -> Option<Vec<usize>> {
+fn load_scope_counts(path: &str) -> Option<ScopeCounts> {
     load_scope_counts_in(&abs_cache_root(), path)
 }
 
-fn load_scope_counts_in(root: &std::path::Path, path: &str) -> Option<Vec<usize>> {
+fn load_scope_counts_in(root: &std::path::Path, path: &str) -> Option<ScopeCounts> {
     let p = cache_path(root, path, ".fscope")?;
     let b = std::fs::read(p).ok()?;
-    if b.len() != (SCOPE_MAX_DEPTH + 1) * 8 {
-        return None;
+    decode_scope_counts(&b)
+}
+
+fn decode_scope_counts(b: &[u8]) -> Option<ScopeCounts> {
+    if b.len() < 8 || &b[..8] != SCOPE_CACHE_MAGIC {
+        return None; // 旧格式/半截文件: 一律当未命中
     }
-    let mut out = Vec::with_capacity(SCOPE_MAX_DEPTH + 1);
-    for i in 0..=SCOPE_MAX_DEPTH {
-        let w: [u8; 8] = b[i * 8..i * 8 + 8].try_into().ok()?;
-        out.push(u64::from_le_bytes(w) as usize);
+    let n = SCOPE_MAX_DEPTH + 1;
+    let mut pos = 8;
+    let mut nodes = Vec::with_capacity(n);
+    for _ in 0..n {
+        let w: [u8; 4] = b.get(pos..pos + 4)?.try_into().ok()?;
+        nodes.push(u32::from_le_bytes(w));
+        pos += 4;
     }
-    Some(out)
+    let mut sizes = Vec::with_capacity(n);
+    for _ in 0..n {
+        let w: [u8; 4] = b.get(pos..pos + 4)?.try_into().ok()?;
+        let len = u32::from_le_bytes(w) as usize;
+        pos += 4;
+        let mut v = Vec::with_capacity(len);
+        for _ in 0..len {
+            let x: [u8; 4] = b.get(pos..pos + 4)?.try_into().ok()?;
+            v.push(u32::from_le_bytes(x));
+            pos += 4;
+        }
+        sizes.push(v);
+    }
+    Some(ScopeCounts { nodes, sizes })
+}
+
+fn encode_scope_counts(c: &ScopeCounts) -> Vec<u8> {
+    let n = SCOPE_MAX_DEPTH + 1;
+    let mut b = Vec::with_capacity(8 + n * 8 + 229 * 1024);
+    b.extend_from_slice(SCOPE_CACHE_MAGIC);
+    for i in 0..n {
+        b.extend_from_slice(&c.nodes.get(i).copied().unwrap_or(0).to_le_bytes());
+    }
+    for i in 0..n {
+        let empty: &[u32] = &[];
+        let v = c.sizes.get(i).map(|x| x.as_slice()).unwrap_or(empty);
+        b.extend_from_slice(&(v.len() as u32).to_le_bytes());
+        for x in v {
+            b.extend_from_slice(&x.to_le_bytes());
+        }
+    }
+    b
 }
 
 /// 落盘失败只当没缓存(与其它缓存一致: 绝不影响结果)。
-fn store_scope_counts(path: &str, counts: &[usize]) {
+fn store_scope_counts(path: &str, counts: &ScopeCounts) {
     store_scope_counts_in(&abs_cache_root(), path, counts)
 }
 
-fn store_scope_counts_in(root: &std::path::Path, path: &str, counts: &[usize]) {
+fn store_scope_counts_in(root: &std::path::Path, path: &str, counts: &ScopeCounts) {
     let Some(p) = cache_path(root, path, ".fscope") else {
         return;
     };
-    let mut buf = Vec::with_capacity((SCOPE_MAX_DEPTH + 1) * 8);
-    for i in 0..=SCOPE_MAX_DEPTH {
-        buf.extend_from_slice(&(counts.get(i).copied().unwrap_or(0) as u64).to_le_bytes());
-    }
     if std::fs::create_dir_all(root).is_err() {
         return;
     }
+    let buf = encode_scope_counts(counts);
     let tmp = p.with_extension("fscope.tmp");
     if std::fs::write(&tmp, &buf).is_ok() {
         let _ = std::fs::rename(&tmp, &p);
@@ -4170,7 +4280,18 @@ impl Trace for FsdbTrace {
 mod scope_cache_tests {
     use super::*;
 
-    /// 自动选层的依据(每层子树节点数)必须能原样落盘/读回 —— 它是"8 路并行只走一遍树"的前提。
+    /// 造一份"每层子树大小"的表: sizes[d] = 该层每棵子树的信号数
+    fn counts_of(per_depth: &[&[u32]]) -> ScopeCounts {
+        let mut c = ScopeCounts::empty();
+        for (d, szs) in per_depth.iter().enumerate() {
+            c.nodes[d] = szs.len() as u32;
+            c.sizes[d] = szs.to_vec();
+        }
+        c
+    }
+
+    /// 自动选层的依据(每层子树个数 + **每棵子树大小**)必须原样落盘/读回 ——
+    /// 它是"8 路并行只走一遍树"的前提, 也是选层模拟 `子树号 % N` 的唯一输入。
     #[test]
     fn scope_count_cache_round_trips_and_keys_on_identity() {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/tmp-scope-cache");
@@ -4183,26 +4304,57 @@ mod scope_cache_tests {
         // 未缓存 → None
         assert!(load_scope_counts_in(&dir, &w).is_none(), "空目录不该命中");
 
-        // 真实 core 级设计的实测口径: depth1/2 只有 1 个子树, depth3=7, depth4=334, depth5=2121
-        let counts = vec![0usize, 1, 1, 7, 334, 2121, 0, 0, 0]; // depth 0..=8
-        store_scope_counts_in(&dir, &w, &counts);
-        assert_eq!(load_scope_counts_in(&dir, &w).unwrap(), counts, "往返必须一致");
-
-        // 选层规则: 取"子树数 ≥ 分片数"的最浅一层(从 depth2 起; depth1 常常切不动)
-        assert_eq!(pick_split_depth(&counts, 7), 3, "7 片: depth3 刚好 7 棵");
-        assert_eq!(pick_split_depth(&counts, 8), 4, "8 片: depth3 不够 → depth4(334 棵)");
-        assert_eq!(pick_split_depth(&counts, 334), 4);
-        assert_eq!(pick_split_depth(&counts, 400), 5);
-        assert_eq!(pick_split_depth(&counts, 1), 0, "单进程不切");
-        // 统计失败(全 0)或怎么切都不够 → **最深一层**: 子树最小, 比"每 worker 走整棵树"安全
-        let zeros = [0usize; 9];
-        assert_eq!(pick_split_depth(&zeros, 8), SCOPE_MAX_DEPTH);
-        assert_eq!(pick_split_depth(&counts, 99_999), SCOPE_MAX_DEPTH);
+        // 真实 core 级设计的实测口径(depth1/2 只有 1 个子树, depth3=7 棵 …)
+        let c = counts_of(&[
+            &[],
+            &[1],
+            &[1],
+            &[7, 1, 1, 1, 1, 1, 1],
+            &[1; 334],
+            &[1; 2121],
+            &[1; 4761],
+            &[1; 13106],
+            &[1; 36760],
+        ]);
+        store_scope_counts_in(&dir, &w, &c);
+        let back = load_scope_counts_in(&dir, &w).expect("应命中");
+        assert_eq!(back.nodes, c.nodes, "每层子树数往返必须一致");
+        assert_eq!(back.sizes, c.sizes, "每棵子树大小往返必须一致");
 
         // 文件变了(size/ctime 变) → 旧统计必须失效
         std::fs::write(&wave, b"not-really-an-fsdb CHANGED").unwrap();
         assert!(load_scope_counts_in(&dir, &w).is_none(), "文件身份变了必须视为未命中");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 选层 = "子树数 ≥ 分片数"里, 每 worker 认领的子树数最接近甜点(默认 256)的那层。
+    #[test]
+    fn split_depth_picks_sweet_spot_layer() {
+        // 真实口径(实测 depth4=42 棵/worker→668s, depth5=265→538s, depth8=4595→760s) → 选 depth5
+        let mut per: Vec<Vec<u32>> = vec![vec![], vec![1], vec![1], vec![1; 7]];
+        per.push(vec![1; 334]);
+        per.push(vec![1; 2121]);
+        per.push(vec![1; 4761]);
+        per.push(vec![1; 13106]);
+        per.push(vec![1; 36760]);
+        let refs: Vec<&[u32]> = per.iter().map(|v| v.as_slice()).collect();
+        let c = counts_of(&refs);
+        assert_eq!(pick_split_depth(&c, 8), 5, "265 棵/worker 最接近甜点 256");
+
+        // 够切的最浅层已经很接近甜点 → 就用它(别无谓地切更深)
+        let c = counts_of(&[&[], &[1], &[1], &[1; 7], &[1; 2300], &[1; 9999]]);
+        assert_eq!(pick_split_depth(&c, 8), 4, "2300/8=287 与 9999/8=1250 里选更近的 depth4");
+
+        // depth3 只有 7 棵(8 片切不动) → 从 depth4 起挑
+        let c = counts_of(&[&[], &[1], &[1], &[1; 7], &[1; 334]]);
+        assert_eq!(pick_split_depth(&c, 8), 4);
+
+        // 单进程不切; 统计失败/怎么切都不够 → 最深一层(比"每 worker 走整棵树"安全)
+        assert_eq!(pick_split_depth(&c, 1), 0);
+        let empty = ScopeCounts::empty();
+        assert_eq!(pick_split_depth(&empty, 8), SCOPE_MAX_DEPTH);
+        let shallow = counts_of(&[&[], &[1], &[1], &[1; 3]]);
+        assert_eq!(pick_split_depth(&shallow, 64), SCOPE_MAX_DEPTH);
     }
 }
 

@@ -285,21 +285,27 @@ NPI 变更流**(`npiFsdbTimeBasedVcIter`), 每次进程启动都要为这次查�
 没有 LSF 时 `--local` 等价于 ①;`--dry-run` 只打印将要提交的 bsub 命令。
 
 **大文件(≥ `WAL_FSDB_WALK_SCAN_MB`, 默认 128MB)上 worker 会自动走内存安全的那条路**:
-自动启用"边走边扫"(`WAL_FSDB_WALK_SCAN=1`)且分片数 > 1 时自动选切分层
-(`WAL_FSDB_SCOPE_SPLIT` 留空/`auto` ⇒ 取"子树节点数 ≥ 分片数"的最浅一层)。
-所以直接 `make fsdb-prewarm FSDB=core.fsdb SHARDS=8 LOCAL=1` 即可 —— 不需要自己
-`export WAL_FSDB_WALK_SCAN=1 WAL_FSDB_SCOPE_SPLIT=4`(忘了设会让 8 个 worker 各走整棵树,
+自动启用"边走边扫"(`WAL_FSDB_WALK_SCAN=1`), 且分片数 > 1 时自动选切分层
+(`WAL_FSDB_SCOPE_SPLIT` 留空/`auto`): 在"子树数 ≥ 分片数"的层里取**每 worker 认领的子树数
+最接近 256**(`WAL_FSDB_SCOPE_TARGET_PER_WORKER`)的那层。所以直接
+`make fsdb-prewarm FSDB=core.fsdb SHARDS=8 LOCAL=1` 即可 —— 不需要自己
+`export WAL_FSDB_WALK_SCAN=1 WAL_FSDB_SCOPE_SPLIT=5`(忘了设会让 8 个 worker 各走整棵树,
 27GB 机器上直接爆内存)。
 
-选层要**先数一遍树**(只数 scope 子树, 不碰变更列; 这份 321MB / 1796 万信号波形约 44s,
-NPI 驻留约 10GB)。这一遍**绝不能让 N 个 worker 同时做** —— 首版就是这么写的, 实测 8 路并发
-直接把 NPI 打崩(`[fhdb][fatal] Can not get user data` 刷屏 + `catch signal 11`)。现在:
-第一个 worker 拿 `<cache>/<file_identity>-v1.fscope.lock` 的 **flock**、走一遍、把每层子树数
-写进 `.fscope`(9 个 u64, 原子 rename);其余 worker 在锁上等 ~44s 后命中缓存, 第二次运行 0 代价。
+这份 core 级设计各层子树数 = `[1,1,7,334,2121,4761,13106,36760]`(8 片时自动选 **depth5**),
+端到端实测(同机同天): depth4 **668s** / depth5 **636s** / depth8 **760s**。
+注意 depth8 的**信号数**是最均衡的(每片恰好 ≈12.3%), 但最慢 —— 决定耗时的是**变更密度**
+(时钟类信号每条 13 万次变化), 均匀切信号数不等于均匀切工作量; 所以选层看"每 worker 认领几棵树",
+不看信号数。三条口径的 `.ftl` 逐字节相同(`md5 ca1cb095…`, 320,204 个时间点)。
+
+选层要**先数一遍树**(只数 scope 与每棵子树大小, 不碰变更列; 这份波形约 44s, NPI 驻留约 10GB)。
+这一遍**绝不能让 N 个 worker 同时做** —— 首版就是这么写的, 实测 8 路并发直接把 NPI 打崩
+(`[fhdb][fatal] Can not get user data` 刷屏 + `catch signal 11`)。现在: 第一个 worker 拿
+`<cache>/<file_identity>-v1.fscope.lock` 的 **flock**、走一遍、把每层子树数与每棵子树大小写进
+`.fscope`(魔术字 `WSCP2`, 原子 rename);其余 worker 在锁上等 ~44s 后命中缓存, 第二次运行 0 代价。
 缓存目录不可写时**不猜也不走树**, 直接按最深一层分片(子树最小 = 每 worker 最省内存;
-"不切分"才是每个 worker 走整棵树的那个危险选择)。`WAL_DEBUG_FSDB=1` 会打印选中的层与各层子树数
-(这份设计是 `[1,1,7,334,2121,4761,13106,36760]`)。想回到旧口径:
-`WAL_FSDB_WALK_SCAN=0`、`WAL_FSDB_SCOPE_SPLIT=0`(或 `off`);显式数字照办;
+"不切分"才是每个 worker 走整棵树的那个危险选择)。`WAL_DEBUG_FSDB=1` 会打印选中的层与各层子树数。
+想回到旧口径: `WAL_FSDB_WALK_SCAN=0`、`WAL_FSDB_SCOPE_SPLIT=0`(或 `off`);显式数字照办;
 小文件行为不变。手工标定(§6.4 的 `WAL_FSDB_SCOPE_STATS`)只在想固定层做 A/B 时才需要。
 
 **③ 手动两步**(批处理系统自己调度的场合):

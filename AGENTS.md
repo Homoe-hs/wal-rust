@@ -154,12 +154,18 @@ Flags: `-l <waveform>`(可重复), `--halt-on-error`(遇错即停)。
   自己那几棵子树, NPI 遍历期内存随子树下降(实测每 worker **2.8~3.9GB** vs 单 walker ~12GB)。
   选层前先用 `WAL_FSDB_SCOPE_STATS=<depth>` 标定(一次树遍历, 这份设计 depth1/2 只有 1 棵子树、
   depth3=7 棵、depth4=334 棵)。**但在 worker 里这件事现在是自动的**: 文件 ≥ `WAL_FSDB_WALK_SCAN_MB`
-  (默认 128MB)且分片数 > 1 时, `WAL_FSDB_SCOPE_SPLIT` 留空/`auto` 会**先数一遍树**(`auto_split_depth`,
-  复用 `ScopeStats`)取"节点数 ≥ 分片数"的最浅一层(这份设计各层 `[1,1,7,334,2121,4761,13106,36760]`,
-  8 片 → depth4), `0`/`off` 关, 数字照办。⚠️ **这一遍树遍历本身约 10GB NPI 驻留, 绝不能让 N 个 worker
-  同时做**: 首版实测 8 worker 并发统计 → 27GB 机器直接 `SIGSEGV`(`[fhdb][fatal] Can not get user data`),
-  现在用 **flock + 双检** 串行化(`<cache>/<file_identity>-v1.fscope`, 9 个 u64; 锁是
+  (默认 128MB)且分片数 > 1 时, `WAL_FSDB_SCOPE_SPLIT` 留空/`auto` 会**先数一遍树**(`walk_scope_counts`,
+  复用 `ScopeStats`, 顺带记下每棵子树的大小), 在"子树数 ≥ 分片数"的层里取**每 worker 认领子树数
+  最接近 256**(`WAL_FSDB_SCOPE_TARGET_PER_WORKER`)的那层; `0`/`off` 关, 数字照办。
+  ⚠️ **别按"信号数最均衡"选层**(试过): 真实波形上 depth4(42 棵/worker)=668s、
+  depth5(265)=**636s**、depth8(4595)=760s, 而 depth8 的**信号数**恰恰是三档里最均匀的
+  (每片精确 ≈12.3%) —— 决定耗时的是**变更密度**(时钟类信号 13 万次变化 vs 逻辑信号几次),
+  切得越深只会让每 worker 认领更多棵树、还都要重复处理浅层信号。所以判据是"目标棵数"。
+  ⚠️ **这一遍树遍历本身约 10GB NPI 驻留, 绝不能让 N 个 worker 同时做**: 首版实测 8 worker
+  并发统计 → 27GB 机器直接 `SIGSEGV`(`[fhdb][fatal] Can not get user data`), 现在用
+  **flock + 双检** 串行化(`<cache>/<file_identity>-v1.fscope`, 魔术字 `WSCP2`, 锁是
   `.fscope.lock`), 第一个 worker 走、其余等锁命中, 缓存目录不可写时按最深一层保守分片(不走树)。
+  ⚠️ 换口径不会动产物: depth4/depth5/depth8 三条口径的 `.ftl` 逐字节相同(320,204 点)。
   手工标定只在想固定层/做 A/B 时才需要。⚠️ **两套分片口径互斥**: 用了 scope 分片就不能再按信号下标
   轮转过滤, 否则每个 worker 会丢掉自己子树里 (N-1)/N 的信号 —— 表现很隐蔽(并集只少几十个
   时间点, 因为并集接近饱和), 只有"不同分片口径必须产出同一并集"的对拍才能抓到(已修 +
