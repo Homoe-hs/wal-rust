@@ -126,7 +126,14 @@ runpar j1 1 build "$Q" "$WORK/j1" || FAILED=1
 runpar jauto auto build "$Q" "$WORK/jauto" || FAILED=1
 runpar j8 8 build "$Q" "$WORK/j8" || FAILED=1
 NPROC=$(nproc)
-say "  本机核数: $NPROC (auto = min(额度, 8))"
+MEM_KB=$(awk '/MemAvailable/{print $2}' /proc/meminfo 2>/dev/null || echo 0)
+say "  本机核数: $NPROC (auto = min(额度, 8))   可用内存: $((MEM_KB / 1024 / 1024)) GB"
+# 每个 FSDB worker 都是一次独立 NPI 会话 + 名字树(4M 信号实测 ~1.5GB/worker, 未命中
+# .fnames 时更高) —— 内存不够时"自动并行"会退化成换页, 比单进程还慢。
+if [ "$MEM_KB" -gt 0 ]; then
+    EST=$((8 * 1600 * 1024))   # 8 worker × ~1.6GB(KB)
+    [ "$MEM_KB" -lt "$EST" ] && say "  ⚠️ 8 路并行预计要 ~12GB, 可用只有 $((MEM_KB / 1024 / 1024)) GB —— 若 jauto 明显慢于 j1, 用 -j 4 之类压一压"
+fi
 
 # 取值一致性
 if [ -f "$WORK/j1.val" ] && [ -f "$WORK/jauto.val" ]; then
