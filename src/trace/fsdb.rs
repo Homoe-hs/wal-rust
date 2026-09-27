@@ -97,6 +97,9 @@ struct TimeIterSyms {
     add: unsafe extern "C" fn(*mut c_void, *mut c_void) -> i64,
     start: unsafe extern "C" fn(*mut c_void, NpiTime, NpiTime),
     next: unsafe extern "C" fn(*mut c_void, *mut NpiTime, *mut *mut c_void) -> i64,
+    /// `iter_next(time&)` 重载(**不吐出信号句柄**)。只要时间并集(建全局时间线)时用它 ——
+    /// 省掉 NPI 每条记录"把变更归到哪个信号"的那一步。**可选**: 老版本 NPI 没有这个符号。
+    next_time: Option<unsafe extern "C" fn(*mut c_void, *mut NpiTime) -> i64>,
     get_value: unsafe extern "C" fn(*mut c_void, *mut NpiFsdbValue) -> c_int,
     stop: unsafe extern "C" fn(*mut c_void),
 }
@@ -268,6 +271,7 @@ impl Npi {
                 add: sym!("_ZN22npiFsdbTimeBasedVcIter3addEPv", unsafe extern "C" fn(*mut c_void, *mut c_void) -> i64),
                 start: sym!("_ZN22npiFsdbTimeBasedVcIter10iter_startEyy", unsafe extern "C" fn(*mut c_void, NpiTime, NpiTime)),
                 next: sym!("_ZN22npiFsdbTimeBasedVcIter9iter_nextERyRPv", unsafe extern "C" fn(*mut c_void, *mut NpiTime, *mut *mut c_void) -> i64),
+                next_time: sym_opt!("_ZN22npiFsdbTimeBasedVcIter9iter_nextERy", unsafe extern "C" fn(*mut c_void, *mut NpiTime) -> i64),
                 get_value: sym!("_ZN22npiFsdbTimeBasedVcIter9get_valueER12npiFsdbValue", unsafe extern "C" fn(*mut c_void, *mut NpiFsdbValue) -> c_int),
                 stop: sym!("_ZN22npiFsdbTimeBasedVcIter9iter_stopEv", unsafe extern "C" fn(*mut c_void)),
             };
@@ -1324,6 +1328,10 @@ pub fn run_timeline_worker(
     stride: usize,
     out: &std::path::Path,
 ) -> Result<(), String> {
+    // worker 不需要名字: 只取句柄(省掉 arena 2.85GB + 索引 384MB + scope 串 ~1GB)
+    if std::env::var("WAL_FSDB_WORKER_NAMES").is_err() {
+        std::env::set_var("WAL_FSDB_HANDLES_ONLY", "1");
+    }
     let trace = FsdbTrace::load(file, "w".to_string())?;
     let n = trace.sigs.len();
     let stride = stride.max(1);
@@ -1762,6 +1770,11 @@ fn unload_each_chunk() -> bool {
 
 impl FsdbTrace {
     pub fn load(path: &Path, id: TraceId) -> Result<Self, String> {
+        // **只取句柄**模式: 时间线 worker(分片预计算)只按**下标**喂句柄给 VC 迭代器,
+        // 从头到尾不需要名字。关掉名字 arena/索引/scope 收集后, 一个 worker 的内存从
+        // 6GB 级掉到 GB 级 —— 这是"1796 万信号也能 8 路并行"的前提。
+        // 由 `run_timeline_worker` 打开(父进程也可以直接设环境变量给子进程)。
+        let handles_only = std::env::var("WAL_FSDB_HANDLES_ONLY").is_ok();
         let npi = npi()?;
         // 用户可能传**相对路径**, 而 NPI 沙箱会把 CWD 切到缓存目录下 npi/ 里:
         // ① NPI open 必须给绝对路径; ② 之后每次算缓存 key 都要 stat 这个文件 ——
@@ -1814,7 +1827,12 @@ impl FsdbTrace {
             let mut cache_hit = false;
             // 冷路径是否已经把名字直接流式写进缓存(写了就不必在收尾再落一次盘)
             let mut streamed_here = false;
-            if let Some((arena, widths, sc)) = try_load_tree_cache(&cache_root, &filename) {
+            if handles_only {
+                // 直接走树, 只留句柄 + 位宽; 名字/scope/索引一律不要
+                let mut ignore_scopes: Vec<String> = Vec::new();
+                let mut push_noop = |_n: &str, _w: usize| {};
+                walk_top(npi, file, &mut sigs, &mut ignore_scopes, &mut push_noop);
+            } else if let Some((arena, widths, sc)) = try_load_tree_cache(&cache_root, &filename) {
                 // 直接解进 arena(不再先造一遍 Vec<String>)
                 names = arena;
                 scopes = sc;
@@ -1900,7 +1918,7 @@ impl FsdbTrace {
             }
             // 流式路径已经在遍历时就写好缓存了; 走 arena 的路径(缓存关闭/只读, 或流式失败)
             // 才需要在这里补一次落盘。
-            if !cache_hit && !streamed_here && !sigs.is_empty() {
+            if !handles_only && !cache_hit && !streamed_here && !sigs.is_empty() {
                 let widths: Vec<usize> = sigs.iter().map(|s| s.width).collect();
                 save_tree_cache_arena(&cache_root, &filename, &names, &widths, &scopes);
             }
@@ -1910,8 +1928,8 @@ impl FsdbTrace {
             }
             // 名字索引: 哈希 → 下标, 命中后比对 arena 里的真实字节(处理哈希碰撞)。
             // 同名取**下标最小**的(与旧的 `entry().or_insert()` 语义一致)。
-            let mut name_index = OpenIndex::new(names.len());
-            for i in 0..names.len() as u32 {
+            let mut name_index = OpenIndex::new(if handles_only { 0 } else { names.len() });
+            for i in 0..(if handles_only { 0 } else { names.len() }) as u32 {
                 let h = fnv1a(names.get(i).as_bytes());
                 if name_index.find_verified(h, |j| names.get(j) == names.get(i)).is_none() {
                     name_index.insert(h, i, |j| fnv1a(names.get(j).as_bytes()));
@@ -2179,29 +2197,60 @@ impl FsdbTrace {
         // 用**文件的总信号数**定块(不是本片的目标数): worker 分片也要把 start 次数压到 ~个位数,
         // 否则每片 500k 信号按 4096 切 = 122 次 start = 12s 纯开销(实测踩过)。
         let chunk = chunk_size(self.sigs.len());
+        let dbg_prof = std::env::var("WAL_DEBUG_FSDB").is_ok();
+        let (mut t_handle, mut t_add, mut t_start, mut t_next, mut n_entries) =
+            (std::time::Duration::ZERO, std::time::Duration::ZERO, std::time::Duration::ZERO, std::time::Duration::ZERO, 0usize);
         let mut all: Vec<u64> = Vec::new();
         let mut lo = 0usize;
         while lo < targets.len() {
             let hi = (lo + chunk).min(targets.len());
             let mut it = IterObj::new(npi);
             for &i in &targets[lo..hi] {
-                if let Ok(h) = self.handle_of(i) {
+                let th = std::time::Instant::now();
+                let h = self.handle_of(i).ok();
+                t_handle += th.elapsed();
+                if let Some(h) = h {
+                    let ta = std::time::Instant::now();
                     unsafe { (npi.iter.add)(it.this(), h) };
+                    t_add += ta.elapsed();
                 }
             }
+            let ts = std::time::Instant::now();
             unsafe { (npi.iter.start)(it.this(), self.min_t, self.max_t) };
+            t_start += ts.elapsed();
             let mut chunk_times: Vec<u64> = Vec::new();
             let mut last = u64::MAX;
-            loop {
-                let mut t: NpiTime = 0;
-                let mut sig: *mut c_void = ptr::null_mut();
-                let rc = unsafe { (npi.iter.next)(it.this(), &mut t, &mut sig) };
-                if rc <= 0 || sig.is_null() {
-                    break;
+            // 只要时间: 用不吐句柄的重载(省掉 NPI 每条记录的"归信号"一步)
+            if let Some(next_time) = npi.iter.next_time {
+                loop {
+                    let mut t: NpiTime = 0;
+                    let tn = std::time::Instant::now();
+                    let rc = unsafe { next_time(it.this(), &mut t) };
+                    t_next += tn.elapsed();
+                    if rc <= 0 {
+                        break;
+                    }
+                    n_entries += 1;
+                    if t > 0 && t != last {
+                        chunk_times.push(t);
+                        last = t;
+                    }
                 }
-                if t > 0 && t != last {
-                    chunk_times.push(t);
-                    last = t;
+            } else {
+                loop {
+                    let mut t: NpiTime = 0;
+                    let mut sig: *mut c_void = ptr::null_mut();
+                    let tn = std::time::Instant::now();
+                    let rc = unsafe { (npi.iter.next)(it.this(), &mut t, &mut sig) };
+                    t_next += tn.elapsed();
+                    if rc <= 0 || sig.is_null() {
+                        break;
+                    }
+                    n_entries += 1;
+                    if t > 0 && t != last {
+                        chunk_times.push(t);
+                        last = t;
+                    }
                 }
             }
             drop(it);
@@ -2212,6 +2261,18 @@ impl FsdbTrace {
             }
             all = merge_sorted_unique(&all, &chunk_times);
             lo = hi;
+        }
+        if dbg_prof {
+            eprintln!(
+                "[fsdb] 时间线扫描剖析: {} 信号, handle_of {:.1}s / add {:.1}s / start {:.1}s / next×{} {:.1}s → {} 个时间点",
+                targets.len(),
+                t_handle.as_secs_f64(),
+                t_add.as_secs_f64(),
+                t_start.as_secs_f64(),
+                n_entries,
+                t_next.as_secs_f64(),
+                all.len()
+            );
         }
         Ok(all)
     }
