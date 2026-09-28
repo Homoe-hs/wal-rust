@@ -219,6 +219,13 @@ Flags: `-l <waveform>`(可重复), `--halt-on-error`(遇错即停)。
   与 `Trace::count_matches()` 让 `getwave`/`at`/边沿计数跳过它。新增/修改这类查询时:
   ① `count_matches` 必须与 `find_indices(..).len()` **逐条一致**(含 `Changed` 在索引 0 的
   特例); ② 后端的 `set_index`/`max_index` 不要变成隐藏的全扫(引擎每次查询都会恢复游标)。
+- **指标/统计算子(延迟、IPC、分布)**: `median` / `percentile` / `stddev` / `stats` / `histogram`
+  (纯数值列表)+ `latency` / `ipc`(波形侧配对),实现在 `src/wal/builtins/metrics.rs`,语义权威是
+  [`docs/waveform-metrics.md`](docs/waveform-metrics.md)(§5 列了"还没做的")。
+  `latency` 默认 **FIFO 配对**、`#restart` 让新 start 作废旧的、单位是**原生时间**;
+  两个波形算子只在**时间域**取变更列(`change_points_time`)——**不建索引空间**,所以千万时间戳的
+  大波形上不会触发全文件物化。闸: `tests/metrics_test.rs`(6 个手算用例)。
+  真实波形验收(336MB / 1796 万信号): 8 个形式一次进程 **10.0s / 6.2GB**。
 - **Dispatcher pattern** for builtins: (1) handler in `src/wal/builtins/<module>.rs` (2) register in `src/wal/builtins/mod.rs::register_all()` (3) 可选 `Operator` variant in `src/wal/ast/operator.rs`。
 - **Global allocator**: `mimalloc` in `src/main.rs`.
 - **VCD trace loading** (0.13.2 起两段式, 懒索引):
@@ -234,6 +241,20 @@ Flags: `-l <waveform>`(可重复), `--halt-on-error`(遇错即停)。
   这类 bug 只会在真实大文件上表现为数字对不上(77629 → 30741), 闸跑得少就会漏。
 - **Signal value reads**: `read_signal_value_at()` uses sparse anchors (`partition_point` on the Vec) + memchr jump scan.
 - **Query semantics (0.12.x, single authoritative definition)**: value AT an index = LAST write in that timestamp (delta cycles collapse); initial value = `$dumpvars` snapshot else x; edges = per-index transitions (x→1 is Changed, never Rising/Falling); count/find always scan the full timeline from INDEX 0 and restore the cursor. See `docs/query-engine-design.md` §1.
+
+- **性能现状(0.14.45, 2026-09-28)与数字在哪**: 权威是 `bench/perf-history.csv`(每版本一套行:
+  FSDB 真波形 11 行、4M 夹具 12 行)与 [`bench/RESULTS.md`](bench/RESULTS.md) 末尾的"当前性能快照"。
+  要点: FSDB 真波形(336MB / 1796 万信号)冷加载 **52.5s / 13.0GB**、暖加载 **10.5~17.2s / 6.2GB**;
+  索引空间查询命中 `.ftl` 后 **11.1~16.6s**;唯一百秒级操作是**时间线冷建 636s**(8 片自动选层);
+  VCD 侧 400 万信号夹具只读头 **0.98s**、984MB 密集夹具冷 `(count (rising …))` **0.49s**。
+  ⚠️ 暖路径 10.5↔17.2s 的差是**页缓存/许可 VM 状态**,不是回归 —— 比数字前先看机器状态;
+  ⚠️ **许可通道不稳**:`.tools/vm/license_up.sh` 报成功后端口可能几分钟内又关(2026-09-28 实测),
+  要在同一次调用里"license_up → 立刻真打开一次"才算数(症状表见 `docs/fsdb-env.md` §5)。
+- **纯 Rust 读 FSDB 全局时间线**(绕开 NPI 的 1.45µs/记录): 方案、里程碑与 **G0–G7 验收门**都在
+  [`docs/fsdb-rust-backend-spec.md`](docs/fsdb-rust-backend-spec.md)(🟡 未实现)。
+  现状一句话: `fsdb-parser` 已有 `time_points()` 与现成集成补丁集, 但在真文件上 `open_meta`
+  只认出 **60 / 17,956,098** 个名字、`max_time=0`(**G0 红**), 所以先要 M0"吃下 VCS-2025 Full64 族"。
+  验收锚点: 320,204 个时间点 / `.ftl` md5 `ca1cb095…` / 冷 ≤30s、暖 ≤5s / RSS ≤2GB / fuzz 只许"相同或 Err"。
 
 ## Performance-sensitive paths
 

@@ -88,6 +88,7 @@ target/release/wal-rust '(length (SIGNALS))' -l x.fsdb
 | `Could not open string resource file …/etc/sdProd.res` | 只拷了 `share/NPI`, 缺 `etc/` | 把 `etc/` 一起拷(第 6 节最小集) |
 | `dlopen libNPI.so 失败` | `$VERDI_HOME`/`$WAL_NPI_LIB` 不对 | `scripts/fsdb_env_check.sh` |
 | lmgrd 日志 `Retrying for about 5 more minutes` | 旧 lmgrd/snpslmd 还占着 27080 | 等它们死透再起(`/mnt/wal/lic25_hostfwd.sh` 已内置等待) |
+| `.tools/vm/license_up.sh` 报 "✅ 通道可用", **一分钟后又不可用**(端口 CLOSED / 报"需要 NPI 许可") | 客机 daemon 起来后又掉了(2026-09-28 本机实测到;宿主侧 `hostfwd` 监听一直在, 所以"端口通"不等于可用) | 在**同一次调用里**"license_up → 立刻跑一次真打开"(`. .tools/vm/host_fsdb_env.sh` + 任一查询)确认;持久问题看客机 `pgrep -c snpslmd` / `lmstat -a` / lmgrd 日志 |
 
 ## 6 别人的波形比本机 reader 新(例如 X-2025.06-**SP3** 写的)
 

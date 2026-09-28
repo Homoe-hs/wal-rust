@@ -13,7 +13,9 @@
 | 加一个新波形后端(VCD/FST/FSDB 之外的) | [`query-engine-design.md`](query-engine-design.md) + `src/trace/trace.rs` 的 `Trace` trait |
 | 动 FSDB 后端 / 排查 NPI 问题 | [`fsdb-npi.md`](fsdb-npi.md) |
 | 读不了/写不了 FSDB(版本、许可、环境) | [`fsdb-env.md`](fsdb-env.md) |
-| [`waveform-metrics.md`](waveform-metrics.md) | ✅ 现行 | 指标与统计算子: 延迟/IPC/分位数/直方图的语义与用例 |
+| 算延迟/IPC/分位数/直方图(指标工具) | [`waveform-metrics.md`](waveform-metrics.md) |
+| 想把 FSDB 全局时间线换成纯 Rust(绕开 NPI) | [`fsdb-rust-backend-spec.md`](fsdb-rust-backend-spec.md)(计划,含验收门) |
+| 看当前性能数字在哪 | [`../bench/RESULTS.md`](../bench/RESULTS.md) 的性能快照 + [`../bench/perf-history.csv`](../bench/perf-history.csv) |
 | 改性能路径前先看历史教训 | [`waveform-io-plan.md`](waveform-io-plan.md)、[`152gb-round.md`](152gb-round.md) |
 | 知道每个版本改了什么 | [`../CHANGELOG.md`](../CHANGELOG.md) |
 | 参与开发/发版 | [`../CONTRIBUTING.md`](../CONTRIBUTING.md) |
@@ -22,17 +24,19 @@
 
 | 文档 | 行数 | 性质 | 状态 |
 |---|---|---|---|
-| [`wal-编程手册.md`](wal-编程手册.md) | 2663 | 使用手册 | ✅ 现行(面向使用者, 随功能更新) |
-| [`4-state-semantics.md`](4-state-semantics.md) | 104 | 规范 | ✅ 现行(四值语义**唯一权威**) |
-| [`query-engine-design.md`](query-engine-design.md) | 219 | 设计 | ✅ 现行(§1 查询语义权威; 后半是当初的方案, 实现进度见文内标注) |
-| [`fsdb-npi.md`](fsdb-npi.md) | 319 | 设计 + 实测 | ✅ 现行(FSDB 后端; §9 多文件/缓存规则) |
-| [`fsdb-env.md`](fsdb-env.md) | 91 | 运行手册 | ✅ 现行(FSDB 读写环境/许可/版本兼容) |
-| [`waveform-io-plan.md`](waveform-io-plan.md) | 154 | 调研 + 计划 | 🟡 部分落地(IO-1..6 的进度见文内) |
-| [`agent-cli.md`](agent-cli.md) | 163 | 草案 | 🟡 草案 v0, **未实现**, 只作为接口约定讨论稿 |
-| [`migration-0.8-0.11.md`](migration-0.8-0.11.md) | 37 | 迁移指南 | 🟡 历史区间(0.8→0.11), 供老用户对照 |
-| [`152gb-round.md`](152gb-round.md) | 202 | 复盘 | 📦 复盘(当时的结构与数字) |
-| [`internal-feedback-review.md`](internal-feedback-review.md) | 38 | 复盘 | 📦 复盘(0.10.10 批次) |
-| [`history/construction-0.5.0.md`](history/construction-0.5.0.md) | 216 | 归档 | 🗄 历史(0.5.0 构建文档, 仅存档) |
+| [`wal-编程手册.md`](wal-编程手册.md) | 2685 | 使用手册 | ✅ 现行(面向使用者, 随功能更新) |
+| [`fsdb-npi.md`](fsdb-npi.md) | 562 | 设计 + 实测 | ✅ 现行(FSDB 后端; §6 性能与并行; §9 多文件/缓存规则) |
+| [`query-engine-design.md`](query-engine-design.md) | 226 | 设计 | ✅ 现行(§1 查询语义权威; 后半是当初的方案, 实现进度见文内标注) |
+| [`152gb-round.md`](152gb-round.md) | 205 | 复盘 | 📦 复盘(当时的结构与数字) |
+| [`history/construction-0.5.0.md`](history/construction-0.5.0.md) | 219 | 归档 | 🗄 历史(0.5.0 构建文档, 仅存档) |
+| [`agent-cli.md`](agent-cli.md) | 166 | 草案 | 🟡 草案 v0, **未实现**, 只作为接口约定讨论稿 |
+| [`waveform-io-plan.md`](waveform-io-plan.md) | 162 | 调研 + 计划 | 🟡 部分落地(IO-1..6 的进度见文内) |
+| [`fsdb-env.md`](fsdb-env.md) | 149 | 运行手册 | ✅ 现行(FSDB 读写环境/许可/版本兼容) |
+| [`4-state-semantics.md`](4-state-semantics.md) | 106 | 规范 | ✅ 现行(四值语义**唯一权威**) |
+| [`fsdb-rust-backend-spec.md`](fsdb-rust-backend-spec.md) | 130 | 计划 + 验收标准 | 🟡 **未实现**(纯 Rust 全局时间线:交付范围、G0–G7 验收门) |
+| [`waveform-metrics.md`](waveform-metrics.md) | 72 | 使用手册 + 规范 | ✅ 现行(延迟/IPC/统计:语义与用例; §5 列出还没做的) |
+| [`internal-feedback-review.md`](internal-feedback-review.md) | 40 | 复盘 | 📦 复盘(0.10.10 批次) |
+| [`migration-0.8-0.11.md`](migration-0.8-0.11.md) | 39 | 迁移指南 | 🟡 历史区间(0.8→0.11), 供老用户对照 |
 
 ## 约定(为什么这么定)
 

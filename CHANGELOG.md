@@ -188,6 +188,19 @@
   身份 sha256/写者 → 环境与许可 → 磁盘余量 → 冷/建/暖基线(`bench_fsdb.sh`) → 并行轴
   `-j 1|auto|8` → **`.ftl` 逐字节一致性**(并行正确性闸)。`--quick` 只做能读+并行收益。
 
+### Docs
+- **新增 [`docs/fsdb-rust-backend-spec.md`](docs/fsdb-rust-backend-spec.md)**: "纯 Rust 读 FSDB 全局
+  时间线"的交付范围与验收标准(里程碑 M0–M3、门 G0–G7、锚点值 320,204 点 / `.ftl` md5
+  `ca1cb095…` / 冷 ≤30s、暖 ≤5s / RSS ≤2GB / fuzz 只许"相同或 Err")。**状态是"计划未实现"**,
+  且写清了今天的实测起点(`open_meta` 在真文件上只认出 60 / 17,956,098 个名字 → G0 红)。
+- **`bench/RESULTS.md` 加"当前性能快照"**(v0.14.45): FSDB 冷热加载/取值/边沿/电平/冷建/指标算子、
+  400 万信号夹具、VCD 现测, 并写明两个坑(暖路径 10.5↔17.2s 是页缓存波动、不是回归;
+  `.tools/vm/license_up.sh` 报成功后许可可能几分钟内又掉)。
+- **`docs/README.md` 修正与刷新**: 修掉"指标算子"那行的列错位、把 `waveform-metrics.md` 正式登记进
+  文档清单、刷新全部行数, 并给新 spec 与"性能数字在哪"加入口。
+- **`docs/fsdb-env.md` §5 补一行判读**: "`license_up.sh` 报成功后一分钟又不可用"的真因与处置
+  (宿主 `hostfwd` 监听一直在, "端口通"≠可用;要在同一次调用里"起来 → 立刻真打开一次")。
+
 ### Internal
 - `trace::name_store`: 把 VCD 后端早就有的 `NameArena`/`OpenIndex` 提成共享类型, FSDB 后端
   迁到同一套;补了 arena 往返、开放寻址扩容/碰撞、每信号字节数的单测。
