@@ -97,3 +97,4 @@ version,date,op,fixture,wall_s,rss_mb,note
 0.14.44,2026-09-28,fsdb-cold-at,many4m.fsdb,4.31,1547,=> (0 "x")
 0.14.44,2026-09-28,fsdb-build-at,many4m.fsdb,3.39,1486,=> (0 "x")
 0.14.44,2026-09-28,fsdb-hit-at,many4m.fsdb,3.21,1486,=> (0 "x")
+0.14.46,2026-09-30,fsdb-stdin-load,aicore_smoke_test_000.fsdb,10.5,6034,--stdin 一次加载分段和: NPI open 4.4s + 名字解码 4.7s + 名字索引 ~1.0s(索引段 5.20s -> 0.94/1.34s: FNV 哈希改 rayon 并行); 同二进制页缓存冷时单次 14.8s

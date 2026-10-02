@@ -99,6 +99,14 @@ Flags: `-l <waveform>`(可重复), `--halt-on-error`(遇错即停)。
   指纹(`wave_fingerprint`)+位宽 + 文件身份 key 三重校验, 不匹配一律视为未命中。
   实测: 暖查询 8.6s → 4.1s(电平)/8.0s → 3.6s(沿), 冷查询 48.5s → 36.6s(200 万时间戳夹具)。
   基准: `make bench-fsdb FSDB=x.fsdb [SIG=tb.clk]`(或 `WAL_FSDB_BENCH=x.fsdb ./scripts/ci.sh --only perf`)。
+- **FSDB 加载路径的分段账(真波形 336MB/1796 万信号, `WAL_DEBUG_FSDB=1` 打时戳)**: NPI
+  `init+open` 4.4s(**每个进程一次**, `--stdin` 会话摊一次) + 名字解码 4.7~6.2s(页缓存敏感) +
+  名字索引 **≈1.0s** ≈ **10.5s**(优化前 15.8s, 索引段当时 5.20s)。已落地的改法: 索引的
+  **FNV 哈希用 rayon 并行算**(2.85GB 名字串行 4s → 并行 0.4s; 插表仍串行)。
+  **两个负结果别重试**: ①逐名 `from_utf8` 换 unchecked 只快 0.15s(噪声级);
+  ②`.fnames` 改 `mmap + decode_tree_into` 实测 4.70s vs 4.69s(中性)且多一个并发截断 → SIGBUS
+  的风险, 因此保持流式解码。名字解码剩下的 ~4.7s 要靠**缓存格式 v3**(偏移表 → 并行解码/
+  零拷贝 arena), 那是我们自己的格式, 与 FSDB 逆向无关。
 - **名字存储必须走 arena + 开放寻址索引**: `trace::name_store::{NameArena, OpenIndex}`。
   百万~千万信号级波形上"每个信号一个 `String`"本身就是 GB 级开销 —— 微基准实测
   **280B/信号**(`Sig.name`+`Sig.full`+`sig_names[]`+`HashMap<String,_>` 四份)对 **73B/信号**

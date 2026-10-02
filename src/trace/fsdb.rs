@@ -909,7 +909,10 @@ fn try_load_tree_cache(
         return None;
     }
     let fp = crate::trace::vcd::wave_fingerprint(std::path::Path::new(filename));
-    // 流式解码: 不把整份缓存(4M 信号 ≈ 207MB)搬进内存
+    // 流式解码: 不把整份缓存(4M 信号 ≈ 207MB)搬进内存。
+    // ⚠️ 试过改成 `mmap + decode_tree_into(&mmap)`(少一次缓冲拷贝、为将来的零拷贝铺路):
+    //    相邻两次实测 **4.70s vs 4.69s**, 收益在噪声里, 还多一个"文件被并发截断 → SIGBUS"
+    //    的风险 —— 所以**没有采用**(负结果记在这里, 免得下次再试)。
     let snap = decode_tree_file(&f, fp);
     if snap.is_none() && std::env::var("WAL_DEBUG_FSDB").is_ok() {
         eprintln!("[fsdb] 名字树缓存未命中/损坏: {}", f.display());
@@ -2655,15 +2658,27 @@ impl FsdbTrace {
                 (npi.close)(file);
                 return Err(format!("{}: FSDB 里没有任何信号", filename));
             }
-            // 名字索引: 哈希 → 下标, 命中后比对 arena 里的真实字节(处理哈希碰撞)。
+            // 名字索引 = 哈希 → 下标, 命中后比对 arena 里的真实字节(处理哈希碰撞);
             // 同名取**下标最小**的(与旧的 `entry().or_insert()` 语义一致)。
-            let mut name_index = OpenIndex::new(if handles_only { 0 } else { names.len() });
-            for i in 0..(if handles_only { 0 } else { names.len() }) as u32 {
-                let h = fnv1a(names.get(i).as_bytes());
+            // **哈希那一步并行算**: 1796 万信号的名字共 2.85GB, 串行 FNV 要 ~4s
+            // (实测整段"名字索引建完"5.2s); 多线程算完 ~0.4s, 剩下插表是随机写
+            // (内存延迟瓶颈)本来就不并行化。临时多一份 u64/信号(143MB), 插完即释放。
+            let n_sigs = if handles_only { 0 } else { names.len() };
+            let hashes: Vec<u64> = {
+                use rayon::prelude::*;
+                (0..n_sigs)
+                    .into_par_iter()
+                    .map(|i| fnv1a(names.get(i as u32).as_bytes()))
+                    .collect()
+            };
+            let mut name_index = OpenIndex::new(n_sigs);
+            for i in 0..n_sigs as u32 {
+                let h = hashes[i as usize];
                 if name_index.find_verified(h, |j| names.get(j) == names.get(i)).is_none() {
-                    name_index.insert(h, i, |j| fnv1a(names.get(j).as_bytes()));
+                    name_index.insert(h, i, |j| hashes[j as usize]);
                 }
             }
+            drop(hashes);
             if dbg {
                 eprintln!("[fsdb] RSS: 名字索引建完 {} MB", rss_kb() / 1024);
             }

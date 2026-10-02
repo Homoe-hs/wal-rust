@@ -15,10 +15,10 @@ FSDB 侧唯一还是百秒级的操作就是**冷建全局时间线**(NPI 的 `n
 
 | 事实 | 证据 |
 |---|---|
-| `fsdb-parser`(本地 `/home/hesheng/Projects/fsdb-parser`,700 轮逆向)已有 `FsdbFile::time_points()`("所有信号变化时刻并集,升序去重")、`fe` 时间表块解析、以及 `wal-integration/` 集成补丁集(`fsdb.rs` / `fsdb_test.rs` / `patched/`,README 4 步可应用) | 读源码 + `wal-integration/README.md`;补丁集当时只被"wal-rust 挂载只读"挡住 |
+| `fsdb-parser`(本地 `/home/hesheng/Projects/fsdb-parser`,700 轮逆向)已有 `FsdbFile::time_points()`("所有信号变化时刻并集,升序去重")、`fe` 时间表块解析、以及一份**现成的 wal-rust 集成补丁集**(wal-integration 目录:纯 Rust 版 FsdbTrace + 集成测试 + patched 三处改动,其 README 4 步可应用) | 读源码 + wal-integration 的 README;补丁集当时只被"wal-rust 挂载只读"挡住 |
 | **但这个写者族还没吃下来**:`open_meta()` 读真文件 0.54s 返回 `Ok`,却只有 **60 个名字**、`max_time=0`、tail 索引为空(NPI 看到 17,956,098 个信号) | `.tools/fsp-probe`(本轮新建的探针) |
-| VC 区是**大量小块 zlib**:全文件候选流头 `78 01/9c/da` ≥13 万个(26,356 / 98,644 / 4,834);文件头偏移 8 起 `04 03 02 01`(VCS 魔数);Python 顺序扫完 336MB 仅 0.4s | 同轮扫描;格式笔记见 `fsdb-parser/docs/format-notes.md`(现代写者 VC 区 zlib) |
-| `fsdb-parser` 已知缺口都在**名字/值**那条线(名字覆盖 3063/3378、值侧金标准 24/705、V-2023.12 gate 0%、">15MB 全解析受 2022 网表名流依赖") | 其 `docs/SUMMARY-r18.md` 与逆向案例附录 |
+| VC 区是**大量小块 zlib**:全文件候选流头 `78 01/9c/da` ≥13 万个(26,356 / 98,644 / 4,834);文件头偏移 8 起 `04 03 02 01`(VCS 魔数);Python 顺序扫完 336MB 仅 0.4s | 同轮扫描;格式笔记见 fsdb-parser 仓库的 docs/format-notes.md(现代写者 VC 区 zlib) |
+| `fsdb-parser` 已知缺口都在**名字/值**那条线(名字覆盖 3063/3378、值侧金标准 24/705、V-2023.12 gate 0%、">15MB 全解析受 2022 网表名流依赖") | 其 SUMMARY-r18 与逆向案例附录 |
 
 **关键判断**: 全局时间**不需要**名字与值,所以"timeline-only"可以绕开上述缺口 ——
 这是这个目标可行的根据,也是本方案刻意**不**做完整后端的原因。
@@ -50,9 +50,9 @@ pub fn timescale_exp(path: &Path) -> Result<i32, FsdbErr>;  // 1ps → -12
 
 | 步 | 做什么 | 产出 |
 |---|---|---|
-| **M0 侦察+结构自证** | 吃下 `VCS X-2025.06-SP2_Full64` 的头部/尾部索引/VC 块清单;先用免许可的 `fsdbdebug -vc/-allvc` 做第三独立 oracle | `header.rs`+`index.rs`;自证:写者串、timescale、`max_time` 全对 |
+| **M0 侦察+结构自证** | 吃下 `VCS X-2025.06-SP2_Full64` 的头部/尾部索引/VC 块清单;先用免许可的 `fsdbdebug -vc/-allvc` 做第三独立 oracle | 头部/索引两个新模块;自证:写者串、timescale、`max_time` 全对 |
 | **M1 timeline-only 扫描** | M0 若发现"时刻表是现成的"→直接读(秒级);否则 mmap + zlib inflate + 逐记录 delta 解码,只累积并集 | `fsdb_rust::timeline()`,与 NPI 逐点相同 |
-| **M2 门与回归** | `scripts/fsdb_rust_equiv.sh` + `tests/fsdb_rust_timeline.rs` + 写进 `bench/perf-history.csv` | PASS/FAIL 表 + 族级覆盖台账 |
+| **M2 门与回归** | 等价比对脚本 + 集成测试 + 写进 `bench/perf-history.csv` | PASS/FAIL 表 + 族级覆盖台账 |
 | **M3(可选)** | 每信号变更列(替 `.fcol`)、值解码、名字表 | 会撞上 §1 的已知缺口,**第一版不做** |
 
 ## 4 验收门(G1/G2 是硬闸,任一红不许切默认)
@@ -124,7 +124,7 @@ G1–G5 在全部语料(≥1 真文件 + ≥6 受控样本)绿,且**连续两个
 | 装置 | 用途 |
 |---|---|
 | `.tools/fsp-probe/`(本地,gitignored) | `open_meta` 探针:一键看纯 Rust 侧认出多少名字 / `max_time` |
-| `fsdb-parser/wal-integration/` | 现成的 wal-rust 集成补丁集(4 步可应用,2026-08-29 核过零漂移) |
+| fsdb-parser 仓库的 wal-integration 目录 | 现成的 wal-rust 集成补丁集(4 步可应用,2026-08-29 核过零漂移) |
 | `scripts/fsdb_env_check.sh <file>` | 写者 / reader / 许可三段体检 |
 | `fsdbdebug -tree/-vc/-allvc` | **免许可**的第三方金标准(名字/值/时刻) |
 | `bench/perf-history.csv` | 回归库(FSDB 行口径见 [`../bench/README.md`](../bench/README.md)) |
