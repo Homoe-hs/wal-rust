@@ -35,6 +35,7 @@
 | [`4-state-semantics.md`](4-state-semantics.md) | 106 | 规范 | ✅ 现行(四值语义**唯一权威**) |
 | [`fsdb-rust-backend-spec.md`](fsdb-rust-backend-spec.md) | 130 | 计划 + 验收标准 | 🟡 **未实现**(纯 Rust 全局时间线:交付范围、G0–G7 验收门) |
 | [`waveform-metrics.md`](waveform-metrics.md) | 72 | 使用手册 + 规范 | ✅ 现行(延迟/IPC/统计:语义与用例; §5 列出还没做的) |
+| [`bttf-experiment.md`](bttf-experiment.md) | 96 | 实验记录 | 🧪 实验(论文两表 SQLite 方案在真波形 19.5M 行上的对照; 结论: 抄 schema 不抄引擎) |
 | [`internal-feedback-review.md`](internal-feedback-review.md) | 40 | 复盘 | 📦 复盘(0.10.10 批次) |
 | [`migration-0.8-0.11.md`](migration-0.8-0.11.md) | 39 | 迁移指南 | 🟡 历史区间(0.8→0.11), 供老用户对照 |
 

@@ -1,0 +1,6 @@
+- generic [ref=e2]:
+  - generic [ref=e5]:
+    - heading "环境异常" [level=2] [ref=e6]
+    - paragraph [ref=e7]: 当前环境异常，完成验证后即可继续访问。
+  - paragraph [ref=e9]:
+    - generic [ref=e10]: 去验证
