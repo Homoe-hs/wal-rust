@@ -12,6 +12,7 @@ mod fst;
 mod vcd;
 pub mod wal;
 pub mod trace;
+pub mod prof;
 
 use crate::cli::{Args, ExecMode};
 use clap::Parser;
@@ -118,7 +119,7 @@ fn main() {
             run_repl();
         }
         ExecMode::StdinSession { load } => {
-            match run_stdin_session(&load) {
+            match crate::prof::phase("session", || run_stdin_session(&load)) {
                 Ok(0) => {}
                 Ok(code) => process::exit(code),
                 Err(e) => {
@@ -146,6 +147,7 @@ fn main() {
             }
         }
     }
+    crate::prof::summary();
 }
 
 /// `(exit N)` 在解释器里以 `Err("exit:N")` 冒泡 → 解析成进程退出码。
@@ -342,7 +344,7 @@ fn run_stdin_session(load: &[PathBuf]) -> Result<i32, String> {
     let mut eval = wal::eval::Evaluator::new();
     for (i, path) in load.iter().enumerate() {
         let tid = format!("t{}", i + 1);
-        eval.load_trace(&path.to_string_lossy(), &tid)
+        crate::prof::phase("load", || eval.load_trace(&path.to_string_lossy(), &tid))
             .map_err(|e| format!("{}: {}", path.display(), e))?;
     }
     let stdin = std::io::stdin();
@@ -356,7 +358,7 @@ fn run_stdin_session(load: &[PathBuf]) -> Result<i32, String> {
         let line = buf.trim();
         if line.is_empty() || line.starts_with(';') { continue; }
         if line == "(exit)" || line == "exit" { break; }
-        match eval.eval(line) {
+        match crate::prof::phase("probe", || eval.eval(line)) {
             Ok(v) => {
                 if !matches!(v, wal::ast::Value::Nil) {
                     println!("=> {}", v);

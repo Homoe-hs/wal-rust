@@ -264,6 +264,16 @@ Flags: `-l <waveform>`(可重复), `--halt-on-error`(遇错即停)。
   只认出 **60 / 17,956,098** 个名字、`max_time=0`(**G0 红**), 所以先要 M0"吃下 VCS-2025 Full64 族"。
   验收锚点: 320,204 个时间点 / `.ftl` md5 `ca1cb095…` / 冷 ≤30s、暖 ≤5s / RSS ≤2GB / fuzz 只许"相同或 Err"。
 
+- **想知道时间花在哪: 先看阶段账, 再看火焰图**(`docs/profiling.md`)。`WAL_PROF=1` 打每个阶段的
+  墙钟与次数(`session`/`load`/`probe`, FSDB 另有 `fsdb:begin/open/names/index`);
+  `--features prof` + `WAL_PROF_SAMPLE=<阶段>` 生成火焰图(pprof-rs 用户态采样, **不需要 perf/root**)。
+  ⚠️ **陷阱**: 火焰图的百分比是"线程采样占比",32 个 rayon 线程自旋会把它冲淡/放大 ——
+  墙钟归属**只信阶段账**; 看函数排序时用 `RAYON_NUM_THREADS=1 WAL_PROF_SAMPLE=load`。
+  首轮结论(真波形 336MB / 1796 万信号, 600 探针): 加载 95%(open 4.4s / names 4.0s / index 0.84s),
+  600 个探针合计 0.71s(每个 ≈1ms); 单线程只在 load 段采样时, 热点是
+  `Vec<Sig>::push` 与 `decode_tree_file` —— **都是"把 1796 万信号整体物化"的代价, 而不是某个算法的常数**,
+  所以方向是"别物化"(惰性/零加载), 不是"把循环写快"。
+
 ## Performance-sensitive paths
 
 | Path | Mechanism |

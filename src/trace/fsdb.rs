@@ -2502,6 +2502,7 @@ fn unload_each_chunk() -> bool {
 
 impl FsdbTrace {
     pub fn load(path: &Path, id: TraceId) -> Result<Self, String> {
+        crate::prof::mark("fsdb:begin");
         // **只取句柄**模式: 时间线 worker(分片预计算)只按**下标**喂句柄给 VC 迭代器,
         // 从头到尾不需要名字。关掉名字 arena/索引/scope 收集后, 一个 worker 的内存从
         // 6GB 级掉到 GB 级 —— 这是"1796 万信号也能 8 路并行"的前提。
@@ -2550,6 +2551,7 @@ impl FsdbTrace {
             if dbg {
                 eprintln!("[fsdb] RSS: open 后 {} MB", rss_kb() / 1024);
             }
+            crate::prof::mark("fsdb:open");
             let t_walk = std::time::Instant::now();
             let mut sigs: Vec<Sig> = Vec::new();
             let mut names = NameArena::with_capacity(0, 0);
@@ -2633,6 +2635,7 @@ impl FsdbTrace {
             if dbg {
                 eprintln!("[fsdb] RSS: 名字就位后 {} MB(信号 {} / scope {})", rss_kb() / 1024, sigs.len(), scopes.len());
             }
+            crate::prof::mark("fsdb:names");
             if dbg {
                 eprintln!(
                     "[fsdb] {}: open {}ms, 树遍历 {}ms ({} 信号 / {} scope), version={} scale={} ({:?}) min={} max={}",
@@ -2682,6 +2685,7 @@ impl FsdbTrace {
             if dbg {
                 eprintln!("[fsdb] RSS: 名字索引建完 {} MB", rss_kb() / 1024);
             }
+            crate::prof::mark("fsdb:index");
             if dbg {
                 eprintln!(
                     "[fsdb] 名字存储: arena {} KB + spans {} KB + 索引 {} KB ({} 信号)",

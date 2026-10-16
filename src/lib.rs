@@ -12,6 +12,7 @@ pub mod vcd;
 pub mod tests_fixtures;
 pub mod wal;
 pub mod trace;
+pub mod prof;
 
 pub use cli::Args;
 pub use fst::{FstWriter, FstOptions, Compression};

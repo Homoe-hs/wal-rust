@@ -17,6 +17,10 @@ default-run = "wal-rust"
 # 打包上 crates.io 时排除本地/历史资产(体积与隐私)
 exclude = ["docs/history/", "test_samples/", "bench/"]
 
+[features]
+# 阶段采样剖析(火焰图): 需要 pprof-rs, 只在你显式 --features prof 时编译
+prof = ["dep:pprof"]
+
 [dependencies]
 # CLI
 clap = { version = "4.5", features = ["derive"] }
@@ -65,6 +69,8 @@ wellen = "0.20.5"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
+# 可选: 采样剖析(--features prof); 用户态 SIGPROF 采样, 不需要 perf/root
+pprof = { version = "0.13", optional = true, default-features = false, features = ["flamegraph", "protobuf-codec"] }
 
 [dev-dependencies]
 tempfile = "3"
