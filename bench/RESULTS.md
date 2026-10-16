@@ -576,3 +576,9 @@ FST:本地没有夹具, **没有可比的性能行**(只有正确性门在守) �
 2. **许可通道不稳**:`.tools/vm/license_up.sh` 会报 "✅ 通道可用", 但端口可能在一分钟内又关
    (2026-09-28 实测:license_up 后立刻 OPEN, 一分钟后再探 CLOSED)。症状与判读见
    [`docs/fsdb-env.md`](../docs/fsdb-env.md) §5。
+
+---
+
+### 逐功能基线(每功能一个数 / 会话内边际)
+
+上面是**按场景**的性能记录。**逐功能**的基线(31 条功能 × mode A 单进程 + 29 条 probe × mode B 会话内边际,含 32 条功能清单、跳过项、缺测项、噪声源与 >20% 回归判定规则)在 [`bench/BASELINE.md`](BASELINE.md);原始中位数在 [`bench/perf-history.csv`](perf-history.csv)。
