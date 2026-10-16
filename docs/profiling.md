@@ -75,4 +75,4 @@ WAL_PROF=1 WAL_PROF_SAMPLE=session WAL_PROF_OUT=.tools/prof \
 * `--features prof` 只在显式开启时编译 pprof-rs;默认构建**不引入任何新依赖**。
 * 剖析二进制带 debuginfo(`CARGO_PROFILE_RELEASE_DEBUG=1 STRIP=false`),**它的墙钟数字不要当性能基线**,
   性能数字一律用普通 release 二进制 + `WAL_PROF=1` 的阶段账。
-* 阶段打点位置:`src/main.rs`(`session`/`load`/`probe`)、`src/trace/fsdb.rs`(`fsdb:begin/open/names/index`)。
+* 阶段打点位置:`src/main.rs`(`session`/`load`/`probe`)、`src/trace/fsdb.rs`(`fsdb:begin` / `fsdb:npi_init` / `fsdb:pre_open` / `fsdb:open` / `fsdb:names` / `fsdb:index`)。
