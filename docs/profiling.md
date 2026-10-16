@@ -19,7 +19,7 @@ WAL_PROF=1 WAL_PROF_SAMPLE=session WAL_PROF_OUT=.tools/prof \
 * 采样器是 **pprof-rs(用户态 SIGPROF + backtrace)**:这台机器没有 `perf`/`valgrind`,也没有 root,
   它照样能用 —— 不需要 `perf_event_open`。
 * `WAL_PROF_TRACE=1`:**每一次**阶段调用都打一行 `[prof] trace <阶段> #<第几次> <ms>ms`
-  —— 会话模式下与 `probes.wal` 的行序一一对应,于是能**逐探针归因**(不必为每条功能各起一个进程)。
+  —— 会话模式下与会话输入文件的行序一一对应,于是能**逐探针归因**(不必为每条功能各起一个进程)。
   只想逐探针归因时,不必再设 `WAL_PROF`。
 * `WAL_PROF_SAMPLE=<阶段名,...>` 决定**哪些阶段**生成火焰图(不设就一个都不生成, 只计时);
   同一时刻只允许一个采样器(嵌套时采被选中的那一层)。

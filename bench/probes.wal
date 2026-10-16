@@ -1,0 +1,58 @@
+; meta-signal-count — 元信息: 信号总数(不许物化整表, 走 signal_count)
+(length (SIGNALS))
+; meta-scope-count — 元信息: scope 总数
+(length SCOPES)
+; meta-timescale — 元信息: 时间单位/精度
+(timescale)
+; index-specials — 索引空间: INDEX / TS / MAX-INDEX(读 .ftl)
+(list INDEX TS MAX-INDEX)
+; name-signal-width — 元信息: 位宽
+(signal-width "tb.aicore_top.u_tnode_top_0.u_rvsys.llp_awaddr")
+; name-find-sig-precise — 信号名列举: 全表名字扫描(精确子串)
+(length (find-sig "core0_por_rstn"))
+; name-find-sig-wide — 信号名列举: 宽匹配(命中多, 物化列表)
+(length (find-sig "clk"))
+; time-at — 按时间取值(时间域, 不建索引空间)
+(at "tb.aicore_top.u_tnode_top_0.u_rvsys.llp_awaddr" 1000000)
+; index-get — 按索引取值(当前 INDEX=0)
+(get "tb.aicore_top.core0_por_rstn")
+; index-sample-at — 按索引取值(指定索引, 走索引空间)
+(sample-at "tb.aicore_top.cbus2gnode_pready_o" 100)
+; value-initial — dumpvars 初值快照
+(initial "tb.aicore_top.core0_por_rstn")
+; change-count — 变更列: 变更计数(时间域 change_points_time)
+(count (changes "tb.aicore_top.u_tnode_top_0.u_rvsys.core_clk"))
+; change-list — 变更列: 变更点列表长度
+(length (getwave "tb.aicore_top.cbus2gnode_pready_o"))
+; edge-rising — 边沿: 上升沿计数
+(count (rising "tb.aicore_top.u_tnode_top_0.u_rvsys.core_clk"))
+; edge-falling — 边沿: 下降沿计数
+(count (falling "tb.aicore_top.u_tnode_top_0.u_rvsys.core_clk"))
+; edge-window — 边沿: 窗口内变更/边沿
+(count-edges "tb.aicore_top.u_tnode_top_0.u_rvsys.core_clk" 0 1000000)
+; edges-list — 边沿: 窗口内变更时间戳列表(edges)
+(length (edges "tb.aicore_top.u_tnode_top_0.u_rvsys.core_clk" 0 1000000))
+; nav-step — 导航: 步进(读 .ftl; 探针自恢复 INDEX, 不污染后续)
+(do (step 5) (step -5) INDEX)
+; time-search — 变更列: 位模式搜索(时间窗口内)
+(length (search "tb.aicore_top.u_tnode_top_0.u_rvsys.llp_awaddr" "1" 0 1000000))
+; level-count — 电平计数(统一引擎, 需要索引空间)
+(count (= (get "tb.aicore_top.u_tnode_top_0.u_rvsys.llp_awvalid") 1))
+; cond-and-count — 组合条件计数(&& 分解 + 统一引擎)
+(count (&& (= (get "tb.aicore_top.u_tnode_top_0.u_rvsys.llp_awvalid") 1) (= (get "tb.aicore_top.u_tnode_top_0.u_rvsys.llp_wvalid") 1)))
+; index-find — 索引空间: find 带 limit
+(length (find (rising "tb.aicore_top.u_tnode_top_0.u_rvsys.core_clk") 10))
+; metric-latency-len — 指标: latency 配对(时间域); 写请求→写响应往返
+(length (latency (rising "tb.aicore_top.u_gnode_top.u_store_0.awvalid") (rising "tb.aicore_top.u_gnode_top.u_store_0.bvalid")))
+; metric-stats — 指标: stats 摘要
+(stats (latency (rising "tb.aicore_top.u_gnode_top.u_store_0.awvalid") (rising "tb.aicore_top.u_gnode_top.u_store_0.bvalid")))
+; metric-percentile — 指标: 分位数 p99
+(percentile (latency (rising "tb.aicore_top.u_gnode_top.u_store_0.awvalid") (rising "tb.aicore_top.u_gnode_top.u_store_0.bvalid")) 99)
+; metric-median — 指标: 中位数
+(median (latency (rising "tb.aicore_top.u_gnode_top.u_store_0.awvalid") (rising "tb.aicore_top.u_gnode_top.u_store_0.bvalid")))
+; metric-histogram — 指标: 直方图
+(histogram (latency (rising "tb.aicore_top.u_gnode_top.u_store_0.awvalid") (rising "tb.aicore_top.u_gnode_top.u_store_0.bvalid")) 10)
+; metric-ipc — 指标: IPC(事件/周期)
+(ipc (rising "tb.aicore_top.u_gnode_top.u_store_0.bvalid") (rising "tb.aicore_top.u_tnode_top_0.u_rvsys.core_clk"))
+; assert-eq-t0 — 断言: t0 恒等(自洽式, 恒真; 失败会让退出码非 0)
+(assert-eq "tb.aicore_top.core0_por_rstn" 0 0 (get "tb.aicore_top.core0_por_rstn"))
