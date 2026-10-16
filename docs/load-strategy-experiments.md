@@ -66,7 +66,7 @@ env -u VERDI_HOME -u WAL_NPI_LIB -u SNPSLMD_LICENSE_FILE -u LM_LICENSE_FILE \
 ```
 
 探针集:单次 = 1 条 `(length (SIGNALS))`;多次 = 600 条 `(count (changes "<sig>"))`
-(与 `docs/bttf-experiment.md` 用的是同一批信号,便于横向比)。
+(与 BTTF 对照实验用的是同一批信号,便于横向比 —— 那份记录在 dev 分支 bttf-waveform-db 上)。
 
 ## 5. 预期结论(待验证,写下来是为了可被证伪)
 
