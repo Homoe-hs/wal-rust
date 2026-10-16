@@ -35,7 +35,8 @@
 | [`4-state-semantics.md`](4-state-semantics.md) | 106 | 规范 | ✅ 现行(四值语义**唯一权威**) |
 | [`fsdb-rust-backend-spec.md`](fsdb-rust-backend-spec.md) | 130 | 计划 + 验收标准 | 🟡 **未实现**(纯 Rust 全局时间线:交付范围、G0–G7 验收门) |
 | [`waveform-metrics.md`](waveform-metrics.md) | 72 | 使用手册 + 规范 |
-| [`profiling.md`](profiling.md) | 96 | 运行手册 | ✅ 现行(`WAL_PROF=1` 阶段账 + `--features prof` 火焰图; 含读图陷阱与首轮结论) | ✅ 现行(延迟/IPC/统计:语义与用例; §5 列出还没做的) |
+| [`profiling.md`](profiling.md) | 96 | 运行手册 |
+| [`load-strategy-experiments.md`](load-strategy-experiments.md) | 88 | 实验设计 | 📋 待跑(cache-only × 惰性:小/大 × 单次/多次 四象限与判据) | ✅ 现行(`WAL_PROF=1` 阶段账 + `--features prof` 火焰图; 含读图陷阱与首轮结论) | ✅ 现行(延迟/IPC/统计:语义与用例; §5 列出还没做的) |
 | [`internal-feedback-review.md`](internal-feedback-review.md) | 40 | 复盘 | 📦 复盘(0.10.10 批次) |
 | [`migration-0.8-0.11.md`](migration-0.8-0.11.md) | 39 | 迁移指南 | 🟡 历史区间(0.8→0.11), 供老用户对照 |
 

@@ -19,7 +19,7 @@ $ wal-rust '(count (&& (= (get "awvalid") 1) (= (get "awready") 1)))' -l design.
 
 | | |
 |---|---|
-| 当前版本 | **0.14.46**(发版记录见 [`CHANGELOG.md`](CHANGELOG.md)) |
+| 当前版本 | **0.14.47**(发版记录见 [`CHANGELOG.md`](CHANGELOG.md)) |
 | 输入格式 | VCD、FST([wellen](https://crates.io/crates/wellen))、**FSDB**(借 Verdi NPI, 纯 Rust FFI) |
 | 平台 | Linux x86_64;发布二进制要求 **glibc ≥ 2.17**(CentOS 7 / RHEL 7 / Ubuntu 16.04+) |
 | 规模 | 已在 **152GB / 58.7GB** 合成波形与 **5.86GB** 真实波形上验证(冷查询单遍读文件, 见[性能](#性能)) |
@@ -81,7 +81,7 @@ wal-rust '(assert-eq "sig" 100000 200000 1)' -l design.vcd   # [t0,t1] 内恒为
 wal-rust run script.wal -l design.vcd
 wal-rust repl
 
-# 4) 会话模式: 一次加载, 多条探针(大波形最划算)
+# 4) 会话模式: 一次加载, 多条探针 —— **大波形的推荐用法**
 printf '(count (changes "clk"))\n(get "state")\n' | wal-rust --stdin -l design.vcd
 
 # 5) CI 用法: 遇错即停, 退出码可判
@@ -89,6 +89,27 @@ wal-rust run --halt-on-error script.wal -l design.vcd
 ```
 
 输入自动识别:以 `(` 开头 → 当表达式;是存在的文件 → 当脚本;没有输入 → REPL。
+
+### 推荐用法:大波形请用「一次加载、多查询」
+
+**加载是唯一的大头。** 真波形实测(336MB / 1796 万信号,`WAL_PROF=1` 阶段账):
+
+| 阶段 | 墙钟 | 说明 |
+|---|---|---|
+| `npi_fsdb_open` | **4.3s** | NPI 自建索引 + checkout 许可(第三方) |
+| 名字表就位(`.fnames`) | **≈0.7s** | 与 open **重叠**后的残余(原来串行 2.6~4.7s) |
+| 名字索引 | **0.8s** | 并行哈希 |
+| **加载合计** | **≈5.8s** | 每个进程只付一次 |
+| 600 个查询 | **0.7s** | **每个 ≈1ms** |
+
+所以:
+
+* **同一条波形要问多个问题 → 用 `--stdin`**(或 `wal-rust repl`):一次加载、多次查询,
+  600 个探针只多花 0.7s;而**每个查询起一个新进程**就要每次重付那 ~5.8s。
+* 集群上把会话整包提交:`scripts/lsf_wal_run.sh <wave.fsdb> <probes.wal> [slots]`。
+* 单发查询(只想问一件事)用普通命令行即可,没必要为了"省一次加载"绕远路。
+* 想知道自己那条命令花在哪:`WAL_PROF=1 wal-rust --stdin …` 会打印阶段账
+  (详见 [`docs/profiling.md`](docs/profiling.md))。
 
 ### 三个容易踩的点
 

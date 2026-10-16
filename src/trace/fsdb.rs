@@ -2509,6 +2509,7 @@ impl FsdbTrace {
         // 由 `run_timeline_worker` 打开(父进程也可以直接设环境变量给子进程)。
         let handles_only = std::env::var("WAL_FSDB_HANDLES_ONLY").is_ok();
         let npi = npi()?;
+        crate::prof::mark("fsdb:npi_init");
         // 用户可能传**相对路径**, 而 NPI 沙箱会把 CWD 切到缓存目录下 npi/ 里:
         // ① NPI open 必须给绝对路径; ② 之后每次算缓存 key 都要 stat 这个文件 ——
         // 相对路径在沙箱里 stat 不到 → cache_path() 返回 None → **缓存永远写不出来**,
@@ -2522,6 +2523,22 @@ impl FsdbTrace {
         let abs = std::path::PathBuf::from(&filename);
         let cpath = CString::new(abs.to_string_lossy().as_bytes())
             .map_err(|_| format!("路径含 NUL 字节: {}", filename))?;
+        // **重叠**: 名字缓存是我们自己的文件(真实 1796 万信号 ≈ 4.7s 解码), 与接下来
+        // NPI open(≈5s, 建它自己的索引 + checkout 许可)**互不依赖** —— 先丢到后台线程,
+        // open 完再 join, 于是省掉两者中较小的那个。缓存未命中就退回原来的串行路径。
+        let preload = if handles_only {
+            None
+        } else {
+            let root = cache_root.clone();
+            let fname = filename.clone();
+            let hit = crate::trace::vcd::cache_mode() != crate::trace::vcd::CacheMode::Off
+                && cache_path(&root, &fname, ".fnames").map(|p| p.exists()).unwrap_or(false);
+            if hit {
+                Some(std::thread::spawn(move || try_load_tree_cache(&root, &fname)))
+            } else {
+                None
+            }
+        };
         let _box = NpiSandbox::enter(false); // open 的版本警告留在 stderr
         unsafe {
             if let Some(f) = npi.is_fsdb {
@@ -2552,6 +2569,8 @@ impl FsdbTrace {
                 eprintln!("[fsdb] RSS: open 后 {} MB", rss_kb() / 1024);
             }
             crate::prof::mark("fsdb:open");
+            // 后台线程大概率已经解完; 没解完就等它剩下的部分(仍比串行省)
+            let preloaded = preload.and_then(|h| h.join().ok()).flatten();
             let t_walk = std::time::Instant::now();
             let mut sigs: Vec<Sig> = Vec::new();
             let mut names = NameArena::with_capacity(0, 0);
@@ -2566,7 +2585,7 @@ impl FsdbTrace {
                 let mut ignore_scopes: Vec<String> = Vec::new();
                 let mut push_noop = |_n: &str, _w: usize| {};
                 walk_top(npi, file, &mut sigs, &mut ignore_scopes, &mut push_noop);
-            } else if let Some((arena, widths, sc)) = try_load_tree_cache(&cache_root, &filename) {
+            } else if let Some((arena, widths, sc)) = preloaded {
                 // 直接解进 arena(不再先造一遍 Vec<String>)
                 names = arena;
                 scopes = sc;
