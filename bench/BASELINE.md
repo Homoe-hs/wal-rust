@@ -50,7 +50,7 @@ python3 scripts/check_bench_regression.py --baseline 0.14.49 --new 0.14.51   # �
 ### mode A —— 每条功能一个独立进程(含加载)
 
 * 一条功能 = 一个 `target/release/wal-rust ... -l "$WAVE"` 进程;**端到端 wall 含加载**;
-* 每条功能跑 **3 次**,取**中位数**(`single.csv` 90 行原始 → `single.median.csv` 30 行中位;`extra/single.csv` 3 行 edges-list → `extra/single.median.csv` 1 行中位);
+* 每条功能跑 **3 次**,取**中位数**(`.tools/bench/baseline/single.csv` 90 行原始 → `.tools/bench/baseline/single.median.csv` 30 行中位;`.tools/bench/baseline/extra/single.csv` 3 行 edges-list → `.tools/bench/baseline/extra/single.median.csv` 1 行中位);
 * `RSS` = 该进程峰值常驻内存(MB,`/usr/bin/time` 口径);
 * 覆盖 **31/32** 条功能;唯一跳过的是 `cli-topsig`(原因见 §6);
 * 单条命令完整路径记录在 `perf-history.csv` 的 `note` 里。
@@ -59,7 +59,7 @@ python3 scripts/check_bench_regression.py --baseline 0.14.49 --new 0.14.51   # �
 
 * 一条命令:`WAL_PROF=1 WAL_PROF_TRACE=1 target/release/wal-rust --stdin -l "$WAVE" < bench/probes.wal`;
 * **加载只付一次**;数字是**会话内边际** —— `WAL_PROF_TRACE=1` 让每次阶段调用打一行 `[prof] trace probe #k <ms>`,`probe #k` 与 `probes.wal` 的行序一一对应,相邻两次时戳之差就是该功能的边际耗时;
-* 会话跑 **3 次**,取中位数(`session.csv` = 3 × 38 行:每轮 1 `wall-total` + 8 条阶段账 + 29 条 `session-probe`);
+* 会话跑 **3 次**,取中位数(`.tools/bench/baseline/session.csv` = 3 × 38 行:每轮 1 `wall-total` + 8 条阶段账 + 29 条 `session-probe`);
 * `RSS` 只有**会话级峰值**(9381 MB),**没有逐探针 RSS**(缺测);
 * 覆盖 **29/29** 条表达式 probe;3 条 CLI 功能没有表达式形式,不进会话(缺测,见 §6)。
 
@@ -95,7 +95,7 @@ python3 scripts/check_bench_regression.py --baseline 0.14.49 --new 0.14.51   # �
 ## 4. mode A —— 单功能单进程(按中位 wall 降序)
 
 `$WAVE` = `/home/hesheng/Downloads/core 级波形/aicore_smoke_test_000.fsdb`(含空格,复制命令时加引号)。
-★ = 中位 wall ≥ 7s,标注见本节末。来源表 = `single.median.csv`(main)/ `extra/single.median.csv`(extra)。
+★ = 中位 wall ≥ 7s,标注见本节末。来源表 = `.tools/bench/baseline/single.median.csv`(main)/ `.tools/bench/baseline/extra/single.median.csv`(extra)。
 
 | 功能 | 中位 wall (s) | 中位 RSS (MB) | 表达式 / 子命令 | 来源表 |
 |---|---:|---:|---|---|
@@ -190,7 +190,7 @@ python3 scripts/check_bench_regression.py --baseline 0.14.49 --new 0.14.51   # �
 
 | 项 | 中位 | 3 次原始值 | 出处 |
 |---|---:|---|---|
-| `wall-total`(进程总墙钟) | 13.48s | 14.26 / 13.45 / 13.48 | `session.csv` |
+| `wall-total`(进程总墙钟) | 13.48s | 14.26 / 13.45 / 13.48 | `.tools/bench/baseline/session.csv` |
 | `session`(阶段账 session) | 13.322s | 14.081 / 13.295 / 13.322 | `session.1..3.log` |
 | `load`(= open + names + index) | 6.397s | 6.436 / 6.282 / 6.397 | 阶段账 |
 | ├ `fsdb:open` | 5.251s | 5.299 / 5.148 / 5.251 | 阶段账 |
@@ -199,7 +199,7 @@ python3 scripts/check_bench_regression.py --baseline 0.14.49 --new 0.14.51   # �
 | └ `fsdb:npi_init` | 0.000s | 0.000 / 0.000 / 0.000 | 阶段账 |
 | `probe`(29 条合计) | 6.773s | 7.341 / 6.773 / 6.678 | 阶段账 |
 | `probe-mean` | 0.233552s/次 | 0.253138 / 0.233552 / 0.230276 | 阶段账 |
-| 会话峰值 RSS | 9381 MB | 9381 / 9379 / 9381 | `session.csv` |
+| 会话峰值 RSS | 9381 MB | 9381 / 9379 / 9381 | `.tools/bench/baseline/session.csv` |
 
 ### 这张账怎么对平
 
@@ -238,7 +238,7 @@ python3 scripts/check_bench_regression.py --baseline 0.14.49 --new 0.14.51   # �
 | 时间线冷建 / `-j` 并行 / scope 分片 | **缺测** | 不在本装置范围(查询不建时间线);见 [`bench/RESULTS.md`](RESULTS.md) 的 FSDB 段 |
 
 另外提示一个**来源细节**,免得读者以为缺一行:mode A 的 `edges-list` 中位在
-`.tools/bench/baseline/extra/single.median.csv`(主表 `single.median.csv` 未含),本文件已并入 §4。
+`.tools/bench/baseline/extra/single.median.csv`(主表 `.tools/bench/baseline/single.median.csv` 未含),本文件已并入 §4。
 
 ---
 
@@ -292,7 +292,7 @@ python3 scripts/check_bench_regression.py --threshold 15 --gate-rss --json      
 
 `bench/perf-history.csv` 在 0.14.50 一次性追加了 **29 行** `fsdb-feat-session-<功能>`(会话内边际中位)。
 这是**只给基线版本**的入库:`append-csv` 的默认行为**不包含**这 29 行 —— 它只写
-(a) `single.median.csv` 里每条功能一行(**30 行**;本基线的 `edges-list` 来自 `extra/` 表,需另行追加)、
+(a) `.tools/bench/baseline/single.median.csv` 里每条功能一行(**30 行**;本基线的 `edges-list` 来自 `extra/` 表,需另行追加)、
 (b) 3 条会话汇总行(`fsdb-feat-session` / `-session-load` / `-session-probe-mean`)。
 也就是每版本约 **33 行**量级,而不是 +29 个新 op。
 
@@ -349,6 +349,6 @@ python3 scripts/check_bench_regression.py --threshold 15 --gate-rss --json      
 同文件的 `cmd_sigs` 早已改成 `signal_count()/signal_at(i)` 懒遍历(并留了注释)。
 这也是仓库自己的规矩("求值热路径禁止 `signals()`")在 CLI 路径上漏掉的一处。
 
-* 复测全套原始产物在 `.tools/bench/verify/`(`REPORT.md` / `wall_compare.csv` / `session_verify.csv` / `correctness.csv`),**本地产物、不入库**;
+* 复测全套原始产物在 `.tools/bench/verify/`(`.tools/bench/verify/REPORT.md` / `.tools/bench/verify/wall_compare.csv` / `.tools/bench/verify/session_verify.csv` / `.tools/bench/verify/correctness.csv`),**本地产物、不入库**;
   本条把它的结论固化进版本库,避免"复测做了但没人看见"。
 * 正确性对拍结论:**跨进程值完全确定**(会话 29 条输出逐行相同);**mode A ↔ mode B:MATCH=29 / DIFF=0 / NA=3**(CLI 不适用)。
