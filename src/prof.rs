@@ -48,6 +48,17 @@ pub fn enabled() -> bool {
         matches!(
             std::env::var("WAL_PROF").as_deref(),
             Ok("1") | Ok("on") | Ok("yes") | Ok("true")
+        ) || trace_on()   // 只想逐探针归因时, 不必再设 WAL_PROF
+    })
+}
+
+/// `WAL_PROF_TRACE=1`: 每**次**阶段调用都打一行(会话模式下就能逐个探针归因)。
+fn trace_on() -> bool {
+    static T: OnceLock<bool> = OnceLock::new();
+    *T.get_or_init(|| {
+        matches!(
+            std::env::var("WAL_PROF_TRACE").as_deref(),
+            Ok("1") | Ok("on") | Ok("yes") | Ok("true")
         )
     })
 }
@@ -122,6 +133,7 @@ pub fn phase<T>(name: &'static str, f: impl FnOnce() -> T) -> T {
     let out = f();
     let dt = t0.elapsed().as_nanos() as u64;
     DEPTH.fetch_sub(1, Ordering::Relaxed);
+    let mut nth = 0u64;
     if let Ok(mut t) = table().lock() {
         if !t.map.contains_key(name) {
             t.order.push(name);
@@ -129,6 +141,11 @@ pub fn phase<T>(name: &'static str, f: impl FnOnce() -> T) -> T {
         let e = t.map.entry(name).or_default();
         e.ns += dt;
         e.calls += 1;
+        nth = e.calls;
+    }
+    if trace_on() {
+        // 会话模式下按顺序逐个探针归因(与 probes.wal 的行序一一对应)
+        eprintln!("[prof] trace {} #{} {:.3}ms", name, nth, dt as f64 / 1e6);
     }
     #[cfg(feature = "prof")]
     if let Some(g) = guard {
