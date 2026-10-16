@@ -23,7 +23,9 @@
 # 产物(默认目录 .tools/bench/baseline/):
 #   single.csv          列 feature,mode,run,wall_s,rss_mb,cmd   (每次 single 重写)
 #   single.median.csv   列 feature,mode,median_wall_s,median_rss_mb,runs,cmd
-#   session.csv         列 feature,mode,run,wall_s,rss_mb,cmd   (每行 = 一个阶段账条目)
+#   session.csv         列 feature,mode,run,wall_s,rss_mb,cmd
+#                       mode=session      → 阶段账条目(wall-total/session/load/probe/probe-mean/fsdb:*)
+#                       mode=session-probe→ **每个功能的会话内边际耗时**(WAL_PROF_TRACE 的 trace probe #k)
 #   session.<n>.log     mode B 的原始输出(含 [prof] 阶段账)
 #   single.failures.tsv 失败/超时的功能与首行错误
 #
@@ -128,7 +130,7 @@ while [ $# -gt 0 ]; do
         --append) APPEND_AFTER_ALL=1; shift ;;
         --note) EXTRA_NOTE="$2"; shift 2 ;;
         --csv) CSV_FILE="$2"; shift 2 ;;
-        --baseline|--new|--threshold|--min-wall|--noise-floor)
+        --baseline|--new|--threshold|--min-wall|--noise-floor|--op)
             CHECK_ARGS+=("$1" "$2"); shift 2 ;;
         --gate-rss|--quiet|--json)
             CHECK_ARGS+=("$1"); shift ;;
@@ -340,6 +342,26 @@ do_single() {
 }
 
 # ---- mode B: session -------------------------------------------------------
+# WAL_PROF_TRACE=1 的逐次打点: "[prof] trace probe #k 17.035ms"
+# ⚠️ 只认 phase 名 = probe 的行; load/session 也会各打一行, 不能算进探针序号。
+parse_traces() { # $1=log → "k<TAB>ms"
+    grep -aoE '^\[prof\] trace probe #[0-9]+ [0-9.]+ms' "$1" |
+        sed -E 's/^\[prof\] trace probe #([0-9]+) ([0-9.]+)ms/\1\t\2/'
+}
+
+# probes.wal 里每个 probe 前面有一行 "; <feature> — <note>"; 按**实际执行序**取 feature 名
+load_probe_features() { # 填全局数组 PROBE_FEAT
+    PROBE_FEAT=()
+    local line f=""
+    while IFS= read -r line; do
+        case "$line" in
+            ';'*) f="${line#; }"; f="${f%% *}" ;;
+            ''|' '*|'\t'*|'   '*) continue ;;
+            *) PROBE_FEAT+=("${f:-probe}") ;;
+        esac
+    done < "$PROBES"
+}
+
 parse_prof() { # $1=log → "name<TAB>secs<TAB>calls"
     awk '
         /^\[prof\] 阶段账/ { next }
@@ -361,11 +383,14 @@ do_session() {
         license_ensure || warn "首次 license_up.sh 未成功 —— 会按失败重试"
     fi
 
-    local cmdstr="WAL_PROF=1 $BIN --stdin -l $WAVE < $PROBES"
+    load_probe_features
+    [ "${#PROBE_FEAT[@]}" -gt 0 ] || warn "probes.wal 里没找到 '; feature' 注释行 → 逐探针行会退化成 probe#k"
+    say "逐探针归因: WAL_PROF_TRACE=1(${#PROBE_FEAT[@]} 个探针名)"
+    local cmdstr="WAL_PROF=1 WAL_PROF_TRACE=1 $BIN --stdin -l $WAVE < $PROBES"
     local run=1
     while [ "$run" -le "$SESSION_RUNS" ]; do
         RUN_STDIN="$PROBES"
-        run_measured "$SESSION_TIMEOUT" env WAL_PROF=1 "$BIN" --stdin -l "$WAVE"
+        run_measured "$SESSION_TIMEOUT" env WAL_PROF=1 WAL_PROF_TRACE=1 "$BIN" --stdin -l "$WAVE"
         RUN_STDIN=""
         local log="$OUTDIR/session.$run.log"
         printf '%s\n' "$OUT" > "$log"
@@ -374,6 +399,19 @@ do_session() {
 
         # 整进程墙钟(time 的 %e)+ 各阶段账
         printf '%s,%s,%s,%s,%s,%s\n' "wall-total" "session" "$run" "$WALL" "$RSS_MB" "$(csv_field "$cmdstr")" >> "$SESSION_CSV"
+
+        # 逐探针**会话内边际耗时**(WAL_PROF_TRACE 的 trace probe #k, 与 probes.wal 非空行序一一对应)
+        local pk pms pfeat psecs nprobe=0
+        while IFS=$'\t' read -r pk pms; do
+            [ -z "$pk" ] && continue
+            pfeat="${PROBE_FEAT[$((pk - 1))]:-probe#$pk}"
+            psecs=$(awk -v m="$pms" 'BEGIN{printf "%.6f", m/1000}')
+            printf '%s,%s,%s,%s,%s,%s\n' "$(csv_field "$pfeat")" "session-probe" "$run" "$psecs" "$RSS_MB" \
+                "$(csv_field "会话内边际(probe #$pk): $cmdstr")" >> "$SESSION_CSV"
+            nprobe=$((nprobe + 1))
+        done < <(parse_traces "$log")
+        [ "$nprobe" -eq 0 ] && warn "没解析到 trace probe 行(二进制是否支持 WAL_PROF_TRACE?)"
+
         local name secs calls
         while IFS=$'\t' read -r name secs calls; do
             [ -z "$name" ] && continue
@@ -396,6 +434,10 @@ do_session() {
         run=$((run + 1))
     done
     say "mode B 完成 → $SESSION_CSV(原始 [prof] 输出: $OUTDIR/session.<run>.log)"
+    say "会话内边际最重的 5 个功能(中位):"
+    median_by_feature "$SESSION_CSV" 4 | awk -F'\t' '$1!="wall-total" && $1!="session" && $1!="load" && $1!="probe" && $1!="probe-mean" && $1!~/^fsdb:/ && $2!="-"' |
+        sort -t$'\t' -k2 -gr | head -5 |
+        while IFS=$'\t' read -r f w n; do printf '        %-24s %8ss (n=%s)\n' "$f" "$w" "$n"; done
     return 0
 }
 
@@ -451,7 +493,9 @@ do_append() {
         rss=$(awk -F, '$1=="wall-total" && $5 ~ /^[0-9]+$/ {print $5}' "$SESSION_CSV" | sort -n | tail -1)
         cmd=$(awk -F, '$1=="wall-total" {print $6; exit}' "$SESSION_CSV")
         [ -z "$rss" ] && rss="-"
-        local note="--stdin 单次加载; load=${load}s; probe 均值 ${pmean}s/次 × ${pcalls} 个探针(${nruns} 次会话取中位); phases 见 $SESSION_CSV; cmd: ${cmd}"
+        local heaviest
+        heaviest=$(median_by_feature "$SESSION_CSV" 4 | awk -F'\t' '$1!="wall-total" && $1!="session" && $1!="load" && $1!="probe" && $1!="probe-mean" && $1!~/^fsdb:/ && $2!="-"' | sort -t$'\t' -k2 -gr | head -1 | awk -F'\t' '{printf "%s=%ss", $1, $2}')
+        local note="--stdin 单次加载; load=${load}s; probe 均值 ${pmean}s/次 × ${pcalls} 个探针(${nruns} 次会话取中位); 最重边际探针 ${heaviest}; 逐探针边际见 $SESSION_CSV; cmd: ${cmd}"
         [ -n "$EXTRA_NOTE" ] && note="$note; $EXTRA_NOTE"
         printf '%s,%s,%s,%s,%s,%s,%s\n' "$version" "$date" "${pf}-feat-session" "$fixture" \
             "$wall" "$rss" "$(csv_field "$note")" >> "$CSV_FILE"
