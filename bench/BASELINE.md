@@ -317,3 +317,38 @@ python3 scripts/check_bench_regression.py --threshold 15 --gate-rss --json      
 
 以上数字**全部**逐字取自这些产物(`0.14.50` 这次没有重测)。任何一处对不上,以 `bench/perf-history.csv` 为准并回来改本文件。
 
+
+## 10. 使用禁忌与独立复测结论(Lead 复核后补写,2026-10-17)
+
+本基线由**另一个人独立复测**过(3 条 5 次复测 + 全量 31 条单次 + 自跑一遍完整会话 + mode A↔B 正确性对拍)。
+结论:**有条件可信** —— 数据立得住,但必须按下面的条件引用。
+
+### 10.1 引用条件(违反会得出错误结论)
+
+1. **mode A 与 mode B 不许相减/互相推算**。两半是**跨批次**测的:本次复测里 mode A 比基线偏高 +6%、
+   mode B 偏低 −5.8%(方向相反各漂约 6%);基线自身也有 25/30 条 mode A 的**最小** wall 低于同一份
+   session 的**最大** load(6.44s)—— 而 mode A 定义上 = 加载 + 查询。要比较就**同批比**。
+2. **会话内边际只用于"同一会话内的相对排序"**,不能当"这个功能独立跑要多久"。对物化整张名字表的
+   功能(`find-sig`)尤其如此:会话内边际系统性低于独立成本(写/读页缓存已被前面的探针预热)。
+3. **`edges-list` 的 mode A 中位在 `.tools/bench/baseline/extra/single.median.csv`**(主表漏收,属装置口径不对称);
+   取数时别当"缺测"。
+4. **名字物化类功能跨批次可漂 ±25%,普通查询 ±14%** ⇒ 判定回归必须**同批**;且 mode A 建议 **≥5 次**
+   (本次基线是 3 次,3 次的小离散是批次内假象:`find-sig-wide` 3 次离散 0.6%,而两次 5 次批测中位差 7%)。
+5. **逐探针 RSS 是缺测**(只有会话级 9381 MB);冷页缓存口径、VCD/FST、时间线冷建/`-j`/scope 分片都不在本装置范围。
+
+### 10.2 装置缺陷(已知,用之前先看这条)
+
+`.tools/bench/baseline/session.<n>.log` 是 `OUT=$(… 2>&1)` **合流**出来的:stdout 的 `=>` 值行与 stderr 的
+`[prof] trace` 行会因管道刷新竞争而**乱序**,**不能**用它做逐 probe 归因(复测同事是自己另做"带标记 + 两路分开"
+的会话才完成对拍的)。要用 `WAL_PROF_TRACE` 做逐功能归因,请:值写 stdout 文件、阶段账写 stderr 文件、并在 probe 里插标记。
+
+### 10.3 基线暴露出的第一个可优化点(建议另开单)
+
+`cli-count` 的 mode A RSS **9273 MB**,而 `cli-sigs` 只有 6193 MB;复测独立复现为 9271 MB。根因:
+`src/main.rs` 的 `cmd_count` 里 `let sigs = tr.signals();` —— **物化整张 1796 万名字表(+约 3.1 GB)**;
+同文件的 `cmd_sigs` 早已改成 `signal_count()/signal_at(i)` 懒遍历(并留了注释)。
+这也是仓库自己的规矩("求值热路径禁止 `signals()`")在 CLI 路径上漏掉的一处。
+
+* 复测全套原始产物在 `.tools/bench/verify/`(`REPORT.md` / `wall_compare.csv` / `session_verify.csv` / `correctness.csv`),**本地产物、不入库**;
+  本条把它的结论固化进版本库,避免"复测做了但没人看见"。
+* 正确性对拍结论:**跨进程值完全确定**(会话 29 条输出逐行相同);**mode A ↔ mode B:MATCH=29 / DIFF=0 / NA=3**(CLI 不适用)。
