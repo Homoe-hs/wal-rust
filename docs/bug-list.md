@@ -137,9 +137,14 @@
   ```
 - 期望:非 VCD/FST 或明显截断的输入应**报错**(rc≠0);至少要有一个"严格模式"开关。空文件已正确报错(`Empty VCD file`),说明有判定能力,只是没用在"缺 $enddefinitions/垃圾内容"上。
 
-## BUG-009 `(sample-at s 越界索引)` 静默返回 nil,负索引却报错
+## ~~BUG-009~~ `(sample-at s 越界索引)` 返回 nil —— **已撤回(不是 bug)**
 
-- 严重度:**中**(越界取值应报错,不能给 nil 让上层继续算)
+> ⚠️ **结论修正**:`test_samples/verify_vcd.wal` 第 32 行明确固化"索引越界返回 nil"
+> (`(null? (sample-at s0 (+ mx 1000000)))`),说明这是**既有约定**(越界探测);负索引报错也保留。
+> 本轮曾按"越界应报错"修过,CI 的 samples 阶段把它抓了回来,已撤回并改为固化该约定的回归测试。
+> 文档已在手册 `sample-at` 节补一句"越界返回 nil"。
+
+- 严重度:(撤回)
 - 复现:
   ```bash
   ./target/release/wal-rust '(sample-at "data" 999)' -l .tools/bughunt/fixtures/basic.vcd   # 观察: => nil
@@ -222,3 +227,51 @@
   (`defsig/new-trace/dump-trace`)、`search/freq/dela/period/groups/in-group`、
   `fsdb-timeline-*` 子命令、**FSDB 后端**(许可通道被宿主 EDA 布局变更破坏,待恢复)。
 - 疑似(未复现):子串匹配回退(`resolve_signal_name` 第三步)可能把 `top.a` 指到 `top.ab` 而不是报歧义。
+
+---
+
+# 根因分析与修复状态(第一轮修复,2026-10-17)
+
+## 已修(带回归测试,`tests/bughunt_regressions.rs`)
+
+| bug | 根因(代码位置) | 修法 | 回归测试 |
+|---|---|---|---|
+| **001** VCD 重复 `#N` 当多索引 | ① `src/trace/vcd.rs::build_dump_index` 每遇 `#` 行就 `ts.push`;② 冷扫描 `anchored_changes` 也按 `#` 行数计 `ts_count` | 两处都改为"**时间戳值变化才新增索引**";跨 chunk 头部重复时间戳在合并时用 `dup_head` 修正基址(列缓存的 `gts` 同步用 `base_off`);偏移保留**第一个** `#` 段以覆盖同刻全部写入 | `bug001_duplicate_timestamps_collapse_to_one_index` |
+| **001b** 同刻多次写入的变更点取到中间值 | 冷扫描合并里的"last write wins"按 index 比较,但 index 计数未去重导致写入落到不同 index;`getwave` 取到中间值、`(find (changes))` 误报 | 同上(去重后同刻写入落在同一 index,last-write 生效);`getwave/`find` 与 FST 对齐 | 同上(断言 getwave 折叠为 3 点、同刻值=最后写入) |
+| **003** FST `SCOPES` 多空根 scope | `src/trace/fst.rs::scopes()` 直接收集 wellen 全部 scope(含根 `""`) | `.filter(|n| !n.is_empty())` | `bug003_fst_scopes_exclude_empty_root` |
+| **007** help 列了未内置的 `filter` | `src/wal/builtins/core.rs` 的帮助文案 | 从文案移除 `filter`(手册本就注明未内置) | —(文案类,手工核对) |
+| **010** `(at s 负时间)` 返回末值 | `src/wal/builtins/wave.rs::op_at` 用 `extract_int(..)? as u64`,负数回绕成巨大值 | 显式判负 → 报错 | `bug010_at_negative_time_errors` |
+| **011** `let` 不支持顺序绑定 | `src/wal/eval/evaluator.rs::eval_let` 在**旧环境**里求值所有 binding 表达式,之后才切到新作用域(与手册 §1.6 的 let* 语义相反) | 先 `mem::replace` 进子作用域,再逐个求值+`define`;用闭包保证出错也恢复环境 | `bug011_let_bindings_are_sequential` |
+| **012** `cond` 不支持 `else` | `cond` 未列入 `eval_list` 的**特殊形式**分支 → 参数被预求值,`(else ...)` 被当函数调用 | 新增 `eval_cond`(guard 不预求值;符号 `else` 恒真)+ 特殊形式分发 | `bug012_cond_supports_else_clause` |
+| **013** 手册 `&&/||` 示例与实现矛盾 | 手册示例输出写 `0/1`,正文与冻结测试 `test_and_or_return_bool` 要求 bool | 示例改为 `false`/`true` | —(文档) |
+| **014** 布尔/浮点/数组显示与手册不一致 | 手册 21 处期望输出写 `#t/#f`、`2.0`、`{...}`;实际输出 `true/false`、`2`、`(...)` | 手册示例统一为实际口径,并在 §1.2 增补"**输出表示**"约定段(bool=`true/false`、整值浮点按整数显示、数组=扁平列表) | —(文档) |
+| **cache** VCD 缓存需失效 | BUG-001 改变了索引语义,但缓存 key 未变(`-v1.wcol`) | key 升到 `-v2.wcol`(旁挂 `.cols` 目录名随之变化),旧缓存自动失效 | 由 CI 与夹具验证 |
+
+## 撤回的"修复"(误判)
+
+- **~~BUG-009~~ `sample-at` 越界返回 nil**:`test_samples/verify_vcd.wal` 早已固化"越界返回 nil"的约定
+  (越界探测语义),CI 的 `samples` 阶段抓到了这处误改 → 已撤回;改为回归测试
+  `sample_at_out_of_range_returns_nil_by_contract` 把该约定固化住(防止以后再被"修"掉)。
+
+## 仍未修(下一轮)
+
+| bug | 现状 | 计划 |
+|---|---|---|
+| **002** FST 读侧把 `\a[0]` 的方括号当范围截掉 | 已定位:`FstWriter::create_var` 把 `data [3:0]` 原样写进名字,FST 读侧(wellen)解析名字尾部 `[..]` 为 range 并剥离;转义名被误伤 | 写侧把"名字/范围"拆成 FST 的结构字段,转义名原样保留;补 VCD/FST 名字集合一致的回归门 |
+| **004** VCD 名带空格范围 `top.data [3:0]` | 与 BUG-002 同源(名字/范围表示不统一);手册/测试有既有断言 | 与 002 一起做**语义决策**(建议统一为 `data[3:0]` 或 `data`,并保留两种写法的解析兼容) |
+| **005** `(SIGNALS)` 顺序跨格式不同 | VCD 声明序 vs FST 字典序;剩余矩阵差异主要来自此(21 条) | 统一为声明序(FST 读侧去掉 `sigs.sort()`),或在文档明确"顺序不保证" |
+| **008** 损坏/截断 VCD 只 warning、rc=0 | 空文件会报错;缺 `$enddefinitions`/垃圾内容只 warning | 加"文件结构完整性"判定 → 默认报错(或提供 `--lenient` 显式放宽) |
+| **015** `(1 2)` 非过程调用静默返回列表 | 待确认设计意图 | 与文档作者确认后二选一(报错 / 写明是列表字面量) |
+
+## 已复现但属"设计/文档"类别(不改实现)
+
+- **016(新)**:单字符/过短名字的解析歧义提示不友好,例:`(getwave "t")` 在 `basic.vcd` 上报
+  `signal 't' is ambiguous (2 candidates: ["top.clk", "top.data [3:0]"])` —— 是子串回退把所有含 `t` 的名字都算候选。
+  行为本身不算错(确实无法唯一确定),但候选列表与"叶子名"语义容易让人误判。**待评估**是否让"叶子名精确命中"优先于子串回退。
+
+## 验证(本轮)
+
+- `cargo test --release`:全部通过(16 个 test binary,含新增 6 条回归)。
+- 文档示例对拍:`MATCH 55 → 79`(`MISMATCH 23 → 1`,剩余 1 条是 CLI 回显 `=>` 造成的比对噪声、1 条是 dump-trace 示例缺前置 defsig)。
+- 单功能矩阵:findings `224 → 40`(剩余全部为 SIGNALS 命名/顺序、TRACE 元信息、FST 名字集合差异,归 BUG-002/004/005)。
+- 组合阶段:findings `25 → 13`(剩余为 BUG-008 损坏文件、以及 `bits->sint` 参数用法/浮点除零等刻意报错项)。

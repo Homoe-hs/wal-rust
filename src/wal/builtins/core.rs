@@ -346,7 +346,7 @@ fn op_help(args: &[Value], _env: &mut Environment, _eval: &mut Evaluator) -> Res
                  语言:\n\
                    + - * / div mod(%) ** = == != < > <= >= && || not\n\
                    if do cond case when unless while define defun let set! fn lambda\n\
-                   map fold filter print printf save import exit assert-eq\n\
+                   map fold print printf save import exit assert-eq\n\
                    defmacro defunm macroexpand gensym   (宏: (doc \"defmacro\"))\n\
                    #name ≡ (resolve-group 'name); expr@offset ≡ (rel_eval expr offset)\n\
                  \n\

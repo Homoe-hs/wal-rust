@@ -217,7 +217,12 @@ fn op_at(args: &[Value], env: &mut Environment, _eval: &mut Evaluator) -> Result
         return Err("(at \"sig\" t) expected".to_string());
     }
     let name = extract_string(&args[0])?;
-    let target = extract_int(&args[1])? as u64;
+    let target_i = extract_int(&args[1])?;
+    if target_i < 0 {
+        // BUG-010: 负时间曾被 `as u64` 回绕成巨大值, 于是静默返回"最后一拍的值"
+        return Err(format!("(at \"sig\" t): 时间不能为负: {}", target_i));
+    }
+    let target = target_i as u64;
     with_signal_trace(env, &name, |tr, sig| {
         let timed: Vec<(u64, ScalarValue)> = tr.change_points_time(sig)?;
         // last change at or before target time

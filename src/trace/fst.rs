@@ -396,6 +396,7 @@ impl Trace for FstTrace {
         let wf = self.wf.borrow();
         let mut scopes: Vec<String> = wf.hierarchy().iter_scopes()
             .map(|s| s.full_name(wf.hierarchy()))
+            .filter(|n| !n.is_empty())   // BUG-003: wellen 的根 scope 是 ""; 它不是可见 scope(VCD 也没有)
             .collect();
         scopes.sort();
         scopes

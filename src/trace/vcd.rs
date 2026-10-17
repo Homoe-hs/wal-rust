@@ -784,10 +784,16 @@ impl VcdTrace {
                             // start with '#' but are NOT timestamps. 走共享判定
                             // (会剥掉 CRLF 的 \r / \n)。
                             if is_ts_line(line) {
-                                current_timestamp = parse_timestamp_fast(line);
-                                ts_seen += 1;
-                                ts.push(current_timestamp);
-                                ts_offsets.push(base_offset + line_start as u64);
+                                let t = parse_timestamp_fast(line);
+                                // BUG-001: 同一时间戳可能由多个 `#N` 段重复出现(合法 VCD; delta 周期)。
+                                // 索引空间按**时间戳**建(docs/4-state-semantics.md), 重复段**不新增索引**;
+                                // 偏移保留第一个段 —— 从它扫到下一个时间戳能覆盖同刻全部写入。
+                                if ts.last() != Some(&t) {
+                                    ts_seen += 1;
+                                    ts.push(t);
+                                    ts_offsets.push(base_offset + line_start as u64);
+                                }
+                                current_timestamp = t;
                             }
                         }
                         b'$' => {}
@@ -890,22 +896,26 @@ impl VcdTrace {
         }
 
         for (chunk_ts, chunk_offsets, chunk_si, chunk_evt, chunk_cols, chunk_want) in all {
-            col_ts_next = col_ts_base + chunk_ts.len();
+            // BUG-001: 块首的 `#N` 可能与本块**上一条**时间戳相同(跨块重复段) —— 也不新增索引。
+            let dup_head = !chunk_ts.is_empty() && timestamps.last() == Some(&chunk_ts[0]);
+            let base_off = col_ts_base - dup_head as usize;
+            col_ts_next = base_off + chunk_ts.len();
             for (wsig, local_ts, val) in chunk_want {
                 // 本块首个 '#' 之前的行属于上一块最后一个时间戳(块 0 = $dumpvars 块 → 跳过)
                 let gts = if local_ts == u32::MAX {
                     if col_ts_base == 0 { continue; }
                     (col_ts_base - 1) as u32
                 } else {
-                    (col_ts_base + local_ts as usize) as u32
+                    (base_off + local_ts as usize) as u32
                 };
                 match want_changes.last_mut() {
                     Some((s0, i0, v0)) if *s0 == wsig && *i0 == gts => *v0 = val,
                     _ => want_changes.push((wsig, gts, val)),
                 }
             }
-            timestamps.extend(chunk_ts);
-            timestamp_offsets.extend(chunk_offsets);
+            let skip = dup_head as usize;
+            timestamps.extend(chunk_ts.iter().skip(skip).copied());
+            timestamp_offsets.extend(chunk_offsets.iter().skip(skip).copied());
             for (sig_idx, s_ts, s_off) in chunk_si {
                 sparse_index.entry(sig_idx).or_default().push((s_ts, s_off));
             }
@@ -923,12 +933,12 @@ impl VcdTrace {
                 _ = &sig_idx;
                 // -1 before the chunk's first '#': the previous chunk's last
                 // timestamp (chunk 0's -1 = the $dumpvars block → skip).
-                let gts_base = col_ts_base as i64 + chunk_cols[i].1;
+                let gts_base = base_off as i64 + chunk_cols[i].1;
                 let present = gts_base >= 0;
                 if present {
                     if let Some(col) = col_cache.get_mut(&sig_idx) {
                         for (_, local_ts, st, _off, _vw) in &chunk_cols[i..j] {
-                            let gts = (col_ts_base as i64 + local_ts) as u32;
+                            let gts = (base_off as i64 + local_ts) as u32;
                             if col.idxs.last() == Some(&gts) {
                                 *col.states.last_mut().unwrap() = *st; // last write wins
                             } else {
@@ -941,7 +951,7 @@ impl VcdTrace {
                         let w = chunk_cols[i].4 as usize;
                         let mut col = Col { width: w, idxs: Vec::with_capacity(j - i), states: Vec::with_capacity(j - i) };
                         for (_, local_ts, st, _off, _vw) in &chunk_cols[i..j] {
-                            let gts = (col_ts_base as i64 + local_ts) as u32;
+                            let gts = (base_off as i64 + local_ts) as u32;
                             col.idxs.push(gts);
                             col.states.push(*st);
                             col_bytes += 20;
@@ -951,7 +961,7 @@ impl VcdTrace {
                         // bisect knob: skip offsets columns entirely
                     } else if let Some(offcol) = off_cache.get_mut(&sig_idx) {
                         for (_, local_ts, _st, offv, _vw) in &chunk_cols[i..j] {
-                            let gts = (col_ts_base as i64 + local_ts) as u32;
+                            let gts = (base_off as i64 + local_ts) as u32;
                             if offcol.idxs.last() == Some(&gts) {
                                 *offcol.offsets.last_mut().unwrap() = *offv;
                             } else {
@@ -963,7 +973,7 @@ impl VcdTrace {
                         // value-column budget exhausted → offsets-only index
                         let mut offcol = OffCol { idxs: Vec::with_capacity(j - i), offsets: Vec::with_capacity(j - i) };
                         for (_, local_ts, _st, offv, _vw) in &chunk_cols[i..j] {
-                            let gts = (col_ts_base as i64 + local_ts) as u32;
+                            let gts = (base_off as i64 + local_ts) as u32;
                             offcol.idxs.push(gts);
                             offcol.offsets.push(*offv);
                         }
@@ -1303,8 +1313,8 @@ impl VcdTrace {
         }
         boundaries.push(data_len);
 
-        // (本块 '#' 行数, 命中: (块内 ts 序号或 u32::MAX, pos, value))
-        let results: Vec<(usize, Vec<(u32, usize, VcdValue)>)> = boundaries[..boundaries.len() - 1]
+        // (本块**不同时间戳**数, 首/末时间戳值, 命中: (块内 ts 序号或 u32::MAX, pos, value))
+        let results: Vec<(usize, Option<u64>, Option<u64>, Vec<(u32, usize, VcdValue)>)> = boundaries[..boundaries.len() - 1]
             .par_iter()
             .enumerate()
             .map(|(ci, &start)| {
@@ -1314,6 +1324,8 @@ impl VcdTrace {
                 let mut ts_count = 0usize;
                 // 本块内最后一个 '#' 的序号; u32::MAX = 本块还没有 '(该行属于上一块)
                 let mut cur_ts = u32::MAX;
+                let mut last_ts_val: Option<u64> = None;
+                let mut first_ts_val: Option<u64> = None;
                 let mut p = 0usize;
                 while p < chunk.len() {
                     let line_start = p;
@@ -1327,8 +1339,14 @@ impl VcdTrace {
                         None => {}
                         Some(b'#') => {
                             if is_ts_line(line) {
-                                ts_count += 1;
-                                cur_ts = (ts_count - 1) as u32;
+                                // BUG-001: 同一时间戳的重复 `#N` 段不新增索引(索引=时间戳)
+                                let t = parse_timestamp_fast(line);
+                                if last_ts_val != Some(t) {
+                                    ts_count += 1;
+                                    cur_ts = (ts_count - 1) as u32;
+                                    last_ts_val = Some(t);
+                                    if first_ts_val.is_none() { first_ts_val = Some(t); }
+                                }
                             }
                         }
                         Some(b'$') => {}
@@ -1353,7 +1371,7 @@ impl VcdTrace {
                         }
                     }
                 }
-                (ts_count, hits)
+                (ts_count, first_ts_val, last_ts_val, hits)
             })
             .collect();
 
@@ -1362,21 +1380,27 @@ impl VcdTrace {
         // 同一时间戳多次写入折叠为最后一次(last write wins)。
         let mut all: Vec<(u32, VcdValue)> = Vec::new();
         {
-            let mut base = 0usize;
-            for (ts_count, hits) in results {
+            let mut base = 0usize;                 // 前面各块的**不同时间戳**数
+            let mut prev_last: Option<u64> = None;
+            for (ts_count, first_ts, last_ts, hits) in results {
+                // 跨块重复: 本块第一个时间戳 == 上一块最后一个时间戳 → 不新增索引
+                let dup_head = first_ts.is_some() && first_ts == prev_last;
+                let base_off = base - dup_head as usize;
                 for (local_idx, _pos, val) in hits {
                     let ts_idx = if local_idx == u32::MAX {
+                        // 本块首个 '#' 之前的行属于上一块**最后一个**时间戳
                         if base == 0 { continue; }
                         base - 1
                     } else {
-                        base + local_idx as usize
+                        base_off + local_idx as usize
                     };
                     match all.last_mut() {
                         Some((i, v)) if *i as usize == ts_idx => *v = val,
                         _ => all.push((ts_idx as u32, val)),
                     }
                 }
-                base += ts_count;
+                base = base_off + ts_count;
+                prev_last = last_ts.or(prev_last);
             }
         }
 
@@ -1996,7 +2020,7 @@ pub(crate) fn file_identity(vcd: &std::path::Path) -> Option<String> {
 
 fn cache_file_for(vcd: &std::path::Path) -> Option<std::path::PathBuf> {
     let id = file_identity(vcd)?;
-    Some(cache_dir().join(format!("{}-v1.wcol", id)))
+    Some(cache_dir().join(format!("{}-v2.wcol", id)))  // v2: BUG-001 索引语义变更(重复时间戳折叠)
 }
 
 /// 列缓存旁挂目录: 与 .wcol 同 key(`file_identity`: basename+size+mtime+ctime+inode),

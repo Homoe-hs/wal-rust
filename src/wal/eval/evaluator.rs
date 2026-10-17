@@ -450,6 +450,9 @@ pub fn eval_value(&mut self, value: Value) -> Result<Value, String> {
                         return self.eval_in_groups(&rest);
                     } else if op == Operator::Let {
                         return self.eval_let(&rest);
+                    } else if op == Operator::Cond {
+                        // BUG-012: cond 的子句**不能预求值**(guard 里可以有 else 符号/边沿条件)
+                        return self.eval_cond(&rest);
                     } else if op == Operator::Quasiquote {
                         return self.eval_quasiquote(&rest);
                     } else if op == Operator::Quote {
@@ -805,6 +808,28 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
         }
     }
 
+    /// `(cond (guard expr+ ...)+ ...)` —— guard 不预求值;符号 `else` 恒真。
+    fn eval_cond(&mut self, args: &[Value]) -> Result<Value, String> {
+        for clause in args {
+            let Value::List(lst) = clause else {
+                return Err("cond expects list clauses".to_string());
+            };
+            if lst.0.is_empty() {
+                return Err("cond clause cannot be empty".to_string());
+            }
+            let test = &lst.0[0];
+            let is_else = matches!(test, Value::Symbol(s) if s.name == "else");
+            if is_else || self.eval_value(test.clone())?.is_truthy() {
+                let mut result = Value::Nil;
+                for expr in lst.rest() {
+                    result = self.eval_value(expr)?;
+                }
+                return Ok(result);
+            }
+        }
+        Ok(Value::Nil)
+    }
+
     fn eval_case(&mut self, args: &[Value]) -> Result<Value, String> {
         if args.len() < 2 {
             return Err("case expects at least key and one clause".to_string());
@@ -936,43 +961,48 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
         if args.len() < 1 {
             return Err("let expects at least bindings".to_string());
         }
-        let mut new_env = self.env.child();
         let bindings = match &args[0] {
             Value::List(list) => list.0.clone(),
             _ => return Err("let expects list of bindings".to_string()),
         };
-        // Support both (let (x 1 y 2) body) and (let ((x 1) (y 2)) body) formats
-        if !bindings.is_empty() && bindings.iter().all(|b| matches!(b, Value::List(p) if p.len() == 2)) {
-            for pair in &bindings {
-                if let Value::List(pair_lst) = pair {
-                    let name = match &pair_lst[0] {
+        // BUG-011: 绑定必须**按顺序**求值(let* 语义, 手册 §1.6):后面的绑定能看见前面的值。
+        // 所以先把新作用域装进 evaluator, 再逐个求值+define; 出错也要恢复环境。
+        let child = self.env.child();
+        let saved_env = std::mem::replace(&mut self.env, child);
+        let result = (|| -> Result<Value, String> {
+            // Support both (let (x 1 y 2) body) and (let ((x 1) (y 2)) body) formats
+            if !bindings.is_empty() && bindings.iter().all(|b| matches!(b, Value::List(p) if p.len() == 2)) {
+                for pair in &bindings {
+                    if let Value::List(pair_lst) = pair {
+                        let name = match &pair_lst[0] {
+                            Value::Symbol(s) => s.name.clone(),
+                            _ => return Err("let binding name must be symbol".to_string()),
+                        };
+                        let value = self.eval_value(pair_lst[1].clone())?;
+                        self.env.define(name, value);
+                    }
+                }
+            } else {
+                for binding in bindings.chunks(2) {
+                    if binding.len() != 2 {
+                        return Err("let binding must be (name value)".to_string());
+                    }
+                    let name = match &binding[0] {
                         Value::Symbol(s) => s.name.clone(),
                         _ => return Err("let binding name must be symbol".to_string()),
                     };
-                    let value = self.eval_value(pair_lst[1].clone())?;
-                    new_env.define(name, value);
+                    let value = self.eval_value(binding[1].clone())?;
+                    self.env.define(name, value);
                 }
             }
-        } else {
-            for binding in bindings.chunks(2) {
-                if binding.len() != 2 {
-                    return Err("let binding must be (name value)".to_string());
-                }
-                let name = match &binding[0] {
-                    Value::Symbol(s) => s.name.clone(),
-                    _ => return Err("let binding name must be symbol".to_string()),
-                };
-                let value = self.eval_value(binding[1].clone())?;
-                new_env.define(name, value);
+            let mut result = Value::Nil;
+            for arg in &args[1..] {
+                result = self.eval_value(arg.clone())?;
             }
-        }
-        let saved_env = std::mem::replace(&mut self.env, new_env);
-        let mut result = Value::Nil;
-        for arg in &args[1..] {
-            result = self.eval_value(arg.clone())?;
-        }
+            Ok(result)
+        })();
         self.env = saved_env;
-        Ok(result)
+        result
     }
 
     fn eval_quasiquote(&mut self, args: &[Value]) -> Result<Value, String> {
