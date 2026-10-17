@@ -80,3 +80,18 @@ WAL_FSDB_CACHE_ONLY=1 WAL_PROF=1 /usr/bin/time -f "%e %M" target/release/wal-rus
 - cache-only 路径**没有**横幅与 `[prof]` 的 `fsdb:open` 段(它本来就不 open),阶段账里 `load` 通常仍有(名字+索引)。
 - 一次 `(count (changes …))` 若该信号没有 `.fcol`,会先付一次**冷列扫描**(小夹具实测 18.5s/次),
   这类格子测出来的"normal 慢"是列扫描,不是加载差异 —— 所以大波形格子特意选了已缓存的 `core_clk`。
+
+## 6. 验证状态与未能完成的门(如实记录)
+
+**已完成**
+- 四象限全部格子:normal vs cache-only **值逐行一致**(过滤 NPI 横幅后 `diff` 空);
+- #3 A/B(eager vs lazy)在真波形 **5 个格子全部 `正确性: yes`**(含元信息与名字解析、单次与多次);
+- cache-only 的 `(timescale)`/`(INDEX TS MAX-INDEX)` 与正常路径一致(`.fmeta` 侧车生效);
+- `make ci` **9/9 PASS**(build/test/clippy/gates/package/docs…)。
+
+**未完成的唯一门**:用基线装置的 29 探针会话对拍"惰性索引前后输出完全一致"
+(`scripts/bench_features.sh session --session-runs 1`,对照文件已留在 `.tools/bench/baseline/session.pre-lazy.out`)。
+原因:许可通道本次**不是抖动,而是被打坏**——宿主 `eda_tools/synopsys/scl` 目录被清空,
+真正的 SCL 变成指向 9p 导出**之外**的符号链接,客机内的许可启动脚本拿不到 `lmgrd`/`snpslmd`,
+`snpslmd` 进程数 0、只有 27080 在听。这属于宿主 EDA 环境变更(不在本任务范围)。
+恢复后补跑上面那条命令并与 `.tools/bench/baseline/session.pre-lazy.out` 逐行 diff 即可。
