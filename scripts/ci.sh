@@ -175,7 +175,7 @@ stage_gates() {
     cargo test --release --test fsdb_diff 2>&1 | tail -2 || rc=1
     if [ -n "${WAL_FSDB_TEST_FILE:-}" ] && [ -n "${WAL_FSDB_TEST_VCD:-}" ]; then
         echo "Verdi 样本已提供 → 跑被 ignore 的 FSDB↔VCD 差分门"
-        cargo test --release --test fsdb_diff -- --include-ignored --nocapture 2>&1 | tail -6 || rc=1
+        cargo test --release --test fsdb_diff -- --include-ignored --nocapture --test-threads=1 2>&1 | tail -6 || rc=1
     else
         echo "FSDB↔VCD 差分门未跑(未设 WAL_FSDB_TEST_FILE/WAL_FSDB_TEST_VCD): 上面应显示 ignored, 不是 passed"
         echo "  跑法: export VERDI_HOME=... SNPSLMD_LICENSE_FILE=... ;"

@@ -471,6 +471,21 @@ RSS 17.2GB 就是这份缓存在涨); 4M 信号夹具上把块放大到 262144, 
 * FSDB 版本比本机 reader 新时无法读取(实测 25A 写的 5.7,2018 的 reader 是 5.6 →
   `npi_fsdb_open` 直接失败),错误信息里已给出这个提示。
 
+### 8.1 线程安全: NPI 是进程级全局状态, 所有 NPI 入口已进程级串行化(BUG-019)
+
+实测(2026-10): 4 个线程各自 `FsdbTrace::load` 后立刻查 `max_index` → **SIGSEGV, 3 次崩 2 次**;
+只有把"加载+查询"串行才不崩 —— NPI 的 `npi_init`/session/VC 迭代器共享进程级状态, 不是线程安全的。
+
+修复:`src/trace/fsdb.rs` 增加 **可重入的进程级串行锁** `NpiSerialGuard`(线程局部深度 + 全局 Mutex),
+覆盖全部 NPI 入口: `load`、`scan`、`scan_times`、`handle_of`、`real_str_of`、
+`global_first_change_time`、`signal_change_counts_top`、`close_now`/`Drop`、以及两个 worker 入口。
+可重入是为了 `load → scan → handle_of` 这类嵌套不死锁。
+
+* CLI(单线程、单会话)无竞争, 只是一次未争用的 lock, 无可测开销;
+* 库用户在多线程里**各加载各的 FSDB** 从此安全(回归测试: `tests/fsdb_thread_load_test.rs`);
+* 仍然建议: 同一进程内不要指望两个 FSDB 会话的**查询**并行加速(锁会串行化);
+  需要并行就把负载拆到多进程(`fsdb-timeline-map` 的 worker 就是 exec 子进程)。
+
 ## 9 多文件语义与缓存一致性(2026-09-17 内网反馈三连)
 
 ### 9.1 谁回答: 加载顺序, 不是 HashMap 顺序(#32 的真凶之一)

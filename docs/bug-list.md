@@ -318,3 +318,71 @@
 - **组合阶段 findings = 0**:`scripts/bughunt/run_combos.py` 的 25 条初判全部收敛
   (真 bug 已修 + 误判项按"既有约定/刻意报错"修正预期)。
 - 单功能矩阵仍余 24 条 `VCD!=FST`,**全部是 trace 元信息(文件路径不同)**,语义零差异。
+
+---
+
+# 第三轮:FSDB 维度(许可通道恢复后,2026-10)
+
+## 3.0 许可通道恢复(基础设施,不涉及产品代码)
+
+宿主 SCL 目录(`eda_tools/synopsys/scl`)悬空后,旧 NixOS/TCG 流程不可用。改走
+**Debian 13 + KVM 硬件虚拟化 VM**(域 `edalab`, `192.168.122.50`):
+客机内跑 `/mnt/vmrepo/os/debian13/vm_lic25.sh`(ic_designer/27080),宿主经 libvirt NAT 直连 **`27080@192.168.122.50`**。
+* 新增(入库)`scripts/fsdb_license_up.sh`:幂等拉起通道(VM 可达性 → 客机许可 → 宿主连通性);
+* `.tools/vm/host_fsdb_env.sh` 的 `SNPSLMD_LICENSE_FILE` 改为新地址;`docs/fsdb-env.md` 更新,
+  旧 NixOS/hostfwd 流程标为"历史存档";
+* 验证:`cal1m.fsdb` → `(17 19 2000000)`,宿主侧 NPI 可用。
+
+## 3.1 BUG-019(高严重度,已修)同进程多线程并发加载 FSDB → SIGSEGV
+
+- **复现**: 4 个线程各自 `FsdbTrace::load()` 后立刻查 `max_index` → **SIGSEGV,3 次崩 2 次**
+  (典型报错:测试二进制被信号 11 打死;用户侧就是"
+  `Service Crash ... encountered a fatal error and was closed`")。
+- **根因**: NPI(`npi_init`/session/VC 迭代器)是**进程级全局状态**,不是线程安全的;
+  之前只在"单线程单会话"假设下使用,库用户/并行测试会撞上。
+- **修复**: `src/trace/fsdb.rs` 增加**可重入的进程级串行锁** `NpiSerialGuard`
+  (线程局部深度计数 + 全局 Mutex;最外层真持锁,嵌套只计数 → `load → scan → handle_of` 不死锁),
+  覆盖全部 NPI 入口: `load` / `scan` / `scan_times` / `handle_of` / `real_str_of` /
+  `global_first_change_time` / `signal_change_counts_top` / `close_now` / `Drop` / 两个 worker 入口。
+- **回归**: `tests/fsdb_thread_load_test.rs`(4 线程并发 load+查,断言信号数一致、不崩)。
+  修复后同一复现程序 **10/10 不再崩**(修复前 2/3 崩)。
+- **已知限制(已写入 `docs/fsdb-npi.md` §8.1)**: 同进程内两个 FSDB **会话的查询**仍会被锁串行化;
+  要并行请拆多进程(timeline worker 本来就是 exec 子进程)。CLI 单会话零开销。
+
+## 3.2 FSDB 单功能/组合测试装置(`scripts/bughunt/run_fsdb.py`)
+
+阶段与结果(小夹具 mini/verilog/z6/zc12/zc110/cal1m + 真实 VCD↔FSDB 成对样本):
+
+| 阶段 | 内容 | 结果 |
+|---|---|---|
+| F1 | SCOPES/SIGNALS/MAX-INDEX/宽度/名字可解析 | 0 findings |
+| F2 | `count(changes/rising/falling)` == `length(find(...))`;`getwave` 与 `at` 互证 | 0 |
+| F3 | 引擎 vs 逐拍 oracle(`WAL_NO_ENGINE=1`) | 0 |
+| F4 | VCD↔FSDB 同设计成对差分(20+ 表达式:元信息/名字/宽度/变更列/getwave/取值) | mini、z6、zc12、zc110 **逐项一致**;verilog 对是**过期夹具**(VCD 189 信号 vs FSDB 181,不同版本设计)→ 记为 PAIR-MISMATCH 跳过 |
+| F5 | 多波形 `-l vcd -l fsdb`:first-match + 次要波形独有信号的查询结果/索引空间与单波形一致 | 0 |
+| F6 | 假 FSDB / 截断 FSDB / 不存在文件 | 全部**干净报错**(无 panic) |
+| F7 | `sigs`/`count`/`topsig`/`--stdin`/`fsdb-timeline-map`+`merge` | 全部通过 |
+| F8 | 指标/窗口算子跨格式(`wave`/`latency`/`median`/`percentile`/`stats`/`histogram`) | 0 |
+| F9 | 缓存冷/建/命中三种口径结果一致 | 0 |
+
+→ **FSDB 维度 findings=1,且是夹具过期(非代码问题)**;语义层面 FSDB 与 VCD 已对齐。
+
+## 3.3 测试装置修补(非产品 bug)
+
+- `tests/fsdb_diff.rs` 的 `--include-ignored` 并发跑时,**两个测试各自改进程 CWD/env**
+  且用的不是同一把锁 → 相互污染(表现为随机 FAILED)。已改为**文件级共享锁** + 恢复 env;
+  `scripts/ci.sh` 的 FSDB gate 改 `--test-threads=1`(NPI 进程级单例,并发跑无意义)。
+- 并行 `fsdb_diff` 连跑 3 次全绿;串行 9/9 全绿。
+
+## 3.4 本轮验证
+
+- `cargo test --release`:**349 passed / 0 failed**。
+- FSDB ignored 门(9 个)并行/串行均绿;线程回归测试绿。
+- 单功能矩阵(VCD/FST)维持上轮结论:语义差异 0(剩余 24 条全是 trace 元信息路径)。
+
+## 仍待办(下一轮)
+
+- 覆盖面补测:宏(`defmacro/defunm/macroexpand`)、虚拟信号(`defsig/new-trace/dump-trace`)、
+  `$dumpoff/$dumpon/$dumpall`、`search/freq/dela/period/groups/in-group`、`fsdb-timeline-*` 正确性
+  (而不只是 smoke);
+- 全部完成后**整体合回 main**。

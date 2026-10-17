@@ -19,7 +19,7 @@ cargo test --test fuzz_vcd_fst_diff   # 随机波形差分: VCD↔FST 等价 + �
 cargo run --release --example npi_probe -- design.fsdb clk   # NPI 探针(不需要 wal-rust 全功能)
 WAL_FSDB_TEST_FILE=x.fsdb WAL_FSDB_TEST_VCD=x.vcd cargo test --release --test fsdb_diff  # FSDB↔VCD 差分门(需 Verdi)
 scripts/fsdb_landing_check.sh x.fsdb   # 现场波形"接收入库+基线体检"(身份/许可/冷热基线/并行轴/.ftl 一致性)
-sh .tools/vm/license_up.sh             # 本机: 拉起"宿主原生读 FSDB"的许可通道(VM 只当许可服务器;幂等)
+bash scripts/fsdb_license_up.sh         # 本机: 拉起"宿主原生读 FSDB"的许可通道(Debian/KVM 许可 VM; 幂等)
 ```
 
 ## CLI input auto-detect
@@ -54,6 +54,9 @@ Flags: `-l <waveform>`(可重复), `--halt-on-error`(遇错即停)。
   **改语法必须重新生成**: 见 `tree-sitter-wal/README.md`(`tree-sitter generate` + CLI 版本固定 + 提交生成物)。
   ⚠️ `token(...)` 里不能引用规则(`$.base_symbol`), 只能内联正则 —— 所以字符类提取成 `BASE_SYMBOL_RE` 共用。
 - **FST read backend**: wellen (`wellen::simple::read` in `src/trace/fst.rs`); legacy hand-rolled reader retired (writer stays: `src/fst/writer.rs`).
+- **FSDB/NPI 是进程级单例(线程不安全)**: 全部 NPI 入口走可重入的进程级串行锁
+  `NpiSerialGuard`(BUG-019: 多线程同时 load 曾 SIGSEGV; 回归 `tests/fsdb_thread_load_test.rs`)。
+  并行要拆**多进程**(timeline worker 就是 exec 子进程), 不要把两个 FSDB 会话放同一进程的线程里并发查。
 - **FSDB read backend**: `src/trace/fsdb.rs` —— 运行期 `dlopen` Synopsys NPI(`libNPI.so`)+
   Itanium mangled 符号,纯 Rust FFI,无 C++ 垫片。只用 `npiFsdbTimeBasedVcIter`(用过后
   `npi_fsdb_create_vct` 会失效);`npiFsdbValue.format` 是**入参**;库路径来自 `$VERDI_HOME`/

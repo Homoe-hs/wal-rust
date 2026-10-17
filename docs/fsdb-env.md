@@ -1,7 +1,18 @@
 # FSDB 环境与许可(读/写波形的前置条件)
 
-> ✅ 现行 —— 本机(Arch 宿主机 + NixOS 客机 VM)上"读 FSDB / 写 FSDB"的完整清单与踩坑。
+> ✅ 现行 —— 本机(Arch 宿主机 + **Debian 13/KVM 客机 VM**)上"读 FSDB"的完整清单与踩坑。
 > 换机器照第 2、4 节核对; **拿到别人的波形先跑 `scripts/fsdb_env_check.sh`**(第 7 节)。
+>
+> 🔄 **2026-10 更新**: 许可 VM 已换成 **Debian 13 + KVM 硬件虚拟化**(域 `edalab`, 启动 8s 级),
+> **旧的 NixOS/TCG 流程(`.tools/vm/run25.sh` + `/mnt/wal/lic25_hostfwd.sh`(历史脚本) + QEMU hostfwd/127.0.0.1)已废弃**,
+> 只在 §4 "历史存档"里保留坑位索引。现在:
+> ```bash
+> bash scripts/fsdb_license_up.sh     # 幂等: VM 检查 → 客机 vm_lic25.sh → 宿主连通性(27080@192.168.122.50)
+> . .tools/vm/host_fsdb_env.sh        # 宿主环境(VERDI_HOME / SNPSLMD_LICENSE_FILE=27080@192.168.122.50)
+> target/release/wal-rust '(length (SIGNALS))' -l x.fsdb
+> ```
+> 许可文件: `~/Projects/eda-tools/env/lic/synopsys2025.lic`(SERVER `ic_designer d05099D4160b 27080`);
+> SCL 二进制: `~/Projects/eda-tools/releases/scl/scl2025clean/scl/2025.03`(旧 `eda_tools/synopsys/scl` 已空)。
 
 ## 1 一句话:FSDB 是**写者产物**
 
@@ -18,11 +29,11 @@
 | 角色 | 版本 | 位置 | 配哪个许可 |
 |---|---|---|---|
 | **reader**(宿主机, 推荐) | Verdi **X-2025.06-SP1** | `~/eda_tools/synopsys/verdi/X-2025.06-SP1` | 25A daemon(27080) |
-| **reader**(客机 VM) | 同上(拷了 NPI+etc+bin 到共享盘) | `/mnt/wal/verdi25` | 25A daemon |
+| **reader**(客机 VM) | 同上 | `/mnt/eda/synopsys/verdi/X-2025.06-SP1`(virtiofs 共享) | 25A daemon |
 | reader(客机 VM, 老) | Verdi O-2018.09-SP2 | `/mnt/eda/verdi_home2018` | 2018 daemon(27051) |
 | **writer** | VCS **X-2025.06-SP1** | `~/Projects/fsdb-parser/eda_tools/synopsys/vcs/X-2025.06-SP1` | 25A daemon(27080) |
 | writer(老) | VCS O-2018.09-SP2 | 同上目录 `vcs/O-2018.09-SP2` | 2018 daemon(27051) |
-| 许可文件 | 25A: `scl/2025.03/admin/license/synopsys.lic`; 2018: `scl/2018.06/.../eetop2018.lic` | 共享盘 | — |
+| 许可文件 | 25A: `~/Projects/eda-tools/env/lic/synopsys2025.lic`; 2018: `eetop2018.lic`(同目录) | 宿主 | — |
 
 > 实测: VCS 25A **编译通过**(`VCS_RC=0`)、25A NPI **能读 2018 写的 FSDB**(只打一条
 > "generated using a previous version" 警告)。
@@ -34,8 +45,26 @@
 | 25A(新) | `ic_designer` | `d0:50:99:d4:16:0b` | 27080 |
 | 2018(旧) | `rone` | `00:0c:29:04:00:65` | 27051 |
 
-所以 VM **一次只能扮一套**: `.tools/vm/run.sh` = 2018 身份, `.tools/vm/run25.sh` = 25A 身份
-(后者已经把 `hostfwd=tcp::27080-:27080` 与 `27081` 一起配好)。
+现行 Debian VM 用**两张网卡固定 MAC 同时满足两代 HOSTID**, 所以不必再切 MAC;
+两套 daemon 由 `/mnt/vmrepo/os/debian13/vm_lic25.sh`(25A/27080)/`/mnt/vmrepo/os/debian13/vm_lic2018.sh`(2018/27051)按需起, 同一时刻只起一套。
+
+## 4 让宿主机**原生**读 FSDB(不经过 VM, 快一个量级)
+
+许可绑的是内网身份 `ic_designer` + MAC, 宿主冒充不了, 所以 **VM 只当"许可服务器"**,
+解析本身完全在宿主原生跑。两条命令:
+
+```bash
+bash scripts/fsdb_license_up.sh    # 幂等: VM 可达性 → 客机 vm_lic25.sh → 宿主侧 27080 连通
+. .tools/vm/host_fsdb_env.sh       # VERDI_HOME + SNPSLMD_LICENSE_FILE=27080@192.168.122.50
+target/release/wal-rust '(length (SIGNALS))' -l x.fsdb   # 真打开一次才算通道可用
+```
+
+SSH 直连:`ssh -F /dev/null -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@192.168.122.50`
+(域 `edalab`; 启动/停止:`bash ~/Projects/fsdb-parser/system-dev-vm/os/debian13/start.sh|stop.sh`)。
+VM 内许可脚本:`bash /mnt/vmrepo/os/debian13/vm_lic25.sh`(主机名 `ic_designer`; 
+Debian 的 `hostname` 拒绝下划线, 脚本用 `sysctl -w kernel.hostname=`)。
+
+### 历史存档(已废弃): NixOS/TCG + QEMU hostfwd
 
 ## 4 让宿主机**原生**读 FSDB(不经过 VM, 快一个量级)
 
@@ -54,7 +83,9 @@ sh .tools/vm/license_up.sh
 target/release/wal-rust '(length (SIGNALS))' -l x.fsdb
 ```
 
-`.tools/vm/license_up.sh` 在客机里做的事**每一步都是踩出来的**:
+> ⚠️ 以下 NixOS/TCG 流程已废弃, 保留只为对照踩坑记录(新流程见上)。
+
+旧 `.tools/vm/license_up.sh` 在客机里做的事**每一步都是踩出来的**:
 
 * **客机 hostname 必须是 `ic_designer`**: 许可 `SERVER` 行按主机名+hostid 匹配; 重启 VM 后
   hostname 会回到 `nixos`(运行期设置不持久), 所以脚本每次都兜一遍。

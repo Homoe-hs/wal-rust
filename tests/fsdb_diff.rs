@@ -14,6 +14,11 @@
 //! 每个索引的取值 / 变更点。任一项不同都说明 FSDB 后端与 VCD 后端语义漂移。
 
 use wal_rust::trace::{Trace, TraceContainer};
+use std::sync::Mutex;
+
+/// 会修改进程级 CWD/环境变量的 FSDB 测试一律先拿这把锁 ——
+/// 否则 `cargo test -- --include-ignored` 并发跑时相对路径/缓存会被别的测试改掉。
+static FSDB_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 fn env_or_skip(k: &str) -> Option<String> {
     match std::env::var(k) {
@@ -47,8 +52,6 @@ fn norm(name: &str) -> String {
 #[test]
 #[ignore = "需要 Verdi/NPI(libNPI.so)+ 同源 FSDB: 用 --include-ignored 跑(见 scripts/ci.sh gates)"]
 fn fsdb_cache_written_for_relative_path() {
-    use std::sync::Mutex;
-    static CWD_LOCK: Mutex<()> = Mutex::new(());
     let fsdb = match env_or_skip("WAL_FSDB_TEST_FILE") {
         Some(v) => v,
         None => return,
@@ -57,7 +60,7 @@ fn fsdb_cache_written_for_relative_path() {
         eprintln!("skip: {} 不存在", fsdb);
         return;
     }
-    let _guard = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _guard = FSDB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let dir = std::env::temp_dir().join(format!("wal_fsdb_rel_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
@@ -82,6 +85,9 @@ fn fsdb_cache_written_for_relative_path() {
         }
     };
     std::env::set_current_dir(prev_cwd).unwrap();
+    std::env::remove_var("WAL_CACHE");
+    std::env::remove_var("WAL_CACHE_DIR");
+    std::env::remove_var("WAL_CACHE_MIN_MB");
     assert!(n > 0, "相对路径加载 FSDB 也必须落缓存(否则每次查询重扫全文件): {:?} 为空", cache);
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -89,6 +95,7 @@ fn fsdb_cache_written_for_relative_path() {
 #[test]
 #[ignore = "需要 Verdi/NPI + 同源 FSDB/VCD 对: 用 --include-ignored 跑(见 scripts/ci.sh gates)"]
 fn fsdb_matches_vcd_when_available() {
+    let _guard = FSDB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let fsdb = match env_or_skip("WAL_FSDB_TEST_FILE") {
         Some(v) => v,
         None => return,

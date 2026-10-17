@@ -157,6 +157,51 @@ pub fn npi_unavailable_reason() -> String {
     }
 }
 
+/// NPI 进程级串行化(BUG-021)。
+///
+/// NPI 的 `npi_init` / session / VC 迭代器共享**进程级全局状态**, 多线程同时进入会 **SIGSEGV**
+/// (实测: 4 线程各 `FsdbTrace::load` 后立刻查 `max_index` → 3 次里崩 2 次)。
+/// 这里用"线程局部深度 + 全局 Mutex"实现**可重入**锁:
+/// 外层 NPI 入口真正拿锁, 内层嵌套调用只计数(depth>0), 因此 `load → scan → handle_of`
+/// 这类嵌套不会死锁。
+///
+/// 影响面: 单会话/单线程(CLI 的常规用法)无竞争, 只是一次未争用的 lock;
+/// 多线程库用户(每个线程各开一个 FSDB 会话)从此安全。
+static NPI_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+thread_local! {
+    static NPI_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// RAII: 最外层持锁, 嵌套只递增深度。
+struct NpiSerialGuard {
+    guard: Option<std::sync::MutexGuard<'static, ()>>,
+}
+
+impl NpiSerialGuard {
+    fn acquire() -> Self {
+        let depth = NPI_DEPTH.with(|d| d.get());
+        if depth == 0 {
+            let guard = NPI_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+            NPI_DEPTH.with(|d| d.set(1));
+            NpiSerialGuard { guard: Some(guard) }
+        } else {
+            NPI_DEPTH.with(|d| d.set(depth + 1));
+            NpiSerialGuard { guard: None }
+        }
+    }
+}
+
+impl Drop for NpiSerialGuard {
+    fn drop(&mut self) {
+        NPI_DEPTH.with(|d| {
+            let cur = d.get();
+            debug_assert!(cur > 0, "NPI 串行锁深度下溢");
+            d.set(cur.saturating_sub(1));
+        });
+        // guard 字段在 self drop 之后释放(最外层 → 解锁)
+    }
+}
+
 fn npi() -> Result<&'static Npi, String> {
     NPI.get_or_init(Npi::load).as_ref().map_err(|e| e.clone())
 }
@@ -1480,6 +1525,7 @@ pub fn merge_timeline_parts(
 /// 每一层有多少个子树、各自多大、够不够分成 N 片、均不均匀。多进程并行时必须先有这个
 /// 数字 —— 按 depth=1 切在这份设计上只有 1 个顶层 scope, 分了等于没分(实测)。
 pub fn scope_stats_dump(path: &str, max_depth: usize) -> Result<String, String> {
+    let _npi_serial = NpiSerialGuard::acquire();
     let npi = npi()?;
     let abs = std::fs::canonicalize(path).map_err(|e| format!("{}: {}", path, e))?;
     let cpath = CString::new(abs.to_string_lossy().as_bytes())
@@ -1744,6 +1790,7 @@ impl Drop for ScopeLock {
 
 /// 数一遍每层的子树个数与每棵子树大小(不碰变更列)。失败返回空表。
 fn walk_scope_counts(path: &str, max_depth: usize) -> ScopeCounts {
+    let _npi_serial = NpiSerialGuard::acquire();
     let npi = match npi() {
         Ok(n) => n,
         Err(_) => return ScopeCounts::empty(),
@@ -1966,6 +2013,7 @@ pub fn timeline_by_walk_split(
     offset: usize,
     split: Option<(usize, usize, usize)>,
 ) -> Result<Vec<u64>, String> {
+    let _npi_serial = NpiSerialGuard::acquire();
     let npi = npi()?;
     let abs = std::fs::canonicalize(path)
         .map_err(|e| format!("{}: 打不开({})", path, e))?;
@@ -2651,6 +2699,8 @@ fn unload_each_chunk() -> bool {
 
 impl FsdbTrace {
     pub fn load(path: &Path, id: TraceId) -> Result<Self, String> {
+        // BUG-021: NPI 进程级非线程安全 → 所有 NPI 入口统一串行化(见 NpiSerialGuard)。
+        let _npi_serial = NpiSerialGuard::acquire();
         crate::prof::mark("fsdb:begin");
         // **只取句柄**模式: 时间线 worker(分片预计算)只按**下标**喂句柄给 VC 迭代器,
         // 从头到尾不需要名字。关掉名字 arena/索引/scope 收集后, 一个 worker 的内存从
@@ -3120,6 +3170,7 @@ impl FsdbTrace {
 
     /// 只算"这些信号的变更时间并集"(升序去重) —— 并行构建时间线的 worker 用。
     fn scan_times(&self, targets: &[usize]) -> Result<Vec<u64>, String> {
+        let _npi_serial = NpiSerialGuard::acquire();
         if self.file.is_null() {
             return Err(format!("cache-only: 该查询需要 NPI({} 缺对应侧车)", self.filename));
         }
@@ -3209,6 +3260,7 @@ impl FsdbTrace {
 
     /// 立刻关闭 FSDB(worker 写完就走, 不等 Drop)
     pub fn close_now(&self) {
+        let _npi_serial = NpiSerialGuard::acquire();
         if !self.file.is_null() {
             if let Ok(npi) = npi() {
                 unsafe { (npi.close)(self.file) };
@@ -3219,6 +3271,7 @@ impl FsdbTrace {
     /// 融合扫描: `want_timeline` 时遍历**所有**信号(算时间线), 同时为 `want`
     /// 里的信号取变更列; 否则只遍历 `want`。
     fn scan(&self, want: &HashSet<usize>, want_timeline: bool) -> Result<ScanOut, String> {
+        let _npi_serial = NpiSerialGuard::acquire();
         if self.file.is_null() {
             return Err(format!("cache-only: 该查询需要 NPI({} 缺对应侧车)", self.filename));
         }
@@ -3833,6 +3886,7 @@ impl FsdbTrace {
 
     /// 取(必要时解析)信号句柄。
     fn handle_of(&self, idx: usize) -> Result<*mut c_void, String> {
+        let _npi_serial = NpiSerialGuard::acquire();
         if self.file.is_null() {
             return Err(format!("cache-only: 该查询需要 NPI({} 缺对应侧车)", self.filename));
         }
@@ -3857,6 +3911,7 @@ impl FsdbTrace {
 
     /// 是否实数/字符串(懒取一次)
     fn real_str_of(&self, idx: usize) -> (bool, bool) {
+        let _npi_serial = NpiSerialGuard::acquire();
         if let Some(v) = self.sigs[idx].real_str.get() {
             return v;
         }
@@ -3896,6 +3951,7 @@ impl FsdbTrace {
     /// 代价刻意压到最低 —— 每块只读**第一条** `t>0` 的条目(块的 add/start 是
     /// 固定开销, 不必把整块拉完); 时间线已经建好时直接取首元素, 零成本。
     fn global_first_change_time(&self) -> Result<Option<u64>, String> {
+        let _npi_serial = NpiSerialGuard::acquire();
         if let Some(v) = self.first_change.get() {
             return Ok(v);
         }
@@ -4095,6 +4151,7 @@ unsafe fn walk_scope(
 impl Drop for FsdbTrace {
     fn drop(&mut self) {
         // cache-only 模式下 file 是空指针(从没 open 过 NPI)
+        let _npi_serial = NpiSerialGuard::acquire();
         if !self.file.is_null() {
             if let Ok(npi) = npi() {
                 unsafe { (npi.close)(self.file) };
@@ -4464,6 +4521,7 @@ impl Trace for FsdbTrace {
 
     /// Top-k 变更数: 一次遍历数完所有信号(默认实现会对每个信号各扫一遍)。
     fn signal_change_counts_top(&self, k: usize) -> Vec<(String, usize)> {
+        let _npi_serial = NpiSerialGuard::acquire();
         let npi = match npi() {
             Ok(n) => n,
             Err(_) => return Vec::new(),
