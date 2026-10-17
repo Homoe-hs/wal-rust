@@ -134,7 +134,6 @@ impl SemanticChecker {
             Operator::Bor | Operator::Band | Operator::Bxor => Some((2, None)),
             
             Operator::Define => Some((2, Some(2))),
-            Operator::Set => Some((2, Some(2))),
             Operator::Let => Some((1, None)),
             Operator::If => Some((2, None)),
             Operator::Fn => Some((1, None)),

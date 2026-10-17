@@ -285,9 +285,9 @@ pub fn expr_from_node(node: tree_sitter::Node, source: &str) -> Result<Value, St
             if values.is_empty() {
                 Err("Invalid timed_atom".to_string())
             } else if values.len() >= 2 {
-                // expr@offset format: (rel_eval expr offset)
+                // expr@offset format: (reval expr offset)
                 Ok(Value::List(WList::from_vec(vec![
-                    Value::Symbol(Symbol::new("rel_eval")),
+                    Value::Symbol(Symbol::new("reval")),
                     values[0].clone(),
                     values[1].clone(),
                 ])))

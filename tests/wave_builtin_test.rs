@@ -59,17 +59,12 @@ fn test_edge_counts_and_period() {
 }
 
 #[test]
-fn test_search_find_sig_assert() {
+fn test_search_find_sig() {
     let mut eval = new_eval(&fst_fixture_path());
     let s = eval_str(&mut eval, "(length (search \"top.clk\" \"1\" 0 500))");
     assert_eq!(s, "3");
     let fs = eval_str(&mut eval, "(find-sig \"clk\")");
     assert!(fs.contains("top.clk"), "got {}", fs);
-    // data == 0b101011001100 for t < 1000 (indices 0..10)
-    let ok = eval_str(&mut eval, "(assert-eq \"top.data\" 0 900 0b101011001100)");
-    assert_eq!(ok, "true");
-    let bad = eval_str(&mut eval, "(assert-eq \"top.data\" 0 900 0)");
-    assert_eq!(bad, "false");
 }
 
 #[test]

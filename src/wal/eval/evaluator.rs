@@ -427,8 +427,6 @@ pub fn eval_value(&mut self, value: Value) -> Result<Value, String> {
                         return self.eval_defsig(&rest);
                     } else if op == Operator::Define {
                         return self.eval_define(&rest);
-                    } else if op == Operator::Set {
-                        return self.eval_set(&rest);
                     } else if op == Operator::Defmacro {
                         return self.eval_defmacro(&rest);
                     } else if op == Operator::While {
@@ -487,10 +485,6 @@ pub fn eval_value(&mut self, value: Value) -> Result<Value, String> {
                         // 必须先当 AST 拿到手 —— 走通用路径会被先求值成 true/false,
                         // 条件就没了(与 count/find/whenever 同一处理方式)。
                         return self.eval_dispatch(op, &rest);
-                    } else if op == Operator::CountStep {
-                        return self.eval_count_step(&rest);
-                    } else if op == Operator::FindStep {
-                        return self.eval_find_step(&rest);
                     } else if op == Operator::ForList {
                         return self.eval_for_list(&rest);
                     } else if op == Operator::Fn {
@@ -650,43 +644,6 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
 
         let expanded = expanded?;
         self.eval_value(expanded)
-    }
-
-    fn eval_set(&mut self, args: &[Value]) -> Result<Value, String> {
-        if args.is_empty() {
-            return Err("set expects at least 1 argument".to_string());
-        }
-
-        // Single mode: (set! name value)
-        if matches!(&args[0], Value::Symbol(_))  {
-            if args.len() != 2 {
-                return Err(format!("set expects 2 arguments for single mode, got {}", args.len()));
-            }
-            let name = match &args[0] {
-                Value::Symbol(s) => s.name.clone(),
-                _ => unreachable!(),
-            };
-            let value = self.eval_value(args[1].clone())?;
-            self.env.set(&name, value.clone())?;
-            return Ok(value);
-        }
-
-        // Multi-pair mode: (set! (name1 val1) (name2 val2) ...)
-        let mut result = Value::Nil;
-        for arg in args {
-            let pair = match arg {
-                Value::List(lst) if lst.len() == 2 => lst,
-                _ => return Err(format!("set: each argument must be a (name value) pair, got {:?}", arg)),
-            };
-            let name = match &pair.0[0] {
-                Value::Symbol(s) => s.name.clone(),
-                _ => return Err("set: pair first element must be a symbol".to_string()),
-            };
-            let value = self.eval_value(pair.0[1].clone())?;
-            self.env.set(&name, value.clone())?;
-            result = value;
-        }
-        Ok(result)
     }
 
     fn eval_defsig(&mut self, args: &[Value]) -> Result<Value, String> {
@@ -1721,8 +1678,11 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
         // Slow path: step-by-step iteration. Queries are full-timeline: always
         // scan from INDEX 0 (never from the current cursor position) and restore
         // the cursor afterwards (152GB round P0-b).
+        // 索引空间 = 本次查询实际读值的波形(与统一引擎/多文件规则一致): 无关的长波形
+        // 不能把结果拉长(曾因逐拍回退推进所有波形而答出 4000 索引里的 3984)。
+        let scan_ids = self.fallback_scan_ids(&args[0]);
         if let Ok(mut t) = self.traces.write() {
-            for tid in &traces_ids {
+            for tid in &scan_ids {
                 let _ = t.set_index(tid, 0);
             }
         }
@@ -1732,7 +1692,7 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
             match self.eval_value(args[0].clone())? {
                 Value::Bool(true) => {
                     if let Ok(t) = self.traces.read() {
-                        let indices: Vec<i64> = traces_ids.iter()
+                        let indices: Vec<i64> = scan_ids.iter()
                             .filter_map(|tid| t.get(tid).map(|tr| tr.index() as i64))
                             .collect();
                         found.push(if indices.len() == 1 {
@@ -1746,7 +1706,7 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
             }
             let mut any_ended = true;
             if let Ok(mut t) = self.traces.write() {
-                for tid in &traces_ids {
+                for tid in &scan_ids {
                     if let Some(tr) = t.get_mut(tid) {
                         if tr.step(1).is_ok() { any_ended = false; }
                     }
@@ -1932,8 +1892,10 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
         // always scan from INDEX 0 (never from the current cursor position) and
         // restore the cursor afterwards. The literal fast paths above scan from 0
         // too, so variable-RHS and literal-RHS stay consistent (152GB round P0-b).
+        // 索引空间 = 本次查询实际读值的波形(同统一引擎规则, 见 fallback_scan_ids)
+        let scan_ids = self.fallback_scan_ids(&resolved_cond);
         if let Ok(mut t) = self.traces.write() {
-            for tid in &traces_ids {
+            for tid in &scan_ids {
                 let _ = t.set_index(tid, 0);
             }
         }
@@ -1945,7 +1907,7 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
             }
             let mut any_ended = true;
             if let Ok(mut t) = self.traces.write() {
-                for tid in &traces_ids {
+                for tid in &scan_ids {
                     if let Some(tr) = t.get_mut(tid) {
                         if tr.step(1).is_ok() { any_ended = false; }
                     }
@@ -2046,6 +2008,23 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
             return None;
         }
         self.eval_value(cond.clone()).ok().map(|v| v.is_truthy())
+    }
+
+    /// 逐拍回退时的扫描波形集合: 与统一引擎同一规则 —— 只推进"本次查询实际读值的
+    /// 波形"(first-match), 无关的长波形不得拉长索引空间。没有任何可解析引用名时
+    /// 回落全部已加载波形(让条件求值照常报"找不到信号")。
+    fn fallback_scan_ids(&mut self, cond: &Value) -> Vec<String> {
+        let mut names = Vec::new();
+        let (mut has_edge, mut idx_dep) = (false, false);
+        self.collect_cond_signals_with_bare(cond, &mut names, &mut has_edge, &mut idx_dep);
+        if let Ok(t) = self.traces.read() {
+            let ids = t.source_ids(&names);
+            if !ids.is_empty() {
+                return ids;
+            }
+            return t.trace_ids();
+        }
+        Vec::new()
     }
 
     fn interval_scan(&mut self, cond: &Value) -> Result<Option<(Vec<usize>, usize)>, String> {
@@ -2225,112 +2204,7 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
         Ok(Some((indices, count)))
     }
 
-    /// Official-WAL semantics: evaluate cond at EVERY waveform index.
-    fn step_scan(&mut self, cond: &Value) -> Result<(Vec<usize>, usize), String> {
-        let (ids, saved): (Vec<String>, Vec<(String, usize)>) = {
-            if let Ok(t) = self.traces.read() {
-                let all = t.trace_ids();
-                let saved = all
-                    .iter()
-                    .filter_map(|tid| t.get(tid).map(|tr| (tid.clone(), tr.index())))
-                    .collect();
-                // 与 interval_scan 同一规则: 索引空间只由**实际读值的**波形决定
-                // (first-match 选源)。否则 `-l vcd -l fsdb` 查两条都有的信号时, 逐拍
-                // 回退会按 FSDB 的时间线一直步进(既物化 FSDB 全局时间线, 又扫出多余索引)。
-                let mut names = Vec::new();
-                let (mut has_edge, mut idx_dep) = (false, false);
-                self.collect_cond_signals_with_bare(cond, &mut names, &mut has_edge, &mut idx_dep);
-                // 没有任何波形能解析出引用名 → 回落全部, 让条件求值照常报"找不到信号"
-                let ids = match t.source_ids(&names) {
-                    v if v.is_empty() => all,
-                    v => v,
-                };
-                (ids, saved)
-            } else {
-                return Err("no traces loaded".to_string());
-            }
-        };
-        if ids.is_empty() {
-            return Ok((Vec::new(), 0));
-        }
-        // INDEX/TS 的基准 = 正在被推进的这条 trace(嵌套扫描按栈恢复)
-        let prev_scan = self.scan_trace.replace(ids[0].clone());
-        // 常量条件: 全索引或空集 → O(1)
-        if let Some(v) = self.const_cond_value(cond) {
-            let max = {
-                let t = self.traces.read().unwrap_or_else(|e| e.into_inner());
-                t.index_space_max(&[])
-            };
-            return Ok(if v { ((0..=max).collect(), max + 1) } else { (Vec::new(), 0) });
-        }
-        // P1 统一引擎: 变更点并集区间扫描等价于"逐索引求值"
-        // (边界之间值恒定, 边沿只可能在边界为真), 先试引擎。
-        if let Some((idxs, n)) = self.interval_scan(cond)? {
-            return Ok((idxs, n));
-        }
-        // Official "every waveform index" semantics: scan from INDEX 0 and
-        // restore the cursor afterwards (152GB round P0-b).
-        if let Ok(mut t) = self.traces.write() {
-            for tid in &ids {
-                let _ = t.set_index(tid, 0);
-            }
-        }
-        let mut found = Vec::new();
-        let mut count = 0usize;
-        let mut ended = false;
-        while !ended {
-            if self.eval_value(cond.clone())?.is_truthy() {
-                count += 1;
-                if let Ok(t) = self.traces.read() {
-                    if let Some(tr) = t.get(&ids[0]) {
-                        found.push(tr.index());
-                    }
-                }
-            }
-            let mut any_ended = true;
-            if let Ok(mut t) = self.traces.write() {
-                for tid in &ids {
-                    if let Some(tr) = t.get_mut(tid) {
-                        if tr.step(1).is_ok() {
-                            any_ended = false;
-                        }
-                    }
-                }
-            }
-            ended = any_ended;
-        }
-        if let Ok(mut t) = self.traces.write() {
-            for (tid, idx) in &saved {
-                let _ = t.set_index(tid, *idx);
-            }
-        }
-        self.scan_trace = prev_scan;
-        Ok((found, count))
-    }
-
     /// (count/step cond) — number of indices where cond is true (per-step scan).
-    fn eval_count_step(&mut self, args: &[Value]) -> Result<Value, String> {
-        if args.is_empty() {
-            return Err("count/step expects at least 1 argument (a condition)".to_string());
-        }
-        let (_, count) = self.step_scan(&args[0])?;
-        Ok(Value::Int(count as i64))
-    }
-
-    /// (find/step cond) — indices where cond is true (per-step scan).
-    fn eval_find_step(&mut self, args: &[Value]) -> Result<Value, String> {
-        if args.is_empty() {
-            return Err("find/step expects at least 1 argument (a condition)".to_string());
-        }
-        let (found, _) = self.step_scan(&args[0])?;
-        Ok(Value::List(WList::from_vec(
-            found.into_iter().map(|i| Value::Int(i as i64)).collect(),
-        )))
-    }
-
-    /// (for/list [x xs] [y ys]... body+) — comprehension; multiple bindings
-    /// iterate in zip over their collections; collects the last body result
-    /// per iteration (official WAL docs example).
     fn eval_for_list(&mut self, args: &[Value]) -> Result<Value, String> {
         if args.len() < 2 {
             return Err("(for/list [x xs] [y ys] ... body+) expected".to_string());
@@ -2671,15 +2545,18 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
     }
 
     fn eval_set_macro(&mut self, args: &[Value]) -> Result<Value, String> {
+        // set! 是唯一的赋值写法规格(上游 WAL);它直接写共享 cell(词法穿透):
+        //   闭包内 (set! n (+ n 1)) 对捕获方可见(累加器), 未知变量报错。
         if args.len() != 2 {
             return Err("set! expects 2 arguments".to_string());
         }
-        let set_expr = Value::List(WList::from_vec(vec![
-            Value::Symbol(Symbol::new("set")),
-            args[0].clone(),
-            args[1].clone(),
-        ]));
-        self.eval_value(set_expr)
+        let name = match &args[0] {
+            Value::Symbol(s) => s.name.clone(),
+            _ => return Err("set!: first argument must be a symbol".to_string()),
+        };
+        let value = self.eval_value(args[1].clone())?;
+        self.env.set(&name, value.clone())?;
+        Ok(value)
     }
 
     // for/list macro: (for/list (x lst) body...) -> map or similar iteration
@@ -2827,7 +2704,7 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
 /// 其余符号若绑定为字符串也按信号名处理(resolve_cond_names 之前调用)。
 /// 有副作用/控制流的操作符: 出现在条件里就不能做"求值一次"的常量折叠。
 const IMPURE_CONDS: &[&str] = &[
-    "set!", "print", "printf", "whenever", "save", "csv", "import", "load",
+    "set!", "print", "printf", "whenever", "load",
     "define", "def", "while", "for",
 ];
 

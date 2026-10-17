@@ -187,7 +187,7 @@ pub enum Node {
 | `count-rise/fall/edges` | 边沿节点 + 区间求和 |
 | `(get/at/sample-at)` | Column 直查(O(log C)),无扫描 |
 | `change_points`/`getwave`/`wave` | Column 变更列表 + 初值 |
-| `save/CSV` | 列 + 区间展开(现状保留,输出层) |
+| ~~`save/CSV`~~ | 已移除(0.14.63;时间查询走 at/getwave/wave/edges) |
 
 ## 4. 4-state 比较语义
 

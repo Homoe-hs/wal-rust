@@ -135,11 +135,6 @@ fn scalar_to_wal(sv: &ScalarValue) -> Value {
     scalar_to_value_x_aware(sv)
 }
 
-/// (t v) pair
-fn tv_pair(t: u64, sv: &ScalarValue) -> Value {
-    Value::List(WList::from_vec(vec![Value::Int(t as i64), scalar_to_wal(sv)]))
-}
-
 // ======================= beat 模式: 时间轴显示为时钟拍号 =======================
 //
 // 配置: 环境变量 `WAL_BEAT_CLK=<时钟信号名>[,<时钟2>...]`
@@ -154,7 +149,7 @@ fn tv_pair(t: u64, sv: &ScalarValue) -> Value {
 //   - 拍号定义: 时钟上升沿序列 e0<e1<..., `beat(t) = #{i : e_i <= t} - 1`
 //     即**首个上升沿 = 第 0 拍**, 每遇到下一个上升沿 +1, 沿所在时刻算新的一拍;
 //     首个上升沿之前 = -1(第一次出现时在 stderr 打一行提示, 之后不重复)。
-//   - 首次使用时校验(每个已加载波形 × 每个时钟: 唯一解析 + 至少一个上升沿);
+//   - 首次使用时校验(每个已加载波形 × 每个时钟: **完整全名**存在 + 至少一个上升沿);
 //     任一失败 → 明确报错并**整体回退**到绝对时间(本进程不再尝试拍号, 绝不半拍号半时间)。
 //   - 多波形: 按"实际会读值的那条波形"解析时钟, 用它的拍号(与索引空间语义一致)。
 //   - 时钟解析失败/无上升沿的判定只做一次(首次使用时), 之后走缓存。
@@ -719,50 +714,6 @@ fn op_search(args: &[Value], env: &mut Environment, _eval: &mut Evaluator) -> Re
     })
 }
 
-fn op_assert_eq(args: &[Value], env: &mut Environment, eval: &mut Evaluator) -> Result<Value, String> {
-    if args.len() != 4 {
-        return Err("(assert-eq \"sig\" t0 t1 val) expected".to_string());
-    }
-    let name = extract_string(&args[0])?;
-    let t0 = extract_int(&args[1])? as u64;
-    let t1 = extract_int(&args[2])? as u64;
-    let expected = extract_int(&args[3])?;
-    // with_first_trace 的闭包不能借用 eval → 先在闭包里落 flag, 出来再记账
-    let mut failed = false;
-    let out = with_first_trace(env, |tr| {
-        let sig = resolve_signal(tr, &name)?;
-        let points = tr.change_points_time(&sig)?;
-        let mut violations = Vec::new();
-        for (t, sv) in &points {
-            let t = *t;
-            if t < t0 { continue; }
-            if t > t1 { break; }
-            let actual = match scalar_to_wal(sv) {
-                Value::Int(n) => n,
-                other => { violations.push(format!("@{}: non-int {:?}", t, other)); continue; }
-            };
-            if actual != expected {
-                violations.push(format!("@{}: got {}, want {}", t, actual, expected));
-            }
-        }
-        if violations.is_empty() {
-            Ok(Value::Bool(true))
-        } else {
-            failed = true;
-            eprintln!("assert-eq {} [{},{}] == {} FAILED:", sig, t0, t1, expected);
-            for v in violations.iter().take(20) {
-                eprintln!("  {}", v);
-            }
-            Ok(Value::Bool(false))
-        }
-    });
-    if failed {
-        // CI 判据: 会话/脚本退出码非 0(返回值仍是 false, 脚本仍可分支)
-        eval.note_test_failure();
-    }
-    out
-}
-
 /// Average rising-edge interval of a clock signal in the waveform's native
 /// time units. Returns None when there are not enough edges.
 fn avg_rise_period_native(tr: &dyn Trace, sig: &str) -> Result<Option<f64>, String> {
@@ -811,12 +762,17 @@ fn op_freq(args: &[Value], env: &mut Environment, eval: &mut Evaluator) -> Resul
     }
 }
 
-fn scalar_display(sv: &ScalarValue) -> String {
-    match sv {
-        ScalarValue::Bit(b) => (*b as char).to_string(),
-        ScalarValue::Vector(v) => v.iter().map(|&b| b as char).collect(),
-        ScalarValue::Real(r) => format!("{}", r),
+fn op_doc(args: &[Value], _env: &mut Environment, _eval: &mut Evaluator) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err("(doc \"cmd\") expected".to_string());
     }
+    let topic = match &args[0] {
+        Value::String(s) => s.clone(),
+        Value::Symbol(s) => s.name.clone(),
+        _ => return Err("(doc \"cmd\") expected".to_string()),
+    };
+    print_doc(&topic);
+    Ok(Value::Nil)
 }
 
 const DOCS: &[(&str, &str)] = &[
@@ -830,10 +786,8 @@ const DOCS: &[(&str, &str)] = &[
     ("find-sig", "(find-sig \"pattern\") → signal names containing the substring"),
     ("take", "(take n list) → first n elements; e.g. (take 5 (find-sig \"clk\")) or (take 5 SIGNALS)"),
     ("search", "(search \"sig\" \"101\" [t0 t1]) → timestamps where bit pattern occurs; WAL_BEAT_CLK 开启时输出拍号"),
-    ("assert-eq", "(assert-eq \"sig\" t0 t1 v) → [t0,t1] 内是否恒等于 v; 失败打印首违例并让进程退出码为 1(CI 可判)"),
     ("exit", "(exit [N]) → 立即结束脚本/会话并返回退出码 N(默认 0)"),
-    ("dump-trace", "(dump-trace \"out.vcd\") → 把已加载的(defsig)信号导出为 VCD; **只支持 .vcd**, .fst 输出被明确拒绝(FST 只读)"),
-    ("defsig", "(defsig name (get \"sig\")) → 定义虚拟信号, 供 dump-trace 导出"),
+    ("defsig", "(defsig name (get \"sig\")) → 定义虚拟信号(表达式每拍动态求值)"),
     ("initial", "(initial \"sig\") → $dumpvars 快照(t0 写入的原值; 没有初值条目 → x)。样本只来自 # 段, 所以「只有 dumpvars、之后不变」的信号 (getwave s) 为空, 读 t0 状态用 (get s)/(at s 0)/(initial s)"),
     ("defmacro", "(defmacro name (args...) body) → 定义宏; 展开用 (macroexpand '(m ...)), 卫生用 (gensym)"),
     ("macroexpand", "(macroexpand '(m a b)) → 展开一次宏调用, 返回展开后的表达式"),
@@ -855,8 +809,8 @@ const DOCS: &[(&str, &str)] = &[
     ("changes", "(changes \"sig\") → 该索引处值是否变化(x/z 之间的变化不算)"),
     ("is-x", "(is-x \"sig\") → 该索引处值是否含 x"),
     ("is-z", "(is-z \"sig\") → 该索引处值是否含 z"),
-    ("count", "(count cond [cond...]) → 满足条件的索引数; (count/step cond) 逐索引等价形式"),
-    ("find", "(find cond [limit]) → 满足条件的索引列表; (find/step cond) 逐索引等价形式"),
+    ("count", "(count cond [cond...]) → 满足条件的索引数"),
+    ("find", "(find cond [limit]) → 满足条件的索引列表"),
     ("whenever", "(whenever cond body...) → 在每个满足条件的索引处执行 body"),
     ("=", "(= a b ...) → 相等比较; 含 x/z 时按位串比较(== 是同一算子的别名)"),
     ("==", "(== a b) → 与 (= a b) 相同"),
@@ -871,47 +825,7 @@ const DOCS: &[(&str, &str)] = &[
     ("sigs", "(sigs \"pat\" [n]) → 信号名列表(子命令, 也可用 find-sig)"),
     ("topsig", "(topsig [n]) → 变化最多的信号(子命令)"),
     // NOTE: keep the unit semantics visible in (help) as well.
-    ("timescale", "Times are in the waveform's NATIVE unit: raw numbers from getwave/wave/at/edges are ps/ns/... per the file's $timescale (see the load summary). Only period/freq and beat convert to seconds / human units."),
 ];
-
-/// (timescale) → print the loaded waveform's time unit (e.g. "1ns"/"?").
-fn op_timescale(args: &[Value], env: &mut Environment, _eval: &mut Evaluator) -> Result<Value, String> {
-    if !args.is_empty() {
-        return Err("(timescale) takes no arguments".to_string());
-    }
-    with_first_trace(env, |tr| {
-        let exp = tr.timescale_exp();
-        match exp {
-            Some(e) => {
-                // VCD 的 $timescale 是"乘数 + 单位"(如 10ps = 10^-11 s);
-                // 这里把指数还原成可读形式, 而不是对非 1 倍数的指数显示 "?"。
-                // 取 <= e 的 3 的倍数(向 -inf 取整; Rust 的 / 向零截断, 负指数要再减一档)
-                let unit_step = if e % 3 == 0 { e } else { (e / 3 - 1) * 3 };
-                let mult = 10i64.pow((e - unit_step) as u32);
-                let unit = match unit_step {
-                    0 => "s", -3 => "ms", -6 => "us", -9 => "ns", -12 => "ps", -15 => "fs",
-                    _ => "?",
-                };
-                println!("timescale: {}{} (10^{} s)", mult, unit, e);
-            }
-            None => println!("timescale: ?"),
-        }
-        Ok(Value::Nil)
-    })
-}
-
-fn op_doc(args: &[Value], _env: &mut Environment, _eval: &mut Evaluator) -> Result<Value, String> {
-    if args.len() != 1 {
-        return Err("(doc \"cmd\") expected".to_string());
-    }
-    let topic = match &args[0] {
-        Value::String(s) => s.clone(),
-        Value::Symbol(s) => s.name.clone(),
-        _ => return Err("(doc \"cmd\") expected".to_string()),
-    };
-    print_doc(&topic);
-    Ok(Value::Nil)
-}
 
 /// 已文档化的主题名(供 (help) 列表展示)
 pub(crate) fn documented_topics() -> Vec<String> {
@@ -995,10 +909,8 @@ pub fn register_wave(disp: &mut Dispatcher) {
     disp.register(Operator::FindSig, op_find_sig);
     disp.register(Operator::Search, op_search);
     disp.register(Operator::Initial, op_initial);
-    disp.register(Operator::AssertEq, op_assert_eq);
-    disp.register(Operator::Period, op_period);
+        disp.register(Operator::Period, op_period);
     disp.register(Operator::Freq, op_freq);
     disp.register(Operator::Doc, op_doc);
     disp.register(Operator::Beat, op_beat);
-    disp.register(Operator::Timescale, op_timescale);
-}
+    }

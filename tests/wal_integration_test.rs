@@ -433,7 +433,7 @@ fn test_and_or_return_bool() {
     assert!(matches!(n, Value::Int(_)));
 }
 
-// ---------- wal-lang.org 0.8.2 coverage: boolean? / for/list / count/step ----------
+// ---------- wal-lang.org 0.8.2 coverage: boolean? / for/list / count ----------
 
 #[test]
 fn test_boolean_predicate() {
@@ -472,13 +472,13 @@ fn test_count_step_and_find_step() {
     let mut eval = Evaluator::new();
     eval.load_trace(&counter_vcd_path().to_string_lossy(), "test").unwrap();
     // counter fixture: 523 timestamps (max_index 522) — step scan visits all
-    let all = eval.eval("(count/step (= 1 1))").unwrap();
+    let all = eval.eval("(count (= 1 1))").unwrap();
     assert_eq!(all, Value::Int(523));
-    let found = eval.eval("(find/step (= 1 1))").unwrap();
+    let found = eval.eval("(find (= 1 1))").unwrap();
     if let Value::List(l) = &found {
         assert_eq!(l.len(), 523);
     } else {
-        panic!("find/step must return a list, got {:?}", found);
+        panic!("find must return a list, got {:?}", found);
     }
 }
 
@@ -509,8 +509,8 @@ fn test_count_fallback_scans_from_zero_after_step() {
     assert_eq!(after_step, lit, "count must scan the full timeline from INDEX 0");
     let again = eval.eval("(count (= (get \"counter_tb.clk\") v))").unwrap();
     assert_eq!(again, lit, "repeated counts must be stable");
-    let skip = eval.eval("(count/step (= (get \"counter_tb.clk\") v))").unwrap();
-    assert_eq!(skip, lit, "count/step must also scan from INDEX 0");
+    let skip = eval.eval("(count (= (get \"counter_tb.clk\") v))").unwrap();
+    assert_eq!(skip, lit, "count must also scan from INDEX 0");
 
     // The cursor must be untouched by the scans.
     assert_eq!(eval.eval("INDEX").unwrap(), Value::Int(200));
@@ -616,7 +616,7 @@ $end\n").unwrap();
         Value::Int(10), Value::Int(170),
     ])));
     // snapshot region is NOT x
-    assert_eq!(eval.eval("(count/step (is-x \"t.v\"))").unwrap(), Value::Int(0));
+    assert_eq!(eval.eval("(count (is-x \"t.v\"))").unwrap(), Value::Int(0));
     // first change at #10 → x before it only when NO snapshot: here it is 15.
     let _ = std::fs::remove_file(&p);
 }
@@ -667,7 +667,7 @@ $var wire 8 ! v [7:0] $end\n$enddefinitions $end\n\
     std::fs::write(&lib, "(define inc (fn [x] (+ x 1)))").unwrap();
     let mut eval4 = Evaluator::new();
     eval4.load_trace(&counter_vcd_path().to_string_lossy(), "t").unwrap();
-    eval4.eval(&format!("(import \"{}\")", lib.display())).unwrap();
+    eval4.eval(&format!("(eval-file \"{}\")", lib.display())).unwrap();
     assert_eq!(eval4.eval("(inc 41)").unwrap(), Value::Int(42));
     let _ = std::fs::remove_file(&lib);
 }

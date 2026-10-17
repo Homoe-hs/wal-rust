@@ -186,14 +186,12 @@ fn queries(sigs: &[Sig], times: &[u64]) -> Vec<String> {
                 if dec > i64::MAX as u128 { continue; } // 字面量超出 i64: 解析器不接受
                 qs.push(format!("(count (= (get \"{}\") {}))", n, dec));
                 qs.push(format!("(count (!= (get \"{}\") {}))", n, dec));
-                qs.push(format!("(count/step (= (get \"{}\") {}))", n, dec));
                 qs.push(format!("(at \"{}\" {})", n, times[times.len() / 2]));
             }
         }
         qs.push(format!("(count (rising \"{}\"))", n));
         qs.push(format!("(count (falling \"{}\"))", n));
         qs.push(format!("(count (changes \"{}\"))", n));
-        qs.push(format!("(count/step (changes \"{}\"))", n));
         qs.push(format!("(count (is-x \"{}\"))", n));
         qs.push(format!("(count (is-z \"{}\"))", n));
         qs.push(format!("(length (find (is-x \"{}\")))", n));

@@ -1,6 +1,6 @@
 //! Special builtin operators
 //!
-//! quote, quasiquote, unquote, eval, parse, fn, defmacro, macroexpand, gensym, rel_eval(@), slice, repl, exit
+//! quote, quasiquote, unquote, eval, fn, defmacro, macroexpand, gensym, reval(@), slice, exit
 
 use crate::wal::ast::{Value, Operator, Symbol, WList, Closure, Macro};
 use crate::wal::eval::{Environment, Dispatcher, Evaluator};
@@ -57,14 +57,6 @@ fn op_unquote(args: &[Value], _env: &mut Environment, _eval: &mut Evaluator) -> 
 fn op_eval(args: &[Value], _env: &mut Environment, eval: &mut Evaluator) -> Result<Value, String> {
     ensure_arity(args, 1)?;
     eval.eval_value_public(args[0].clone())
-}
-
-fn op_parse(args: &[Value], _env: &mut Environment, _eval: &mut Evaluator) -> Result<Value, String> {
-    ensure_arity(args, 1)?;
-    let source = extract_string(&args[0])?;
-    let mut parser = crate::wal::WalParser::new()
-        .map_err(|e| format!("Failed to create parser: {}", e))?;
-    parser.parse_expr(&source)
 }
 
 fn op_fn(args: &[Value], env: &mut Environment, _eval: &mut Evaluator) -> Result<Value, String> {
@@ -250,18 +242,6 @@ fn op_slice(args: &[Value], _env: &mut Environment, eval: &mut Evaluator) -> Res
     }
 }
 
-fn op_repl(_args: &[Value], _env: &mut Environment, _eval: &mut Evaluator) -> Result<Value, String> {
-    Err("repl: interactive REPL not available in this context".to_string())
-}
-
-fn op_import(args: &[Value], _env: &mut Environment, eval: &mut Evaluator) -> Result<Value, String> {
-    ensure_arity(args, 1)?;
-    let path = extract_string(&args[0])?;
-    let source = std::fs::read_to_string(&path)
-        .map_err(|e| format!("import: cannot read '{}': {}", path, e))?;
-    eval.eval(&source)
-}
-
 fn ensure_arity(args: &[Value], expected: usize) -> Result<(), String> {
     if args.len() != expected {
         return Err(format!("Expected {} arguments, got {}", expected, args.len()));
@@ -298,24 +278,14 @@ fn extract_symbol(v: &Value) -> Result<String, String> {
     }
 }
 
-fn extract_string(v: &Value) -> Result<String, String> {
-    match v {
-        Value::String(s) => Ok(s.clone()),
-        _ => Err("Expected string".to_string()),
-    }
-}
-
 pub fn register_special(disp: &mut Dispatcher) {
     disp.register(Operator::Quote, op_quote);
     disp.register(Operator::Quasiquote, op_quasiquote);
     disp.register(Operator::Unquote, op_unquote);
     disp.register(Operator::Eval, op_eval);
-    disp.register(Operator::Parse, op_parse);
-    disp.register(Operator::Fn, op_fn);
+        disp.register(Operator::Fn, op_fn);
     disp.register(Operator::Defmacro, op_defmacro);
     disp.register(Operator::Macroexpand, op_macroexpand);
     disp.register(Operator::Gensym, op_gensym);
     disp.register(Operator::Slice, op_slice);
-    disp.register(Operator::Repl, op_repl);
-    disp.register(Operator::Import, op_import);
-}
+        }

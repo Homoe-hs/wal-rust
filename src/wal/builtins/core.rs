@@ -52,14 +52,6 @@ fn op_define(args: &[Value], env: &mut Environment, _eval: &mut Evaluator) -> Re
     Ok(value)
 }
 
-fn op_set(args: &[Value], env: &mut Environment, _eval: &mut Evaluator) -> Result<Value, String> {
-    ensure_arity(args, 2)?;
-    let name = extract_symbol(&args[0])?;
-    let value = args[1].clone();
-    env.set(&name, value.clone())?;
-    Ok(value)
-}
-
 fn op_let(args: &[Value], env: &mut Environment, eval: &mut Evaluator) -> Result<Value, String> {
     ensure_arity_atleast(args, 1)?;
     let mut new_env = env.child();
@@ -341,12 +333,12 @@ fn op_help(args: &[Value], _env: &mut Environment, _eval: &mut Evaluator) -> Res
                    signal-width SIGNALS all-scopes SCOPES  CS CG LOCAL-SIGNALS\n\
                  \n\
                  导航与元信息:\n\
-                   INDEX TS MAX-INDEX step / load unload / timescale / beat\n\
+                   INDEX TS MAX-INDEX step / load unload / beat\n\
                  \n\
                  语言:\n\
                    + - * / div mod(%) ** = == != < > <= >= && || not\n\
                    if do cond case when unless while define defun let set! fn lambda\n\
-                   map fold print printf save import exit assert-eq\n\
+                   map fold print printf exit\n\
                    defmacro defunm macroexpand gensym   (宏: (doc \"defmacro\"))\n\
                    #name ≡ (resolve-group 'name); expr@offset ≡ (rel_eval expr offset)\n\
                  \n\
@@ -629,8 +621,7 @@ pub fn register_core(disp: &mut Dispatcher) {
     disp.register(Operator::Or, op_or);
     disp.register(Operator::If, op_if);
     disp.register(Operator::Define, op_define);
-    disp.register(Operator::Set, op_set);
-    disp.register(Operator::Let, op_let);
+        disp.register(Operator::Let, op_let);
     disp.register(Operator::Do, op_do);
     disp.register(Operator::While, op_while);
     disp.register(Operator::When, op_when);

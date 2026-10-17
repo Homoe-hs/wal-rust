@@ -1,8 +1,8 @@
 //! Signal builtin operators
 //!
-//! load, unload, step, find, find/g, whenever, signal-width, sample-at, trim-trace, signal?
+//! load, unload, step, find, find/g, whenever, signal-width, sample-at, signal?
 
-use crate::wal::ast::{Value, WList, Operator, Symbol};
+use crate::wal::ast::{Value, WList, Operator};
 use crate::wal::eval::{Environment, Dispatcher, Evaluator, resolve_signal_name};
 use crate::trace::{FindCondition, ResolveCompat, ScalarValue, Trace, TraceContainer};
 use std::path::Path;
@@ -550,36 +550,6 @@ fn op_whenever(args: &[Value], env: &mut Environment, eval: &mut Evaluator) -> R
     Ok(Value::Nil)
 }
 
-/// Signal name resolution: returns (selected_signal, all_substring_matches for warning)
-/// Returns empty candidates vec for exact/suffix matches (no ambiguity).
-pub(crate) fn fuzzy_match_signal<'a>(name: &str, signals: &'a [String]) -> (Option<&'a String>, Vec<&'a String>) {
-    // 1. Exact match
-    if let Some(s) = signals.iter().find(|s| s.as_str() == name) {
-        return (Some(s), vec![]);
-    }
-    // 2. Suffix match: signal ends with .name
-    let dot_name = format!(".{}", name);
-    let suffix: Vec<&'a String> = signals.iter().filter(|s| s.ends_with(&dot_name)).collect();
-    if suffix.len() == 1 { return (Some(suffix[0]), vec![]); }
-    if suffix.len() > 1 { return (Some(suffix[0]), suffix); }
-
-    // 3. Last component match for short names
-    if name.len() <= 8 || !name.contains('.') {
-        let last_comp: Vec<&'a String> = signals.iter()
-            .filter(|s| s.rsplitn(2, '.').next().unwrap_or("") == name)
-            .collect();
-        if last_comp.len() == 1 { return (Some(last_comp[0]), vec![]); }
-        if last_comp.len() > 1 { return (Some(last_comp[0]), last_comp); }
-    }
-
-    // 4. Substring match
-    let sub: Vec<&'a String> = signals.iter().filter(|s| s.contains(name)).collect();
-    if sub.len() == 1 { return (Some(sub[0]), vec![]); }
-    if sub.len() > 1 { return (Some(sub[0]), sub); }
-
-    (None, vec![])
-}
-
 /// Parse a simple condition expression like (= (get "signal") N)
 pub(crate) fn parse_edge_condition(expr: &Value) -> Option<(String, FindCondition)> {
     let lst = match expr {
@@ -780,71 +750,6 @@ fn op_releval(args: &[Value], env: &mut Environment, eval: &mut Evaluator) -> Re
     Err("No traces loaded".to_string())
 }
 
-fn op_fold_signal(args: &[Value], env: &mut Environment, eval: &mut Evaluator) -> Result<Value, String> {
-    // golden-compatible: (fold/signal f acc stop signal)
-    //   f     = function (fn [acc val] ...) applied at each step
-    //   acc   = initial accumulator value
-    //   stop  = condition expression; fold stops when truthy
-    //   signal = signal name
-    ensure_arity(args, 4)?;
-    let f = &args[0];
-    let mut acc = eval.eval_value_public(args[1].clone())?;
-    let stop = &args[2];
-    let signal_name = extract_symbol(&args[3])?;
-
-    if let Some(traces) = env.get_traces() {
-        // Save current trace positions
-        let saved_positions: Vec<(String, usize)> = {
-            let t = traces.read().unwrap_or_else(|e| e.into_inner());
-            t.trace_ids().iter().filter_map(|tid| {
-                t.get(tid).map(|tr| (tid.clone(), tr.index()))
-            }).collect()
-        };
-
-        let mut stopped = false;
-        while !stopped {
-            // Check stop condition
-            if eval.eval_value_public(stop.clone())?.is_truthy() {
-                break;
-            }
-
-            // Read current signal value
-            let signal_val = {
-                let t = traces.read().unwrap_or_else(|e| e.into_inner());
-                t.first_trace().and_then(|tr| {
-                    let idx = tr.index();
-                    tr.signal_value(&signal_name, idx).ok()
-                }).unwrap_or(ScalarValue::Bit(b'0'))
-            };
-            let val_value = scalar_to_value(signal_val);
-
-            // Apply f(acc, signal_val) → new acc
-            let call_expr = Value::List(WList::from_vec(vec![
-                f.clone(),
-                Value::List(WList::from_vec(vec![Value::Symbol(Symbol::new("quote")), acc])),
-                Value::List(WList::from_vec(vec![Value::Symbol(Symbol::new("quote")), val_value])),
-            ]));
-            acc = eval.eval_value_public(call_expr)?;
-
-            // Step forward
-            let mut t = traces.write().unwrap_or_else(|e| e.into_inner());
-            let mut any_ended = true;
-            for trace in t.traces_iter_mut() {
-                if trace.step(1).is_ok() { any_ended = false; }
-            }
-            stopped = any_ended;
-        }
-
-        // Restore positions
-        let mut t = traces.write().unwrap_or_else(|e| e.into_inner());
-        for (tid, idx) in &saved_positions {
-            let _ = t.set_index(tid, *idx);
-        }
-        return Ok(acc);
-    }
-    Ok(Value::Nil)
-}
-
 fn op_signal_width(args: &[Value], env: &mut Environment, _eval: &mut Evaluator) -> Result<Value, String> {
     ensure_arity(args, 1)?;
     let name = extract_name(&args[0])?;
@@ -899,21 +804,6 @@ fn op_sample_at(args: &[Value], env: &mut Environment, _eval: &mut Evaluator) ->
             }
         }
     }
-    Ok(Value::Nil)
-}
-
-fn op_trim_trace(args: &[Value], _env: &mut Environment, _eval: &mut Evaluator) -> Result<Value, String> {
-    // (trim-trace start end) — trim all traces to [start, end] index range
-    ensure_arity(args, 2)?;
-    let _start = match &args[0] {
-        Value::Int(i) => *i as usize,
-        _ => return Err("trim-trace: start must be integer".to_string()),
-    };
-    let _end = match &args[1] {
-        Value::Int(i) => *i as usize,
-        _ => return Err("trim-trace: end must be integer".to_string()),
-    };
-    // Trace trimming is not supported by current Trace trait — acknowledge
     Ok(Value::Nil)
 }
 
@@ -1135,53 +1025,12 @@ fn op_signal_p(args: &[Value], env: &mut Environment, _eval: &mut Evaluator) -> 
     Ok(Value::Bool(false))
 }
 
-fn op_call(args: &[Value], env: &mut Environment, eval: &mut Evaluator) -> Result<Value, String> {
-    // (call name args...) — dynamically call a named function
-    ensure_arity_atleast(args, 2)?;
-    let callee = eval.eval_value_public(args[0].clone())?;
-    let call_args: Vec<Value> = args[1..].to_vec();
-    match callee {
-        Value::Closure(c) => eval.eval_closure(c, &call_args),
-        Value::Macro(m) => eval.eval_macro(m, &call_args),
-        Value::Symbol(s) => {
-            if let Some(val) = env.lookup(&s.name) {
-                match val {
-                    Value::Closure(c) => eval.eval_closure(c, &call_args),
-                    Value::Macro(m) => eval.eval_macro(m, &call_args),
-                    _ => Err(format!("call: '{}' is not callable", s.name)),
-                }
-            } else {
-                Err(format!("call: '{}' not found", s.name))
-            }
-        }
-        _ => Err("call: first argument must be callable".to_string()),
-    }
-}
-
 fn op_eval_file(args: &[Value], _env: &mut Environment, eval: &mut Evaluator) -> Result<Value, String> {
     ensure_arity(args, 1)?;
     let path = extract_string(&args[0])?;
     let source = std::fs::read_to_string(&path)
         .map_err(|e| format!("eval-file: cannot read '{}': {}", path, e))?;
     eval.eval(&source)
-}
-
-fn op_require(args: &[Value], _env: &mut Environment, eval: &mut Evaluator) -> Result<Value, String> {
-    // (require name) — load a WAL module from the search path
-    ensure_arity(args, 1)?;
-    let name = extract_symbol(&args[0])?;
-    // Search for the file in standard locations
-    let search_paths = [".", "/usr/local/share/wal/stdlib", "/usr/share/wal/stdlib"];
-    for base in &search_paths {
-        let path = std::path::Path::new(base).join(format!("{}.wal", name));
-        if path.exists() {
-            let source = std::fs::read_to_string(&path)
-                .map_err(|e| format!("require: cannot read '{}': {}", path.display(), e))?;
-            return eval.eval(&source);
-        }
-    }
-    // Check if already loaded
-    Err(format!("require: module '{}' not found in search paths", name))
 }
 
 fn ensure_arity(args: &[Value], expected: usize) -> Result<(), String> {
@@ -1314,16 +1163,12 @@ pub fn register_signal(disp: &mut Dispatcher) {
     disp.register(Operator::Unload, op_unload);
     disp.register(Operator::Step, op_step);
     disp.register(Operator::Whenever, op_whenever);
-    disp.register(Operator::FoldSignal, op_fold_signal);
-    disp.register(Operator::SignalWidth, op_signal_width);
+        disp.register(Operator::SignalWidth, op_signal_width);
     disp.register(Operator::SampleAt, op_sample_at);
-    disp.register(Operator::TrimTrace, op_trim_trace);
-    disp.register(Operator::IsSignal, op_signal_p);
+        disp.register(Operator::IsSignal, op_signal_p);
     disp.register(Operator::Get, op_get);
-    disp.register(Operator::Call, op_call);
-    disp.register(Operator::EvalFile, op_eval_file);
-    disp.register(Operator::Require, op_require);
-    disp.register(Operator::LoadedTraces, op_loaded_traces);
+        disp.register(Operator::EvalFile, op_eval_file);
+        disp.register(Operator::LoadedTraces, op_loaded_traces);
     disp.register(Operator::RelEval, op_releval);
     disp.register(Operator::Timeframe, op_timeframe);
     disp.register(Operator::Rising, op_rising);

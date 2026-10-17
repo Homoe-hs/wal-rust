@@ -12,6 +12,21 @@
 ## [未发布]
 
 ### Changed
+- **`rel_eval` 正式更名为上游写法 `reval`**(旧名不再兼容;`expr@offset` 语法糖不变)。
+- **`set` 移除, `set!` 成为唯一赋值写法**(直接对已定义变量赋值,词法穿透共享 cell;不再支持
+  `(set (x 1) (y 2))` 多对赋值)。
+- **`count/step` / `find/step` 移除**(与 `count`/`find` 完全重叠:统一引擎与逐拍回退现在共用
+  "索引空间=实际读值波形"的同一规则,不再需要两组算子)。
+
+### Removed
+- **与上游 WAL 对齐的功能清理**:`save`(CSV 导出)、`parse`、`require`、`import`、`call`、
+  `repl`(算子形式)、`fold/signal`、`trim-trace`、`new-trace`、`dump-trace`、`timescale`、
+  `assert-eq`、`set`。保留 `eval-file`(上游核心文件加载)、`reval/@`、groups/scopes、宏系统、
+  谓词、`print/printf`、`timeframe`、`for/list` 等上游核心与波形核心算子。
+  替代:`assert-eq` 用脚本 `(if ... (exit 1))`;`count/step`→`count`;`find/step`→`find`;
+  `import/require`→`eval-file`;`fold/signal`→`find` + `map`/`sum` 组合。
+
+### Changed
 - **`fmt-time` 更名为 `beat`**:`(beat t)` 返回人类可读时间串;`(beat t "clk")` 返回**整数拍号**
   (首个上升沿 = 第 0 拍,首沿之前 = -1)。旧名 `fmt-time` **不再兼容**(调用报未知算子)。
 - **拍号显示模式 `WAL_BEAT_CLK=<clk[,clk2]>`**:设置后 `at` / `getwave` / `wave` / `edges` / `search`

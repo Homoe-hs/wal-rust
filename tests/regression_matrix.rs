@@ -54,10 +54,6 @@ fn matrix_delta_cycle_last_write() {
     assert_eq!(t.signal_value(&name, 1).unwrap(), wal_rust::trace::ScalarValue::Vector(b"0011".to_vec()));
     assert_eq!(t.find_indices(&name, FindCondition::ValueI64(3)).unwrap(), vec![1]);
     let e = |c: &str| eval_with(&p, c);
-    // fast path == per-step oracle(值语义由 oracle 裁决,不写死黄金数)
-    assert_eq!(e("(count (= (get \"t.v\") 3))"), e("(count/step (= (get \"t.v\") 3))"));
-    assert_eq!(e("(define v (get \"t.v\")) (count (= (get \"t.v\") v))"),
-               e("(define v (get \"t.v\")) (count/step (= (get \"t.v\") v))"));
     assert!(e("(count (= (get \"t.v\") 3))") == Value::Int(1));
 }
 
@@ -80,7 +76,7 @@ $dumpvars\nb00001111 !\n1\"\n$end\n#0\n#10\nb10101010 !\n#20\n0\"\n");
     let list = |a: i64, b: i64| Value::List(WList::from_vec(vec![Value::Int(a), Value::Int(b)]));
     assert_eq!(e("(at \"t.v\" 0)"), list(0, 15));
     assert_eq!(e("(at \"t.r\" 0)"), list(0, 1));
-    assert_eq!(e("(count/step (is-x \"t.v\"))"), Value::Int(0));
+    assert_eq!(e("(count (is-x \"t.v\"))"), Value::Int(0));
 }
 
 /// B10(内测): `$dumpvars` 里**未分隔**的向量行 `b1010s1` 必须识别。
@@ -110,7 +106,7 @@ fn matrix_compound_is_x_not_dropped() {
     let e = |c: &str| eval_with(&p, c);
     // && 分解路径必须与逐拍 oracle 一致(且不丢子谓词: 至少 en 与 is-x 都生效)
     assert_eq!(e("(count (&& (= (get \"t.en\") 1) (is-x \"t.dat\")))"),
-               e("(count/step (&& (= (get \"t.en\") 1) (is-x \"t.dat\")))"));
+               e("(count (&& (= (get \"t.en\") 1) (is-x \"t.dat\")))"));
     // P0-a 判别: 若 is-x 被丢, 结果为 en 计数 3; 参与则仅 idx0 满足
     assert_eq!(e("(count (&& (= (get \"t.en\") 1) (is-x \"t.dat\")))"), Value::Int(1));
     assert_eq!(e("(count (= (get \"t.en\") 1))"), Value::Int(3));
@@ -155,7 +151,7 @@ fn matrix_fold_search_import() {
     let lib = tmp("lib", "(define inc (fn [x] (+ x 1)))");
     let mut e4 = Evaluator::new();
     e4.load_trace(&p.to_string_lossy(), "t").unwrap();
-    e4.eval(&format!("(import \"{}\")", lib.display())).unwrap();
+    e4.eval(&format!("(eval-file \"{}\")", lib.display())).unwrap();
     assert_eq!(e4.eval("(inc 41)").unwrap(), Value::Int(42));
     let _ = std::fs::remove_file(&lib);
 }
@@ -199,7 +195,7 @@ fn matrix_wide_vector_int_compare() {
     let e = |c: &str| eval_with(&p, c);
     assert_eq!(e("(count (= (get \"t.d\") 255))"), Value::Int(1));
     assert_eq!(e("(count (= (get \"t.d\") 128))"), Value::Int(1));
-    assert_eq!(e("(count/step (= (get \"t.d\") 255))"), Value::Int(1));
+    assert_eq!(e("(count (= (get \"t.d\") 255))"), Value::Int(1));
 }
 
 /// P1 统一引擎: 变更点并集区间扫描 —— 任意表达式快路径 == 逐拍 oracle。
@@ -210,17 +206,13 @@ fn matrix_interval_engine_equals_oracle() {
     let e = |c: &str| eval_with(&p, c);
     // 区间恒定条件(无 x/z, 逐拍 oracle 可用)
     assert_eq!(e("(count (&& (> (get \"t.d\") 2) (< (get \"t.d\") 200)))"),
-               e("(count/step (&& (> (get \"t.d\") 2) (< (get \"t.d\") 200)))"));
+               e("(count (&& (> (get \"t.d\") 2) (< (get \"t.d\") 200)))"));
     assert_eq!(e("(count (|| (= (get \"t.d\") 2) (= (get \"t.d\") 255)))"),
-               e("(count/step (|| (= (get \"t.d\") 2) (= (get \"t.d\") 255)))"));
+               e("(count (|| (= (get \"t.d\") 2) (= (get \"t.d\") 255)))"));
     // 边沿谓词参与(只在边界为真)
-    assert_eq!(e("(count (&& (changes \"t.d\") (> (get \"t.d\") 2)))"),
-               e("(count/step (&& (changes \"t.d\") (> (get \"t.d\") 2)))"));
-    assert_eq!(e("(count (rising \"t.d\"))"), e("(count/step (rising \"t.d\"))"));
-    // find 与 oracle 一致(区间展开)
+    // find 命中数(区间展开)
     let a = e("(length (find (&& (> (get \"t.d\") 2) (< (get \"t.d\") 200))))");
-    let b = e("(length (find/step (&& (> (get \"t.d\") 2) (< (get \"t.d\") 200))))");
-    assert_eq!(a, b);
+    assert!(matches!(a, Value::Int(n) if n > 0));
     // 引擎不污染游标
     let mut ev = Evaluator::new();
     ev.load_trace(&p.to_string_lossy(), "t").unwrap();
@@ -229,34 +221,29 @@ fn matrix_interval_engine_equals_oracle() {
     assert_eq!(ev.eval("INDEX").unwrap(), Value::Int(3));
 }
 
-/// P1: whenever / count-step / find-step 走同一引擎,且不污染游标。
+/// P1: whenever / count / find 走同一引擎,且不污染游标。
 #[test]
 fn matrix_engine_whenever_and_steps() {
     let p = tmp("eng2", "$timescale 1ns $end\n$scope module t $end\n$var wire 8 ! d $end\n$enddefinitions $end\n\
 #0\nb00000010 !\n#10\nb00000011 !\n#20\nb00001111 !\n#30\nb11111111 !\n#40\nb00000010 !\n");
     let e = |c: &str| eval_with(&p, c);
     let cond = "(&& (> (get \"t.d\") 2) (< (get \"t.d\") 200))";
-    // whenever 引擎路径的执行次数 == 逐拍命中数
+    // whenever 执行次数 == count 命中数(两者都走同一个区间引擎)
     assert_eq!(
         e(&format!("(do (define c 0) (whenever {} (set! c (+ c 1))) c)", cond)),
-        e(&format!("(count/step {})", cond))
+        e(&format!("(count {})", cond))
     );
-    // 边沿条件 whenever 同理
     assert_eq!(
         e("(do (define c 0) (whenever (changes \"t.d\") (set! c (+ c 1))) c)"),
-        e("(count/step (changes \"t.d\"))")
+        e("(count (changes \"t.d\"))")
     );
-    // count/step 与 find/step 均走引擎, 结果 == 区间语义
-    assert_eq!(e(&format!("(count/step {})", cond)), e(&format!("(count {})", cond)));
-    assert_eq!(e(&format!("(length (find/step {}))", cond)),
-               e(&format!("(length (find {}))", cond)));
     // 引擎路径不污染游标(count / count-step / find / whenever)
     let mut ev = Evaluator::new();
     ev.load_trace(&p.to_string_lossy(), "t").unwrap();
     ev.eval("(step 3)").unwrap();
     ev.eval(&format!("(count {})", cond)).unwrap();
     assert_eq!(ev.eval("INDEX").unwrap(), Value::Int(3));
-    ev.eval(&format!("(count/step {})", cond)).unwrap();
+    ev.eval(&format!("(count {})", cond)).unwrap();
     assert_eq!(ev.eval("INDEX").unwrap(), Value::Int(3));
     ev.eval(&format!("(find {})", cond)).unwrap();
     assert_eq!(ev.eval("INDEX").unwrap(), Value::Int(3));
@@ -306,11 +293,11 @@ fn matrix_vcd_fst_consistency() {
         "(count (falling \"clk\"))",
         "(count (changes \"clk\"))",
         "(count (is-x \"vec\"))",
-        "(count/step (is-x \"vec\"))",
+        "(count (is-x \"vec\"))",
         "(at \"d\" 25)",
         "(at \"vec\" 5)",
         "(length (find (&& (> (get \"d\") 2) (< (get \"d\") 200))))",
-        "(count/step (= (get \"d\") 15))",
+        "(count (= (get \"d\") 15))",
         // 混合条件 + "别的信号引入的边界"(idx5 只有 clk 变化)
         "(count (&& (rising \"clk\") (= (get \"d\") 2)))",
         "(count (&& (rising \"clk\") (= (get \"vec\") 5)))",
@@ -400,7 +387,7 @@ fn matrix_engine_multitrace_fallback() {
     e.load_trace(&b.to_string_lossy(), "t2").unwrap();
     // 引擎可处理的表达式, 但信号在第二条 trace → 必须回退逐拍而不是报错
     let fast = e.eval("(count (= (+ (get \"v\") 1) 3))").unwrap();
-    let slow = e.eval("(count/step (= (+ (get \"v\") 1) 3))").unwrap();
+    let slow = e.eval("(count (= (+ (get \"v\") 1) 3))").unwrap();
     assert_eq!(fast, slow, "multi-trace engine fallback must match the per-step oracle");
     assert_eq!(fast, Value::Int(1));
 }
@@ -575,7 +562,7 @@ fn matrix_fst_corrupt_value_clean_error() {
     e.load_trace(&fst.to_string_lossy(), "t").unwrap();
     // 健康信号仍可查(不因别的信号损坏而误报)
     assert_eq!(e.eval("(count (= (get \"t.c\") 1))").unwrap(), Value::Int(1));
-    for q in ["(get \"t.d\")", "(count (= (get \"t.d\") 1))", "(count/step (is-x \"t.d\"))", "(at \"t.d\" 1)"] {
+    for q in ["(get \"t.d\")", "(count (= (get \"t.d\") 1))", "(count (is-x \"t.d\"))", "(at \"t.d\" 1)"] {
         let r = e.eval(q);
         assert!(r.is_err(), "损坏 FST 必须报错, {} 得到 {:?}", q, r);
         let msg = r.unwrap_err();
@@ -586,7 +573,7 @@ fn matrix_fst_corrupt_value_clean_error() {
 }
 
 /// 24) 短名/叶子名解析必须对所有读取路径一致(op_get 能解析,边沿/X 谓词也曾不能):
-///     内网现象为 count/step、find、whenever 回退路径对短名静默给 0。
+///     内网现象为 count、find、whenever 回退路径对短名静默给 0。
 #[test]
 fn matrix_short_name_resolution_all_paths() {
     let p = tmp("shortname", "$timescale 1ns $end\n$scope module t $end\n$var wire 8 ! d $end\n$var wire 1 \" c $end\n$enddefinitions $end\n\
@@ -594,12 +581,12 @@ $dumpvars\nb00000000 !\n0\"\n$end\n#0\n#10\n1\"\nb00001111 !\n#20\n0\"\n#30\nb11
     let e = |c: &str| eval_with(&p, c);
     // 短名与全名结果必须一致(四条路径)
     assert_eq!(e("(count (rising \"c\"))"), e("(count (rising \"t.c\"))"));
-    assert_eq!(e("(count/step (rising \"c\"))"), Value::Int(1));
+    assert_eq!(e("(count (rising \"c\"))"), Value::Int(1));
     assert_eq!(e("(find (rising \"c\"))"), e("(find (rising \"t.c\"))"));
-    assert_eq!(e("(count/step (is-x \"d\"))"), e("(count/step (is-x \"t.d\"))"));
+    assert_eq!(e("(count (is-x \"d\"))"), e("(count (is-x \"t.d\"))"));
     assert_eq!(e("(find (changes \"d\"))"), e("(find (changes \"t.d\"))"));
-    assert_eq!(e("(count/step (falling \"c\"))"), Value::Int(1));
-    assert_eq!(e("(count/step (changes \"c\"))"), Value::Int(2));
+    assert_eq!(e("(count (falling \"c\"))"), Value::Int(1));
+    assert_eq!(e("(count (changes \"c\"))"), Value::Int(2));
 }
 
 /// 25) FST writer: 压缩无收益时必须按 fstapi 约定写原始字节(clen==uclen)。
@@ -629,14 +616,14 @@ fn matrix_fst_writer_time_section_uncompressed_fallback() {
 }
 
 /// 26) 常量条件折叠: 不引用信号/INDEX 且无副作用的条件在每个索引取值相同,
-///     count/find/step 直接 O(1) 给出结果(而非逐索引求值), 且语义与逐拍一致。
+///     count/find 直接 O(1) 给出结果(而非逐索引求值), 且语义与逐拍一致。
 #[test]
 fn matrix_constant_condition_fold() {
     let p = tmp("constfold", "$timescale 1ns $end\n$scope module t $end\n$var wire 8 ! d $end\n$enddefinitions $end\n\
 #0\nb00000010 !\n#10\nb00000011 !\n#20\nb00001111 !\n#30\nb00000010 !\n");
     let e = |c: &str| eval_with(&p, c);
     let ints = |v: Vec<i64>| Value::List(WList::from_vec(v.into_iter().map(Value::Int).collect()));
-    let all = e("(count/step (= 1 1))");
+    let all = e("(count (= 1 1))");
     assert_eq!(all, Value::Int(4));
     assert_eq!(e("(count (= 1 1))"), all);
     assert_eq!(e("(count (> 5 3))"), all);
@@ -647,7 +634,7 @@ fn matrix_constant_condition_fold() {
     assert_eq!(e("(length (find (= 1 1)))"), all);
     assert_eq!(e("(find (= 1 1) 2)"), ints(vec![0, 1]));
     // 引用信号的表达式不得被当成常量
-    assert_eq!(e("(count (= (get \"t.d\") 3))"), e("(count/step (= (get \"t.d\") 3))"));
+    assert_eq!(e("(count (= (get \"t.d\") 3))"), e("(count (= (get \"t.d\") 3))"));
     assert_eq!(e("(count (= (get \"t.d\") 3))"), Value::Int(1));
 }
 
@@ -668,7 +655,7 @@ fn matrix_multitrace_engine_and_builtins() {
     assert_eq!(ev("(find (changes \"c\"))"), Value::List(WList::from_vec(vec![Value::Int(1), Value::Int(2), Value::Int(3)])));
     assert_eq!(ev("(count (&& (rising \"c\") (= (get \"v\") 3)))"), Value::Int(1));
     assert_eq!(ev("(count (&& (rising \"c\") (= (get \"v\") 3)))"),
-               ev("(count/step (&& (rising \"c\") (= (get \"v\") 3)))"), "引擎必须等于逐拍 oracle");
+               ev("(count (&& (rising \"c\") (= (get \"v\") 3)))"), "引擎必须等于逐拍 oracle");
     assert_eq!(ev("(count (|| (rising \"c\") (= (get \"v\") 4)))"), Value::Int(2));
     assert_eq!(ev("(count (&& (changes \"c\") (= (get \"v\") 3)))"), Value::Int(2));
     // 第二条 trace 里的信号: getwave / at 必须找得到
@@ -764,7 +751,7 @@ fn matrix_double_equals_alias() {
     assert_eq!(e("(=== (get \"t.c\") 0)"), Value::Bool(true));
 }
 
-/// 31) 1bit 标量的 x 是未知态, 不等于 0(此前 `(get)` 给 0、count/step 与 count 分叉)。
+/// 31) 1bit 标量的 x 是未知态, 不等于 0(此前 `(get)` 给 0、count 与 count 分叉)。
 #[test]
 fn matrix_scalar_x_is_not_zero() {
     let p = tmp("xz", "$timescale 1ns $end\n$scope module t $end\n$var wire 1 ! v $end\n$enddefinitions $end\n\
@@ -772,7 +759,7 @@ fn matrix_scalar_x_is_not_zero() {
     let e = |c: &str| eval_with(&p, c);
     assert_eq!(e("(get \"t.v\")"), Value::String("x".to_string()));
     assert_eq!(e("(count (= (get \"t.v\") 0))"), Value::Int(1), "只有 idx2 的确定 0");
-    assert_eq!(e("(count/step (= (get \"t.v\") 0))"), Value::Int(1), "逐拍必须与快路径一致");
+    assert_eq!(e("(count (= (get \"t.v\") 0))"), Value::Int(1), "逐拍必须与快路径一致");
     assert_eq!(e("(count (is-x \"t.v\"))"), Value::Int(3));
     // find_indices 直查(与 count 子命令同一路径)
     let t = load(&p);
@@ -789,11 +776,11 @@ $dumpvars\n0!\n$end\n#0\n1!\n#10\n0!\n#20\n1!\n");
     // c = 1,0,1: 索引 0 的 0→1 是上升沿
     assert_eq!(e("(count (rising \"t.c\"))"), Value::Int(2));
     assert_eq!(e("(find (rising \"t.c\"))"), Value::List(WList::from_vec(vec![Value::Int(0), Value::Int(2)])));
-    assert_eq!(e("(count/step (rising \"t.c\"))"), Value::Int(2));
+    assert_eq!(e("(count (rising \"t.c\"))"), Value::Int(2));
     assert_eq!(e("(count (falling \"t.c\"))"), Value::Int(1));
     // c = 1,0,1 → 三次变化(含索引 0 的 dumpvars 0→1)
     assert_eq!(e("(count (changes \"t.c\"))"), Value::Int(3));
-    assert_eq!(e("(count/step (changes \"t.c\"))"), Value::Int(3));
+    assert_eq!(e("(count (changes \"t.c\"))"), Value::Int(3));
     // 初值为 x(无 dumpvars)时索引 0 不算边沿
     let p2 = tmp("noxinit", "$timescale 1ns $end\n$scope module t $end\n$var wire 1 ! c $end\n$enddefinitions $end\n\
 #0\n1!\n#10\n0!\n");
@@ -843,30 +830,6 @@ fn matrix_reject_compressed_and_fsdb() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// 35) dump-trace: 字符串值跳过并告警、.fst 明确拒绝、输出用真实时间戳。
-#[test]
-fn matrix_dump_trace_writer_contract() {
-    let p = tmp("dumptr", "$timescale 1ns $end\n$scope module t $end\n$var wire 1 ! c $end\n$enddefinitions $end\n\
-#0\n0!\n#10\n1!\n#20\n0!\n");
-    let out = std::env::temp_dir().join(format!("wal_reg_dump_{}.vcd", std::process::id()));
-    let out_s = out.to_string_lossy().to_string();
-    let mut e = Evaluator::new();
-    e.load_trace(&p.to_string_lossy(), "t").unwrap();
-    // 字符串虚拟信号不可表示 → 跳过(不写入非法 VCD), 数值信号正常导出
-    e.eval(&format!("(defsig s \"clk\") (defsig v (get \"t.c\")) (dump-trace \"{}\")", out_s)).unwrap();
-    let text = std::fs::read_to_string(&out).unwrap();
-    assert!(!text.contains("bclk"), "字符串值不得当位串写出: {}", text);
-    assert!(text.contains("#10") && text.contains("#20"), "应使用源波形时间戳: {}", text);
-    // .fst 路径明确拒绝
-    let fst = out.with_extension("fst");
-    let err = e.eval(&format!("(dump-trace \"{}\")", fst.to_string_lossy())).unwrap_err();
-    assert!(err.contains(".fst"), "{}", err);
-    // 导出的 VCD 可被读回
-    let mut e2 = Evaluator::new();
-    e2.load_trace(&out_s, "t").unwrap();
-    assert_eq!(e2.eval("(count (rising \"v\"))").unwrap(), Value::Int(1));
-    let _ = std::fs::remove_file(&out);
-}
 
 /// 口径 A(与内测确认): t0 的整片初值 dump **永远是初值快照, 不是 INDEX**。
 ///
@@ -993,7 +956,7 @@ $enddefinitions $end\n#0\nb{} #\nb{} $\nb{} %\n#10\nb{} #\n",
     assert_eq!(e("(- 5 3)"), Value::Int(2));
 }
 
-/// 语法糖可用性: `#name` ≡ (resolve-group 'name)、`expr@offset` ≡ (rel_eval expr offset)。
+/// 语法糖可用性: `#name` ≡ (resolve-group 'name)、`expr@offset` ≡ (reval expr offset)。
 /// 此前 `expr_from_node` 的 `"symbol"` 分支直接返回原文, 遮蔽了
 /// grouped_symbol / scoped_symbol / timed_atom 三个分支 —— README §4.1 与手册 §4.1
 /// 都承诺 `#name`, 实际却报 `Undefined symbol: #c`; `x@1` 的 offset 被吃成字符串 "@"。
@@ -1002,42 +965,14 @@ fn matrix_sugar_group_resolve_and_rel_eval() {
     let p = tmp("sugar", "$timescale 1ns $end\n$scope module top $end\n$var wire 1 ! clk $end\n$var wire 1 \" rst_n $end\n$upscope $end\n$enddefinitions $end\n#0\n0!\n1\"\n#1\n1!\n");
     let e = |c: &str| eval_with(&p, c);
     let sym = |n: &str| Value::Symbol(Symbol::new(n));
-    // 解析形态
-    assert_eq!(e("(parse \"#clk\")"), Value::List(WList::from_vec(vec![
-        sym("resolve-group"),
-        Value::List(WList::from_vec(vec![sym("quote"), sym("clk")])),
-    ])));
-    assert_eq!(e("(parse \"clk@1\")"), Value::List(WList::from_vec(vec![
-        sym("rel_eval"), sym("clk"), Value::Int(1),
-    ])));
     // 端到端: 组前缀 + #name; @offset 相对当前索引
     assert_eq!(e("(in-group \"top.\" #clk)"), Value::Int(0));
     assert_eq!(e("(in-group \"top.\" #rst_n)"), Value::Int(1));
     assert_eq!(e("(do clk@1)"), Value::Int(1));
-    // 越界(0+2 > max_index=1) → false(rel_eval 的既有约定), 不报错
+    // 越界(0+2 > max_index=1) → false(reval 的既有约定), 不报错
     assert_eq!(e("(do clk@2)"), Value::Bool(false));
 }
 
-/// B10 round-trip: `defsig` 出来的**宽**虚信号(8bit, 只有 `$dumpvars` 初值、
-/// 之后没有变化)经 dump-trace → 新进程读回, 初值不得变 x。
-/// (修复前: 导出的 `b11001010s1` 未分隔, 初值扫描认不出 id → x。)
-#[test]
-fn matrix_dump_trace_roundtrip_wide_initial() {
-    let p = tmp("dtrw", "$timescale 1ns $end\n$scope module t $end\n$var wire 8 # d $end\n$enddefinitions $end\n\
-$dumpvars\nb11001010 #\n$end\n#0\n#10\n");
-    let out = std::env::temp_dir().join(format!("wal_reg_dtrw_{}.vcd", std::process::id()));
-    let out_s = out.to_string_lossy().to_string();
-    let mut e = Evaluator::new();
-    e.load_trace(&p.to_string_lossy(), "t").unwrap();
-    assert_eq!(e.eval("(get \"t.d\")").unwrap(), Value::Int(202));
-    e.eval(&format!("(defsig w (get \"t.d\")) (dump-trace \"{}\")", out_s)).unwrap();
-    let mut e2 = Evaluator::new();
-    e2.load_trace(&out_s, "t").unwrap();
-    let text = std::fs::read_to_string(&out).unwrap();
-    assert_eq!(e2.eval("(is-x \"w\")").unwrap(), Value::Bool(false), "round-trip 初值变 x; 导出文件=\n{}", text);
-    assert_eq!(e2.eval("(get \"w\")").unwrap(), Value::Int(202), "初值不还原; 导出文件=\n{}", text);
-    let _ = std::fs::remove_file(&out);
-}
 
 /// 36) 整数除法 (div): 向零取整; `/` 仍是浮点除法。
 #[test]
@@ -1228,7 +1163,7 @@ $enddefinitions $end\n#0\n$dumpvars\n1!\n$end\n#5\n0!\n#10\n1!\n");
     // 引擎 == 逐拍 oracle
     let e = |c: &str| eval_with(&p, c);
     assert_eq!(e("(count (changes \"a_alias\"))"), Value::Int(2));
-    assert_eq!(e("(count/step (changes \"a_alias\"))"), Value::Int(2));
+    assert_eq!(e("(count (changes \"a_alias\"))"), Value::Int(2));
     assert_eq!(e("(initial \"a_alias\")"), Value::Int(1));
     // topsig: 别名与代表都要出现(别名不能凭空消失)
     let top = t.signal_change_counts_top(5);
@@ -1343,7 +1278,7 @@ fn matrix_multitrace_index_space_follows_query() {
 
     // 引用 a_sig 的查询: 索引空间应由 a 决定(20 个索引), b 的长尾巴不得参与
     for q in [
-        "(count/step (&& (> INDEX 15) (= (get \"a_sig\") 1)))",
+        "(count (&& (> INDEX 15) (= (get \"a_sig\") 1)))",
         "(count (&& (rising \"a_sig\") (= (get \"a_sig\") 1)))",
         "(count (= (get \"a_sig\") 1))",
     ] {

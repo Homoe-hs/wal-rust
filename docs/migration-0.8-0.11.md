@@ -30,7 +30,7 @@
 
 - `groups / in-group / resolve-group / in-scope / in-scopes / all-scopes`、`CG`/`CS`、`@`/`#`/`~` 语法糖均保留
 - `slice` 对列表按 Python 语义；`(for/list [x xs] body+)`（含多绑定 zip）
-- `save` 导出 CSV 保留 x/z 原样位串（唯一“原样”面板，get 见上表）
+- `save` 导出 CSV 保留 x/z 原样位串；**该算子已在 0.14.63 移除**
 
 ## 已知边界（诚实标注）
 
