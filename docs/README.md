@@ -38,6 +38,7 @@
 | [`profiling.md`](profiling.md) | 96 | 运行手册 | ✅ 现行(`WAL_PROF` 阶段账 + 火焰图; 含读图陷阱与首轮结论) |
 | [`load-strategy-experiments.md`](load-strategy-experiments.md) | 88 | 实验设计 | ✅ 已跑,结论见 [`load-strategy-results.md`](load-strategy-results.md) |
 | [`load-strategy-results.md`](load-strategy-results.md) | 82 | 实验结果 | ✅ 2026-10-17(#2 cache-only 采用; #3 惰性索引部分保留) |
+| [`bug-list.md`](bug-list.md) | 224 | 找 bug 清单 | 🟡 收集中(单功能矩阵 + 组合测试产出;12 条已复现 + 覆盖缺口) |
 | [`internal-feedback-review.md`](internal-feedback-review.md) | 40 | 复盘 | 📦 复盘(0.10.10 批次) |
 | [`migration-0.8-0.11.md`](migration-0.8-0.11.md) | 39 | 迁移指南 | 🟡 历史区间(0.8→0.11), 供老用户对照 |
 
