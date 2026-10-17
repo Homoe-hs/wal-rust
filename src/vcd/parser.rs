@@ -183,7 +183,7 @@ impl<R: Read> VcdParser<R> {
         let id_pos = line.find(parts[3]).unwrap_or(0);
         let name_start = id_pos + parts[3].len();
         let name_end = line.rfind("$end").unwrap_or(line.len());
-        let name = line[name_start..name_end].trim().to_string();
+        let name = crate::vcd::canonical_var_name(line[name_start..name_end].trim()).to_string();
 
         self.signal_ids.push(id.clone());
 
@@ -604,7 +604,7 @@ impl MmapVcdParser {
         let id_pos = line.find(&id).unwrap_or(0);
         let name_start = id_pos + id.len();
         let name_end = line.rfind("$end").unwrap_or(line.len());
-        let name = line[name_start..name_end].trim().to_string();
+let name = crate::vcd::canonical_var_name(line[name_start..name_end].trim()).to_string();
         let name = if name.is_empty() { id.clone() } else { name };
 
         self.signal_ids.push(id.clone());

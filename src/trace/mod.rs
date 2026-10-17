@@ -9,6 +9,56 @@ mod vcd;
 mod fst;
 pub mod fsdb;
 
+/// 去掉名字尾部的 range/位选(`data[3:0]` / `data [3:0]` → `data`)。
+///
+/// **BUG-004**: VCD 的规范名已统一为**引用名**(不带 range, 与 FST 一致);
+/// 这个函数用于让"旧写法"(带 range 的查询)继续可用。转义标识符(`\a[0]`)的
+/// 方括号属于名字 → 不剥。
+pub fn strip_range_suffix(name: &str) -> Option<&str> {
+    if name.starts_with('\\') {
+        return None;
+    }
+    let t = name.trim_end();
+    if !t.ends_with(']') {
+        return None;
+    }
+    let open = t.rfind('[')?;
+    let inner = &t[open + 1..t.len() - 1];
+    let looks_like_range = !inner.is_empty()
+        && inner.bytes().all(|b| b.is_ascii_digit() || b == b':')
+        && inner.bytes().any(|b| b.is_ascii_digit());
+    if !looks_like_range {
+        return None;
+    }
+    let base = t[..open].trim_end();
+    if base.is_empty() {
+        None
+    } else {
+        Some(base)
+    }
+}
+
+/// 名字解析兼容层:`resolve_name` 失败时去掉尾部 range 再试一次(见 [`strip_range_suffix`])。
+pub trait ResolveCompat {
+    fn resolve_name_compat(&self, name: &str) -> Option<String>;
+    fn resolve_name_strict_compat(&self, name: &str) -> Result<String, String>;
+}
+
+impl<T: Trace + ?Sized> ResolveCompat for T {
+    fn resolve_name_compat(&self, name: &str) -> Option<String> {
+        self.resolve_name(name).or_else(|| {
+            let base = strip_range_suffix(name)?;
+            if base == name { None } else { self.resolve_name(base) }
+        })
+    }
+    fn resolve_name_strict_compat(&self, name: &str) -> Result<String, String> {
+        self.resolve_name_strict(name).or_else(|e| match strip_range_suffix(name) {
+            Some(base) if base != name => self.resolve_name_strict(base).map_err(|_| e),
+            _ => Err(e),
+        })
+    }
+}
+
 pub use trace::{Trace, TraceId, ScalarValue, FindCondition, BatchEntry};
 pub use container::{TraceContainer, SharedTraceContainer, new_shared};
 pub use vcd::VcdTrace;

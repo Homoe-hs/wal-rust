@@ -241,7 +241,8 @@ fn parse_header_and_register(
                             .take_while(|p| !p.starts_with(b"$end") && **p != b"$end")
                             .map(|p| std::str::from_utf8(p).unwrap_or(""))
                             .collect();
-                        let name = name_parts.join(" ");
+                        let raw = name_parts.join(" ");
+                        let name = crate::vcd::canonical_var_name(&raw).to_string();
                         let vcd_type = std::str::from_utf8(parts[1]).unwrap_or("wire");
                         writer.create_var(&name, width, VarType::from_vcd_type(vcd_type, width));
                     }

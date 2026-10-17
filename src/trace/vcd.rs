@@ -511,14 +511,22 @@ impl VcdTrace {
             }
         }
 
-        // If no $enddefinitions found, use current position
+        // If no $enddefinitions found → 文件被截断(或根本不是 VCD)。
+        // BUG-008: 旧行为只打 warning 然后返回"部分信号/空结果"(rc=0), 脚本无法靠退出码发现坏输入;
+        // 现在默认报错, 显式设 `WAL_VCD_LENIENT=1` 才按旧行为放宽。
         if header_end_offset == 0 {
-            // 文件被截断(或不是 VCD): 明确告警, 否则用户拿到的是"部分信号/空结果"
-            eprintln!(
-                "warning: {}: 未找到 $enddefinitions — 文件可能被截断或不是完整 VCD(信号/时间戳可能不完整)",
-                filename
-            );
-            header_end_offset = reader.current_offset();
+            if std::env::var("WAL_VCD_LENIENT").is_ok() {
+                eprintln!(
+                    "warning: {}: 未找到 $enddefinitions — 文件可能被截断或不是完整 VCD(WAL_VCD_LENIENT=1 已放宽)",
+                    filename
+                );
+                header_end_offset = reader.current_offset();
+            } else {
+                return Err(format!(
+                    "{}: 不是完整 VCD: 未找到 $enddefinitions(文件被截断、或根本不是 VCD 文件)。\n                       若确实要读截断文件, 设 WAL_VCD_LENIENT=1 放宽为旧行为。",
+                    filename
+                ));
+            }
         }
 
         // ====== PASS 1b: Parallel chunk scan of dump section ======
@@ -1864,7 +1872,8 @@ fn parse_var_decl_fast2(line: &[u8]) -> Option<(u64, &[u8], usize, &[u8], bool)>
     let name_end = line[name_start..].iter().position(|&b| b == b'$').map(|p| name_start + p).unwrap_or(line.len());
     let mut ne = name_end;
     while ne > name_start && (line[ne - 1] == b' ' || line[ne - 1] == b'\t') { ne -= 1; }
-    let name = &line[name_start..ne];
+    // BUG-004: 规范名 = 引用名(去掉尾部 range); 转义标识符保持原样
+    let name = crate::vcd::canonical_var_name_bytes(&line[name_start..ne]);
 
     Some((sig_hash, name, width, id_bytes, is_event))
 }
@@ -3145,7 +3154,7 @@ $end\n").unwrap();
         std::fs::write(&p, vcd).unwrap();
         let trace = load_vcd(p.to_str().unwrap());
         let sigs = trace.signals();
-        let name = sigs.iter().find(|s| s.contains("v [")).unwrap().clone();
+        let name = sigs.iter().find(|s| s.ends_with(".v") || *s == "v").unwrap().clone();  // BUG-004: 名字已规范化为引用名(无 range)
         eprintln!("9bit signal: {}", name);
         let idx = trace.find_indices(&name, FindCondition::Changed).unwrap();
         eprintln!("changes(9bit {}) = {:?} (len {})", name, &idx[..idx.len().min(5)], idx.len());
@@ -3210,7 +3219,7 @@ $end\n\
 b00000000 !\n\
 $end\n").unwrap();
         let trace = load_vcd(p.to_str().unwrap());
-        let name = trace.signals().iter().find(|s| s.contains("v [")).unwrap().clone();
+        let name = trace.signals().iter().find(|s| s.ends_with(".v") || s.as_str() == "v").unwrap().clone();  // BUG-004
 
         // Initial x is a full-width vector (same shape as "bxxxxxxxx"), not a Bit.
         let sv0 = trace.signal_value(&name, 0).unwrap();

@@ -385,11 +385,11 @@ impl Trace for FstTrace {
 
     fn signals(&self) -> Vec<String> {
         let wf = self.wf.borrow();
-        let mut sigs: Vec<String> = wf.hierarchy().iter_vars()
+        // BUG-005: 保持**声明序**(FST hierarchy 顺序 = 写者声明序 = VCD 头顺序),
+        // 不再按字典序重排 —— 否则依赖 `(first (SIGNALS))` 的脚本跨格式结果不同。
+        wf.hierarchy().iter_vars()
             .map(|v| v.full_name(wf.hierarchy()))
-            .collect();
-        sigs.sort();
-        sigs
+            .collect()
     }
 
     fn scopes(&self) -> Vec<String> {

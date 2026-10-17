@@ -129,7 +129,17 @@ fn parse_value_change(line: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
             let bits = &line[1..sp];
             if bits.is_empty() { return None; }
             let id = line[sp + 1..].to_vec();
-            let val: Vec<u8> = bits.iter().map(|&b| if b == b'1' { b'1' } else { b'0' }).collect();
+            // BUG-017: 必须保留 4-state(x/z), 不能折叠成 0 —— 折叠会把波形值变成静默错误的数字。
+            let val: Vec<u8> = bits
+                .iter()
+                .map(|&b| match b {
+                    b'1' => b'1',
+                    b'0' => b'0',
+                    b'x' | b'X' => b'x',
+                    b'z' | b'Z' => b'z',
+                    _ => b'x',
+                })
+                .collect();
             Some((id, val))
         }
         b'r' => {
@@ -235,7 +245,7 @@ b11110000 #
         let reader = FstReader::from_path(&fst_path).unwrap();
         let names: std::collections::HashSet<&str> =
             reader.file.signals.iter().map(|s| s.name.as_str()).collect();
-        assert!(names.contains("counter_tb.count [7:0]"), "count signal");
+        assert!(names.contains("counter_tb.count"), "count signal");
         assert!(names.contains("counter_tb.clk"), "clk signal");
         assert!(names.contains("counter_tb.rst"), "rst signal");
         assert!(names.contains("counter_tb.uut.clk"), "uut clk signal");
@@ -381,12 +391,13 @@ pub fn vcd_to_fst_streaming(
                         if parts.len() >= 5 {
                             if let Ok(width) = parts[2].parse::<u32>() {
                                 let id_bytes = parts[3].as_bytes().to_vec();
-                                let name = parts[4..]
+                                let raw = parts[4..]
                                     .iter()
                                     .take_while(|&&p| p != "$end")
                                     .cloned()
                                     .collect::<Vec<_>>()
                                     .join(" ");
+                                let name = crate::vcd::canonical_var_name(&raw).to_string();
                                 if width > 0 && !id_bytes.is_empty() && !name.is_empty() {
                                     let handle = writer.create_var(
                                         &name, width,
@@ -497,6 +508,13 @@ pub fn vcd_to_fst_streaming(
         }
     }
 
+    // BUG-008: 缺 $enddefinitions = 截断/非 VCD → 默认报错(与 trace 加载路径一致)
+    if !header_done && std::env::var("WAL_VCD_LENIENT").is_err() {
+        return Err(format!(
+            "{}: 不是完整 VCD: 未找到 $enddefinitions(文件被截断、或根本不是 VCD 文件)",
+            vcd_path.display()
+        ));
+    }
     _progress.store(file_len as u64, Ordering::Relaxed);
     writer.close().map_err(|e| format!("FST close: {}", e))?;
     let _ = fs::remove_file(resume_path);

@@ -19,7 +19,7 @@
 //!   (save "out.csv" "sig"...)    → export time/value pairs to CSV
 //!   (doc "getwave")              → one-line docs for a command
 
-use crate::trace::{Trace, ScalarValue};
+use crate::trace::{ResolveCompat, ScalarValue, Trace};
 use crate::wal::ast::{Operator, Value, WList};
 use crate::wal::eval::{Dispatcher, Environment, Evaluator};
 
@@ -62,7 +62,7 @@ fn with_signal_trace<R>(
     let mut ambiguous: Option<String> = None;
     for tid in &ids {
         let tr = match guard.get(tid) { Some(tr) => tr, None => continue };
-        match tr.resolve_name_strict(name) {
+        match tr.resolve_name_strict_compat(name) {
             Ok(resolved) => return f(tr, &resolved),
             Err(e) => {
                 // 歧义(有多个候选)是可操作的错误 → 直接返回; 否则继续找别的 trace
@@ -78,9 +78,10 @@ fn with_signal_trace<R>(
 }
 
 /// Resolve a signal name strictly (exact or UNIQUE substring; 有歧义即报错)。
-/// 走 trace.resolve_name_strict(零分配), 不再每次拉整张信号表。
+/// 走 trace.resolve_name_strict_compat(零分配), 不再每次拉整张信号表。
 fn resolve_signal(tr: &dyn Trace, name: &str) -> Result<String, String> {
-    tr.resolve_name_strict(name)
+    // 兼容层: `data`/`data[3:0]`/`data [3:0]` 都能解析(BUG-004)
+    tr.resolve_name_strict_compat(name)
 }
 
 /// IEEE 1364-1995 §14.1.1.4 / 1800-2012 §21.2.1.4 value convention:

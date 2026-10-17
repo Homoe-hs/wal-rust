@@ -4,7 +4,7 @@
 
 use crate::wal::ast::{Value, WList, Operator, Symbol};
 use crate::wal::eval::{Environment, Dispatcher, Evaluator, resolve_signal_name};
-use crate::trace::{FindCondition, ScalarValue, Trace, TraceContainer};
+use crate::trace::{FindCondition, ResolveCompat, ScalarValue, Trace, TraceContainer};
 use std::path::Path;
 
 fn op_load(args: &[Value], env: &mut Environment, _eval: &mut Evaluator) -> Result<Value, String> {
@@ -324,7 +324,7 @@ pub(crate) fn try_count_simple(cond: &Value, env: &mut Environment) -> Option<Re
         let t = traces.read().ok()?;
         let tid = t.source_ids(&[sig_name.clone()]).into_iter().next()?;
         let tr = t.get(&tid)?;
-        let resolved = tr.resolve_name(&sig_name)?;
+        let resolved = tr.resolve_name_compat(&sig_name)?;
         tr.count_matches(&resolved, cond_enum).ok()?
     };
     Some(Ok(n))
@@ -338,7 +338,7 @@ fn try_find_indices_enum(sig_name: &str, cond_enum: FindCondition, max_results: 
         let t = traces.read().ok()?;
         let tid = t.source_ids(&[sig_name.to_string()]).into_iter().next()?;
         let tr = t.get(&tid)?;
-        let resolved = tr.resolve_name(sig_name)?;
+        let resolved = tr.resolve_name_compat(sig_name)?;
         (tid, resolved)
     };
 
@@ -440,7 +440,7 @@ fn op_whenever(args: &[Value], env: &mut Environment, eval: &mut Evaluator) -> R
             };
             if let Some(trace) = {
                 let t = traces.read().unwrap_or_else(|e| e.into_inner());
-                t.first_trace().map(|tr| (tr.id().clone(), tr.resolve_name(&sig_name)))
+                t.first_trace().map(|tr| (tr.id().clone(), tr.resolve_name_compat(&sig_name)))
             } {
                 let (tid, resolved) = trace;
                 if std::env::var("WAL_DEBUG_FIND").is_ok() {
@@ -486,7 +486,7 @@ fn op_whenever(args: &[Value], env: &mut Environment, eval: &mut Evaluator) -> R
             };
             if let Some(trace) = {
                 let t = traces.read().unwrap_or_else(|e| e.into_inner());
-                t.first_trace().map(|tr| (tr.id().clone(), tr.resolve_name(&sig_name)))
+                t.first_trace().map(|tr| (tr.id().clone(), tr.resolve_name_compat(&sig_name)))
             } {
                 let (tid, resolved) = trace;
                 if let Some(resolved) = resolved {
@@ -693,7 +693,7 @@ fn op_get(args: &[Value], env: &mut Environment, eval: &mut Evaluator) -> Result
         let traces = traces.read().unwrap_or_else(|e| e.into_inner());
         // Search every loaded trace (not just the first): the same short name
         // may live in a second -l file (multi-trace get, feedback round B12).
-        // 模糊匹配走 trace.resolve_name(零分配): 此前每个 trace 都 signals() 拉整张表
+        // 模糊匹配走 trace.resolve_name_compat(零分配): 此前每个 trace 都 signals() 拉整张表
         // (4M 信号 ≈ 0.6-0.8s/次)。候选提示只在最终失败时用 suggest_names 取前 5 个。
         let mut preview: Vec<String> = Vec::new();
         for trace in traces.traces_iter() {
@@ -702,7 +702,7 @@ fn op_get(args: &[Value], env: &mut Environment, eval: &mut Evaluator) -> Result
                     return Ok(slice_value(sv, hi, lo));
                 }
             }
-            if let Some(matched) = trace.resolve_name(&name) {
+            if let Some(matched) = trace.resolve_name_compat(&name) {
                 if let Ok(sv) = trace.signal_value(&matched, trace.index()) {
                     return Ok(slice_value(sv, hi, lo));
                 }
@@ -852,7 +852,7 @@ fn op_signal_width(args: &[Value], env: &mut Environment, _eval: &mut Evaluator)
     if let Some(traces) = env.get_traces() {
         let traces_lock = traces.read().unwrap_or_else(|e| e.into_inner());
         if let Some(trace) = traces_lock.first_trace() {
-            let resolved = trace.resolve_name(&name).unwrap_or(name.clone());
+            let resolved = trace.resolve_name_compat(&name).unwrap_or(name.clone());
             if let Ok(w) = trace.signal_width(&resolved) {
                 return Ok(Value::Int(w as i64));
             }
@@ -888,7 +888,7 @@ fn op_sample_at(args: &[Value], env: &mut Environment, _eval: &mut Evaluator) ->
     if let Some(traces) = env.get_traces() {
         let traces_lock = traces.read().unwrap_or_else(|e| e.into_inner());
         if let Some(trace) = traces_lock.first_trace() {
-            let resolved = trace.resolve_name(&signal_name).unwrap_or(signal_name.clone());
+            let resolved = trace.resolve_name_compat(&signal_name).unwrap_or(signal_name.clone());
             if let Ok(sv) = trace.signal_value(&resolved, index) {
                 return Ok(scalar_to_value(sv));
             }
@@ -1016,7 +1016,7 @@ fn edge_values_at_cursor(
     let mut any_trace = false;
     for tr in traces.traces_iter() {
         any_trace = true;
-        let resolved = match tr.resolve_name(name) { Some(r) => r, None => continue };
+        let resolved = match tr.resolve_name_compat(name) { Some(r) => r, None => continue };
         let idx = tr.index();
         let cur = match tr.signal_value(&resolved, idx) { Ok(v) => v, Err(_) => continue };
         let prev = if idx == 0 {

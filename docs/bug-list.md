@@ -28,9 +28,9 @@
   索引空间按**时间戳**建 → `MAX-INDEX` 应为 2,`getwave` 在 t=10 只应有 1 个点(值取最后写入 1)。
 - 疑似根因:`src/trace/vcd.rs` 的 `build_dump_index` 对每个 `#<digits>` 行都 `ts.push(...)`,没有合并相邻相同时间戳。
 
-## BUG-002 FST 读侧名字丢失向量范围,并把**转义标识符**里的方括号误当范围截掉
+## BUG-002 FST 读侧名字丢失向量范围(转义标识符场景)——**结论:格式固有限制,已记录**
 
-- 严重度:**高**(转义名整条查询失效;向量名跨格式不一致)
+- 严重度:**已缓解**(VCD 侧已把名字规范为引用名,与 FST 一致;只有"转义标识符且含方括号"这一 FST 格式固有场景仍不一致)
 - 类别:跨格式一致性 / 名字解析
 - 夹具:`.tools/bughunt/fixtures/escaped.vcd` / `wide.vcd`(及 FST 孪生体)
 - 复现:
@@ -61,7 +61,7 @@
 - 期望:同一设计两种格式给出相同的 scope 列表(根 scope `""` 不应作为可见 scope)。
 - 疑似根因:`src/trace/fst.rs::scopes()` 直接收集 `wf.hierarchy().iter_scopes()`(wellen 含根),未过滤空名。
 
-## BUG-004 VCD 信号名带范围且用**空格**分隔(`top.data [3:0]`),自然写法查不到
+## ~~BUG-004~~ VCD 信号名带范围且用**空格**分隔 —— **已修**
 
 - 严重度:**中**(可用性 + 跨格式不一致;用户自然输入 `top.data[3:0]` 或 `top.data` 行为不同)
 - 类别:名字解析 / 跨格式一致
@@ -77,7 +77,7 @@
 - 备注:`src/vcd/convert.rs:238` 的既有断言 `names.contains("counter_tb.count [7:0]")` 说明当前行为**被测试固化**过,
   修复属于**语义决策**,需要与文档/README 一起改。
 
-## BUG-005 `(SIGNALS)` 顺序跨格式不同(VCD 声明序 vs FST 字典序)
+## ~~BUG-005~~ `(SIGNALS)` 顺序跨格式不同 —— **已修**
 
 - 严重度:**中**(依赖顺序的用户脚本(`(first (SIGNALS))` 等)在换格式后结果不同)
 - 类别:跨格式一致性
@@ -123,7 +123,7 @@
   ```
 - 期望:help 与手册一致(手册 §5.9 明确 `filter` **未内置**,可 `map`+条件替代)。修法:help 里标注未内置或移除。
 
-## BUG-008 损坏/截断波形只 warning 不报错(rc=0,空/部分结果)
+## ~~BUG-008~~ 损坏/截断波形只 warning 不报错 —— **已修(默认报错,`WAL_VCD_LENIENT=1` 可放宽)**
 
 - 严重度:**中**(脚本只能靠 stderr 发现输入损坏;静默空结果是分析事故隐患)
 - 复现:
@@ -207,7 +207,7 @@
 - 期望:统一一种约定(建议:显示层按手册改 `#t`/`2.0`/`{...}`,或把手册示例全部改成实际输出;二选一)。
   注:手册 §1.2 已说明输入字面量 `#t`/`true` 均可,输出口径需要明确。
 
-## BUG-015(待确认)`(1 2)` 数字当函数调用静默返回列表
+## ~~BUG-015~~ `(1 2)` 数字当函数调用返回列表 —— **不是 bug(设计如此,已补文档)**
 
 - 严重度:**待定**
 - 复现:
@@ -275,3 +275,32 @@
 - 文档示例对拍:`MATCH 55 → 79`(`MISMATCH 23 → 1`,剩余 1 条是 CLI 回显 `=>` 造成的比对噪声、1 条是 dump-trace 示例缺前置 defsig)。
 - 单功能矩阵:findings `224 → 40`(剩余全部为 SIGNALS 命名/顺序、TRACE 元信息、FST 名字集合差异,归 BUG-002/004/005)。
 - 组合阶段:findings `25 → 13`(剩余为 BUG-008 损坏文件、以及 `bits->sint` 参数用法/浮点除零等刻意报错项)。
+
+---
+
+# 第二轮修复记录(名字/范围统一 + 4-state 转换 + 严格输入)
+
+| bug | 根因(代码位置) | 修法 | 回归测试 |
+|---|---|---|---|
+| **004** VCD 名带空格 range | VCD 头解析把整个名字字段(`data [3:0]`)当引用名 | 新增 `vcd::canonical_var_name`(转义标识符原样保留),在 `src/trace/vcd.rs`、`src/vcd/convert.rs`、`src/vcd/parallel_convert.rs`、`src/vcd/parser.rs` 四处统一;新增 `Trace::resolve_name*_compat` 兼容层(旧写法 `data[3:0]`/`data [3:0]` 继续可解析),所有 builtin 的名字解析改走 compat | `bug004_vcd_signal_names_are_references_only` |
+| **005** `(SIGNALS)` 顺序跨格式不同 | FST 读侧 `signals()` 对结果 `sort()` | 去掉排序,保持 FST 文件里 hierarchy 顺序(= 写者声明序 = VCD 头顺序);现在 VCD/FST 的 `(SIGNALS)` **逐项一致(含顺序)** | `bug005_fst_signal_order_is_declaration_order` |
+| **002** FST 转义名 `\a[0]` 被截 | FST 格式把 range 编码在 var 名字尾部,wellen 读端按 fstapi 约定剥离 → 转义标识符里的 `[0]` 无法与真 range 区分 | **格式固有限制**:VCD 侧保留 `\a[0]` 原样;FST 读写无法无损表示。已在清单记录,不做破坏格式的 hack | 由 bug004 测试覆盖 VCD 侧 |
+| **017(新)** VCD→FST 转换把 x/z 折叠成 0 | `src/vcd/convert.rs::parse_value_change` 的 `if b == b'1' {b'1'} else {b'0'}` | 保留 4-state(x/X→x, z/Z→z),转换后 `(getwave)` 与 VCD 逐值一致 | `bug017_vcd_to_fst_preserves_four_state` |
+| **008** 截断/垃圾 VCD 静默成功 | `src/trace/vcd.rs` header 扫描找不到 `$enddefinitions` 只 `eprintln!` warning;转换器同样 | 默认**报错**(提示 `WAL_VCD_LENIENT=1` 放宽);转换器 `vcd_to_fst_streaming` 同样严格 | `bug008_truncated_vcd_errors_by_default` |
+| **015** `(1 2)` 返回列表 | 求值器 `eval_list` 明确设计:非符号开头的列表按数据列表求值(注释在案) | **不是 bug**:手册 §1.2 补"列表字面量"说明 | —(文档) |
+
+## 第二轮验证
+
+- `cargo test --release`:**348 passed / 0 failed**(含 `tests/bughunt_regressions.rs` 10 条)。
+- 单功能矩阵:`VCD!=FST` 差异 **224 → 24**,且剩余 24 条**全部是 trace 元信息(文件路径不同)**,语义层面跨格式已对齐;
+  名字集合差异只剩 1 条(`escaped` 夹具的 FST 固有限制);`(1 2)` 1 条已定性为设计。
+- 组合阶段:findings 仅剩"损坏文件"(已修)与刻意报错项,重跑后应为 0 语义问题。
+- 文档示例对拍:MATCH 79 / MISMATCH 1(CLI 回显噪声)/ ERR 1(dump-trace 示例缺前置 defsig)。
+
+## 仍待办
+
+- FSDB 维度测试:许可通道仍未恢复(宿主 SCL 悬空链接),需先修 9p 共享;
+- 覆盖面补测:宏(`defmacro/defunm/macroexpand`)、虚拟信号(`defsig/new-trace/dump-trace`)、
+  `$dumpoff/$dumpon/$dumpall`、`search/freq/dela/period/groups/in-group`、`fsdb-timeline-*`、
+  多波形组合的更多组合;
+- 全部完成后合回 main。

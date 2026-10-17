@@ -2968,6 +2968,18 @@ mod tests {
 /// Resolve a signal name against a trace's signal list using the same fuzzy matching
 /// as `op_get`. Returns the full signal name if found.
 pub fn resolve_signal_name(name: &str, sigs: &[String]) -> Option<String> {
+    // BUG-004 兼容: 旧写法 `data[3:0]` / `data [3:0]` 在 VCD 名字规范化后仍可解析
+    if let Some(base) = crate::trace::strip_range_suffix(name) {
+        if base != name {
+            if let Some(hit) = resolve_signal_name_plain(base, sigs) {
+                return Some(hit);
+            }
+        }
+    }
+    resolve_signal_name_plain(name, sigs)
+}
+
+fn resolve_signal_name_plain(name: &str, sigs: &[String]) -> Option<String> {
     // 1. Exact match
     if let Some(s) = sigs.iter().find(|s| *s == name) {
         return Some(s.clone());

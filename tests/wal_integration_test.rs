@@ -111,7 +111,7 @@ fn test_max_index() {
 #[test]
 fn test_first_signal() {
     let t = load(&counter_vcd_path().to_string_lossy());
-    assert_eq!(t.signals()[0], "counter_tb.count [7:0]");
+    assert_eq!(t.signals()[0], "counter_tb.count");
 }
 
 // ---------- 3. Regression: memchr # in value lines ----------
