@@ -26,7 +26,8 @@
 #   session.csv         列 feature,mode,run,wall_s,rss_mb,cmd
 #                       mode=session      → 阶段账条目(wall-total/session/load/probe/probe-mean/fsdb:*)
 #                       mode=session-probe→ **每个功能的会话内边际耗时**(WAL_PROF_TRACE 的 trace probe #k)
-#   session.<n>.log     mode B 的原始输出(含 [prof] 阶段账)
+#   session.<n>.out/.err  mode B 的**分流**原始输出(.out=值行, .err=[prof] 阶段账; 逐探针归因只认 .err)
+#   session.<n>.log     mode B 的合流副本(仅兼容/人读; 管道刷新可能让两路行交错, 不可用于归因)
 #   single.failures.tsv 失败/超时的功能与首行错误
 #
 # 硬约束(踩过才写):
@@ -51,8 +52,12 @@ WAVE="${WAL_BENCH_WAVE:-/home/hesheng/Downloads/core 级波形/aicore_smoke_test
 OUTDIR="${WAL_BENCH_OUTDIR:-.tools/bench/baseline}"
 FEATURES=""
 PROBES=""
-RUNS="${WAL_BENCH_RUNS:-3}"
+RUNS="${WAL_BENCH_RUNS:-5}"
 SESSION_RUNS="${WAL_BENCH_SESSION_RUNS:-1}"
+# single --append: 不清空已有数据(用于单点补测, 如 edges-list 归位), 之后会重算中位表
+APPEND_SINGLE="${WAL_BENCH_APPEND:-0}"
+# 非空时 run_measured 把 stdout/stderr 分流到 <prefix>.out / <prefix>.err
+SPLIT_PREFIX=""
 TIMEOUT="${WAL_BENCH_TIMEOUT:-900}"
 SESSION_TIMEOUT="${WAL_BENCH_SESSION_TIMEOUT:-1800}"
 ONLY=""
@@ -83,7 +88,8 @@ usage() {
   --features FILE    功能清单 TSV (默认 bench/features.tsv = 权威; 回退 .tools 本地副本)
   --probes FILE      mode B 的 probe 清单 (默认 bench/probes.wal = 权威; 回退 .tools 本地副本)
   --outdir DIR       产物目录 (默认 .tools/bench/baseline)
-  --runs N           mode A 每功能重复次数 (默认 3, 取中位)
+  --runs N           mode A 每功能重复次数 (默认 5, 取中位)
+  --append           配合 single: 不清空既有 CSV, 只补测(之后重算中位表)
   --session-runs N   mode B 重复次数 (默认 1)
   --timeout SEC      mode A 单次超时 (默认 900)
   --session-timeout SEC mode B 单次超时 (默认 1800)
@@ -120,6 +126,7 @@ while [ $# -gt 0 ]; do
         --probes) PROBES="$2"; shift 2 ;;
         --outdir) OUTDIR="$2"; shift 2 ;;
         --runs) RUNS="$2"; shift 2 ;;
+        --append) APPEND_SINGLE=1; shift ;;
         --session-runs) SESSION_RUNS="$2"; shift 2 ;;
         --timeout) TIMEOUT="$2"; shift 2 ;;
         --session-timeout) SESSION_TIMEOUT="$2"; shift 2 ;;
@@ -231,7 +238,18 @@ run_measured() {
     [ "$LICENSE_EACH" = 1 ] && need_license && license_ensure
     while : ; do
         attempt=$((attempt + 1))
-        if [ -n "$RUN_STDIN" ]; then
+        if [ -n "$SPLIT_PREFIX" ]; then
+            # stdout 与 stderr **分流**: 值行(=>)与 [prof] trace 行各自保序, 才能可靠地逐探针归因
+            if [ -n "$RUN_STDIN" ]; then
+                timeout -k 5 "$T" /usr/bin/time -f "$TIME_FMT" "$@" < "$RUN_STDIN" \
+                    > "$SPLIT_PREFIX.out" 2> "$SPLIT_PREFIX.err"
+            else
+                timeout -k 5 "$T" /usr/bin/time -f "$TIME_FMT" "$@" \
+                    > "$SPLIT_PREFIX.out" 2> "$SPLIT_PREFIX.err"
+            fi
+            RC=$?
+            OUT="$(cat "$SPLIT_PREFIX.out" "$SPLIT_PREFIX.err" 2>/dev/null)"
+        elif [ -n "$RUN_STDIN" ]; then
             OUT=$(timeout -k 5 "$T" /usr/bin/time -f "$TIME_FMT" "$@" < "$RUN_STDIN" 2>&1)
         else
             OUT=$(timeout -k 5 "$T" /usr/bin/time -f "$TIME_FMT" "$@" 2>&1)
@@ -290,9 +308,14 @@ build_argv() { # $1=kind $2=a_cmd → ARGV
 
 do_single() {
     [ -f "$FEATURES" ] || die "缺功能清单 $FEATURES"
-    csv_reset "$SINGLE_CSV" 'feature,mode,run,wall_s,rss_mb,cmd'
+    if [ "$APPEND_SINGLE" -eq 1 ] && [ -s "$SINGLE_CSV" ]; then
+        say "single --append: 保留既有 $(($(wc -l < "$SINGLE_CSV") - 1)) 行, 只补测 ${ONLY:-<全部>}"
+        [ -z "$ONLY" ] && warn "--append 但没给 --only: 会与既有行叠加, 建议配 --only <正则>"
+    else
+        csv_reset "$SINGLE_CSV" 'feature,mode,run,wall_s,rss_mb,cmd'
+        : > "$FAIL_LOG"
+    fi
     mkdir -p "$OUTDIR"
-    : > "$FAIL_LOG"
 
     if need_license; then
         say "许可配方: 先拉一次通道(${BIN} 读 $(basename "$WAVE"))…"
@@ -390,7 +413,9 @@ do_session() {
     local run=1
     while [ "$run" -le "$SESSION_RUNS" ]; do
         RUN_STDIN="$PROBES"
+        SPLIT_PREFIX="$OUTDIR/session.$run"
         run_measured "$SESSION_TIMEOUT" env WAL_PROF=1 WAL_PROF_TRACE=1 "$BIN" --stdin -l "$WAVE"
+        SPLIT_PREFIX=""
         RUN_STDIN=""
         local log="$OUTDIR/session.$run.log"
         printf '%s\n' "$OUT" > "$log"
@@ -409,7 +434,7 @@ do_session() {
             printf '%s,%s,%s,%s,%s,%s\n' "$(csv_field "$pfeat")" "session-probe" "$run" "$psecs" "$RSS_MB" \
                 "$(csv_field "会话内边际(probe #$pk): $cmdstr")" >> "$SESSION_CSV"
             nprobe=$((nprobe + 1))
-        done < <(parse_traces "$log")
+        done < <(parse_traces "$OUTDIR/session.$run.err")   # trace 行在 stderr(与值行分流后保序)
         [ "$nprobe" -eq 0 ] && warn "没解析到 trace probe 行(二进制是否支持 WAL_PROF_TRACE?)"
 
         local name secs calls

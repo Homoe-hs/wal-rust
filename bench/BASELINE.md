@@ -352,3 +352,18 @@ python3 scripts/check_bench_regression.py --threshold 15 --gate-rss --json      
 * 复测全套原始产物在 `.tools/bench/verify/`(`.tools/bench/verify/REPORT.md` / `.tools/bench/verify/wall_compare.csv` / `.tools/bench/verify/session_verify.csv` / `.tools/bench/verify/correctness.csv`),**本地产物、不入库**;
   本条把它的结论固化进版本库,避免"复测做了但没人看见"。
 * 正确性对拍结论:**跨进程值完全确定**(会话 29 条输出逐行相同);**mode A ↔ mode B:MATCH=29 / DIFF=0 / NA=3**(CLI 不适用)。
+
+## 11. 0.14.51:装置三处修复与补测(2026-10-17)
+
+1. **session 日志已分流**(修 §10.2 的缺陷):mode B 现在写 `session.<n>.out`(值行)与 `session.<n>.err`(`[prof] trace` 各阶段账),
+   两路各自保序;`session.<n>.log` 仅作为**合流兼容副本**保留(人读可以,归因不可)。逐探针归因请只读 `.err`。
+2. **`cli-count` 的物化问题已修**(§10.3 的优化点):改为懒解析(精确 → 叶子名 → 子串,语义与 `resolve_signal_name` 一致),不再 `tr.signals()`。
+   真波形实测(3 次,`/usr/bin/time -f "%e %M"`):**wall 8.00s(中位,10.02/8.00/7.76)、RSS 6191~6193 MB**;
+   对照修复前 **8.19s / 9273 MB** ⇒ 时间基本不变,**RSS −3.08 GB(−33%)**;三种名字形式(全名/叶子名/子串)输出逐字节一致。
+3. **`edges-list` 已归位主表**(修 §10.1 第 3 条的不对称):补测 **5 次**,中位 **5.34s / 6197MB**,已并入 `single.median.csv`(现 31 条非 heavy 全覆盖)。
+4. **装置默认改为 `--runs 5`**(mode A),与 §10.1 第 4 条一致;`single --append --only <正则>` 可在不动既有数据的前提下单点补测。
+
+**0.14.51 的 session 复测**(分流日志、2 轮):load 6.48s(open 5.35 / names 0.14 / index 0.95);
+最重边际 `find-sig wide` **4.12s**、`find-sig precise` **4.09s**、`(length SCOPES)` 0.49s、`index-find` 0.044s;
+其余 ≤11ms。⚠️ 注意:`find-sig precise` 在两个批次间从 2.34s 漂到 4.09s(§10.1 第 4 条说的名字物化类 ±25% 甚至更多),
+**跨批次不要直接比,只看同一会话内的名次**。
