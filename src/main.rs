@@ -414,9 +414,25 @@ fn resolve_sig_or_err<'a>(sigs: &'a [String], name: &str) -> Result<&'a str, Str
 fn cmd_count(wave: &Path, sig: &str, value: i64) -> Result<(), String> {
     let tc = load_one_wave(wave)?;
     let tr = tc.get(&"t".to_string()).ok_or("no trace loaded")?;
-    let sigs = tr.signals();
-    let resolved = resolve_sig_or_err(&sigs, sig)?;
-    let n = tr.find_indices(resolved, trace::FindCondition::ValueI64(value))?.len();
+    // **懒解析, 不要 `tr.signals()`**: 真实 core 级波形 1796 万信号上物化整张名字表实测
+    // 多背 ~3.1GB RSS(基线 fsdb-feat-cli-count: 9273MB vs cli-sigs 6193MB)。
+    // 语义与 `wal::eval::resolve_signal_name` 一致: 精确 → 叶子名 → 子串, 都取**下标最小**的。
+    let cnt = tr.signal_count();
+    let allow_leaf = sig.len() <= 8 || !sig.contains('.');
+    let mut resolved = (0..cnt).find_map(|i| tr.signal_at(i).filter(|s| *s == sig));
+    if resolved.is_none() && allow_leaf {
+        resolved = (0..cnt)
+            .find_map(|i| tr.signal_at(i).filter(|s| s.rsplitn(2, '.').next() == Some(sig)));
+    }
+    if resolved.is_none() {
+        resolved = (0..cnt).find_map(|i| tr.signal_at(i).filter(|s| s.contains(sig)));
+    }
+    // 注意: "names containing it" 提示在旧实现里**必然是空**(走到这里说明连子串都不匹配),
+    // 所以错误文案保持不变。
+    let Some(resolved) = resolved else {
+        return Err(format!("signal '{}' not found in wave", sig));
+    };
+    let n = tr.find_indices(&resolved, trace::FindCondition::ValueI64(value))?.len();
     println!("{}", n);
     Ok(())
 }
