@@ -251,6 +251,43 @@ pub(crate) fn rising_edge_times(tr: &dyn Trace, sig: &str) -> Result<Vec<u64>, S
     Ok(out)
 }
 
+/// 只接受**完整信号名**:配置/`(beat t "clk")` 不做短名、叶子名、子串匹配
+/// (拍号是强语义输出, 猜错时钟会静默算错拍;宁可明确报错)。
+fn resolve_exact_full_name(tr: &dyn Trace, name: &str) -> Result<String, String> {
+    match tr.resolve_name(name) {
+        Some(resolved) if resolved == name => Ok(resolved),
+        Some(resolved) => Err(format!(
+            "'{}' 不是完整信号名(完整名是 '{}'; WAL_BEAT_CLK/(beat t \"clk\") 只接受完整全名)",
+            name, resolved
+        )),
+        None => Err(format!("信号 '{}' 不存在(时钟名必须写完整全名)", name)),
+    }
+}
+
+/// 在已加载的波形里找**完整全名**匹配的 trace;找不到 → 明确错误。
+fn with_exact_trace<R>(
+    env: &Environment,
+    name: &str,
+    f: impl FnOnce(&dyn Trace, &str) -> Result<R, String>,
+) -> Result<R, String> {
+    let traces = env
+        .get_traces()
+        .ok_or_else(|| "No waveform loaded".to_string())?;
+    let guard = traces.read().unwrap_or_else(|e| e.into_inner());
+    let mut last_err = None;
+    for tid in guard.trace_ids() {
+        let tr = match guard.get(&tid) {
+            Some(t) => t,
+            None => continue,
+        };
+        match resolve_exact_full_name(tr, name) {
+            Ok(resolved) => return f(tr, &resolved),
+            Err(e) => last_err = Some(e),
+        }
+    }
+    Err(last_err.unwrap_or_else(|| format!("信号 '{}' 不存在", name)))
+}
+
 fn beat_config_clocks() -> Vec<String> {
     std::env::var("WAL_BEAT_CLK")
         .ok()
@@ -289,11 +326,11 @@ fn beat_plan(env: &Environment) -> Option<Rc<BeatPlan>> {
                 None => continue,
             };
             for clk in &clocks {
-                let resolved = match tr.resolve_name_strict_compat(clk) {
+                let resolved = match resolve_exact_full_name(tr, clk) {
                     Ok(r) => r,
                     Err(e) => {
                         beat_fail(&format!(
-                            "WAL_BEAT_CLK: 时钟 '{}' 在 {} 中无法唯一解析({})",
+                            "WAL_BEAT_CLK: 时钟 '{}' 在 {} 中不可用: {}",
                             clk,
                             tr.filename(),
                             e
@@ -924,7 +961,7 @@ fn op_beat(args: &[Value], env: &mut Environment, _eval: &mut Evaluator) -> Resu
     if let Some(clk_arg) = args.get(1) {
         let clk = extract_string(clk_arg)?;
         let clk_for_err = clk.clone();
-        return with_signal_trace(env, &clk, move |tr, sig| {
+        return with_exact_trace(env, &clk, move |tr, sig| {
             let edges = rising_edge_times(tr, sig)?;
             if edges.is_empty() {
                 return Err(format!("(beat t \"{}\") 无上升沿, 无法换算拍号", clk_for_err));

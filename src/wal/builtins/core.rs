@@ -364,7 +364,7 @@ fn op_help(args: &[Value], _env: &mut Environment, _eval: &mut Evaluator) -> Res
                  \n\
                  时间单位: getwave/wave/at/edges 返回波形原生单位(ps/ns/...);\n\
                  period/freq/beat 换算成秒/人类可读。\n\
-                 WAL_BEAT_CLK=<clk[,clk2]>  时间输出改为时钟拍号(首沿=第0拍; 首沿前=-1);\n\
+                 WAL_BEAT_CLK=<clk[,clk2]>  时间输出改为时钟拍号(首沿=第0拍; 首沿前=-1; 时钟须写完整全名);\n\
                  多时钟分开显示; 解析失败明确报错并整体回退绝对时间。\n\
                  \n\
                  细节: (doc \"count\") / (doc semantics); (doc 未知主题) 会列出全部可用主题。\n\

@@ -3,7 +3,7 @@
 ## Quick commands
 
 ```bash
-cargo test                          # all Rust tests (~290)
+cargo test                          # all Rust tests (~370)
 cargo test --test wal_integration_test  # integration tests only
 cargo test test_vcd_pyvcd_verify_strobe -- --nocapture  # single test + stdout
 cargo build --release               # release build

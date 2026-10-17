@@ -202,3 +202,25 @@ fn beat_env_uses_clock_of_the_trace_that_answers() {
     assert_eq!(l, "=> (0 1)", "应按 b 的时钟算拍号; stdout={stdout}");
     let _ = std::fs::remove_dir_all(dir);
 }
+
+#[test]
+fn beat_requires_exact_full_clock_name() {
+    let dir = tmpdir("exact");
+    let wave = fixture(&dir);
+    // 配置里写短名: 必须明确报错 + 整体回退绝对时间(不猜叶子名)
+    let o = run(&dir, &wave, "(at \"top.d\" 30)", &[("WAL_BEAT_CLK", "clk")]);
+    assert_eq!(line(&o), "=> (20 1)", "短名不应被猜成 top.clk; stderr={}", o.stderr);
+    assert!(
+        o.stderr.contains("完整信号名") || o.stderr.contains("完整全名"),
+        "应说明只接受完整全名: {}",
+        o.stderr
+    );
+    // (beat t "clk") 的时钟参数同样只接受完整全名
+    let o = run(&dir, &wave, "(beat 20 \"clk\")", &[]);
+    assert_ne!(o.code, 0, "短名应报错");
+    assert!(o.stderr.contains("完整信号名"), "{}", o.stderr);
+    // 完整全名正常
+    let o = run(&dir, &wave, "(beat 20 \"top.clk\")", &[]);
+    assert_eq!(line(&o), "=> 0");
+    let _ = std::fs::remove_dir_all(dir);
+}
