@@ -360,7 +360,7 @@ python3 scripts/check_bench_regression.py --threshold 15 --gate-rss --json      
 2. **`cli-count` 的物化问题已修**(§10.3 的优化点):改为懒解析(精确 → 叶子名 → 子串,语义与 `resolve_signal_name` 一致),不再 `tr.signals()`。
    真波形实测(3 次,`/usr/bin/time -f "%e %M"`):**wall 8.00s(中位,10.02/8.00/7.76)、RSS 6191~6193 MB**;
    对照修复前 **8.19s / 9273 MB** ⇒ 时间基本不变,**RSS −3.08 GB(−33%)**;三种名字形式(全名/叶子名/子串)输出逐字节一致。
-3. **`edges-list` 已归位主表**(修 §10.1 第 3 条的不对称):补测 **5 次**,中位 **5.34s / 6197MB**,已并入 `single.median.csv`(现 31 条非 heavy 全覆盖)。
+3. **`edges-list` 已归位主表**(修 §10.1 第 3 条的不对称):补测 **5 次**,中位 **5.34s / 6197MB**,已并入 `.tools/bench/baseline/single.median.csv`(现 31 条非 heavy 全覆盖)。
 4. **装置默认改为 `--runs 5`**(mode A),与 §10.1 第 4 条一致;`single --append --only <正则>` 可在不动既有数据的前提下单点补测。
 
 **0.14.51 的 session 复测**(分流日志、2 轮):load 6.48s(open 5.35 / names 0.14 / index 0.95);
