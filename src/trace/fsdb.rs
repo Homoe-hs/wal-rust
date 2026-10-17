@@ -138,6 +138,12 @@ unsafe impl Sync for Npi {}
 
 static NPI: OnceLock<Result<Npi, String>> = OnceLock::new();
 
+/// `WAL_FSDB_CACHE_ONLY=1`: 分发层**不要**先要求 NPI/许可 —— 交由 `FsdbTrace::load` 判定
+/// (侧车齐备 → 完全不碰 NPI; 缺侧车 → strict 报错 / 非 strict 回退 NPI)。
+pub fn cache_only_requested() -> bool {
+    std::env::var("WAL_FSDB_CACHE_ONLY").is_ok()
+}
+
 /// FSDB 支持是否可用(库能找到 + `npi_init` 成功)。结果缓存, 第二次是纯查询。
 pub fn npi_available() -> bool {
     npi().is_ok()
@@ -747,6 +753,27 @@ fn get_scalar(buf: &[u8], pos: &mut usize) -> Option<ScalarValue> {
 /// 旁挂列缓存的编码(纯函数, 便于单元测试往返): `WALFCOL2` + 指纹 + 位宽 +
 /// init 编码 + 条数 + [delta 时间 varint, 值]*。
 /// init 放在头部, `initial_of()` 读前 64KB 就能拿到(不必解整列)。
+
+/// 名字索引: 哈希 → 下标(**并行算哈希**, 插表串行)。名称重复时取下标最小的。
+fn build_name_index(names: &NameArena) -> OpenIndex {
+    let n = names.len();
+    let hashes: Vec<u64> = {
+        use rayon::prelude::*;
+        (0..n)
+            .into_par_iter()
+            .map(|i| fnv1a(names.get(i as u32).as_bytes()))
+            .collect()
+    };
+    let mut idx = OpenIndex::new(n);
+    for i in 0..n as u32 {
+        let h = hashes[i as usize];
+        if idx.find_verified(h, |j| names.get(j) == names.get(i)).is_none() {
+            idx.insert(h, i, |j| hashes[j as usize]);
+        }
+    }
+    idx
+}
+
 fn encode_col_cache(fp: u64, width: usize, init: Option<&ScalarValue>, pts: &[(u64, ScalarValue)]) -> Vec<u8> {
     let mut out: Vec<u8> = Vec::with_capacity(32 + pts.len() * 6);
     out.extend_from_slice(b"WALFCOL2");
@@ -889,6 +916,56 @@ fn abs_cache_root() -> std::path::PathBuf {
     }
 }
 
+/// `.fmeta` 侧车: cache-only 模式需要的元信息(时间单位/时间范围)。
+/// 布局: magic "WFMETA1\0"(8) + fingerprint u64 + ts_exp 标志/值(8) + min_t u64 + max_t u64。
+#[derive(Clone, Copy)]
+struct MetaInfo {
+    ts_exp: Option<i8>,
+    min_t: u64,
+    max_t: u64,
+}
+
+const FMETA_MAGIC: &[u8; 8] = b"WFMETA1\0";
+
+fn meta_cache_path(cache_root: &std::path::Path, filename: &str) -> Option<std::path::PathBuf> {
+    cache_path(cache_root, filename, ".fmeta")
+}
+
+fn write_meta_cache(cache_root: &std::path::Path, filename: &str, ts_exp: Option<i8>, min_t: u64, max_t: u64) {
+    if crate::trace::vcd::cache_mode() == crate::trace::vcd::CacheMode::Off {
+        return;
+    }
+    let Some(p) = meta_cache_path(cache_root, filename) else { return };
+    let tmp = p.with_extension("fmeta.tmp");
+    let fp = crate::trace::vcd::wave_fingerprint(std::path::Path::new(filename));
+    let mut buf = Vec::with_capacity(40);
+    buf.extend_from_slice(FMETA_MAGIC);
+    buf.extend_from_slice(&fp.to_le_bytes());
+    let mut ts = [0u8; 8];
+    if let Some(e) = ts_exp { ts[0] = 1; ts[1] = e as u8; }
+    buf.extend_from_slice(&ts);
+    buf.extend_from_slice(&min_t.to_le_bytes());
+    buf.extend_from_slice(&max_t.to_le_bytes());
+    if std::fs::write(&tmp, &buf).is_ok() { let _ = std::fs::rename(&tmp, &p); }
+}
+
+fn try_load_meta_cache(cache_root: &std::path::Path, filename: &str) -> Option<MetaInfo> {
+    if crate::trace::vcd::cache_mode() == crate::trace::vcd::CacheMode::Off {
+        return None;
+    }
+    let p = meta_cache_path(cache_root, filename)?;
+    let buf = std::fs::read(&p).ok()?;
+    if buf.len() < 40 || &buf[..8] != FMETA_MAGIC { return None; }
+    let fp = u64::from_le_bytes(buf[8..16].try_into().ok()?);
+    if fp != crate::trace::vcd::wave_fingerprint(std::path::Path::new(filename)) { return None; }
+    let ts_exp = if buf[16] == 1 { Some(buf[17] as i8) } else { None };
+    Some(MetaInfo {
+        ts_exp,
+        min_t: u64::from_le_bytes(buf[24..32].try_into().ok()?),
+        max_t: u64::from_le_bytes(buf[32..40].try_into().ok()?),
+    })
+}
+
 /// 通用缓存路径: `<cache>/<basename>-<size>-<mtime>-v1<ext>`
 fn cache_path(cache_root: &std::path::Path, filename: &str, ext: &str) -> Option<std::path::PathBuf> {
     // key 用 `file_identity`(含 ctime/inode): 只按 size+mtime 会漏掉"同秒等长改写",
@@ -958,6 +1035,75 @@ where
         return false;
     }
     true
+}
+
+/// **cache-only 原型(#2)**: 只用侧车构造 `FsdbTrace`, 不碰 NPI。
+///
+/// 需要的侧车:`.fnames`(名字/位宽/scope, 必需)+ `.ftl`(时间线, 可选)。
+/// 列 `.fcol` 按信号懒加载; 没有 `.fcol` 的信号在 cache-only 下会得到明确错误(而不是静默错值)。
+/// 返回 `Ok(None)` 表示侧车不足 → 调用方回退 NPI 路径。
+fn load_cache_only(
+    id: TraceId,
+    filename: &str,
+    cache_root: &std::path::Path,
+) -> Result<Option<FsdbTrace>, String> {
+    let Some((names, widths, scopes)) = try_load_tree_cache(cache_root, filename) else {
+        return Ok(None);
+    };
+    let sigs: Vec<Sig> = widths
+        .iter()
+        .map(|w| Sig {
+            handle: Cell::new(ptr::null_mut()),
+            width: if *w > 0 { *w } else { 1 },
+            real_str: Cell::new(None),
+        })
+        .collect();
+    let meta = try_load_meta_cache(cache_root, filename);
+    let mut t = FsdbTrace {
+        id,
+        filename: filename.to_string(),
+        cache_root: cache_root.to_path_buf(),
+        file: ptr::null_mut(),
+        sigs,
+        names,
+        name_index: std::cell::OnceCell::new(),
+        scopes,
+        ts_exp: meta.and_then(|m| m.ts_exp),
+        min_t: meta.map_or(0, |m| m.min_t),
+        max_t: meta.map_or(0, |m| m.max_t),
+        timeline: RefCell::new(None),
+        cols: RefCell::new(HashMap::new()),
+        idx_cols: RefCell::new(HashMap::new()),
+        initials: RefCell::new(HashMap::new()),
+        prepared: RefCell::new(Vec::new()),
+        name_cache: RefCell::new(HashMap::new()),
+        leaf_order: std::cell::OnceCell::new(),
+        first_change: Cell::new(None),
+        current_index: 0,
+        highest_valid: Cell::new(0),
+        fatal: RefCell::new(None),
+        scanning: Cell::new(false),
+    };
+    if let Some((times, first)) = t.try_load_timeline_cache() {
+        if let Some(&lo) = times.first() {
+            t.min_t = lo;
+        }
+        if let Some(&hi) = times.last() {
+            t.max_t = hi;
+        }
+        t.first_change.set(Some(first));
+        *t.timeline.borrow_mut() = Some(Rc::new(times));
+    }
+    if std::env::var("WAL_DEBUG_FSDB").is_ok() {
+        let pts = t.timeline.borrow().as_ref().map_or(0, |v| v.len());
+        eprintln!(
+            "[fsdb] cache-only: {} 信号 / 时间线 {} 点 / 不碰 NPI(open=0)",
+            t.names.len(),
+            pts
+        );
+    }
+    crate::prof::mark("fsdb:cache_only_ready");
+    Ok(Some(t))
 }
 
 /// 写名字树缓存(arena 版; 生产路径)
@@ -2433,7 +2579,10 @@ pub struct FsdbTrace {
     /// 全名 arena(每信号一份; 连续存放, 每信号只多 8B 的 (偏移,长度))
     names: NameArena,
     /// 全名 → 信号下标(开放寻址, 键是 64 位哈希; 命中后再比对 arena 里的真实字节)
-    name_index: OpenIndex,
+    ///
+    /// **惰性构建**(#3 原型): 元信息类查询(`(length (SIGNALS))`/`(timescale)`/`(MAX-INDEX)`)
+    /// 根本不解析名字, 却要为 1796 万信号预建这张表(实测 0.82s / ~400MB)。
+    name_index: std::cell::OnceCell<OpenIndex>,
 
     scopes: Vec<String>,
     ts_exp: Option<i8>,
@@ -2508,8 +2657,6 @@ impl FsdbTrace {
         // 6GB 级掉到 GB 级 —— 这是"1796 万信号也能 8 路并行"的前提。
         // 由 `run_timeline_worker` 打开(父进程也可以直接设环境变量给子进程)。
         let handles_only = std::env::var("WAL_FSDB_HANDLES_ONLY").is_ok();
-        let npi = npi()?;
-        crate::prof::mark("fsdb:npi_init");
         // 用户可能传**相对路径**, 而 NPI 沙箱会把 CWD 切到缓存目录下 npi/ 里:
         // ① NPI open 必须给绝对路径; ② 之后每次算缓存 key 都要 stat 这个文件 ——
         // 相对路径在沙箱里 stat 不到 → cache_path() 返回 None → **缓存永远写不出来**,
@@ -2520,6 +2667,21 @@ impl FsdbTrace {
             .unwrap_or_else(|_| path.to_string_lossy().to_string());
         // 缓存根必须在进 NPI 沙箱**之前**算成绝对路径(沙箱里 CWD 已经变了)
         let cache_root = abs_cache_root();
+        // **cache-only 原型(#2)**: 侧车齐备时完全不碰 NPI(不 dlopen / 不 open / 不需要许可)。
+        // 缺侧车的查询会拿到明确错误; 有侧车的查询结果与 NPI 路径逐字节一致。
+        if !handles_only
+            && std::env::var("WAL_FSDB_CACHE_ONLY").is_ok()
+            && crate::trace::vcd::cache_mode() != crate::trace::vcd::CacheMode::Off
+        {
+            if let Some(t) = load_cache_only(id.clone(), &filename, &cache_root)? {
+                return Ok(t);
+            }
+            if std::env::var("WAL_FSDB_CACHE_ONLY").as_deref() == Ok("strict") {
+                return Err(format!("{}: cache-only 模式缺 .fnames 侧车", filename));
+            }
+        }
+        let npi = npi()?;
+        crate::prof::mark("fsdb:npi_init");
         let abs = std::path::PathBuf::from(&filename);
         let cpath = CString::new(abs.to_string_lossy().as_bytes())
             .map_err(|_| format!("路径含 NUL 字节: {}", filename))?;
@@ -2564,6 +2726,9 @@ impl FsdbTrace {
             let scale = Npi::cstr((npi.file_property_str)(FILE_SCALE_UNIT, file));
             let version = Npi::cstr((npi.file_property_str)(FILE_VERSION, file));
             let ts_exp = crate::vcd::convert::parse_timescale(scale.as_bytes());
+            if !handles_only {
+                write_meta_cache(&cache_root, &filename, ts_exp, min_t, max_t);
+            }
             let dbg = std::env::var("WAL_DEBUG_FSDB").is_ok();
             if dbg {
                 eprintln!("[fsdb] RSS: open 后 {} MB", rss_kb() / 1024);
@@ -2685,36 +2850,21 @@ impl FsdbTrace {
             // **哈希那一步并行算**: 1796 万信号的名字共 2.85GB, 串行 FNV 要 ~4s
             // (实测整段"名字索引建完"5.2s); 多线程算完 ~0.4s, 剩下插表是随机写
             // (内存延迟瓶颈)本来就不并行化。临时多一份 u64/信号(143MB), 插完即释放。
-            let n_sigs = if handles_only { 0 } else { names.len() };
-            let hashes: Vec<u64> = {
-                use rayon::prelude::*;
-                (0..n_sigs)
-                    .into_par_iter()
-                    .map(|i| fnv1a(names.get(i as u32).as_bytes()))
-                    .collect()
-            };
-            let mut name_index = OpenIndex::new(n_sigs);
-            for i in 0..n_sigs as u32 {
-                let h = hashes[i as usize];
-                if name_index.find_verified(h, |j| names.get(j) == names.get(i)).is_none() {
-                    name_index.insert(h, i, |j| hashes[j as usize]);
-                }
-            }
-            drop(hashes);
+            let name_index = std::cell::OnceCell::new();
+            let _ = handles_only;
             if dbg {
                 eprintln!("[fsdb] RSS: 名字索引建完 {} MB", rss_kb() / 1024);
             }
             crate::prof::mark("fsdb:index");
             if dbg {
                 eprintln!(
-                    "[fsdb] 名字存储: arena {} KB + spans {} KB + 索引 {} KB ({} 信号)",
+                    "[fsdb] 名字存储: arena {} KB + spans {} KB + 索引(惰性) ({} 信号)",
                     names.blob_len() / 1024,
                     names.len() * 8 / 1024,
-                    name_index.bytes() / 1024,
                     names.len()
                 );
             }
-            Ok(FsdbTrace {
+            let mut t = FsdbTrace {
                 id,
                 filename,
                 cache_root,
@@ -2738,7 +2888,12 @@ impl FsdbTrace {
                 highest_valid: Cell::new(0),
                 fatal: RefCell::new(None),
                 scanning: Cell::new(false),
-            })
+            };
+            // A/B 开关: 强制回到"加载时预建名字索引"(旧行为)
+            if std::env::var("WAL_FSDB_EAGER_INDEX").is_ok() {
+                t.name_idx();
+            }
+            Ok(t)
         }
     }
 
@@ -2815,9 +2970,14 @@ impl FsdbTrace {
         Some(hi - lo == 1)
     }
 
+    /// 名字索引按需构建(只付一次)。
+    fn name_idx(&self) -> &OpenIndex {
+        self.name_index.get_or_init(|| build_name_index(&self.names))
+    }
+
     fn resolve_idx(&self, name: &str) -> Option<usize> {
         let h = fnv1a(name.as_bytes());
-        if let Some(i) = self.name_index.find_verified(h, |j| self.name_at(j as usize) == name) {
+        if let Some(i) = self.name_idx().find_verified(h, |j| self.name_at(j as usize) == name) {
             return Some(i as usize);
         }
         if let Some(c) = self.name_cache.borrow().get(name) {
@@ -2960,6 +3120,9 @@ impl FsdbTrace {
 
     /// 只算"这些信号的变更时间并集"(升序去重) —— 并行构建时间线的 worker 用。
     fn scan_times(&self, targets: &[usize]) -> Result<Vec<u64>, String> {
+        if self.file.is_null() {
+            return Err(format!("cache-only: 该查询需要 NPI({} 缺对应侧车)", self.filename));
+        }
         let npi = npi()?;
         // 用**文件的总信号数**定块(不是本片的目标数): worker 分片也要把 start 次数压到 ~个位数,
         // 否则每片 500k 信号按 4096 切 = 122 次 start = 12s 纯开销(实测踩过)。
@@ -3046,14 +3209,19 @@ impl FsdbTrace {
 
     /// 立刻关闭 FSDB(worker 写完就走, 不等 Drop)
     pub fn close_now(&self) {
-        if let Ok(npi) = npi() {
-            unsafe { (npi.close)(self.file) };
+        if !self.file.is_null() {
+            if let Ok(npi) = npi() {
+                unsafe { (npi.close)(self.file) };
+            }
         }
     }
 
     /// 融合扫描: `want_timeline` 时遍历**所有**信号(算时间线), 同时为 `want`
     /// 里的信号取变更列; 否则只遍历 `want`。
     fn scan(&self, want: &HashSet<usize>, want_timeline: bool) -> Result<ScanOut, String> {
+        if self.file.is_null() {
+            return Err(format!("cache-only: 该查询需要 NPI({} 缺对应侧车)", self.filename));
+        }
         let npi = npi()?;
         let n = self.sigs.len();
         let mut out = ScanOut::default();
@@ -3665,6 +3833,10 @@ impl FsdbTrace {
 
     /// 取(必要时解析)信号句柄。
     fn handle_of(&self, idx: usize) -> Result<*mut c_void, String> {
+        if self.file.is_null() {
+            return Err(format!("cache-only: 该查询需要 NPI({} 缺对应侧车)", self.filename));
+        }
+
         let h = self.sigs[idx].handle.get();
         if !h.is_null() {
             return Ok(h);
@@ -3738,6 +3910,9 @@ impl FsdbTrace {
             self.first_change.set(Some(v));
             *self.timeline.borrow_mut() = Some(Rc::new(times));
             return Ok(v);
+        }
+        if self.file.is_null() {
+            return Err(format!("cache-only: 该查询需要 NPI({} 缺对应侧车)", self.filename));
         }
         let npi = npi()?;
         let chunk = chunk_size(self.sigs.len());
@@ -3919,8 +4094,11 @@ unsafe fn walk_scope(
 
 impl Drop for FsdbTrace {
     fn drop(&mut self) {
-        if let Ok(npi) = npi() {
-            unsafe { (npi.close)(self.file) };
+        // cache-only 模式下 file 是空指针(从没 open 过 NPI)
+        if !self.file.is_null() {
+            if let Ok(npi) = npi() {
+                unsafe { (npi.close)(self.file) };
+            }
         }
     }
 }
@@ -4039,7 +4217,7 @@ impl Trace for FsdbTrace {
 
     fn resolve_name_strict(&self, name: &str) -> Result<String, String> {
         let h = fnv1a(name.as_bytes());
-        if let Some(i) = self.name_index.find_verified(h, |j| self.name_at(j as usize) == name) {
+        if let Some(i) = self.name_idx().find_verified(h, |j| self.name_at(j as usize) == name) {
             return Ok(self.name_at(i as usize).to_string());
         }
         fn leaf(s: &str) -> &str {

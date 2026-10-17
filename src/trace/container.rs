@@ -122,6 +122,10 @@ impl TraceContainer {
             || head.windows(4).any(|w| w == b"FSDB")
             || (n >= 8 && head[..4] == [0, 0, 0, 0] && &head[4..8] == b"FSDB");
         if is_fsdb {
+            // cache-only 原型(#2): 侧车齐备时**不要求 NPI/许可**; 能否真跑由 FsdbTrace::load 判
+            if super::fsdb::cache_only_requested() {
+                return Ok(());
+            }
             // 有 Verdi/NPI 就用 NPI 读;没有则维持原来的明确报错(不静默退化)
             if super::fsdb::npi_available() {
                 return Ok(());
