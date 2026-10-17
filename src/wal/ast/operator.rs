@@ -154,9 +154,8 @@ pub enum Operator {
     AssertEq,
     Period,
     Freq,
-    Save,
     Doc,
-    FmtTime,
+    Beat,
     Timescale,
 
     // Scope/group operations
@@ -311,7 +310,6 @@ impl Operator {
     "assert-eq",
     "period",
     "freq",
-    "save",
     "doc",
     "all-scopes",
     "scoped",
@@ -498,9 +496,8 @@ impl Operator {
             "assert-eq" => Some(Operator::AssertEq),
             "period" => Some(Operator::Period),
             "freq" => Some(Operator::Freq),
-            "save" => Some(Operator::Save),
             "doc" => Some(Operator::Doc),
-            "fmt-time" => Some(Operator::FmtTime),
+            "beat" => Some(Operator::Beat),
             "timescale" => Some(Operator::Timescale),
 
             // Scope/group
@@ -672,9 +669,8 @@ impl Operator {
             Operator::AssertEq => "assert-eq",
             Operator::Period => "period",
             Operator::Freq => "freq",
-            Operator::Save => "save",
             Operator::Doc => "doc",
-            Operator::FmtTime => "fmt-time",
+            Operator::Beat => "beat",
             Operator::Timescale => "timescale",
             Operator::Allscopes => "all-scopes",
             Operator::Scoped => "scoped",

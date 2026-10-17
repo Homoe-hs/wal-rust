@@ -127,18 +127,6 @@ fn test_set_penetrates_closures() {
     assert!(err.contains("Undefined") || err.contains("undefined"), "got {}", err);
 }
 
-#[test]
-fn test_save_csv() {
-    let mut eval = new_eval(&fst_fixture_path());
-    let out = std::env::temp_dir().join(format!("wal_save_test_{}.csv", std::process::id()));
-    let src = format!("(save \"{}\" \"top.clk\")", out.display());
-    eval_str(&mut eval, &src);
-    let csv = std::fs::read_to_string(&out).unwrap();
-    assert!(csv.starts_with("time,top.clk\n"), "csv header: {}", csv);
-    let lines = csv.lines().count();
-    assert!(lines >= 20, "expected >=20 rows, got {}", lines);
-    let _ = std::fs::remove_file(&out);
-}
 
 #[test]
 fn test_vcd_change_points_include_first() {

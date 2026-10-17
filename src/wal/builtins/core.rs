@@ -341,7 +341,7 @@ fn op_help(args: &[Value], _env: &mut Environment, _eval: &mut Evaluator) -> Res
                    signal-width SIGNALS all-scopes SCOPES  CS CG LOCAL-SIGNALS\n\
                  \n\
                  导航与元信息:\n\
-                   INDEX TS MAX-INDEX step / load unload / timescale / fmt-time\n\
+                   INDEX TS MAX-INDEX step / load unload / timescale / beat\n\
                  \n\
                  语言:\n\
                    + - * / div mod(%) ** = == != < > <= >= && || not\n\
@@ -363,7 +363,9 @@ fn op_help(args: &[Value], _env: &mut Environment, _eval: &mut Evaluator) -> Res
                    WAL_NO_ENGINE=1                 禁用统一引擎(纯逐拍) → 回归对拍用的独立 oracle\n\
                  \n\
                  时间单位: getwave/wave/at/edges 返回波形原生单位(ps/ns/...);\n\
-                 period/freq/fmt-time 换算成秒/人类可读。\n\
+                 period/freq/beat 换算成秒/人类可读。\n\
+                 WAL_BEAT_CLK=<clk[,clk2]>  时间输出改为时钟拍号(首沿=第0拍; 首沿前=-1);\n\
+                 多时钟分开显示; 解析失败明确报错并整体回退绝对时间。\n\
                  \n\
                  细节: (doc \"count\") / (doc semantics); (doc 未知主题) 会列出全部可用主题。\n\
                  ==========================\n"

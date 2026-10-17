@@ -140,6 +140,222 @@ fn tv_pair(t: u64, sv: &ScalarValue) -> Value {
     Value::List(WList::from_vec(vec![Value::Int(t as i64), scalar_to_wal(sv)]))
 }
 
+// ======================= beat 模式: 时间轴显示为时钟拍号 =======================
+//
+// 配置: 环境变量 `WAL_BEAT_CLK=<时钟信号名>[,<时钟2>...]`
+//   - 未设置/空: 关闭 —— 所有时间输出保持原生时间(默认行为, 不变);
+//   - 设置后: `at`/`getwave`/`wave`/`edges`/`search` 输出"拍号"而不是时间:
+//       * 单时钟: 整数拍号, 可直接参与计算;
+//       * 多时钟: ((拍号 ("clk名" 拍号)) ...) 每个时钟分开显示, 不合并成一个数
+//         (可读性优先, 便于人和模型分辨是哪个时钟的拍), 形状:
+//           at     → (((\"clk1\" b1) (\"clk2\" b2)) 值)
+//           getwave→ (((\"clk1\" b1) (\"clk2\" b2)) 值) ...
+//           edges  → (((\"clk1\" b1) (\"clk2\" b2)) ...)
+//   - 拍号定义: 时钟上升沿序列 e0<e1<..., `beat(t) = #{i : e_i <= t} - 1`
+//     即**首个上升沿 = 第 0 拍**, 每遇到下一个上升沿 +1, 沿所在时刻算新的一拍;
+//     首个上升沿之前 = -1(第一次出现时在 stderr 打一行提示, 之后不重复)。
+//   - 首次使用时校验(每个已加载波形 × 每个时钟: 唯一解析 + 至少一个上升沿);
+//     任一失败 → 明确报错并**整体回退**到绝对时间(本进程不再尝试拍号, 绝不半拍号半时间)。
+//   - 多波形: 按"实际会读值的那条波形"解析时钟, 用它的拍号(与索引空间语义一致)。
+//   - 时钟解析失败/无上升沿的判定只做一次(首次使用时), 之后走缓存。
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
+use std::rc::Rc;
+
+thread_local! {
+    static BEAT_PLAN: RefCell<Option<Rc<BeatPlan>>> = const { RefCell::new(None) };
+    static BEAT_DISABLED: Cell<bool> = const { Cell::new(false) };
+    static BEAT_NEG_HINTED: Cell<bool> = const { Cell::new(false) };
+}
+
+struct BeatPlan {
+    clocks: Vec<String>,
+    // (trace 文件标识, 配置里的时钟名) -> 上升沿原生时间序列
+    edges: RefCell<HashMap<(String, String), Rc<Vec<u64>>>>,
+}
+
+impl BeatPlan {
+    fn edges_for(&self, tr: &dyn Trace, clock: &str) -> Rc<Vec<u64>> {
+        let key = (tr.filename().to_string(), clock.to_string());
+        if let Some(v) = self.edges.borrow().get(&key) {
+            return v.clone();
+        }
+        // 校验阶段已确认能解析且有上升沿; 这里再算一次(结果入缓存)
+        let v = Rc::new(rising_edge_times(tr, clock).unwrap_or_default());
+        self.edges.borrow_mut().insert(key, v.clone());
+        v
+    }
+
+    fn beat_of(&self, tr: &dyn Trace, clock: &str, t: u64) -> i64 {
+        let edges = self.edges_for(tr, clock);
+        beat_index(t, &edges)
+    }
+
+    fn time_value(&self, tr: &dyn Trace, t: u64) -> Value {
+        if self.clocks.len() == 1 {
+            return Value::Int(self.beat_of(tr, &self.clocks[0], t));
+        }
+        let pairs: Vec<Value> = self
+            .clocks
+            .iter()
+            .map(|c| {
+                Value::List(WList::from_vec(vec![
+                    Value::String(c.clone()),
+                    Value::Int(self.beat_of(tr, c, t)),
+                ]))
+            })
+            .collect();
+        Value::List(WList::from_vec(pairs))
+    }
+}
+
+/// 拍号: 上升沿序列中 <= t 的个数 - 1(首个沿 = 0, 首沿之前 = -1)。
+fn beat_index(t: u64, edges: &[u64]) -> i64 {
+    let b = edges.partition_point(|&e| e <= t) as i64 - 1;
+    if b < 0 {
+        BEAT_NEG_HINTED.with(|h| {
+            if !h.get() {
+                h.set(true);
+                eprintln!(
+                    "提示: 拍号 -1 表示该时间早于时钟的首个上升沿; \
+                     如需查看绝对时间, 取消 WAL_BEAT_CLK 后重跑。"
+                );
+            }
+        });
+    }
+    b
+}
+
+/// 时钟的全部上升沿(原生时间, 升序)。与 (rising ...) 同口径: 0→1 才算, x/z→1 不算。
+pub(crate) fn rising_edge_times(tr: &dyn Trace, sig: &str) -> Result<Vec<u64>, String> {
+    let points = tr.change_points_time(sig)?;
+    let mut prev: Option<u8> = match tr.initial_value(sig) {
+        Some(ScalarValue::Bit(b)) => Some(b),
+        Some(ScalarValue::Vector(ref v)) if v.len() == 1 => Some(v[0]),
+        _ => None,
+    };
+    let mut out = Vec::new();
+    for (t, sv) in &points {
+        let bit = match sv {
+            ScalarValue::Bit(b) => Some(*b),
+            ScalarValue::Vector(v) if v.len() == 1 => Some(v[0]),
+            _ => None,
+        };
+        if prev == Some(b'0') && bit == Some(b'1') {
+            out.push(*t);
+        }
+        if let Some(b) = bit {
+            prev = Some(b);
+        }
+    }
+    Ok(out)
+}
+
+fn beat_config_clocks() -> Vec<String> {
+    std::env::var("WAL_BEAT_CLK")
+        .ok()
+        .map(|s| {
+            s.split(',')
+                .map(|x| x.trim().to_string())
+                .filter(|x| !x.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn beat_fail(msg: &str) {
+    BEAT_DISABLED.with(|d| d.set(true));
+    eprintln!("error: {msg} — 已整体回退到绝对时间显示(WAL_BEAT_CLK 本进程内不再生效)。");
+}
+
+/// 首次使用时校验 + 缓存; 返回 None 表示"不启用拍号模式"(未配置/已回退)。
+fn beat_plan(env: &Environment) -> Option<Rc<BeatPlan>> {
+    if BEAT_DISABLED.with(|d| d.get()) {
+        return None;
+    }
+    if let Some(p) = BEAT_PLAN.with(|p| p.borrow().clone()) {
+        return Some(p);
+    }
+    let clocks = beat_config_clocks();
+    if clocks.is_empty() {
+        return None;
+    }
+    let traces = env.get_traces()?;
+    {
+        let guard = traces.read().unwrap_or_else(|e| e.into_inner());
+        for tid in guard.trace_ids() {
+            let tr = match guard.get(&tid) {
+                Some(t) => t,
+                None => continue,
+            };
+            for clk in &clocks {
+                let resolved = match tr.resolve_name_strict_compat(clk) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        beat_fail(&format!(
+                            "WAL_BEAT_CLK: 时钟 '{}' 在 {} 中无法唯一解析({})",
+                            clk,
+                            tr.filename(),
+                            e
+                        ));
+                        return None;
+                    }
+                };
+                match rising_edge_times(tr, &resolved) {
+                    Ok(e) if !e.is_empty() => {}
+                    Ok(_) => {
+                        beat_fail(&format!(
+                            "WAL_BEAT_CLK: 时钟 '{}' 在 {} 中没有上升沿",
+                            clk,
+                            tr.filename()
+                        ));
+                        return None;
+                    }
+                    Err(e) => {
+                        beat_fail(&format!("WAL_BEAT_CLK: 读取时钟 '{}' 失败: {}", clk, e));
+                        return None;
+                    }
+                }
+            }
+        }
+    }
+    let plan = Rc::new(BeatPlan {
+        clocks,
+        edges: RefCell::new(HashMap::new()),
+    });
+    BEAT_PLAN.with(|p| *p.borrow_mut() = Some(plan.clone()));
+    Some(plan)
+}
+
+/// 把原生时间渲染成输出值: 未启用拍号 → 整数原生时间; 启用 → 拍号(单/多时钟形状)。
+fn time_value(plan: Option<&Rc<BeatPlan>>, tr: &dyn Trace, t: u64) -> Value {
+    match plan {
+        Some(p) => p.time_value(tr, t),
+        None => Value::Int(t as i64),
+    }
+}
+
+/// `(拍号 值)` / 多时钟 `(("clk1" b1) ("clk2" b2) 值)` —— 每个时钟分开显示。
+fn time_point(plan: Option<&Rc<BeatPlan>>, tr: &dyn Trace, t: u64, sv: &ScalarValue) -> Value {
+    if let Some(p) = plan {
+        if p.clocks.len() > 1 {
+            let mut out: Vec<Value> = p
+                .clocks
+                .iter()
+                .map(|c| {
+                    Value::List(WList::from_vec(vec![
+                        Value::String(c.clone()),
+                        Value::Int(p.beat_of(tr, c, t)),
+                    ]))
+                })
+                .collect();
+            out.push(scalar_to_wal(sv));
+            return Value::List(WList::from_vec(out));
+        }
+    }
+    Value::List(WList::from_vec(vec![time_value(plan, tr, t), scalar_to_wal(sv)]))
+}
+
 /// Parse optional [t0 t1] window args (times in the file's native unit).
 fn parse_window(args: &[Value]) -> (Option<u64>, Option<u64>) {
     match args.len() {
@@ -187,11 +403,12 @@ fn op_getwave(args: &[Value], env: &mut Environment, _eval: &mut Evaluator) -> R
         return Err("(getwave \"sig\") expected".to_string());
     }
     let name = extract_string(&args[0])?;
-    with_signal_trace(env, &name, |tr, sig| {
+    let plan = beat_plan(env);
+    with_signal_trace(env, &name, move |tr, sig| {
         let points = tr.change_points_time(sig)?;
         let mut out = Vec::with_capacity(points.len());
         for (t, sv) in points {
-            out.push(tv_pair(t, &sv));
+            out.push(time_point(plan.as_ref(), tr, t, &sv));
         }
         Ok(Value::List(WList::from_vec(out)))
     })
@@ -203,11 +420,12 @@ fn op_wave(args: &[Value], env: &mut Environment, _eval: &mut Evaluator) -> Resu
     }
     let name = extract_string(&args[0])?;
     let (t0, t1) = parse_window(&args[1..]);
-    with_signal_trace(env, &name, |tr, sig| {
+    let plan = beat_plan(env);
+    with_signal_trace(env, &name, move |tr, sig| {
         let points = windowed_changes(tr, sig, t0, t1)?;
         let mut out = Vec::with_capacity(points.len());
         for (t, sv) in points {
-            out.push(tv_pair(t, &sv));
+            out.push(time_point(plan.as_ref(), tr, t, &sv));
         }
         Ok(Value::List(WList::from_vec(out)))
     })
@@ -224,13 +442,12 @@ fn op_at(args: &[Value], env: &mut Environment, _eval: &mut Evaluator) -> Result
         return Err(format!("(at \"sig\" t): 时间不能为负: {}", target_i));
     }
     let target = target_i as u64;
-    with_signal_trace(env, &name, |tr, sig| {
+    let plan = beat_plan(env);
+    with_signal_trace(env, &name, move |tr, sig| {
         let timed: Vec<(u64, ScalarValue)> = tr.change_points_time(sig)?;
         // last change at or before target time
         match timed.iter().rev().find(|(t, _)| *t <= target) {
-            Some((t, sv)) => Ok(Value::List(WList::from_vec(vec![
-                Value::Int(*t as i64), scalar_to_wal(sv),
-            ]))),
+            Some((t, sv)) => Ok(time_point(plan.as_ref(), tr, *t, sv)),
             None => {
                 // target precedes the first change: report the INITIAL held
                 // value at time 0 (the $dumpvars snapshot, else x) — the value
@@ -243,7 +460,7 @@ fn op_at(args: &[Value], env: &mut Environment, _eval: &mut Evaluator) -> Result
                 // (例: dumpvars s=10, 唯一时间戳 #1000 写 s=3 → (at s 0) 曾返回 3)。
                 let init_sv = tr.initial_value(&sig).unwrap_or(ScalarValue::Bit(b'x'));
                 Ok(Value::List(WList::from_vec(vec![
-                    Value::Int(0), scalar_to_wal(&init_sv),
+                    time_value(plan.as_ref(), tr, 0), scalar_to_wal(&init_sv),
                 ])))
             }
         }
@@ -326,7 +543,8 @@ fn op_edges(args: &[Value], env: &mut Environment, _eval: &mut Evaluator) -> Res
     }
     let name = extract_string(&args[0])?;
     let (t0, t1) = parse_window(&args[1..]);
-    with_first_trace(env, |tr| {
+    let plan = beat_plan(env);
+    with_first_trace(env, move |tr| {
         let sig = resolve_signal(tr, &name)?;
         let points = tr.change_points_time(&sig)?;
         let mut out = Vec::new();
@@ -341,7 +559,7 @@ fn op_edges(args: &[Value], env: &mut Environment, _eval: &mut Evaluator) -> Res
                 (None, None) => true,
             };
             if in_window {
-                out.push(Value::Int(t as i64));
+                out.push(time_value(plan.as_ref(), tr, t));
             }
         }
         Ok(Value::List(WList::from_vec(out)))
@@ -420,7 +638,8 @@ fn op_search(args: &[Value], env: &mut Environment, _eval: &mut Evaluator) -> Re
     let name = extract_string(&args[0])?;
     let pattern = extract_string(&args[1])?;
     let (t0, t1) = parse_window(&args[2..]);
-    with_first_trace(env, |tr| {
+    let plan = beat_plan(env);
+    with_first_trace(env, move |tr| {
         let sig = resolve_signal(tr, &name)?;
         let points = tr.change_points_time(&sig)?;
     let pattern: Vec<char> = pattern.chars().collect();
@@ -444,14 +663,15 @@ fn op_search(args: &[Value], env: &mut Environment, _eval: &mut Evaluator) -> Re
             // Search pattern within the signal bit string since last check.
             // One result per change point: a pattern may match at several bit
             // offsets of the same value — report the timestamp once (B3).
+            let tv = time_value(plan.as_ref(), tr, t);
             for (i, &b) in bits.iter().enumerate() {
                 window.push(b);
                 if window.len() > pattern.len() {
                     window.remove(0);
                 }
                 if window.len() == pattern.len() && window.iter().zip(&pattern).all(|(a, b)| a == b) {
-                    if out.last() != Some(&Value::Int(t as i64)) {
-                        out.push(Value::Int(t as i64));
+                    if out.last() != Some(&tv) {
+                        out.push(tv.clone());
                     }
                 }
                 let _ = i;
@@ -554,57 +774,6 @@ fn op_freq(args: &[Value], env: &mut Environment, eval: &mut Evaluator) -> Resul
     }
 }
 
-fn op_save(args: &[Value], env: &mut Environment, _eval: &mut Evaluator) -> Result<Value, String> {
-    if args.len() < 2 {
-        return Err("(save \"out.csv\" \"sig1\" ...) expected".to_string());
-    }
-    let path = extract_string(&args[0])?;
-    with_first_trace(env, |tr| {
-        let mut header = String::new();
-        header.push_str("time");
-        let mut names: Vec<String> = Vec::new();
-        for a in &args[1..] {
-            let name = extract_string(a)?;
-            let sig = resolve_signal(tr, &name)?;
-            header.push(',');
-            header.push_str(&sig);
-            names.push(sig);
-        }
-        header.push('\n');
-        // Union of all change timestamps
-        let mut all: Vec<(u64, Vec<Option<ScalarValue>>)> = Vec::new();
-        for (ci, sig) in names.iter().enumerate() {
-            if let Ok(points) = tr.change_points_time(sig) {
-                for (t, sv) in points {
-                    if let Some(entry) = all.iter_mut().find(|(t0, _)| *t0 == t) {
-                        entry.1[ci] = Some(sv);
-                    } else {
-                        let mut vals: Vec<Option<ScalarValue>> = vec![None; names.len()];
-                        vals[ci] = Some(sv);
-                        all.push((t, vals));
-                    }
-                }
-            }
-        }
-        all.sort_by_key(|(t, _)| *t);
-        let mut body = String::new();
-        for (t, vals) in all {
-            body.push_str(&t.to_string());
-            for v in vals {
-                body.push(',');
-                match v {
-                    Some(sv) => body.push_str(&scalar_display(&sv)),
-                    None => {}
-                }
-            }
-            body.push('\n');
-        }
-        std::fs::write(&path, header + &body)
-            .map_err(|e| format!("save: cannot write {}: {}", path, e))?;
-        Ok(Value::Bool(true))
-    })
-}
-
 fn scalar_display(sv: &ScalarValue) -> String {
     match sv {
         ScalarValue::Bit(b) => (*b as char).to_string(),
@@ -620,10 +789,10 @@ const DOCS: &[(&str, &str)] = &[
     ("count-rise", "(count-rise \"sig\" [t0 t1]) → rising edges in window"),
     ("count-fall", "(count-fall \"sig\" [t0 t1]) → falling edges in window"),
     ("count-edges", "(count-edges \"sig\" [t0 t1]) → number of changes in window"),
-    ("edges", "(edges \"sig\" [t0 t1]) → change timestamps in window"),
+    ("edges", "(edges \"sig\" [t0 t1]) → change timestamps in window; WAL_BEAT_CLK 开启时输出拍号"),
     ("find-sig", "(find-sig \"pattern\") → signal names containing the substring"),
     ("take", "(take n list) → first n elements; e.g. (take 5 (find-sig \"clk\")) or (take 5 SIGNALS)"),
-    ("search", "(search \"sig\" \"101\" [t0 t1]) → timestamps where the bit pattern occurs"),
+    ("search", "(search \"sig\" \"101\" [t0 t1]) → timestamps where bit pattern occurs; WAL_BEAT_CLK 开启时输出拍号"),
     ("assert-eq", "(assert-eq \"sig\" t0 t1 v) → [t0,t1] 内是否恒等于 v; 失败打印首违例并让进程退出码为 1(CI 可判)"),
     ("exit", "(exit [N]) → 立即结束脚本/会话并返回退出码 N(默认 0)"),
     ("dump-trace", "(dump-trace \"out.vcd\") → 把已加载的(defsig)信号导出为 VCD; **只支持 .vcd**, .fst 输出被明确拒绝(FST 只读)"),
@@ -636,15 +805,14 @@ const DOCS: &[(&str, &str)] = &[
     ("e", "未实现: WAL 无 `e` 形式(wal-rust 与其上游都没有); 科学计数法字面量同样不支持(用 (* 1.5 (** 10 3)))"),
     ("period", "(period \"clk\") → average clock period in seconds"),
     ("freq", "(freq \"clk\") → clock frequency in Hz"),
-    ("save", "(save \"out.csv\" \"sig\"...) → export time/value columns to CSV"),
-    ("fmt-time", "(fmt-time t [\"clk\"]) → t formatted with the waveform's timescale (e.g. 1.06ms); with a clock signal: \"beat N (1.06ms)\""),
+    ("beat", "(beat t [\"clk\"]) → 无时钟: 人类可读时间串; 带时钟: 整数拍号(首个上升沿=第0拍, 首沿前=-1)"),
     ("doc", "(doc \"cmd\"|cmd) → one-line documentation for a command"),
     ("semantics", "四值语义(权威口径): docs/4-state-semantics.md — 索引模型/取值与显示/比较/真值/边沿/聚合一致性"),
     ("x-semantics", "x 不是 0: (= x 0) 为假, (!= x 0) 为真, x→1 算变化但不算上升沿, 索引 0 无前驱(除 $dumpvars 给确定初值)"),
     ("INDEX", "INDEX 是当前游标索引; (get s) 取该索引处的值, 不随 map/遍历位置变化; 按时间取值用 (at s T)"),
     // ---- 核心查询算子(内测反馈: 这些以前查不到文档) ----
     ("get", "(get \"sig\" [hi lo]) → 索引处取值; 含 x/z 时返回位串(如 \"x\"/\"00x1\"), 否则整数"),
-    ("at", "(at \"sig\" t) → (时间 值): t 时刻最后写入的值; 首变化前返回 (0 初值)"),
+    ("at", "(at \"sig\" t) → (时间 值): t 时刻最后写入的值; 首变化前返回 (0 初值); WAL_BEAT_CLK 开启时“时间”是拍号"),
     ("rising", "(rising \"sig\") → 该索引处是否 0→非零(含 x/z 不算)"),
     ("falling", "(falling \"sig\") → 该索引处是否非零→0"),
     ("changes", "(changes \"sig\") → 该索引处值是否变化(x/z 之间的变化不算)"),
@@ -666,7 +834,7 @@ const DOCS: &[(&str, &str)] = &[
     ("sigs", "(sigs \"pat\" [n]) → 信号名列表(子命令, 也可用 find-sig)"),
     ("topsig", "(topsig [n]) → 变化最多的信号(子命令)"),
     // NOTE: keep the unit semantics visible in (help) as well.
-    ("timescale", "Times are in the waveform's NATIVE unit: raw numbers from getwave/wave/at/edges are ps/ns/... per the file's $timescale (see the load summary). Only period/freq and fmt-time convert to seconds / human units."),
+    ("timescale", "Times are in the waveform's NATIVE unit: raw numbers from getwave/wave/at/edges are ps/ns/... per the file's $timescale (see the load summary). Only period/freq and beat convert to seconds / human units."),
 ];
 
 /// (timescale) → print the loaded waveform's time unit (e.g. "1ns"/"?").
@@ -747,27 +915,26 @@ fn format_timestamp(t: u64, exp: Option<i8>) -> String {
     format!("{:.2}s", seconds)
 }
 
-fn op_fmt_time(args: &[Value], env: &mut Environment, _eval: &mut Evaluator) -> Result<Value, String> {
-    if args.len() < 1 || args.len() > 2 {
-        return Err("(fmt-time t [\"clk\"]) expected".to_string());
+fn op_beat(args: &[Value], env: &mut Environment, _eval: &mut Evaluator) -> Result<Value, String> {
+    if args.is_empty() || args.len() > 2 {
+        return Err("(beat t [\"clk\"]) expected".to_string());
     }
     let t = extract_int(&args[0])? as u64;
-    with_first_trace(env, |tr| {
-        let exp = tr.timescale_exp();
-        // Beat mode: (fmt-time t "clk") → "beat N (human time)"
-        if let Some(clk_arg) = args.get(1) {
-            let clk = extract_string(clk_arg)?;
-            let sig = resolve_signal(tr, &clk)?;
-            if let Some(period) = avg_rise_period_native(tr, &sig)? {
-                let beats = (t as f64 / period).round() as i64;
-                return Ok(Value::String(format!(
-                    "beat {} ({})",
-                    beats,
-                    format_timestamp(t, exp)
-                )));
+    // 带时钟: 整数拍号(与 WAL_BEAT_CLK 模式同一套定义: 首个上升沿 = 第 0 拍, 首沿前 = -1)
+    if let Some(clk_arg) = args.get(1) {
+        let clk = extract_string(clk_arg)?;
+        let clk_for_err = clk.clone();
+        return with_signal_trace(env, &clk, move |tr, sig| {
+            let edges = rising_edge_times(tr, sig)?;
+            if edges.is_empty() {
+                return Err(format!("(beat t \"{}\") 无上升沿, 无法换算拍号", clk_for_err));
             }
-        }
-        Ok(Value::String(format_timestamp(t, exp)))
+            Ok(Value::Int(beat_index(t, &edges)))
+        });
+    }
+    // 不带时钟: 人类可读时间串(原 fmt-time 能力)
+    with_first_trace(env, |tr| {
+        Ok(Value::String(format_timestamp(t, tr.timescale_exp())))
     })
 }
 
@@ -794,8 +961,7 @@ pub fn register_wave(disp: &mut Dispatcher) {
     disp.register(Operator::AssertEq, op_assert_eq);
     disp.register(Operator::Period, op_period);
     disp.register(Operator::Freq, op_freq);
-    disp.register(Operator::Save, op_save);
     disp.register(Operator::Doc, op_doc);
-    disp.register(Operator::FmtTime, op_fmt_time);
+    disp.register(Operator::Beat, op_beat);
     disp.register(Operator::Timescale, op_timescale);
 }
