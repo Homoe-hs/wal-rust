@@ -61,7 +61,24 @@ fn op_unset_scope(_args: &[Value], env: &mut Environment, _eval: &mut Evaluator)
     Ok(Value::Nil)
 }
 
-fn op_groups(args: &[Value], env: &mut Environment, _eval: &mut Evaluator) -> Result<Value, String> {
+/// 组前缀 + 短名 → 候选全名(BUG-025)。
+///
+/// 组名有两种来源:`groups` 返回的前缀带尾点(`"top.in_."`), 而手册示例
+/// `(in-group "top.in_" #ready)` 不带尾点。直拼只对前一种成立, 所以两种都试。
+pub(crate) fn group_prefixed_names(group: &str, name: &str) -> Vec<String> {
+    if group.is_empty() {
+        return vec![name.to_string()];
+    }
+    if group.ends_with('.') || name.starts_with('.') {
+        vec![format!("{}{}", group, name)]
+    } else {
+        vec![format!("{}{}", group, name), format!("{}.{}", group, name)]
+    }
+}
+
+/// `(groups posts*)` 的实现: 返回所有使 `pre + post` 是有效信号名的前缀。
+/// post 可以是信号名后缀(不含分隔点, 如 "ready")或带点后缀(如 ".ready")。
+pub(crate) fn groups_impl(args: &[Value], env: &Environment) -> Result<Value, String> {
     // (groups posts*) — find all signal name prefixes matching all post suffixes
     if args.is_empty() {
         // No post conditions → return empty list
@@ -110,6 +127,10 @@ fn op_groups(args: &[Value], env: &mut Environment, _eval: &mut Evaluator) -> Re
         return Ok(Value::List(crate::wal::ast::WList::from_vec(result)));
     }
     Ok(Value::List(crate::wal::ast::WList::new()))
+}
+
+fn op_groups(args: &[Value], env: &mut Environment, _eval: &mut Evaluator) -> Result<Value, String> {
+    groups_impl(args, env)
 }
 
 fn op_in_group(args: &[Value], env: &mut Environment, eval: &mut Evaluator) -> Result<Value, String> {
@@ -168,21 +189,26 @@ fn op_resolve_group(args: &[Value], env: &mut Environment, _eval: &mut Evaluator
         }
         _ => return Err("resolve-group: expected symbol".to_string()),
     };
-    // Per WAL spec: prepend CG (current group) to signal name, then look up trace signal
+    // Per WAL spec: prepend CG (current group) to signal name, then look up trace signal.
+    // BUG-025: 组名可能带尾点也可能不带, 两种拼接都试。
     let group = env.get_group();
-    let full_name = format!("{}{}", group, name);
+    let candidates = group_prefixed_names(group, &name);
     if let Some(traces) = env.get_traces() {
         let traces = traces.read().unwrap_or_else(|e| e.into_inner());
         if let Some(trace) = traces.first_trace() {
-            match trace.signal_value(&full_name, trace.index()) {
-                Ok(sv) => {
+            for full_name in &candidates {
+                if let Ok(sv) = trace.signal_value(full_name, trace.index()) {
                     return Ok(scalar_to_value(sv));
                 }
-                Err(_) => {}
             }
         }
     }
-    Err(format!("Unresolved group signal: {} (CG='{}')", full_name, group))
+    Err(format!(
+        "Unresolved group signal: {} (CG='{}', 候选: {:?})",
+        candidates.first().map(|s| s.as_str()).unwrap_or(&name),
+        group,
+        candidates
+    ))
 }
 
 fn op_in_scope(args: &[Value], env: &mut Environment, eval: &mut Evaluator) -> Result<Value, String> {

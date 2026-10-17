@@ -353,11 +353,12 @@ pub fn eval_value(&mut self, value: Value) -> Result<Value, String> {
         // 叶子名/子串匹配由后端自己的解析器负责(语义一致)。
         if let Some(traces) = self.env.get_traces() {
             let traces = traces.read().unwrap_or_else(|e| e.into_inner());
-            let candidates = [
-                name.clone(),
-                format!("{}{}", self.env.get_scope(), name),
-                format!("{}{}", self.env.get_group(), name),
-            ];
+            let mut candidates = vec![name.clone(), format!("{}{}", self.env.get_scope(), name)];
+            // BUG-025: 组名可能带尾点(groups 返回 "top.in_."), 也可能不带(手册示例 "top.in_"),
+            // 两种都要试, 否则 (in-group "top.in_" #ready) 得到 "top.in_ready" 解析失败。
+            candidates.extend(crate::wal::builtins::scope::group_prefixed_names(
+                self.env.get_group(), &name,
+            ));
             for candidate in &candidates {
                 for id in traces.trace_ids() {
                     let Some(tr) = traces.get(&id) else { continue };
@@ -440,6 +441,10 @@ pub fn eval_value(&mut self, value: Value) -> Result<Value, String> {
                         return self.eval_case(&rest);
                     } else if op == Operator::Scoped {
                         return self.eval_scoped(&rest);
+                    } else if op == Operator::Groups {
+                        // BUG-024: posts 是"后缀名"字面量(符号/字符串), 不能被当值预求值;
+                        // 之前 (groups valid ready) 会把两个符号求值成信号值/报错 → 返回 ()。
+                        return self.eval_groups(&rest);
                     } else if op == Operator::InGroup {
                         return self.eval_in_group(&rest);
                     } else if op == Operator::InScope {
@@ -489,25 +494,13 @@ pub fn eval_value(&mut self, value: Value) -> Result<Value, String> {
                     } else if op == Operator::ForList {
                         return self.eval_for_list(&rest);
                     } else if op == Operator::Fn {
-                        // fn is a special form — create closure, then call with remaining args
-                        if rest.len() <= 2 {
-                            // Just create closure (no extra call args)
-                            return self.eval_fn_special(&rest);
-                        }
-                        // Create closure and call with args[2..]
-                        let closure_val = self.eval_fn_special(&rest)?;
-                        match closure_val {
-                            Value::Closure(c) => {
-                                let call_args: Result<Vec<Value>, String> = rest[2..].iter()
-                                    .map(|a| self.eval_value(a.clone()))
-                                    .collect();
-                                self.eval_closure(c, &call_args?)
-                            }
-                            Value::Macro(m) => {
-                                self.eval_macro(m, &rest[2..].to_vec())
-                            }
-                            _ => Ok(closure_val),
-                        }
+                        // BUG-020: `(fn (x) body1 body2 ...)` 的多个 body 必须包成 do
+                        // (手册: "多个 body 表达式自动包装为 do 块")。
+                        // 之前 rest.len()>2 会把 body 当成"立即调用的实参"求值 ——
+                        // 于是 (fn () (set! k (+ k 1)) k) 变成"创建并调用", set! 在
+                        // 参数求值期就跑、闭包本体反而拿不到正确状态(累加器全变 1)。
+                        // IIFE 写法 `((fn (x) ...) 5)` 走 List-首元素分支, 不依赖这里。
+                        return self.eval_fn_special(&rest);
                     } else {
                         // 快路: `(length (SIGNALS))` / `(length SIGNALS)` —— 只要个数,
                         // 不要为了数个数把整张名字表物化(真实 core 级波形 1796 万信号,
@@ -761,7 +754,13 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
                     }
                     _ => (self.eval_value(args[1].clone())?, false),
                 };
-                self.env.define(name, value.clone());
+                self.env.define(name.clone(), value.clone());
+                // BUG-021: 闭包捕获的是 define 之前的环境快照(bindings map 拷贝),
+                // 里面还没有它自己的名字 → body 里引用自身会 "Unknown operator"。
+                // 把绑定同步进捕获环境(map 新增一项; cell 语义不变)。
+                if let Value::Closure(ref c) = value {
+                    c.env.borrow_mut().define(name, value.clone());
+                }
                 return Ok(value);
             }
             Value::List(list) => {
@@ -787,7 +786,10 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
                 ).with_name(&func_name);
 
                 let closure_val = Value::Closure(closure);
-                self.env.define(func_name, closure_val.clone());
+                self.env.define(func_name.clone(), closure_val.clone());
+                if let Value::Closure(ref c) = closure_val {
+                    c.env.borrow_mut().define(func_name, closure_val.clone());
+                }
                 Ok(closure_val)
             }
             _ => Err("define expects symbol or function definition".to_string()),
@@ -884,6 +886,12 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
         let group_name = scope_extract_name(&args[0])?;
         let mut new_env = self.env.child();
         new_env.set_group(&group_name);
+        // BUG-026: 手册说 in-group 要"同步更新 CS 为组名去掉尾点" ——
+        // 但只有 scope.rs 的 builtin 版本做了, evaluator 的特殊形式分支漏了(CS 一直是 "")。
+        let scope_from_group = group_name.trim_end_matches('.');
+        if !scope_from_group.is_empty() {
+            new_env.set_scope(scope_from_group);
+        }
         let saved_env = std::mem::replace(&mut self.env, new_env);
         let mut result = Value::Nil;
         for arg in &args[1..] {
@@ -891,6 +899,19 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
         }
         self.env = saved_env;
         Ok(result)
+    }
+
+    /// `(groups post...)`: post 是后缀名字面量; 非符号/字符串参数仍求值(向后兼容)。
+    fn eval_groups(&mut self, args: &[Value]) -> Result<Value, String> {
+        let mut literal = Vec::with_capacity(args.len());
+        for a in args {
+            let v = match a {
+                Value::Symbol(_) | Value::String(_) => a.clone(),
+                _ => self.eval_value(a.clone())?,
+            };
+            literal.push(v);
+        }
+        crate::wal::builtins::scope::groups_impl(&literal, &self.env)
     }
 
     fn eval_in_scope(&mut self, args: &[Value]) -> Result<Value, String> {
@@ -1758,6 +1779,10 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
         // Batch mode: multiple conditions → single scan for all (including &&)
         if args.len() > 1 {
             let mut batch_entries: Vec<BatchEntry> = Vec::new();
+            // BUG-023: 只有**每个**条件都能分解成批量项时才走批量路径。
+            // 之前 (count (rising "a") (rising "b")) 里两条都分解失败 → batch_entries<2
+            // 就掉到"单条件路径"用 args[0] 算, 静默返回标量而不是列表。
+            let mut all_batchable = true;
             for arg in args {
                 // Resolve variable references in (get <symbol>) → (get "resolved_string")
                 let resolved_arg = self.resolve_rhs_vars(self.resolve_get_symbols(arg));
@@ -1767,10 +1792,14 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
                     // (&& cond1 cond2 ...) → build And entry
                     if subs.len() >= 2 {
                         batch_entries.push(BatchEntry::And(subs));
+                    } else {
+                        all_batchable = false;
                     }
+                } else {
+                    all_batchable = false;
                 }
             }
-            if batch_entries.len() >= 2 {
+            if all_batchable && batch_entries.len() >= 2 {
                 let _result_counts: Vec<Value> = Vec::new();
                 let mut batch_counts: Option<Vec<Value>> = None;
                 {
@@ -1815,6 +1844,13 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
                     return Ok(Value::List(WList::from_vec(counts)));
                 }
             }
+            // BUG-023: 无法整体批量 → **逐条件**各算一个, 返回列表(手册多参语义);
+            // 绝不能静默只算 args[0] 返回标量。
+            let mut out: Vec<Value> = Vec::with_capacity(args.len());
+            for a in args {
+                out.push(self.eval_count(std::slice::from_ref(a))?);
+            }
+            return Ok(Value::List(WList::from_vec(out)));
         }
 
         // Fast path 0: 只数个数。时间优先的后端(FSDB 走 NPI)在这里**不需要物化
@@ -1980,6 +2016,14 @@ pub fn eval_closure(&mut self, closure: Closure, args: &[Value]) -> Result<Value
         };
         let guard = traces.read().unwrap_or_else(|e| e.into_inner());
         for name in syms {
+            if self.env.is_virtual_signal(&name) {
+                // BUG-027: 虚拟信号的值是**每拍动态求值**的表达式; 它引用的真实信号
+                // 必须计入依赖, 否则 count/find 会把条件当常量折叠。
+                if let Some(expr) = self.env.lookup(&name) {
+                    self.collect_cond_signals_with_bare(&expr, out, has_edge, idx_dep);
+                }
+                continue;
+            }
             if self.env.lookup(&name).is_some() {
                 continue; // 变量/闭包/宏优先, 不是信号
             }

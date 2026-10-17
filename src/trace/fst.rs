@@ -536,6 +536,20 @@ impl Trace for FstTrace {
         Some(exp)
     }
 
+    /// BUG-028: FST 早先没实现初值 → `(initial s)` 恒为 "x", 而同一条 trace 的
+    /// `(getwave s)` 首点却是 `(0 真实初值)`(自相矛盾)。FST 的时间表第 0 帧就是初值,
+    /// 取该信号的**首个变更**:若它落在 index 0 即为初值;否则 0 帧没有记录(=x)。
+    fn initial_value(&self, name: &str) -> Option<ScalarValue> {
+        let sig_ref = self.ensure_loaded(name).ok()?;
+        let wf = self.wf.borrow();
+        let sig = wf.get_signal(sig_ref)?;
+        let mut it = sig.iter_changes();
+        match it.next() {
+            Some((0, sv)) => Some(value_to_scalar(&sv)),
+            _ => None,
+        }
+    }
+
     fn change_points(&self, name: &str) -> Result<Vec<(usize, ScalarValue)>, String> {
         let sig_ref = self.ensure_loaded(name)?;
         let wf = self.wf.borrow();

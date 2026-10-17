@@ -278,7 +278,14 @@ fn edge_count(args: &[Value], env: &mut Environment, rising: bool) -> Result<Val
         let sig = resolve_signal(tr, &name)?;
         let points = tr.change_points_time(&sig)?;
         let mut count = 0usize;
-        let mut prev: Option<u8> = None;
+        // BUG-022: 首个变更也要和**初值**比才判得出边沿 —— 之前 prev=None 把
+        // "初值 0 → 首个变更 1" 这条上升沿丢了(与 (count (rising ..)) 不一致)。
+        // x/z 初值 → prev=None(x→1 不算沿, 与 find/rising 口径一致)。
+        let mut prev: Option<u8> = match tr.initial_value(&sig) {
+            Some(ScalarValue::Bit(b)) => Some(b),
+            Some(ScalarValue::Vector(ref v)) if v.len() == 1 => Some(v[0]),
+            _ => None,
+        };
         for (t, sv) in &points {
             let bit = match sv {
                 ScalarValue::Bit(b) => Some(*b),

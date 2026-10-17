@@ -249,3 +249,169 @@ fn bug008_truncated_vcd_errors_by_default() {
     let _ = std::fs::remove_file(p);
 }
 
+
+// ============================================================================
+// 第四轮(语言/语义覆盖): fn 多 body、递归、边沿计数、多参 count、组、虚拟信号、FST 初值
+// ============================================================================
+
+fn clk_vcd() -> String {
+    vcd(
+        "$var wire 1 ! clk $end\n$var wire 1 \" rst $end\n",
+        "$dumpvars\n0!\n1\"\n$end\n#10\n1!\n#20\n0!\n0\"\n#30\n1!\n#40\n0!\n#50\n1!\n",
+    )
+}
+
+/// BUG-020: `(fn (args) body1 body2 ...)` 在表达式位置必须只**创建闭包**(多 body 包 do),
+/// 之前 rest.len()>2 被当成"创建并立即调用", 导致 set! 累加器/多 body 闭包全坏。
+#[test]
+fn bug020_fn_multi_body_is_closure_not_immediate_call() {
+    let mut ev = Evaluator::new();
+    // 多 body 闭包: 先 set! 再返回 —— 每次调用应累加(修复前恒为 1)
+    ev.eval("(define cnt (let ((n 0)) (fn () (set! n (+ n 1)) n)))").unwrap();
+    let v1 = ev.eval("(cnt)").unwrap();
+    let v2 = ev.eval("(cnt)").unwrap();
+    let v3 = ev.eval("(cnt)").unwrap();
+    assert_eq!((v1, v2, v3), (Value::Int(1), Value::Int(2), Value::Int(3)), "set! 累加器必须跨调用保持");
+    // IIFE 仍工作
+    assert_eq!(ev.eval("((fn (x) (* x 2)) 21)").unwrap(), Value::Int(42));
+    // 多 body 返回最后一个表达式
+    assert_eq!(ev.eval("((fn (x) (+ x 1) (* x 10)) 4)").unwrap(), Value::Int(40));
+}
+
+/// BUG-021: define 的函数自引用(递归) —— 闭包捕获环境里必须能看见自己的名字。
+#[test]
+fn bug021_recursive_defines_work() {
+    let mut ev = Evaluator::new();
+    ev.eval("(defun fact (n) (if (<= n 1) 1 (* n (fact (- n 1)))))").unwrap();
+    assert_eq!(ev.eval("(fact 5)").unwrap(), Value::Int(120));
+    ev.eval("(define fib (fn (n) (if (< n 2) n (+ (fib (- n 1)) (fib (- n 2))))))").unwrap();
+    assert_eq!(ev.eval("(fib 7)").unwrap(), Value::Int(13));
+}
+
+/// BUG-022: count-rise/count-fall 必须和 count(rising)/count(falling) 一致:
+/// 首个变更要拿**初值**判边沿(初值 0 → 首个 1 是上升沿)。
+#[test]
+fn bug022_count_rise_fall_include_initial_edge() {
+    let body = clk_vcd();
+    let mut ev = Evaluator::new();
+    let p = load_vcd(&mut ev, "edge_clk", &body);
+    let rise = ev.eval("(count-rise \"clk\")").unwrap();
+    let fall = ev.eval("(count-fall \"clk\")").unwrap();
+    let rise2 = ev.eval("(count (rising \"clk\"))").unwrap();
+    let fall2 = ev.eval("(count (falling \"clk\"))").unwrap();
+    assert_eq!(rise, Value::Int(3), "10/30/50 三个上升沿");
+    assert_eq!(fall, Value::Int(2), "20/40 两个下降沿");
+    assert_eq!(rise, rise2);
+    assert_eq!(fall, fall2);
+    // FST 后端同口径
+    let fst = std::env::temp_dir().join(format!("wal_bughunt_edge_{}.fst", std::process::id()));
+    let resume = std::env::temp_dir().join(format!("wal_bughunt_edge_{}.resume", std::process::id()));
+    wal_rust::vcd::convert::vcd_to_fst_streaming(
+        &p, &fst, &resume, std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+    ).unwrap();
+    let mut ev_fst = Evaluator::new();
+    ev_fst.load_trace(&fst.to_string_lossy(), "t").unwrap();
+    assert_eq!(ev_fst.eval("(count-rise \"clk\")").unwrap(), Value::Int(3));
+    assert_eq!(ev_fst.eval("(count-fall \"clk\")").unwrap(), Value::Int(2));
+    let _ = std::fs::remove_file(p);
+    let _ = std::fs::remove_file(fst);
+    let _ = std::fs::remove_file(resume);
+}
+
+/// BUG-023: 多参数 count 里含边沿/混合条件时必须返回**列表**, 不能静默只算第一个参数。
+#[test]
+fn bug023_multi_arg_count_returns_list_for_edge_conditions() {
+    let body = clk_vcd();
+    let mut ev = Evaluator::new();
+    let p = load_vcd(&mut ev, "multi_count", &body);
+    assert_eq!(ev.eval("(count (rising \"rst\"))").unwrap(), Value::Int(0));
+    assert_eq!(
+        ev.eval("(count (rising \"clk\") (rising \"rst\"))").unwrap(),
+        Value::List(wal_rust::wal::ast::WList::from_vec(vec![Value::Int(3), Value::Int(0)]))
+    );
+    // 混合: 简单条件 + 边沿条件
+    let mixed = ev.eval("(count (rising \"clk\") (= (get \"rst\") 1))").unwrap();
+    match mixed {
+        Value::List(l) => {
+            assert_eq!(l.0[0], Value::Int(3));
+            assert_eq!(l.0[1], Value::Int(1));
+        }
+        other => panic!("混合条件应返回列表, 得到 {other:?}"),
+    }
+    let _ = std::fs::remove_file(p);
+}
+
+/// BUG-024/025/026: `groups` 接受符号字面量; `#name` 兼容带点/不带点的组名; in-group 同步 CS。
+#[test]
+fn bug024_026_groups_and_in_group_semantics() {
+    let body = vcd(
+        "$scope module in_ $end\n$var wire 1 ! ready $end\n$var wire 1 \" valid $end\n$upscope $end\n$scope module out_ $end\n$var wire 1 $ ready $end\n$upscope $end\n",
+        "$dumpvars\n0!\n1\"\n0$\n$end\n#10\n1!\n",
+    );
+    let mut ev = Evaluator::new();
+    let p = load_vcd(&mut ev, "grp_sem", &body);
+    // 符号字面量(手册示例写法)必须能拿到组前缀(修复前 (groups ready) → ())
+    let groups = format!("{:?}", ev.eval("(groups ready)").unwrap());
+    assert!(groups.contains("top.in_."), "groups 前缀应带尾点: {groups}");
+    assert!(groups.contains("top.out_."), "{groups}");
+    // 带点后缀写法同样可用
+    let groups2 = format!("{:?}", ev.eval("(groups \".ready\")").unwrap());
+    assert!(groups2.contains("top.in_"), "{groups2}");
+    // in-group: 组名带点/不带点都要能解析 #ready; CS 同步
+    assert_eq!(ev.eval("(in-group \"top.in_\" #ready)").unwrap(), Value::Int(1));
+    assert_eq!(ev.eval("(in-group \"top.in_.\" #ready)").unwrap(), Value::Int(1));
+    assert_eq!(
+        ev.eval("(in-group \"top.in_\" (list CG CS))").unwrap(),
+        Value::List(wal_rust::wal::ast::WList::from_vec(vec![
+            Value::String("top.in_".to_string()),
+            Value::String("top.in_".to_string()),
+        ])),
+        "CG 用原组名, CS 用去掉尾点的组名"
+    );
+    let _ = std::fs::remove_file(p);
+}
+
+/// BUG-027: 虚拟信号出现在条件里必须展开它引用的真实信号(不能当常量折叠)。
+#[test]
+fn bug027_virtual_signal_conditions_are_per_index() {
+    let body = clk_vcd();
+    let mut ev = Evaluator::new();
+    let p = load_vcd(&mut ev, "virt_cond", &body);
+    assert_eq!(ev.eval("(count (= (+ clk 1) 2))").unwrap(), Value::Int(3));
+    assert_eq!(
+        ev.eval("(do (defsig myv (+ clk 1)) (count (= myv 2)))").unwrap(),
+        Value::Int(3),
+        "虚拟信号条件按每拍求值"
+    );
+    assert_eq!(
+        ev.eval("(do (defsig is1 (= clk 1)) (count is1))").unwrap(),
+        Value::Int(3)
+    );
+    let _ = std::fs::remove_file(p);
+}
+
+/// BUG-028: FST `(initial s)` 取时间表第 0 帧的值(之前恒为 "x", 与自身 getwave 首点矛盾)。
+#[test]
+fn bug028_fst_initial_value_uses_zeroth_frame() {
+    use wal_rust::fst::{FstOptions, FstWriter, ScopeType, VarType};
+    use wal_rust::trace::{FstTrace, Trace};
+    let p = std::env::temp_dir().join(format!("wal_bughunt_fst_init_{}.fst", std::process::id()));
+    {
+        let mut w = FstWriter::create(&p, FstOptions::default()).unwrap();
+        w.set_timescale(-9);
+        w.push_scope("top", ScopeType::VcdModule);
+        let a = w.create_var("a", 1, VarType::VcdWire);
+        w.pop_scope();
+        w.emit_time_change(0);
+        w.emit_value_change(a, &[b'1']);
+        w.emit_time_change(10);
+        w.emit_value_change(a, &[b'0']);
+        w.close().unwrap();
+    }
+    let tr = FstTrace::load(&p, "t".to_string()).unwrap();
+    assert_eq!(tr.initial_value("top.a"), Some(wal_rust::trace::ScalarValue::Bit(b'1')));
+    let mut ev = Evaluator::new();
+    ev.load_trace(&p.to_string_lossy(), "t").unwrap();
+    assert_eq!(ev.eval("(initial \"top.a\")").unwrap(), Value::Int(1));
+    let _ = std::fs::remove_file(p);
+}

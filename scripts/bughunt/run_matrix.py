@@ -127,6 +127,11 @@ for (name, fmt) in list(FIX_SIGS):
         add("P2-names", "-", name, "VCD/FST 信号集合不同", f"vcd={vn[:6]} fst={fn[:6]}")
         continue
     for expr, src, _ in survivors[:250]:
+        # `initial` 在 FST 上是**格式固有限制**: FST 没有 $dumpvars 快照概念, 初值只能取
+        # 时间表第 0 帧的值(== #0 最后一次写入); VCD 的 (initial) 是 dumpvars 快照。
+        # 两者仅当"dumpvars 与 #0 写入不同"时才有差异 → 跨格式差分跳过(BUG-029)。
+        if "(initial" in expr:
+            continue
         e1 = rewrite(expr, name, "vcd")
         e2 = rewrite(expr, name, "fst")
         rc1, o1, er1, _ = run([BIN, e1, "-l", vcd])

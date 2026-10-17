@@ -76,11 +76,10 @@ fn sig_width_in_traces(name: &str, env: &Environment) -> Option<u32> {
     let traces = traces.read().ok()?;
     for tr in traces.traces_iter() {
         let sigs = tr.signals();
-        let candidates = [
-            name.to_string(),
-            format!("{}{}", env.get_scope(), name),
-            format!("{}{}", env.get_group(), name),
-        ];
+        let mut candidates = vec![name.to_string(), format!("{}{}", env.get_scope(), name)];
+        candidates.extend(crate::wal::builtins::scope::group_prefixed_names(
+            env.get_group(), name,
+        ));
         let resolved = candidates.iter()
             .find(|c| sigs.iter().any(|s| s == *c))
             .cloned()

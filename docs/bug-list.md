@@ -386,3 +386,42 @@
   `$dumpoff/$dumpon/$dumpall`、`search/freq/dela/period/groups/in-group`、`fsdb-timeline-*` 正确性
   (而不只是 smoke);
 - 全部完成后**整体合回 main**。
+
+---
+
+# 第四轮:语言/语义覆盖(宏/闭包/组/虚拟信号/边沿计数,2026-10)
+
+## 4.1 已修(带回归测试,`tests/bughunt_regressions.rs` 第四轮 6 条)
+
+| bug | 症状(最小复现) | 根因(代码位置) | 修法 |
+|---|---|---|---|
+| **020** `(fn (x) body1 body2 ...)` 多 body 全坏 | `(define cnt (let ((n 0)) (fn () (set! n (+ n 1)) n))) (cnt)(cnt)(cnt)` → `1 1 1`(应为 `1 2 3`);<br>`(define f (fn (n) ... (f ...)))` 递归报 Unknown operator | `src/wal/eval/evaluator.rs` 符号头 `fn` 分支:`rest.len()>2` 时把第 2 个起的 body 当成**立即调用的实参**求值(IIFE 语义)。而 IIFE 写法 `((fn ...) args)` 本来就走 List-首元素分支,这个分支纯属误伤 | 符号头 `(fn ...)` **一律只创建闭包**(多 body 由 op_fn 包 do) |
+| **021** define 的函数不能递归 | `(defun fact (n) ...(fact ...))` → `Unknown operator: fact` | 闭包捕获的是 define **之前**的环境快照(bindings map 拷贝), 之后 `self.env.define(name, closure)` 新增的绑定在快照里不存在 | define 之后把绑定**同步进闭包捕获环境**(自引用可用); 两个 define 分支都做 |
+| **022** `count-rise/count-fall` 漏首个边沿 | 初值 0、10/20/30/40/50 翻转的 clk:`(count-rise)`=2 而 `(count (rising))`=3 | `src/wal/builtins/wave.rs::edge_count` 的 `prev` 从 `None` 开始, 没用初值判第一个变更 | `prev` 用 `tr.initial_value(sig)` 播种(0/1; x/z → None, 与 find/rising 口径一致) |
+| **023** 多参数 count 含边沿条件时静默只算第一个 | `(count (rising "clk") (rising "rst"))` → `3`(应为 `(3 0)`) | `eval_count` 批量路径只解析"简单条件"; 任一条件分解失败时 `batch_entries<2` 就掉回单条件路径用 `args[0]` | 记录 `all_batchable`, 只有**全部**条件可批量才走批量; 否则**逐条件各算一个**返回列表 |
+| **024** `(groups ready)` 返回 `()` | 手册示例 `(groups valid ready)` 无输出; `(groups ".ready")` 才工作 | `groups` 是普通 builtin, 参数被**预求值**(符号 ready 被当信号值/常量) | 在 evaluator 加 `Groups` 特殊形式: 符号/字符串参数按字面量, 其它表达式仍求值 |
+| **025** 组前缀拼接缺分隔点 | `(in-group "top.in_" #ready)`(手册示例) → `Unresolved group signal: top.in_ready` | 4 处 `format!("{}{}", group, name)` 直拼; `groups` 返回的前缀带尾点, 手册示例不带点 → 直拼少一个 `.` | 新增 `scope::group_prefixed_names`(带点/不带点两种候选都试), 用于 evaluator/get/virtual-size/resolve-group |
+| **026** in-group 不同步 CS | 手册说"同步 CS 为组名去掉尾点", 实测 `(in-group "top.in_" (list CG CS))` → CS `""` | evaluator 的 `eval_in_group` 特殊形式没设 scope(scope.rs 的 builtin 版本设了, 但分派走特殊形式) | 特殊形式里同步 `CS = group.trim_end_matches('.')` |
+| **027** 虚拟信号在条件里被常量折叠 | `(do (defsig myv (+ clk 1)) (count (= myv 2)))` → 5(应为 3) | `collect_cond_signals_with_bare`: 裸符号能 env.lookup 到就直接 `continue`(变量优先), 虚拟信号引用的真实信号没进依赖 → 条件被折叠成常量 | 虚拟信号 → 递归展开其绑定的表达式收集信号名(循环风险: 自引用虚拟信号仍可能递归; 记录待观察) |
+| **028** FST `(initial s)` 恒为 x | FST 上 `(getwave s)` 首点 `(0 1)` 但 `(initial s)` = "x"(自相矛盾) | `FstTrace` 未实现 `initial_value`(trait 默认 None) | 取时间表第 0 帧值(首变更落在 index 0) |
+
+## 4.2 已定性为"格式限制/设计"(不修, 文档说明)
+
+- **029** VCD↔FST 的 `(initial)` 语义差异:VCD 的 `initial` = `$dumpvars` 快照(冻结口径, 见
+  `matrix_t0_dump_is_snapshot_not_index`/`matrix_dumpvars_sample_model`);FST 没有 dumpvars 概念,
+  只能给第 0 帧值(== `#0` 最后一次写入)。二者仅在"dumpvars 与 #0 写入不同"时有差;
+  跨格式矩阵已把 `initial` 排除在 VCD↔FST 对比之外, 并在此记录。
+- **030** `(save out.csv ...)` 输出是**稀疏事件表**(未在该时间戳变化的信号列留空),
+  不是"每行完整状态"。属可用性设计问题, 待用户确认是否需要 held-value 填充(不擅自改语义)。
+
+## 4.3 第四轮验证
+
+- `cargo test --release`:**355 passed / 0 failed**(新增 6 条回归)。
+- 单功能矩阵(VCD/FST):语义差异 0(24 条全是 trace 元信息; `initial` 已标注格式限制)。
+- 组合阶段 findings=0;文档示例对拍 MATCH 79(剩余 1 条 CLI 回显噪声 + 1 条 dump-trace 示例缺前置 defsig)。
+- 语言/宏/闭包手算样例:fact 720、fib 13、累加器 (1 2 3)、IIFE 42、多 body 40、groups/in-group/CS 全部符合手册。
+
+## 仍待办(下一轮)
+
+- 剩余覆盖:宏变参/嵌套 macroexpand、`$dumpoff/$dumpon/$dumpall` 真实语料、`save/csv/import` 文件算子、
+  REPL 交互细节、以及把上述修复**整体合回 main**。

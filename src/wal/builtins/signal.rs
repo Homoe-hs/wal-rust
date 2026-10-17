@@ -683,11 +683,10 @@ fn op_get(args: &[Value], env: &mut Environment, eval: &mut Evaluator) -> Result
     }
 
     // Try exact candidates with scope/group prepended
-    let candidates = [
-        name.clone(),
-        format!("{}{}", env.get_scope(), name),
-        format!("{}{}", env.get_group(), name),
-    ];
+    let mut candidates = vec![name.clone(), format!("{}{}", env.get_scope(), name)];
+    candidates.extend(crate::wal::builtins::scope::group_prefixed_names(
+        env.get_group(), &name,
+    ));
 
     if let Some(traces) = env.get_traces() {
         let traces = traces.read().unwrap_or_else(|e| e.into_inner());

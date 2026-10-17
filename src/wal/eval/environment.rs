@@ -154,8 +154,7 @@ impl Environment {
         self.bindings.get(name).map(|cell| cell.borrow().clone())
     }
 
-    pub fn set(&mut self, name: &str, value: Value) -> Result<(), String> {
-        if let Some(cell) = self.bindings.get(name) {
+    pub fn set(&mut self, name: &str, value: Value) -> Result<(), String> {        if let Some(cell) = self.bindings.get(name) {
             *cell.borrow_mut() = value;
             Ok(())
         } else if let Some(ref parent) = self.parent {
