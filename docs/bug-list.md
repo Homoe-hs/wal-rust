@@ -425,3 +425,48 @@
 
 - 剩余覆盖:宏变参/嵌套 macroexpand、`$dumpoff/$dumpon/$dumpall` 真实语料、`save/csv/import` 文件算子、
   REPL 交互细节、以及把上述修复**整体合回 main**。
+
+---
+
+# 收官:全部修复合回 main(第五轮,2026-10)
+
+## 5.1 合并状态
+
+- `dev/bughunt`(含 `dev/load-strategy` 的缓存/懒索引改动 + 本目标全部修复)**fast-forward 合入 `main`**,
+  main = `48d2d34`,版本 **0.14.60**;
+- 本地 `make ci` **9/9 全绿**(preflight/docs/fmt/clippy/build/test/samples/gates/package);
+- 目标验收(A)–(E)对照:
+
+| 目标项 | 证据 |
+|---|---|
+| (A) 每个功能逐一单功能测试 | 153 个注册算子(全部有 help);单功能矩阵 364 条表达式 × VCD/FST;文档示例对拍 124 条;FSDB 维度 F1–F9;CLI 子命令/参数/退出码逐项 |
+| (B) 功能组合测试 | 组合测试 6 类(嵌套算子/跨格式对齐/多波形/CLI+脚本+stdin/文件健壮性/取值边界)→ findings **0**;另有 VCD↔FST 随机差分(fuzz)、引擎 vs 逐拍 oracle、确定性连跑 |
+| (C) 版本化 bug list | 本文件:BUG-001…030 全量台账,每条含最小复现、观察 vs 期望、根因、状态 |
+| (D) 根因分析 | 逐轮根因表(第 1–4 轮)+ 定性结论(撤回项/格式限制),共归纳出 6 类根因:索引语义、名字/范围表示、4-state 转换、NPI 线程安全、语言求值语义、边沿/窗口口径 |
+| (E) 整体修复+回归+CI 绿+合并 | 21 个真 bug 修复(每个带回归测试,共 17 条 bug 回归 + FSDB 9 门 + 349 原有测试)、2 个误判撤回、3 个格式限制记录;356 tests 全绿;main 已合并 |
+
+## 5.2 修复清单(按根因归类)
+
+| 根因 | 修复的 bug |
+|---|---|
+| **索引语义**(重复时间戳/首沿/初值) | 001、001b、022;缓存 key `-v1`→`-v2` |
+| **名字/范围表示**(跨格式统一) | 004、005、024、025、026;002/029 记格式限制 |
+| **4-state 语义** | 017(VCD→FST x/z 折叠)、028(FST 初值) |
+| **NPI 线程安全** | 019(并发 load SIGSEGV → 进程级串行锁) |
+| **语言求值语义** | 011(let 顺序)、012(cond else)、020(fn 多 body 误当调用)、021(递归捕获)、023(多参 count)、027(虚拟信号折叠) |
+| **边沿/输入/格式约定** | 010、018、019;003;007;008;013/014/015(文档口径/撤回);030(待确认) |
+
+## 5.3 最终验证数字
+
+- `cargo test --release`:**356 passed / 0 failed**;
+- FSDB 门:`fsdb_diff` 9/9(`--include-ignored --test-threads=1`)、`fsdb_thread_load_test` 1/1;
+- 单功能矩阵:VCD↔FST 语义差异 **0**(24 条为 trace 文件路径元信息);
+- 组合阶段 findings **0**;文档示例 MATCH 79 / MISMATCH 1(CLI 回显噪声)/ ERR 1(dump-trace 示例缺 defsig);
+- FSDB 单功能/组合(F1–F9):findings 1(过期夹具,非代码问题)。
+
+## 5.4 遗留(不在本目标范围)
+
+- 纯 Rust FSDB 全局时间线后端(见 `docs/fsdb-rust-backend-spec.md`,独立方向);
+- `save` CSV 是否要填充 held value(BUG-030,待用户确认);
+- FST 转义名/初值的格式固有限制(BUG-002/029,已文档化);
+- 覆盖率可继续加深:真实大波形(数百 MB~GB)上的组合/边界回归。
