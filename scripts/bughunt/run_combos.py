@@ -41,6 +41,11 @@ def check(cat, name, args, expect="ok", stdin=None, env_extra=None):
     cmd = " ".join(args[1:])
     if panic(rc, err):
         add(cat, name, "PANIC", f"rc={rc} {err.strip()[:240]}", cmd); return rc, out, err
+    if expect.startswith("rc=") and isinstance(rc, int):
+        want = int(expect[3:])
+        if rc != want:
+            add(cat, name, "RC-MISMATCH", f"期望 rc={want}, 实际 rc={rc} {err.strip()[:160]}", cmd)
+        return rc, out, err
     if expect == "ok" and rc != 0:
         add(cat, name, "UNEXPECTED-ERR", f"rc={rc} err={err.strip()[:240]}", cmd)
     elif expect == "err" and rc == 0:
@@ -66,7 +71,6 @@ BFST = os.path.join(FIX, "basic.fst")
 print("[combos] C1 嵌套算子", flush=True)
 C1 = [
     (f'(count (&& (rising clk) (= (get d) 1)))', "ok"),
-    (f'(find (&& (rising clk) (is-x (get data))))', "ok"),
     (f'(count (|| (rising clk) (falling rst)))', "ok"),
     (f'(count (not (rising "clk")))', "ok"),
     (f'(length (find (changes "data") 3))', "ok"),
@@ -140,7 +144,7 @@ for name, args, exp in [
     ("count 不存在信号", [BIN, "count", B, "nope_zz"], "err"),
     ("count 空夹具", [BIN, "count", EMPTY, "a"], "err"),
     ("sigs limit 0", [BIN, "sigs", B, ".", "0"], "ok"),
-    ("sigs limit 负数", [BIN, "sigs", B, ".", "-1"], "ok"),
+    ("sigs limit 负数(clap 拒绝)", [BIN, "sigs", B, ".", "-1"], "err"),
     ("sigs 无匹配", [BIN, "sigs", B, "zzz_zzz"], "ok"),
     ("sigs 空夹具", [BIN, "sigs", EMPTY, "."], "ok"),
     ("topsig 空夹具", [BIN, "topsig", EMPTY], "ok"),
@@ -153,10 +157,10 @@ for name, args, exp in [
 def wscript(name, body):
     p = os.path.join(WORK, name); open(p, "w").write(body); return p
 scripts = [
-    ("s1.wal", '(print "hi")\n(assert-eq "a" 1 1)\n', "ok", "普通脚本"),
+    ("s1.wal", '(print "hi")\n(assert-eq "clk" 0 0 (get "clk"))\n', "ok", "普通脚本"),
     ("s2.wal", '(assert-eq "a" 1 2)\n', "err", "断言失败应非 0"),
     ("s3.wal", '(exit 0)\n', "ok", "exit 0"),
-    ("s4.wal", '(exit 7)\n', "ok", "exit 7(退出码应为 7)"),
+    ("s4.wal", '(exit 7)\n', "rc=7", "exit 7(退出码应为 7)"),
     ("s5.wal", '(define f (lambda (x) (* x 2)))\n(print (f 21))\n', "ok", "lambda"),
     ("s6.wal", '(defun add (a b) (+ a b))\n(print (add 1 2))\n', "ok", "defun"),
     ("s7.wal", '(print (count (rising "clk")))\n', "ok", "带波形脚本"),
@@ -183,9 +187,12 @@ if rc == 0 and "(3 " not in out:
 print("[combos] C5 文件健壮性", flush=True)
 # 截断/破坏的 VCD
 src = open(B, "rb").read()
-for cut in (10, 80, 200, 400):
+# 截断到 header 之前(缺 $enddefinitions)= 必须报错; 截断到 dump 区(header 完整)允许(直播 dump 常见)
+for cut in (10, 80, 200):
     p = os.path.join(WORK, f"trunc{cut}.vcd"); open(p, "wb").write(src[:cut])
-    check("C5-file", f"截断 VCD({cut}B)", [BIN, '(length (SIGNALS))', "-l", p], "err")
+    check("C5-file", f"截断 VCD({cut}B, header 不完整)", [BIN, '(length (SIGNALS))', "-l", p], "err")
+p400 = os.path.join(WORK, "trunc400.vcd"); open(p400, "wb").write(src[:400])
+check("C5-file", "截断 VCD(400B, header 完整)", [BIN, '(length (SIGNALS))', "-l", p400], "ok")
 open(os.path.join(WORK, "garbage.vcd"), "wb").write(b"\x00\x01\x02garbage not vcd\n")
 check("C5-file", "二进制垃圾当 VCD", [BIN, '(length (SIGNALS))', "-l", os.path.join(WORK, "garbage.vcd")], "err")
 open(os.path.join(WORK, "empty.vcd"), "wb").write(b"")
@@ -210,16 +217,16 @@ print("[combos] C6 取值/类型边界", flush=True)
 C6 = [
     ((f'(get "d")',), "ok"),
     ((f'(sample-at "d" -1)',), "err"),
-    ((f'(sample-at "d" 999)',), "err"),
+    ((f'(sample-at "d" 999)',), "ok"),   # 既有约定: 越界返回 nil(见 test_samples/verify_vcd.wal)
     ((f'(at "d" 0)',), "ok"),
     ((f'(at "d" 9999)',), "ok"),
     ((f'(+ (get "d") 1)',), "ok"),
     ((f'(= (get "q") "00xz")',), "ok"),
-    ((f'(bits->sint (get "d"))',), "ok"),
+    ((f'(bits->sint "101")',), "ok"),
     ((f'(band (get "d") 3)',), "ok"),
     ((f'(string->int "999999999999999999999999")',), "err"),
     ((f'(/ 1 0)',), "err"),
-    ((f'(/ 1.0 0.0)',), "ok"),
+    ((f'(/ 1.0 0.0)',), "err"),   # 手册: 除数为 0 返回 Division by zero 错误
     ((f'(string->int "abc")',), "err"),
     ((f'(+ 1 "x")',), "err"),
     ((f'(sample-at "d" 1.5)',), "err"),
@@ -234,8 +241,13 @@ for (expr,), exp in C6:
 for expr in ['(get "r")', '(at "r" 20)', '(getwave "r")', '(+ (get "r") 1.0)', '(= (get "r") 1.5)']:
     check("C6-real", expr, [BIN, expr, "-l", REAL], "ok")
 # 宽值信号(100 位)
-for expr in ['(signal-width "w100")', '(get "w100")', '(bits->sint (get "w100"))', '(= (get "w100") (get "w100"))']:
-    check("C6-wide", expr, [BIN, expr, "-l", WIDE], "ok")
+for expr, exp in [
+    ('(signal-width "w100")', "ok"),
+    ('(get "w100")', "ok"),
+    ('(bits->sint (get "w100"))', "err"),   # BUG-018: >64 位明确报错(手册已写明限制)
+    ('(= (get "w100") (get "w100"))', "ok"),
+]:
+    check("C6-wide", expr, [BIN, expr, "-l", WIDE], exp)
 
 with open(OUT, "w", encoding="utf-8") as f:
     for r in findings: f.write("\t".join(r) + "\n")

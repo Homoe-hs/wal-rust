@@ -304,3 +304,17 @@
   `$dumpoff/$dumpon/$dumpall`、`search/freq/dela/period/groups/in-group`、`fsdb-timeline-*`、
   多波形组合的更多组合;
 - 全部完成后合回 main。
+
+## 第三轮(收尾核对): 两条"疑似"重新定性
+
+- **截断到 dump 区**(header 完整、`$enddefinitions` 在,数据在中途断) → 仍可加载:
+  与"直播 dump 正在写"场景兼容,是**合理行为**;只对"header 不完整"(缺 `$enddefinitions`)报错。
+- **`(sample-at s 越界)` 返回 nil** → 既有约定(见 BUG-009 撤回说明),不是 bug。
+
+## 第二轮收尾
+
+- **BUG-018(新)**:`bits->sint` 对 >64 位位串报含糊的 `invalid bits`;
+  改为明确报错"仅支持 ≤64 位(收到 N 位)…",手册补限制说明(结果用 64 位整数表示)。
+- **组合阶段 findings = 0**:`scripts/bughunt/run_combos.py` 的 25 条初判全部收敛
+  (真 bug 已修 + 误判项按"既有约定/刻意报错"修正预期)。
+- 单功能矩阵仍余 24 条 `VCD!=FST`,**全部是 trace 元信息(文件路径不同)**,语义零差异。

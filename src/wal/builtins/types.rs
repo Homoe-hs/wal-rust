@@ -98,6 +98,14 @@ fn op_bits_to_sint(args: &[Value], _env: &mut Environment, eval: &mut Evaluator)
                 return Err("bits->sint: empty string".to_string());
             }
             if s.chars().all(|c| c == '0' || c == '1') {
+                // BUG-018: 结果用 i64 表示 → >64 位的位串无法无损转换。给**明确**错误,
+                // 而不是含糊的 "invalid bits"(旧文案让用户以为字符串非法)。
+                if s.len() > 64 {
+                    return Err(format!(
+                        "bits->sint: 仅支持 ≤64 位(收到 {} 位);更宽的位串请先截取所需位,或改用 (string->int ...) 处理十进制",
+                        s.len()
+                    ));
+                }
                 if s.starts_with('1') {
                     let inverted: String = s.chars().map(|c| if c == '0' { '1' } else { '0' }).collect();
                     let u_res = isize::from_str_radix(&inverted, 2).map_err(|_| "invalid bits")? + 1;
