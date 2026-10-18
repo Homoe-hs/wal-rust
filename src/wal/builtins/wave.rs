@@ -796,6 +796,9 @@ const DOCS: &[(&str, &str)] = &[
     ("e", "未实现: WAL 无 `e` 形式(wal-rust 与其上游都没有); 科学计数法字面量同样不支持(用 (* 1.5 (** 10 3)))"),
     ("period", "(period \"clk\") → average clock period in seconds"),
     ("freq", "(freq \"clk\") → clock frequency in Hz"),
+    ("reval", "(reval expr offset) / expr@offset → 在 当前INDEX+offset 处重求值(流水线跨周期分析); 越界返回 false"),
+    ("set!", "(set! id expr) → 对已定义变量赋值(词法穿透共享 cell; wal-rust 唯一赋值写法)"),
+    ("eval-file", "(eval-file \"path.wal\") → 读取并求值 WAL 文件, 定义并入当前环境(上游核心库加载方式)"),
     ("beat", "(beat t [\"clk\"]) → 无时钟: 人类可读时间串; 带时钟: 整数拍号(首个上升沿=第0拍, 首沿前=-1)"),
     ("doc", "(doc \"cmd\"|cmd) → one-line documentation for a command"),
     ("semantics", "四值语义(权威口径): docs/4-state-semantics.md — 索引模型/取值与显示/比较/真值/边沿/聚合一致性"),
@@ -827,6 +830,32 @@ const DOCS: &[(&str, &str)] = &[
     // NOTE: keep the unit semantics visible in (help) as well.
 ];
 
+/// 0.14.63 起移除/更名的算子 → 给"不再支持 + 替代写法"的明确提示。
+pub(crate) fn removed_operator_help(topic: &str) -> Option<&'static str> {
+    Some(match topic {
+        "save" => "已移除(CSV 导出): 不再支持;需要时间序列请用 (getwave s) 自行处理",
+        "parse" => "已移除: 不再支持;动态求值用 (eval expr) 或直接写表达式",
+        "require" => "已移除: 不再支持;加载脚本请用 (eval-file \"path.wal\")",
+        "import" => "已移除: 不再支持;加载脚本请用 (eval-file \"path.wal\")",
+        "call" => "已移除: 不再支持;直接调用函数,或用闭包",
+        "repl" => "算子形式已移除: 不再支持;交互式 REPL 请用 CLI 命令 wal-rust repl",
+        "count/step" => "已移除: 不再支持;请用 (count ...)(统一引擎,含逐拍回退)",
+        "find/step" => "已移除: 不再支持;请用 (find ...)(统一引擎,含逐拍回退)",
+        "fold/signal" => "已移除: 不再支持;请用 (find ...) + (map ...)/(fold ...) 组合",
+        "trim-trace" => "已移除: 不再支持(原实现为 stub, 无实际效果)",
+        "new-trace" => "已移除: 不再支持(原实现为 stub)",
+        "dump-trace" => "已移除: 不再支持;wal-rust 是只读查询工具,CLI 不提供波形导出",
+        "timescale" => "已移除: 不再支持;时间单位见加载摘要,换算用 (beat t) 或 period/freq",
+        "assert-eq" => "已移除: 不再支持;脚本断言用 (if cond ... (exit 1)) 代替",
+        "set" => "已移除: 不再支持;唯一赋值写法是 (set! id expr)",
+        "fmt-time" => "已更名为 beat: 请用 (beat t) / (beat t \"clk\")",
+        "rel_eval" => "已更名为 reval: 请用 (reval expr offset), expr@offset 语法糖不变",
+        "tl-latency" => "已移除(历史清理): 不再支持;可用 whenever + 状态变量实现",
+        "tl-bandwidth" => "已移除(历史清理): 不再支持;可用 count + 位宽自行计算",
+        _ => return None,
+    })
+}
+
 /// 已文档化的主题名(供 (help) 列表展示)
 pub(crate) fn documented_topics() -> Vec<String> {
     let mut v: Vec<String> = DOCS.iter().map(|(n, _)| (*n).to_string()).collect();
@@ -842,7 +871,11 @@ pub(crate) fn print_doc(topic: &str) {
     } else {
         let mut names: Vec<&str> = DOCS.iter().map(|(n, _)| *n).collect();
         names.sort_unstable();
-        println!("No docs for '{}'. Documented topics: {}", topic, names.join(", "));
+        if let Some(msg) = removed_operator_help(topic) {
+            println!("'{}' {}.", topic, msg);
+        } else {
+            println!("No docs for '{}'. Documented topics: {}", topic, names.join(", "));
+        }
     }
 }
 

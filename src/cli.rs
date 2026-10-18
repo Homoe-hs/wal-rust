@@ -18,7 +18,8 @@ use std::path::PathBuf;
                   - mmap-based on-demand VCD loading (two-pass scan + sparse index + LRU cache)\n  \
                   - Handles 150GB+ dumps; process HEAP is O(signals + queried columns)\n  \
                     (RSS additionally counts mmap'd file pages — see docs/waveform-io-plan.md)\n  \
-                  - FST read support (wellen); FST **write** is not supported (dump-trace only\n  \
+                  - FST read support (wellen); read-only query tool (no CLI waveform export —\n  \
+                    FST write exists only in the library writer for tests/examples)\n  \
                     writes VCD — use an external converter for FST export)\n  \
                   - FSDB read via Verdi's NPI (runtime-discovered libNPI.so, pure Rust FFI,\n  \
                     no C++ shim): set $VERDI_HOME or $WAL_NPI_LIB; needs a Verdi license\n  \

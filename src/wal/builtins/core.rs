@@ -318,8 +318,8 @@ fn op_help(args: &[Value], _env: &mut Environment, _eval: &mut Evaluator) -> Res
                    (get s) 取**当前 INDEX** 处的值, 不随 map/遍历位置变化; 按时间取用 (at s T)\n\
                  \n\
                  查询(任意表达式走统一区间扫描引擎: 成本 O(变更点), 而非 O(时间戳)):\n\
-                   count cond [cond...]      满足条件的索引数(count/step 为逐索引等价形式)\n\
-                   find cond [limit]         满足条件的索引列表(find/step 同理)\n\
+                   count cond [cond...]      满足条件的索引数\n\
+                   find cond [limit]         满足条件的索引列表\n\
                    whenever cond body...     在每个命中索引处执行 body\n\
                    rising/falling/changes    边沿与变化谓词\n\
                    is-x / is-z               未知位 / 高阻\n\
@@ -340,7 +340,7 @@ fn op_help(args: &[Value], _env: &mut Environment, _eval: &mut Evaluator) -> Res
                    if do cond case when unless while define defun let set! fn lambda\n\
                    map fold print printf exit\n\
                    defmacro defunm macroexpand gensym   (宏: (doc \"defmacro\"))\n\
-                   #name ≡ (resolve-group 'name); expr@offset ≡ (rel_eval expr offset)\n\
+                   #name ≡ (resolve-group 'name); expr@offset ≡ (reval expr offset)\n\
                  \n\
                  CLI 子命令(不需要 WAL 表达式):\n\
                    wal-rust count <wave> <sig> [value]   值计数(默认 =1; 变化数用 (count (changes s)))\n\
@@ -368,15 +368,22 @@ fn op_help(args: &[Value], _env: &mut Environment, _eval: &mut Evaluator) -> Res
             text
         }
         _ => {
-            // 回落到 DOCS 表: 否则 defmacro/macroexpand/dump-trace 这些
-            // "(doc X) 有、(help \"X\") 说没有"的算子让人无从查起。
+            // 回落到 DOCS 表: 否则 defmacro/macroexpand 这些 "(doc X) 有、(help \"X\") 说没有"
+            // 的算子让人无从查起。
             if let Some(t) = topic.as_deref() {
                 if crate::wal::builtins::wave::documented_topics().iter().any(|d| *d == t) {
                     crate::wal::builtins::wave::print_doc(t);
                     return Ok(Value::Nil);
                 }
+                // 已移除的算子: 明确说"不再支持"并给替代写法(而不是含糊的 No help)
+                if let Some(msg) = crate::wal::builtins::wave::removed_operator_help(t) {
+                    format!("'{}' {}.", t, msg)
+                } else {
+                    format!("No help for '{}'. Try (help) for the overview.", t)
+                }
+            } else {
+                format!("No help for '{}'. Try (help) for the overview.", topic.unwrap_or_default())
             }
-            format!("No help for '{}'. Try (help) for the overview.", topic.unwrap_or_default())
         }
     };
     println!("{}", help_text);
