@@ -82,14 +82,13 @@
 
 ## 5. 聚合入口的一致性
 
-`count` / `count/step` / `count` 子命令(`wal-rust count <wave> <sig> <v>`)/ `find` /
+`count` / `count` 子命令(`wal-rust count <wave> <sig> <v>`)/ `find` /
 `getwave` / `whenever` **必须**给出同一口径的答案:
 
 | 入口 | 语义 |
 |---|---|
 | `(count (= (get s) V))` | 值等于 V 的**索引数**(x 不等于 V) |
 | `wal-rust count w s V` | 同上 |
-| `(count/step ...)` | 同上(逐索引等价形式) |
 | `(count (changes s))` | 变化的**索引数**(不含初值快照) |
 | `(count (rising s))` | 上升沿的**索引数** |
 

@@ -19,7 +19,7 @@ $ wal-rust '(count (&& (= (get "awvalid") 1) (= (get "awready") 1)))' -l design.
 
 | | |
 |---|---|
-| 当前版本 | **0.14.63**(发版记录见 [`CHANGELOG.md`](CHANGELOG.md)) |
+| 当前版本 | **0.14.64**(发版记录见 [`CHANGELOG.md`](CHANGELOG.md)) |
 | 输入格式 | VCD、FST([wellen](https://crates.io/crates/wellen))、**FSDB**(借 Verdi NPI, 纯 Rust FFI) |
 | 平台 | Linux x86_64;发布二进制要求 **glibc ≥ 2.17**(CentOS 7 / RHEL 7 / Ubuntu 16.04+) |
 | 规模 | 已在 **152GB / 58.7GB** 合成波形与 **5.86GB** 真实波形上验证(冷查询单遍读文件, 见[性能](#性能)) |
@@ -75,7 +75,7 @@ wal-rust '(count (rising "top.clk"))' -l design.vcd
 wal-rust '(count (is-x "state"))'     -l design.vcd          # 有多少时间处于 X
 wal-rust '(getwave "state")'          -l design.vcd          # 全部变更点 (t v)
 wal-rust '(at "state" 1515000)'       -l design.vcd          # 某时刻的值
-wal-rust '(assert-eq "sig" 100000 200000 1)' -l design.vcd   # [t0,t1] 内恒为 1?
+wal-rust '(count (= (get "sig") 1))' -l design.vcd   # 值恒为 1 的时间戳数
 
 # 3) 脚本 / REPL
 wal-rust run script.wal -l design.vcd
@@ -114,7 +114,7 @@ wal-rust run --halt-on-error script.wal -l design.vcd
 ### 三个容易踩的点
 
 * **时间单位**:`getwave`/`at`/`edges` 用文件原生单位(VCD 的 `$timescale`),
-  人读时间用 `(fmt-time T)`,节拍号用 `(fmt-time T "clk")`。
+  人读时间用 `(beat T)`,拍号(第几拍)用 `(beat T "clk")` 或 `WAL_BEAT_CLK=<完整时钟名>` 全局模式。
 * **`(get s)` 取的是当前 `INDEX`**,不随 `map` 的位置漂移;按时间取值用 `(at s T)`。
 * **x/z**:`x` 不等于 0(`(= (get a) 0)` 为假);`x→1` 算 `changes` 但**不算** `rising`;
   索引 0 没有前驱,除非 `$dumpvars` 给了确定初值(此时会有告警提示)。
@@ -125,7 +125,7 @@ wal-rust run --halt-on-error script.wal -l design.vcd
 
 | 类别 | 用法 |
 |---|---|
-| 算术/比较 | `+ - * / %`、`== != < <= > >=`、`min max abs`、`(fmt-time T)` |
+| 算术/比较 | `+ - * / %`、`== != < <= > >=`、`min max abs`、`(beat T)` |
 | 逻辑 | `&& \|\| ! not`;真值:**`#f` / `0` / `()` 为假**,其余为真 |
 | 绑定/函数 | `(define x v)`、`(define (f a) ...)`、`(set! x v)`(词法穿透)、`(fn (a) ...)`、闭包 |
 | 列表/数组 | `(list …)`、`(map f lst)`、`(length l)`;⚠️ `car/cdr/append/reverse/filter/sort/dotimes/stable` 等**上游标准库形式 wal-rust 未内置**(调用会报未知算子, 见手册 §1.10/§8.5) |
@@ -133,10 +133,10 @@ wal-rust run --halt-on-error script.wal -l design.vcd
 | 控制流 | `(if c a b)`、`(when c …)`、`(cond …)`、`(while c …)`(后两者逐拍推进, 大波形上慎用) |
 | 波形取值 | `(get s)`、`(at s T)`、`(sample-at s idx)`、`(getwave s)`、`(edges s T0 T1)` |
 | 边沿/状态 | `(rising s)`、`(falling s)`、`(changes s)`、`(is-x s)`、`(is-z s)` |
-| 计数/查找 | `(count cond)`、`(find cond)`、`(whenever cond …)`、`count/step`、`find/step` |
+| 计数/查找 | `(count cond)`、`(find cond)`、`(whenever cond …)` |
 | 信号名 | `(find-sig "pat")`(支持 `*` `?`)、`(SIGNALS)`、`(signal-width s)` |
 | 特殊变量 | `(INDEX)`、`(MAX-INDEX)`、`(TS)`、`(SIGNALS)`、`(TRACE-NAME)`、`(TRACE-FILE)` —— **只认大写** |
-| 其它 | `(printf …)`、`(assert-eq s T0 T1 v)`、`(doc "topic")`、`(exit N)` |
+| 其它 | `(printf …)`、`(doc "topic")`、`(exit N)` |
 
 > ⚠️ `(TS)` 目前返回的是**当前 INDEX**(不是原生时间戳)。要按时间过滤, 用
 > `(at s T)` / `(getwave s)` 配合原生时间;这一点与手册 §8.4 的说明一致, 未来若改为
@@ -182,8 +182,8 @@ wal-rust '(count (rising "clk"))' -l a.vcd -l b.fsdb
 
 | 格式 | 读 | 写 | 说明 |
 |---|---|---|---|
-| **VCD** | ✅ | ✅(`dump-trace`) | mmap + 懒索引;支持 gzip/bzip2/zlib;别名信号(idcode 复用)已收敛 |
-| **FST** | ✅([wellen](https://crates.io/crates/wellen)) | ⚠️ 仅往返测试 | 手写 reader 已从查询路径退役;`dump-trace` 只写 VCD, `.fst` 会明确拒绝 |
+| **VCD** | ✅ | ❌(0.14.63 起无导出算子) | mmap + 懒索引;支持 gzip/bzip2/zlib;别名信号(idcode 复用)已收敛 |
+| **FST** | ✅([wellen](https://crates.io/crates/wellen)) | ⚠️ 仅库内 writer/示例 | 手写 reader 已从查询路径退役;CLI 不提供格式导出 |
 | **FSDB** | ✅(借 Verdi NPI) | ❌ | **不逆向、不转换**:运行期 `dlopen` `libNPI.so` + `dlsym`,二进制无 C++ 依赖 |
 
 FSDB 用法与要点(`docs/fsdb-npi.md`):

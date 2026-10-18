@@ -70,7 +70,7 @@ Flags: `-l <waveform>`(可重复), `--halt-on-error`(遇错即停)。
   索引空间 —— 否则 `-l vcd -l fsdb` 查一个两条都有的信号会先物化 FSDB 全局时间线
   (内网 >900s, 单加载秒级)。③**禁止跨波形合并索引集合**: 索引是各自的变更排名,
   合并出来的既不是这条也不是那条(实测 `-l s1 -l s2` 同名信号答出 s2 的数);
-  所有取值/取索引路径统一 first-match。逐拍(`step_scan`)与统一引擎必须用同一规则;
+  所有取值/取索引路径统一 first-match。逐拍回退(`count`/`find` 的 fallback)与统一引擎必须用同一规则;
   `INDEX`/`TS` 读"正在被推进的那条 trace"(`Evaluator::scan_trace`)。
 - **CLI 多顶层形式 = `(list ...)`**: `parse_expr` 把"一个参数里写多个顶层形式"包成 `(list form1 form2 ...)`
   (求值顺序 = 书写顺序, 结果回显各形式的值)。**绝不能**让它以裸列表进 `eval_list` —— 那里的 IIFE 分支
@@ -289,8 +289,8 @@ Flags: `-l <waveform>`(可重复), `--halt-on-error`(遇错即停)。
 | `count &&` decomposition | `(count (&& a b) ...)` → `BatchEntry::And` → single pass |
 | `whenever` do decomposition | → independent `count` calls |
 | **懒索引 + 变更列融合** | `(load)` 只读头; 首次查询声明信号(`Trace::prepare`)→ 索引与变更列同一次遍历; 58.7GB 冷查询 216s→73s, `(load)` 63s→1s |
-| **统一区间扫描引擎** | `interval_scan`(变更点并集边界 + 解释器值覆盖): count/find/whenever/count/step 同一实现;含边沿谓词时"边界真值 + 区间内部真值(边沿强制 false)"两段计入 |
-| **多文件选源与索引空间收口** | 加载顺序决定选源(first-match), 且 `interval_scan`/`step_scan`/`find_indices` 只对**会读值的**波形取 `max_index`; 禁止跨波形合并索引集合(内网 #32: `-l vcd -l fsdb` 查同名信号 >900s → 秒级) |
+| **统一区间扫描引擎** | `interval_scan`(变更点并集边界 + 解释器值覆盖): count/find/whenever 同一实现(0.14.63 起不暴露 count/step, 逐拍回退仅内部用);含边沿谓词时"边界真值 + 区间内部真值(边沿强制 false)"两段计入 |
+| **多文件选源与索引空间收口** | 加载顺序决定选源(first-match), 且 `interval_scan`/逐拍回退/`find_indices` 只对**会读值的**波形取 `max_index`; 禁止跨波形合并索引集合(内网 #32: `-l vcd -l fsdb` 查同名信号 >900s → 秒级) |
 | **旁挂列缓存(跨进程)** | 冷扫描后按信号落盘 `<cache>/<file_identity>-v1.cols/<fnv(name)>.col`(key 含 ctime+inode);下一个进程 `anchored_changes` 直接命中(58.7GB 同查询 113.8s → 3.35s) |
 | **FSDB 列缓存(`.fcol`)** | 同构但独立的一套(FSDB 只能靠 NPI 重扫): 列 + t0 初值在头部, 指纹/位宽校验; 暖查询 8.6s→4.1s, 冷 48.5s→36.6s(200 万时间戳夹具); `make bench-fsdb` |
 | **纯逐拍 oracle** | `WAL_NO_ENGINE=1` 让引擎直接返回 None → 全部走逐拍;矩阵在子进程里用它做独立对拍 |

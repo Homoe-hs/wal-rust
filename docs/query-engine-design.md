@@ -135,7 +135,7 @@ pub enum Node {
 
 4. **名字解析必须所有读取路径一致**。`op_get` 走 `resolve_signal_name`(短名/叶子名/
    子串),而 `op_rising`/`op_falling`/`op_changes`/`is-x`/`is-z` 曾直接按字面名读 →
-   短名场景下边沿/X 谓词静默给 false(`count/step`、`find` 回退、`whenever` 回退全中招)。
+   短名场景下边沿/X 谓词静默给 false(`find` 回退、`whenever` 回退、`count` 逐拍回退全中招)。
    现在解析下沉到 `VcdTrace::resolve_idx` / `FstTrace::resolve_cached`(带缓存,
    一次 O(N) 扫描后 O(1)),所有路径共用。
 5. **INDEX/TS 依赖的条件必须放弃引擎**。区间内部"值恒定"的前提只对信号成立;
@@ -148,7 +148,7 @@ pub enum Node {
 回退逐拍(正确性优先,性能后补)。
 
 6. **0 个信号引用 = 常量条件**。不引用信号/INDEX 且无副作用的条件在每个索引取值相同,
-   `count`/`find`/`count/step` 直接 O(1) 给出结果(全索引或空集),不再逐索引求值。
+   `count`/`find` 直接 O(1) 给出结果(全索引或空集),不再逐索引求值。
    纯度判定:`collect_cond_signals` 为空且 AST 无 `set!`/`print`/`while`/… 且无闭包调用;
    引用信号的表达式绝不折叠(与逐拍 oracle 对拍在矩阵 `matrix_constant_condition_fold`)。
 
@@ -182,7 +182,7 @@ pub enum Node {
 |---|---|
 | `count cond` | Sweep + 区间长求和 |
 | `find cond [limit]` | Sweep,收集命中索引 |
-| `count/step` `find/step` | 同上显式逐点(语义相同,返回逐拍) |
+| 逐拍回退(内部) | `WAL_NO_ENGINE=1`/无法引擎化时使用;0.14.63 起不暴露 `count/step`、`find/step` 算子 |
 | `whenever [changed] sig cond body` | Sweep,命中处 set INDEX 后 eval body(现有语义) |
 | `count-rise/fall/edges` | 边沿节点 + 区间求和 |
 | `(get/at/sample-at)` | Column 直查(O(log C)),无扫描 |
@@ -205,7 +205,7 @@ pub enum Node {
 | P2 | `Column` 抽象 + `Trace::columns()`(VCD 单遍收集、FST 打包) | 同信号列 == 旧 change_points 语义(含 delta 折叠/初值快照) |
 | P3 | Expr 编译 + IntervalSweep;`count`/`find` 切换到引擎 | diff gate(scripts/diff_find.sh)ALL MATCH + 矩阵全绿 |
 | **P3 ✅ 已落地(0.12.x)** | **实现变体**: 不另写表达式编译器,而是"同一解释器 + 信号值覆盖"——`interval_scan` 收集引用信号,取变更点并集为边界,在边界处给 `op_get`/边沿谓词安装值覆盖后调用**现有解释器**求值;无边缘谓词按区间长度计入,含边缘谓词只计边界。`count`/`find` 回退前先试引擎。矩阵用例 `matrix_interval_engine_equals_oracle` 全绿 |
-| **P4 ✅ 已落地(0.12.x)** | whenever/`count/step`/`find/step`/`at` 收敛到引擎(count/find/whenever/step 四个入口同一实现) | 矩阵 20/20 全绿(含子进程独立 oracle) |
+| **P4 ✅ 已落地(0.12.x)** | whenever/`at` 收敛到引擎(count/find/whenever/step 入口同一实现;逐拍回退仅作内部 oracle) | 矩阵 20/20 全绿(含子进程独立 oracle) |
 | P5 ⏳ **未落地** | 批量向量化 + SIMD 行解析 | 部分达成: 并行分块/`memchr` 已有, 绝对秒数见 README「性能」;SIMD 未做 |
 | P6 ⏳ **未落地** | 删除旧 `FindCondition` 匹配路径(仅保留 CLI/导出视图) | `FindCondition` 仍在 `src/trace/trace.rs`;`Trace::columns()` 也没引入(`grep -rn 'fn columns' src/trace/` 为空) |
 

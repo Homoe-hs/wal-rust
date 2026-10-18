@@ -1,5 +1,7 @@
 # 加载策略实验结果:#2 cache-only × #3 惰性
 
+> ⚠️ **历史记录**:本文写于 0.14.63 之前;该版本清理了 `count/step`/`find/step`/`dump-trace` 等算子,旧命令不再可直接运行(现行口径见 `docs/wal-编程手册.md`)。
+
 > 状态:✅ **已跑并给结论**(2026-10-17,分支 `dev/load-strategy`)。
 > 实验设计见 [`load-strategy-experiments.md`](load-strategy-experiments.md)(判据在该文 §3,先写死后跑)。
 > 被测二进制 0.14.52 + 本分支原型;真波形 = `aicore_smoke_test_000.fsdb`(336MB / 1796 万信号),

@@ -2543,25 +2543,23 @@ wal-rust 将以下 golden 标准库宏实现为内置操作符：
 - `(count cond)` — 计数
 - `(timeframe body+)` — 时间范围
 - `(sum xs)` — 列表求和
-- `(set! key value)` — 展开为 `(set key value)`
+- `(set! key value)` — 直接赋值(词法穿透共享 cell;0.14.63 起为唯一赋值写法)
 - `(defun name args body+)` — 展开为 `(define name (fn args body...))`
 - `(for/list (sym data) body+)` — 展开为 `map`
 - `(defunm name args body)` — 展开为 `(defmacro name args body)`
 
 ### 8.5 行为差异
 
+> 0.14.63 起 `import`/`require`/`trim-trace`/`call` 已从 wal-rust 移除(见 §8.2 清理清单)。
+
 | 操作 | golden | wal-rust |
 |------|--------|----------|
 | `(*)` | 报错（需 ≥2 参数） | 返回 1 |
 | `(&& expr ...)` / `(|| expr ...)` 求值 | 短路求值 | 参数预求值后再逻辑判断（**非**短路，有副作用的参数总会执行） |
 | `(! expr)` | 支持 ≥1 参数，仅接受 int | 固定 ≥1 参数，任意类型 |
-| `(import module)` | 加载 Python 模块 | 加载 WAL 源文件 |
-| `(require module)` | 模块绑定导入（支持 rename-in/only-in/prefix-in） | 读文件系统 `.wal` 文件 |
 | `(type x)` | Python type 对象（`<class 'int'>`） | 字符串（`"<class 'int'>"`） |
 | `(sample-at ...)` | 设置采样点 | 读取指定索引的信号值（相反操作） |
-| `(trim-trace ...)` | 实际裁剪 | stub 实现，无效果 |
 | `(expr)@offset` | 支持任意 sexpr | 仅支持 `atom@atom` |
-| `(call ...)` | 调用 Python 模块函数 | 调用 WAL 函数/宏 |
 | `(scoped ...)` | `(scoped scope expr)` 固定 2 参数 | `(scoped scope body+)` 可变 body |
 | `(step)` | 无参数 | 支持 `(step)`、`(step amount)`、`(step id amount)` 三种形式 |
 | `(define ...)` | 仅符号绑定 | 支持 `(define x val)` 和 `(define (fn args) body)` 两种形式 |

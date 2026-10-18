@@ -108,10 +108,10 @@
     (define max_i (max-index))
     (while (< idx max_i)
       (step 1)
-      (set idx (ts))
+      (set! idx (ts))
       (if (> (get v-name) 0)
         (if (> (get r-name) 0)
-          (set hs (+ hs 1)))))
+          (set! hs (+ hs 1)))))
     (step 0)
     hs))
 
@@ -123,10 +123,10 @@
     (define max_i (max-index))
     (while (< idx max_i)
       (step 1)
-      (set idx (ts))
+      (set! idx (ts))
       (if (> (get v-name) 0)
         (if (> (get r-name) 0)
-          (set hs (+ hs 1)))))
+          (set! hs (+ hs 1)))))
     (step 0)
     hs))
 
@@ -162,12 +162,12 @@
     (define idx 0)
     (while (< idx max_idx)
       (step 1)
-      (set idx (ts))
+      (set! idx (ts))
       (if (> (get v-name) 0)
         (do
-          (set v-cycles (+ v-cycles 1))
+          (set! v-cycles (+ v-cycles 1))
           (if (= (get r-name) 0)
-            (set stall (+ stall 1))))))
+            (set! stall (+ stall 1))))))
     (if (> v-cycles 0)
       (printf "  {0}: valid={1}  stalled={2}  util={3}%"
         label v-cycles stall
@@ -201,20 +201,20 @@
     (define idx 0)
     (while (< idx max_idx)
       (step 1)
-      (set idx (ts))
+      (set! idx (ts))
       (if (> (get v-name) 0)
         (if (> (get r-name) 0)
-          (set beats (+ beats 1)))))
+          (set! beats (+ beats 1)))))
     (step 0)
     beats))
 
 (define resp_handshakes 0)
 
 (if (= PROTO "tilelink")
-  (set resp_handshakes (count-data-beats D_VALID D_READY)))
+  (set! resp_handshakes (count-data-beats D_VALID D_READY)))
 
 (if (= PROTO "axi")
-  (set resp_handshakes (+
+  (set! resp_handshakes (+
     (count-data-beats R_VALID R_READY)    ;; read data
     (count-data-beats W_VALID W_READY)))) ;; write data
 
@@ -228,7 +228,7 @@
 (step 0)
 (define max_idx_data (signal-width A_DATA))
 (if (> max_idx_data 0)
-  (set DATA_BYTES (/ max_idx_data 32)))
+  (set! DATA_BYTES (/ max_idx_data 32)))
 
 (printf "  Approx data width: {0} bytes" DATA_BYTES)
 (printf "  Approx total data transferred: {0} MB"
@@ -253,14 +253,14 @@
     (define idx 0)
     (while (and (< idx max_idx) (< sample_count 100))
       (step 1)
-      (set idx (ts))
+      (set! idx (ts))
       (if (> (get A_VALID) 0)
         (if (> (get A_READY) 0)
           (do
-            (set sample_count (+ sample_count 1))
+            (set! sample_count (+ sample_count 1))
             (define op (get A_OPCODE))
-            (if (< op 4) (set put_count (+ put_count 1))
-              (if (< op 6) (set get_count (+ get_count 1))))))))
+            (if (< op 4) (set! put_count (+ put_count 1))
+              (if (< op 6) (set! get_count (+ get_count 1))))))))
     (printf "  Sampled {0} transactions:" sample_count)
     (printf "    Put:  {0} ({1}%)" put_count
       (if (> sample_count 0) (/ (* put_count 100) sample_count) 0))
@@ -293,31 +293,31 @@
     (define hs 0)
     (while (< idx max_idx)
       (step 1)
-      (set idx (ts))
+      (set! idx (ts))
       (if (> (get req-v) 0)
         (if (> (get req-r) 0)
           (do
-            (set hs (+ hs 1))
+            (set! hs (+ hs 1))
             (if (= (mod hs LAT_SAMPLE_INTERVAL) 0)
               (do
                 (define start_idx idx)
                 (define found_resp false)
                 (define search_i idx)
                 (while (not found_resp)
-                  (set search_i (+ search_i 1))
+                  (set! search_i (+ search_i 1))
                   (if (> search_i max_idx)
-                    (set found_resp true)
+                    (set! found_resp true)
                     (do
                       (step 1)
                       (if (> (get resp-v) 0)
                         (if (> (get resp-r) 0)
                           (do
                             (define lat (- search_i start_idx))
-                            (set total (+ total lat))
-                            (set samples (+ samples 1))
-                            (if (< lat min_l) (set min_l lat))
-                            (if (> lat max_l) (set max_l lat))
-                            (set found_resp true)))))))))))))
+                            (set! total (+ total lat))
+                            (set! samples (+ samples 1))
+                            (if (< lat min_l) (set! min_l lat))
+                            (if (> lat max_l) (set! max_l lat))
+                            (set! found_resp true)))))))))))))
     (if (> samples 0)
       (do
         (printf "  {0}: {1} samples, avg={2} min={3} max={4}"

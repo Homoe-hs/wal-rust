@@ -157,8 +157,8 @@ for name, args, exp in [
 def wscript(name, body):
     p = os.path.join(WORK, name); open(p, "w").write(body); return p
 scripts = [
-    ("s1.wal", '(print "hi")\n(assert-eq "clk" 0 0 (get "clk"))\n', "ok", "普通脚本"),
-    ("s2.wal", '(assert-eq "a" 1 2)\n', "err", "断言失败应非 0"),
+    ("s1.wal", '(print "hi")\n(count (rising "clk"))\n', "ok", "普通脚本"),
+    ("s2.wal", '(nonexistent-op 1)\n', "err", "未知算子应非 0"),
     ("s3.wal", '(exit 0)\n', "ok", "exit 0"),
     ("s4.wal", '(exit 7)\n', "rc=7", "exit 7(退出码应为 7)"),
     ("s5.wal", '(define f (lambda (x) (* x 2)))\n(print (f 21))\n', "ok", "lambda"),

@@ -64,7 +64,7 @@ CURATED = [
     '(count (not (= (get "SIG") 1)))',
     # 索引 / 时间
     '(list INDEX TS MAX-INDEX)', '(do (step 1) (list INDEX TS))', '(do (step 2) INDEX (step -2) INDEX)',
-    '(timescale)', '(fmt-time 0)', '(fmt-time 1000)', '(fmt-time 123456789)',
+    '(timescale)', '(beat 0)', '(beat 1000)', '(beat 123456789)',
     # 元信息
     '(length (SIGNALS))', '(length SCOPES)', '(list CG)', '(list LOCAL-SIGNALS)',
     '(all-scopes)', '(length (all-scopes))', '(in-scope "top.u1")',
@@ -76,7 +76,7 @@ CURATED = [
     '(histogram (latency (rising "A") (rising "B")) 4)', '(ipc (rising "A") (rising "B"))',
     '(latency (rising "A") (rising "B"))',
     # 断言 / 错误路径
-    '(assert-eq "SIG" 0 0 (get "SIG"))', '(assert-eq "SIG" 99 0 (get "SIG"))',
+    '(count (= (get "SIG") 0))', '(search "SIG" "1")',
     # 语言/集合
     '(+ 1 2)', '(- 1 2)', '(* 3 4)', '(/ 1 0)', '(div 1 0)', '(mod 1 0)', '(/ 1 0.0)',
     '(< 1 2)', '(= 1 1)', '(&& 0 1)', '(|| 0 1)', '(not 0)',
