@@ -106,7 +106,7 @@ fi
 bullets=$(printf '%s' "$NOTES" | grep -c '^- ')
 [ "$bullets" -ge 2 ] || die "CHANGELOG 里 $VERSION 一节只有 $bullets 条变更 —— release notes 至少写清 2 条"
 say "release notes 预览($bullets 条):"
-printf '%s\n' "$NOTES" | sed 's/^/    /' | head -12
+printf '%s\n' "$NOTES" | sed -n '1,12{s/^/    /;p}'
 
 # --- 3. 本地 CI --------------------------------------------------------------
 if [ $SKIP_CI -eq 1 ]; then
